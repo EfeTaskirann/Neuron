@@ -4,6 +4,32 @@ Running journal of agent-driven changes. Newest entry on top. See `AGENTS.md` §
 
 ---
 
+## 2026-04-28T19:27:40Z WP-W2-02 completed
+- sub-agent: general-purpose
+- files changed: 8 (`src-tauri/Cargo.toml`, `src-tauri/migrations/0001_init.sql`, `src-tauri/src/db.rs` (new module, 244 lines incl. 5 tests), `src-tauri/src/lib.rs` (setup hook + manage pool + register health_db), `src-tauri/src/commands/mod.rs` (new), `src-tauri/src/commands/health.rs` (new, smoke command), `src-tauri/.sqlx/query-976b52de…json` (offline cache), `Cargo.lock`)
+- commit SHA: `8870de6`
+- acceptance: ✅ pass — orchestrator independently re-ran the gates after sub-agent return
+  - `cargo test --manifest-path src-tauri/Cargo.toml -- db` → exit 0, **5/5 tests passing**:
+    - `migration_creates_all_eleven_tables` — list matches expected sorted set
+    - `pragma_foreign_keys_is_on_per_connection` — verified across 3 connections
+    - `migrations_are_idempotent` — second-launch + fresh-pool, exactly 1 row in `_sqlx_migrations`
+    - `pool_can_insert_and_select` — round-trip via the agents table
+    - `macro_query_uses_offline_cache` — `sqlx::query_scalar!` compiles + runs against `.sqlx/`
+  - `cargo check` → exit 0, 0.70s warm
+  - 11 schema tables present in `0001_init.sql`: agents, edges, mailbox, nodes, pane_lines, panes, runs, runs_spans, server_tools, servers, workflows
+  - `.sqlx/` offline cache committed (1 query JSON for the test macro)
+  - DbPool wired via `app.manage(pool)` in `lib.rs` setup hook; smoke command `health_db` returns `{ tables, foreignKeysOn }`
+  - prototype isolation: `git diff HEAD~1 HEAD` shows zero `Neuron Design/` / `neuron-docs/` / `app/` / `docs/` files touched
+  - frontend regression check: `pnpm typecheck` ✅, `pnpm lint` ✅, `pnpm test --run` ✅ (still 1 file 2 tests — Hello Neuron + OKLCH)
+  - manual `pnpm tauri dev` + `sqlite3 .tables` verification: pending — sandbox cannot launch desktop window
+- naming deviation (transparent): smoke command exposed as `health_db` (underscore) instead of charter-canonical `health:db` (colon). Reason: Tauri 2.x's `#[tauri::command]` does not ship a stable `rename = "..."` attribute without extra crates; per WP-W2-02 explicit allowance the underscore form is acceptable for this WP only. WP-W2-03 introduces `tauri-specta` binding generation which will alias the IPC surface back to colon-namespaced names.
+- informational: actual Tauri bundle identifier is `app.neuron.desktop` (set in WP-W2-01's `tauri.conf.json`) — DB file lands at `%APPDATA%\app.neuron.desktop\neuron.db` on Windows, NOT the WP body's example `com.neuron.dev`. WP body comment was illustrative; behaviour follows the actual identifier.
+- toolchain: `sqlx-cli` installed via `cargo install sqlx-cli --no-default-features --features sqlite` (one-time, on user PATH; not a project dependency)
+- branch: `main` (local; not pushed)
+- next: WP-W2-03 (Tauri command surface) — depends on WP-W2-02 only
+
+---
+
 ## 2026-04-28T18:26:30Z WP-W2-01 completed
 - sub-agent: general-purpose
 - files changed: 19 (key: `app/{package.json,vite.config.ts,vitest.config.ts,index.html,tsconfig*.json,eslint.config.js}`, `app/src/{main.tsx,App.tsx,App.test.tsx,styles.css,test/setup.ts,vite-env.d.ts}`, `src-tauri/{Cargo.toml,build.rs,tauri.conf.json,src/{main.rs,lib.rs},capabilities/default.json,icons/}`, root `{package.json,pnpm-workspace.yaml,Cargo.toml,Cargo.lock,pnpm-lock.yaml,.nvmrc,.gitignore,.cargo/config.toml}`)
