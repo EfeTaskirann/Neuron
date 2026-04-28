@@ -6,6 +6,13 @@ authors = ["Neuron Contributors"]
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+# Disambiguate `cargo run` (and therefore `pnpm tauri dev`) when the
+# package contains the implicit `neuron` bin alongside the
+# `export-bindings` helper bin under `src/bin/`. Without this, cargo
+# silently picks the alphabetically first bin (`export-bindings`),
+# which exits after writing `bindings.ts` — and the desktop window
+# never launches.
+default-run = "neuron"
 
 # Tauri 2 needs `cdylib` (system-library bridge) and `staticlib` (mobile)
 # alongside the regular `rlib` so future workspace crates can depend on
