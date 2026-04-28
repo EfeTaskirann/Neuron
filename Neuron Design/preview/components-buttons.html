@@ -1,0 +1,33 @@
+<!doctype html>
+<html class="dark">
+<head><meta charset="utf-8"><link rel="stylesheet" href="../colors_and_type.css">
+<style>
+body{margin:0;padding:24px 22px;background:var(--background);color:var(--foreground);font-family:var(--font-sans);display:flex;flex-direction:column;gap:14px;align-items:flex-start;}
+.row{display:flex;gap:10px;align-items:center;}
+button{font-family:var(--font-sans);font-weight:500;font-size:13px;padding:0 14px;height:36px;border-radius:8px;border:1px solid transparent;cursor:pointer;display:inline-flex;align-items:center;gap:6px;transition:all 120ms var(--ease-out);}
+.primary{background:var(--primary);color:var(--primary-foreground);}
+.primary:hover{box-shadow:var(--glow-violet-sm);transform:translateY(-1px);}
+.secondary{background:var(--secondary);color:var(--secondary-foreground);}
+.secondary:hover{background:var(--accent);color:var(--accent-foreground);}
+.ghost{background:transparent;color:var(--foreground);}
+.ghost:hover{background:var(--muted);}
+.outline{background:transparent;color:var(--foreground);border-color:var(--border);}
+.outline:hover{background:var(--muted);border-color:var(--neuron-violet-700);}
+.destructive{background:var(--destructive);color:var(--destructive-foreground);}
+.icon{width:36px;padding:0;justify-content:center;}
+.kbd{font-family:var(--font-mono);font-size:10px;padding:1px 5px;border-radius:3px;background:oklch(1 0 0 / 0.08);border:1px solid oklch(1 0 0 / 0.12);}
+.label{font-size:10px;letter-spacing:0.08em;text-transform:uppercase;color:var(--muted-foreground);font-weight:600;width:80px;}
+</style></head>
+<body>
+<div class="row"><span class="label">Primary</span>
+  <button class="primary"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>New workflow</button>
+  <button class="primary">Connect server <span class="kbd">⌘K</span></button>
+</div>
+<div class="row"><span class="label">Secondary</span>
+  <button class="secondary">Cancel</button>
+  <button class="outline">Import</button>
+  <button class="ghost">Skip</button>
+  <button class="destructive">Delete</button>
+  <button class="outline icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg></button>
+</div>
+</body></html>

@@ -1,0 +1,35 @@
+<!doctype html>
+<html class="dark">
+<head><meta charset="utf-8"><link rel="stylesheet" href="../colors_and_type.css">
+<style>
+body{margin:0;padding:0;background:var(--background);color:var(--foreground);font-family:var(--font-sans);display:grid;grid-template-columns:1fr 1fr;}
+.pane{padding:18px 20px;}
+.pane.light{background:oklch(0.992 0.004 308);color:oklch(0.190 0.046 258);}
+.pane.dark{background:oklch(0.135 0.032 258);color:oklch(0.972 0.012 258);}
+.label{font-size:10px;font-weight:600;letter-spacing:0.08em;text-transform:uppercase;opacity:0.6;margin:0 0 12px;}
+.tok{display:flex;align-items:center;gap:10px;margin-bottom:7px;font-size:12px;}
+.chip{width:22px;height:22px;border-radius:6px;flex:none;border:1px solid currentColor;border-color:transparent;}
+.name{font-family:var(--font-mono);font-size:11px;}
+</style></head>
+<body>
+<div class="pane light">
+  <div class="label">Light · semantic</div>
+  <div class="tok"><span class="chip" style="background:oklch(0.992 0.004 308);border-color:rgba(0,0,0,0.1)"></span><span class="name">--background</span></div>
+  <div class="tok"><span class="chip" style="background:oklch(0.190 0.046 258)"></span><span class="name">--foreground</span></div>
+  <div class="tok"><span class="chip" style="background:oklch(0.555 0.226 297)"></span><span class="name">--primary</span></div>
+  <div class="tok"><span class="chip" style="background:oklch(0.946 0.029 305)"></span><span class="name">--accent</span></div>
+  <div class="tok"><span class="chip" style="background:oklch(0.972 0.012 258)"></span><span class="name">--muted</span></div>
+  <div class="tok"><span class="chip" style="background:oklch(0.585 0.230 18)"></span><span class="name">--destructive</span></div>
+  <div class="tok"><span class="chip" style="background:oklch(0.872 0.044 258 / 0.6);border-color:oklch(0.190 0.046 258 / 0.2)"></span><span class="name">--border</span></div>
+</div>
+<div class="pane dark">
+  <div class="label">Dark · semantic (default)</div>
+  <div class="tok"><span class="chip" style="background:oklch(0.135 0.032 258);border-color:rgba(255,255,255,0.1)"></span><span class="name">--background</span></div>
+  <div class="tok"><span class="chip" style="background:oklch(0.972 0.012 258)"></span><span class="name">--foreground</span></div>
+  <div class="tok"><span class="chip" style="background:oklch(0.643 0.214 298)"></span><span class="name">--primary</span></div>
+  <div class="tok"><span class="chip" style="background:oklch(0.470 0.207 296)"></span><span class="name">--accent</span></div>
+  <div class="tok"><span class="chip" style="background:oklch(0.265 0.068 258)"></span><span class="name">--muted</span></div>
+  <div class="tok"><span class="chip" style="background:oklch(0.640 0.230 18)"></span><span class="name">--destructive</span></div>
+  <div class="tok"><span class="chip" style="background:oklch(0.265 0.068 258 / 0.6);border-color:rgba(255,255,255,0.1)"></span><span class="name">--border</span></div>
+</div>
+</body></html>

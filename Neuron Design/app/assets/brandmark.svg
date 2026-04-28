@@ -1,0 +1,91 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 80 80" fill="none" aria-label="Neuron brandmark">
+  <defs>
+    <linearGradient id="nrn-soma" x1="0.15" y1="0.1" x2="0.9" y2="0.95">
+      <stop offset="0" stop-color="#ede4f7"></stop>
+      <stop offset="0.4" stop-color="#a874d6"></stop>
+      <stop offset="1" stop-color="#491e78"></stop>
+    </linearGradient>
+    <linearGradient id="nrn-dend" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#dcc7ef"></stop>
+      <stop offset="1" stop-color="#5d2596"></stop>
+    </linearGradient>
+    <linearGradient id="nrn-axon" x1="0" y1="0" x2="1" y2="0.6">
+      <stop offset="0" stop-color="#a874d6"></stop>
+      <stop offset="0.6" stop-color="#7332b5"></stop>
+      <stop offset="1" stop-color="#381958"></stop>
+    </linearGradient>
+  </defs>
+
+  
+  <g stroke="url(#nrn-dend)" stroke-linecap="round" fill="none">
+    
+    <path d="M30 28 C 30 20, 28 13, 26 6" stroke-width="2.2"></path>
+    <path d="M28 14 C 24 12, 21 11, 18 9" stroke-width="1.6"></path>
+    <path d="M29 9  C 31 6,  35 5,  39 5" stroke-width="1.4"></path>
+    <path d="M27 18 C 23 18, 20 17, 17 15" stroke-width="1.3"></path>
+
+    
+    <path d="M27 30 C 20 26, 13 24, 6 22" stroke-width="2"></path>
+    <path d="M14 24 C 11 22, 8  19, 6  15" stroke-width="1.4"></path>
+    <path d="M10 23 C 7  24, 4  25, 2  27" stroke-width="1.3"></path>
+
+    
+    <path d="M27 33 C 20 35, 13 36, 6 38" stroke-width="1.9"></path>
+    <path d="M13 37 C 10 39, 8  42, 7  46" stroke-width="1.4"></path>
+
+    
+    <path d="M28 36 C 23 42, 18 47, 12 52" stroke-width="1.7"></path>
+    <path d="M18 47 C 14 49, 11 52, 8  56" stroke-width="1.3"></path>
+
+    
+    <path d="M34 27 C 36 22, 38 19, 41 16" stroke-width="1.5"></path>
+  </g>
+
+  
+  <g fill="#c4a1e4">
+    <circle cx="26" cy="6" r="1.5"></circle>
+    <circle cx="18" cy="9" r="1.2"></circle>
+    <circle cx="39" cy="5" r="1.3"></circle>
+    <circle cx="17" cy="15" r="1.1"></circle>
+    <circle cx="6" cy="22" r="1.4"></circle>
+    <circle cx="6" cy="15" r="1.1"></circle>
+    <circle cx="2" cy="27" r="1.1"></circle>
+    <circle cx="6" cy="38" r="1.4"></circle>
+    <circle cx="7" cy="46" r="1.1"></circle>
+    <circle cx="12" cy="52" r="1.2"></circle>
+    <circle cx="8" cy="56" r="1.0"></circle>
+    <circle cx="41" cy="16" r="1.2"></circle>
+  </g>
+
+  
+  <circle cx="31" cy="32" r="7.5" fill="url(#nrn-soma)"></circle>
+  
+  <ellipse cx="28.5" cy="29.5" rx="2.4" ry="1.6" fill="#f7f3fb" opacity="0.55"></ellipse>
+  
+  <circle cx="32" cy="33" r="2.2" fill="#381958" opacity="0.35"></circle>
+
+  
+  <path d="M37 34 C 40 35, 42 36, 44 37 L 44 39 C 42 40, 40 41, 37 42 Z" fill="url(#nrn-axon)" opacity="0.85"></path>
+
+  
+  <path d="M44 38 C 54 38, 62 42, 70 50 C 73 53, 75 57, 76 62" stroke="url(#nrn-axon)" stroke-width="2.6" stroke-linecap="round" fill="none"></path>
+
+  
+  <g stroke="#ede4f7" stroke-width="0.8" stroke-linecap="round" opacity="0.55">
+    <line x1="53" y1="38.4" x2="55" y2="38.6"></line>
+    <line x1="62" y1="41.5" x2="63.6" y2="42.4"></line>
+    <line x1="69.5" y1="49" x2="70.8" y2="50.4"></line>
+  </g>
+
+  
+  <g stroke="url(#nrn-axon)" stroke-width="1.8" stroke-linecap="round" fill="none">
+    <path d="M76 62 C 75 65, 73 67, 70 69"></path>
+    <path d="M76 62 C 78 65, 79 68, 79 71"></path>
+    <path d="M76 62 C 74 64, 72 65, 69 65"></path>
+  </g>
+  <g fill="url(#nrn-soma)">
+    <circle cx="70" cy="69" r="2.2"></circle>
+    <circle cx="79" cy="71" r="1.8"></circle>
+    <circle cx="69" cy="65" r="1.6"></circle>
+  </g>
+</svg>

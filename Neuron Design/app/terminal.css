@@ -1,0 +1,283 @@
+/* Terminal screen — pane grid, chrome, body, status bar. */
+
+/* Agent accents — separate from --neuron-* so accent swap doesn't kill semantics */
+:root {
+  --agent-violet:  oklch(0.660 0.150 298);
+  --agent-emerald: oklch(0.700 0.170 158);
+  --agent-amber:   oklch(0.795 0.165 78);
+  --agent-sky:     oklch(0.715 0.145 232);
+  --agent-slate:   oklch(0.660 0.020 258);
+  --term-bg:       oklch(0.135 0.032 258);
+}
+
+.term-route {
+  position: absolute; inset: 0;
+  display: grid;
+  grid-template-rows: 1fr 32px;
+  background:
+    radial-gradient(circle at 30% 10%, color-mix(in oklch, var(--neuron-violet-500) 5%, transparent), transparent 40%),
+    var(--background);
+  overflow: hidden;
+}
+
+.pane-grid {
+  display: grid; gap: 8px; padding: 12px 12px 8px;
+  min-height: 0;
+}
+.pane-grid.layout-1   { grid-template: 1fr / 1fr; }
+.pane-grid.layout-2v  { grid-template: 1fr / 1fr 1fr; }
+.pane-grid.layout-2h  { grid-template: 1fr 1fr / 1fr; }
+.pane-grid.layout-2x2 { grid-template: 1fr 1fr / 1fr 1fr; }
+.pane-grid.layout-3x4 { grid-template: 1fr 1fr / 1fr 1fr 1fr; }
+
+/* Status → color map. Single source of truth — border, stripe, glow all read --st-color.
+   --st-color is set as a CONCRETE oklch value (not via var()) so color-mix can resolve it
+   reliably across browsers. */
+.pane {
+  --st-color: oklch(0.555 0.020 258);  /* slate fallback */
+  position: relative;
+  background: var(--term-bg);
+  border: 1px solid color-mix(in oklch, var(--st-color) 40%, var(--border));
+  border-radius: var(--radius-lg);
+  display: grid;
+  grid-template-rows: auto auto 1fr;
+  overflow: hidden;
+  cursor: pointer;
+  transition: border-color 200ms ease, box-shadow 200ms ease;
+  min-height: 0;
+}
+.pane.status-idle              { --st-color: oklch(0.555 0.020 258); }
+.pane.status-running           { --st-color: oklch(0.737 0.159 299); }   /* violet-400 */
+.pane.status-success           { --st-color: oklch(0.700 0.170 158); }   /* emerald-500 */
+.pane.status-error             { --st-color: oklch(0.640 0.230 18); }    /* rose-500 */
+.pane.status-awaiting_approval { --st-color: oklch(0.795 0.165 78); }    /* amber-400 */
+
+.pane:hover {
+  border-color: color-mix(in oklch, var(--st-color) 60%, var(--border));
+}
+
+/* Running panes get a subtle ambient glow even when not active — so users see live work at a glance */
+.pane.status-running:not(.active) {
+  border-color: color-mix(in oklch, var(--st-color) 65%, var(--border));
+  box-shadow:
+    0 0 0 1px color-mix(in oklch, var(--st-color) 40%, transparent),
+    0 0 18px -4px color-mix(in oklch, var(--st-color) 35%, transparent);
+  animation: pane-running-breathe 2.8s ease-in-out infinite;
+}
+@keyframes pane-running-breathe {
+  0%, 100% {
+    box-shadow:
+      0 0 0 1px color-mix(in oklch, var(--st-color) 35%, transparent),
+      0 0 14px -4px color-mix(in oklch, var(--st-color) 30%, transparent);
+  }
+  50% {
+    box-shadow:
+      0 0 0 1px color-mix(in oklch, var(--st-color) 60%, transparent),
+      0 0 26px -2px color-mix(in oklch, var(--st-color) 50%, transparent);
+  }
+}
+
+/* Success panes — gentle emerald breathe at low intensity. Calm but alive. */
+.pane.status-success:not(.active) {
+  border-color: color-mix(in oklch, var(--st-color) 60%, var(--border));
+  animation: pane-success-breathe 3.6s ease-in-out infinite;
+}
+@keyframes pane-success-breathe {
+  0%, 100% {
+    box-shadow:
+      0 0 0 1px color-mix(in oklch, var(--st-color) 25%, transparent),
+      0 0 10px -4px color-mix(in oklch, var(--st-color) 20%, transparent);
+  }
+  50% {
+    box-shadow:
+      0 0 0 1px color-mix(in oklch, var(--st-color) 40%, transparent),
+      0 0 18px -4px color-mix(in oklch, var(--st-color) 35%, transparent);
+  }
+}
+
+/* Awaiting & error also get a steady ring so they're impossible to miss */
+.pane.status-awaiting_approval:not(.active),
+.pane.status-error:not(.active) {
+  border-color: color-mix(in oklch, var(--st-color) 70%, var(--border));
+  box-shadow:
+    0 0 0 1px color-mix(in oklch, var(--st-color) 45%, transparent),
+    0 0 16px -4px color-mix(in oklch, var(--st-color) 35%, transparent);
+}
+
+/* Active pane — glow that pulses so user can see which terminal they're focused on.
+   Brighter overall and stronger pulse so success/idle panes are also obviously active. */
+.pane.active {
+  border-color: var(--st-color);
+  animation: pane-active-glow 2.2s ease-in-out infinite;
+}
+@keyframes pane-active-glow {
+  0%, 100% {
+    box-shadow:
+      0 0 0 1.5px var(--st-color),
+      0 0 32px -2px color-mix(in oklch, var(--st-color) 75%, transparent),
+      0 0 64px -8px color-mix(in oklch, var(--st-color) 45%, transparent);
+  }
+  50% {
+    box-shadow:
+      0 0 0 2px var(--st-color),
+      0 0 48px 0 color-mix(in oklch, var(--st-color) 95%, transparent),
+      0 0 96px -4px color-mix(in oklch, var(--st-color) 65%, transparent);
+  }
+}
+
+.pane-stripe {
+  position: absolute; left: 0; top: 0; bottom: 0; width: 3px;
+  background: var(--st-color) !important;
+  z-index: 2;
+  box-shadow: 0 0 8px 0 color-mix(in oklch, var(--st-color) 50%, transparent);
+}
+.pane.active .pane-stripe {
+  width: 4px;
+  box-shadow: 0 0 14px 0 color-mix(in oklch, var(--st-color) 80%, transparent);
+}
+.pane.status-running .pane-stripe { animation: stripe-pulse 1.6s ease-in-out infinite; }
+@keyframes stripe-pulse { 0%,100% { opacity: 0.7; } 50% { opacity: 1; } }
+
+/* head */
+.pane-head {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: center;
+  gap: 12px;
+  padding: 7px 10px 7px 14px;
+  background: color-mix(in oklch, var(--surface-1) 70%, transparent);
+  backdrop-filter: blur(8px);
+  border-bottom: 1px solid var(--border);
+  font-size: 11.5px;
+}
+.pane-head-l { display: flex; align-items: center; gap: 7px; }
+.pane-head-r { display: flex; gap: 1px; }
+.pane-head-r .icon-btn.sm { width: 22px; height: 22px; }
+.pane-name { font-weight: 500; color: var(--foreground); }
+.pane-dot { width: 6px; height: 6px; border-radius: 50%; margin-left: 2px; flex: none; }
+.pane-dot.status-idle              { background: oklch(0.555 0.020 258); }
+.pane-dot.status-running           { background: oklch(0.737 0.159 299); animation: pulse 1.6s ease-in-out infinite; }
+.pane-dot.status-success           { background: oklch(0.700 0.170 158); }
+.pane-dot.status-error             { background: oklch(0.640 0.230 18); }
+.pane-dot.status-awaiting_approval { background: oklch(0.795 0.165 78); animation: pulse 1.6s ease-in-out infinite; }
+.pane-status {
+  font-family: var(--font-mono); font-size: 9.5px; letter-spacing: 0.04em;
+  color: var(--muted-foreground); text-transform: lowercase;
+}
+.pane-role { font-family: var(--font-mono); font-size: 9.5px; color: var(--muted-foreground); }
+.pane-cwd {
+  font-family: var(--font-mono); font-size: 10.5px; color: var(--muted-foreground);
+  text-align: center; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0;
+  direction: rtl;
+}
+
+/* approval banner */
+.approval-banner {
+  display: flex; align-items: center; gap: 8px;
+  padding: 8px 12px;
+  background: color-mix(in oklch, var(--neuron-amber-400) 10%, transparent);
+  border-bottom: 1px solid color-mix(in oklch, var(--neuron-amber-400) 30%, var(--border));
+  font-family: var(--font-mono); font-size: 11px;
+}
+.ab-tag {
+  font-size: 9px; letter-spacing: 0.08em; text-transform: uppercase;
+  color: var(--neuron-amber-400); padding: 1px 6px; border-radius: 4px;
+  background: color-mix(in oklch, var(--neuron-amber-400) 15%, transparent);
+}
+.ab-tool   { color: var(--foreground); }
+.ab-arrow  { color: var(--muted-foreground); }
+.ab-target { color: var(--neuron-violet-300); }
+.ab-diff   { display: flex; gap: 6px; margin-left: 6px; }
+.ab-add    { color: var(--syn-success); }
+.ab-rem    { color: var(--syn-error); }
+.ab-spacer { flex: 1; }
+
+/* body */
+.pane-body {
+  padding: 10px 14px 12px;
+  font-family: var(--font-mono);
+  font-size: 12px; line-height: 1.5;
+  color: oklch(0.872 0.044 258);
+  overflow-y: auto;
+  min-height: 0;
+}
+.pane-body::-webkit-scrollbar { width: 4px; }
+.pane-body::-webkit-scrollbar-thumb {
+  background: color-mix(in oklch, var(--neuron-violet-500) 50%, transparent); border-radius: 2px;
+}
+
+.tl { white-space: pre-wrap; word-break: break-word; }
+.tl.sys      { color: var(--muted-foreground); font-style: italic; }
+.tl.prompt   { color: var(--neuron-violet-300); }
+.tl-prompt-sigil { color: var(--neuron-violet-400); }
+.tl-cmd      { color: var(--foreground); }
+.tl.command  { color: var(--foreground); margin-bottom: 2px; }
+.tl.thinking { color: var(--muted-foreground); font-style: italic; padding-left: 14px; }
+.tl-think-dot {
+  display: inline-block; width: 6px; height: 6px; border-radius: 50%;
+  background: var(--neuron-violet-300); margin-right: 8px;
+  animation: pulse 1.6s ease-in-out infinite; vertical-align: 1px;
+}
+.tl.tool {
+  color: var(--neuron-sky-300); padding-left: 14px;
+  display: flex; align-items: baseline; gap: 6px;
+}
+.tl.tool span { color: var(--muted-foreground); }
+.tl.out { color: oklch(0.872 0.044 258); }
+.tl.err { color: var(--syn-error); }
+
+.term-cursor-line { padding-left: 0; }
+.term-cursor {
+  display: inline-block; width: 8px; height: 14px;
+  background: var(--neuron-violet-400); vertical-align: -2px;
+  animation: blink 1s steps(1) infinite;
+  box-shadow: 0 0 10px 0 color-mix(in oklch, var(--neuron-violet-400) 60%, transparent);
+}
+
+/* status bar */
+.term-statusbar {
+  display: grid; grid-template-columns: 1fr auto 1fr;
+  align-items: center; gap: 12px;
+  padding: 0 14px;
+  border-top: 1px solid var(--border);
+  background: var(--surface-1);
+  font-size: 11px;
+}
+.tsb-l, .tsb-r { display: flex; align-items: center; }
+.tsb-r { justify-content: flex-end; }
+.tsb-c { display: flex; gap: 8px; }
+.tsb-ws {
+  display: inline-flex; align-items: center; gap: 6px;
+  color: var(--muted-foreground);
+}
+.tsb-pill {
+  --pill-color: oklch(0.555 0.020 258);
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 2px 9px; border-radius: 999px;
+  font-family: var(--font-mono); font-size: 10px;
+  color: var(--pill-color);
+  background: color-mix(in oklch, var(--pill-color) 14%, transparent);
+  border: 1px solid color-mix(in oklch, var(--pill-color) 45%, transparent);
+}
+.tsb-pill::before {
+  content: ""; width: 5px; height: 5px; border-radius: 50%;
+  background: var(--pill-color);
+  box-shadow: 0 0 6px 0 color-mix(in oklch, var(--pill-color) 70%, transparent);
+}
+.tsb-pill.st-running   { --pill-color: oklch(0.737 0.159 299); }   /* violet */
+.tsb-pill.st-success   { --pill-color: oklch(0.700 0.170 158); }   /* emerald */
+.tsb-pill.st-awaiting  { --pill-color: oklch(0.795 0.165 78); }    /* amber */
+.tsb-pill.st-error     { --pill-color: oklch(0.640 0.230 18); }    /* rose */
+.tsb-pill.st-idle      { --pill-color: oklch(0.555 0.020 258); }
+.tsb-pill.st-running::before,
+.tsb-pill.st-awaiting::before { animation: pulse 1.6s ease-in-out infinite; }
+
+.layout-switcher { display: flex; gap: 1px; padding: 2px; background: var(--surface-2); border-radius: var(--radius-sm); }
+.ls-btn {
+  display: grid; place-items: center;
+  width: 22px; height: 22px;
+  border: 0; background: transparent; cursor: pointer; border-radius: 4px;
+  color: var(--muted-foreground);
+}
+.ls-btn:hover { color: var(--foreground); }
+.ls-btn.active { background: var(--surface-3); color: var(--neuron-violet-300); }

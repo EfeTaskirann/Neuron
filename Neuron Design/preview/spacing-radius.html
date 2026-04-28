@@ -1,0 +1,24 @@
+<!doctype html>
+<html class="dark">
+<head><meta charset="utf-8"><link rel="stylesheet" href="../colors_and_type.css">
+<style>
+body{margin:0;padding:20px;background:var(--background);color:var(--foreground);font-family:var(--font-sans);}
+.grid{display:grid;grid-template-columns:repeat(7,1fr);gap:10px;align-items:end;}
+.cell{text-align:center;}
+.box{background:var(--neuron-violet-700);height:64px;border:1px solid var(--neuron-violet-500);}
+.label{font-family:var(--font-mono);font-size:10px;color:var(--muted-foreground);margin-top:6px;}
+.tag{font-size:10px;color:var(--muted-foreground);margin-top:1px;}
+.title{font-size:11px;font-weight:600;letter-spacing:0.08em;text-transform:uppercase;color:var(--muted-foreground);margin:0 0 14px;}
+</style></head>
+<body>
+<div class="title">Border radius</div>
+<div class="grid">
+  <div class="cell"><div class="box" style="border-radius:2px"></div><div class="label">xs</div><div class="tag">2px</div></div>
+  <div class="cell"><div class="box" style="border-radius:4px"></div><div class="label">sm</div><div class="tag">4px</div></div>
+  <div class="cell"><div class="box" style="border-radius:8px"></div><div class="label">md</div><div class="tag">8px</div></div>
+  <div class="cell"><div class="box" style="border-radius:12px"></div><div class="label">lg</div><div class="tag">12px · default</div></div>
+  <div class="cell"><div class="box" style="border-radius:16px"></div><div class="label">xl</div><div class="tag">16px · nodes</div></div>
+  <div class="cell"><div class="box" style="border-radius:24px"></div><div class="label">2xl</div><div class="tag">24px · cards</div></div>
+  <div class="cell"><div class="box" style="border-radius:9999px"></div><div class="label">full</div><div class="tag">pill</div></div>
+</div>
+</body></html>

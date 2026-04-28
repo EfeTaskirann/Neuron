@@ -1,0 +1,21 @@
+<!doctype html>
+<html class="dark">
+<head><meta charset="utf-8"><link rel="stylesheet" href="../colors_and_type.css">
+<style>
+body{margin:0;padding:24px 20px;background:var(--background);color:var(--foreground);font-family:var(--font-sans);}
+.grid{display:grid;grid-template-columns:repeat(5,1fr);gap:18px;}
+.cell{text-align:center;}
+.box{background:var(--card);height:72px;border-radius:12px;border:1px solid var(--border);}
+.label{font-family:var(--font-mono);font-size:11px;color:var(--muted-foreground);margin-top:10px;}
+.title{font-size:11px;font-weight:600;letter-spacing:0.08em;text-transform:uppercase;color:var(--muted-foreground);margin:0 0 18px;}
+</style></head>
+<body>
+<div class="title">Elevation · violet-tinted shadows</div>
+<div class="grid">
+  <div class="cell"><div class="box" style="box-shadow:var(--shadow-xs)"></div><div class="label">xs</div></div>
+  <div class="cell"><div class="box" style="box-shadow:var(--shadow-sm)"></div><div class="label">sm</div></div>
+  <div class="cell"><div class="box" style="box-shadow:var(--shadow-md)"></div><div class="label">md</div></div>
+  <div class="cell"><div class="box" style="box-shadow:var(--shadow-lg)"></div><div class="label">lg</div></div>
+  <div class="cell"><div class="box" style="box-shadow:var(--shadow-xl)"></div><div class="label">xl</div></div>
+</div>
+</body></html>

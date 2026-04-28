@@ -1,0 +1,22 @@
+<!doctype html>
+<html class="dark">
+<head><meta charset="utf-8"><link rel="stylesheet" href="../colors_and_type.css">
+<style>
+body{margin:0;padding:20px;background:var(--background);color:var(--foreground);font-family:var(--font-sans);}
+.grid{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;}
+.cell{padding:14px 14px 12px;border-radius:12px;border:1px solid var(--border);background:var(--card);}
+.dot{width:18px;height:18px;border-radius:6px;margin-bottom:10px;}
+.name{font-size:12px;font-weight:600;}
+.use{font-size:11px;color:var(--muted-foreground);margin-top:2px;}
+.label{font-size:11px;font-weight:600;letter-spacing:0.06em;text-transform:uppercase;color:var(--muted-foreground);margin:0 0 12px;}
+</style></head>
+<body>
+<div class="label">Status palette</div>
+<div class="grid">
+  <div class="cell"><div class="dot" style="background:var(--neuron-emerald-500);box-shadow:var(--glow-emerald-sm)"></div><div class="name">Emerald 500</div><div class="use">success</div></div>
+  <div class="cell"><div class="dot" style="background:var(--neuron-amber-500);box-shadow:var(--glow-amber-sm)"></div><div class="name">Amber 500</div><div class="use">human · warn</div></div>
+  <div class="cell"><div class="dot" style="background:var(--neuron-rose-500);box-shadow:var(--glow-rose-sm)"></div><div class="name">Rose 500</div><div class="use">destructive</div></div>
+  <div class="cell"><div class="dot" style="background:var(--neuron-sky-500)"></div><div class="name">Sky 500</div><div class="use">tool node</div></div>
+  <div class="cell"><div class="dot" style="background:var(--neuron-slate-500)"></div><div class="name">Slate 500</div><div class="use">logic node</div></div>
+</div>
+</body></html>

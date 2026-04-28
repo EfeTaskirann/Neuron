@@ -1,0 +1,40 @@
+<!doctype html>
+<html class="dark">
+<head><meta charset="utf-8"><link rel="stylesheet" href="../colors_and_type.css">
+<style>
+body{margin:0;padding:20px;background:var(--background);color:var(--foreground);font-family:var(--font-sans);}
+.row{display:grid;grid-template-columns:repeat(11,1fr);gap:6px;}
+.swatch{height:64px;border-radius:8px;display:flex;flex-direction:column;justify-content:flex-end;padding:6px 8px;font-size:10px;font-family:var(--font-mono);}
+.label{font-size:11px;font-weight:600;letter-spacing:0.04em;color:var(--muted-foreground);text-transform:uppercase;margin:0 0 8px;}
+.label:not(:first-child){margin-top:14px;}
+</style></head>
+<body>
+<div class="label">Violet · brand primary · hue 295</div>
+<div class="row">
+  <div class="swatch" style="background:var(--neuron-violet-50);color:#000">50</div>
+  <div class="swatch" style="background:var(--neuron-violet-100);color:#000">100</div>
+  <div class="swatch" style="background:var(--neuron-violet-200);color:#000">200</div>
+  <div class="swatch" style="background:var(--neuron-violet-300);color:#000">300</div>
+  <div class="swatch" style="background:var(--neuron-violet-400);color:#000">400</div>
+  <div class="swatch" style="background:var(--neuron-violet-500);color:#fff;box-shadow:0 0 0 2px var(--neuron-violet-300)">500</div>
+  <div class="swatch" style="background:var(--neuron-violet-600);color:#fff">600</div>
+  <div class="swatch" style="background:var(--neuron-violet-700);color:#fff">700</div>
+  <div class="swatch" style="background:var(--neuron-violet-800);color:#fff">800</div>
+  <div class="swatch" style="background:var(--neuron-violet-900);color:#fff">900</div>
+  <div class="swatch" style="background:var(--neuron-violet-950);color:#fff">950</div>
+</div>
+<div class="label">Midnight · surface · hue 258</div>
+<div class="row">
+  <div class="swatch" style="background:var(--neuron-midnight-50);color:#000">50</div>
+  <div class="swatch" style="background:var(--neuron-midnight-100);color:#000">100</div>
+  <div class="swatch" style="background:var(--neuron-midnight-200);color:#000">200</div>
+  <div class="swatch" style="background:var(--neuron-midnight-300);color:#000">300</div>
+  <div class="swatch" style="background:var(--neuron-midnight-400);color:#000">400</div>
+  <div class="swatch" style="background:var(--neuron-midnight-500);color:#fff">500</div>
+  <div class="swatch" style="background:var(--neuron-midnight-600);color:#fff">600</div>
+  <div class="swatch" style="background:var(--neuron-midnight-700);color:#fff">700</div>
+  <div class="swatch" style="background:var(--neuron-midnight-800);color:#fff">800</div>
+  <div class="swatch" style="background:var(--neuron-midnight-900);color:#fff">900</div>
+  <div class="swatch" style="background:var(--neuron-midnight-950);color:#fff;box-shadow:0 0 0 2px var(--neuron-violet-700)">950</div>
+</div>
+</body></html>
