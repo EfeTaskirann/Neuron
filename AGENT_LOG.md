@@ -4,6 +4,36 @@ Running journal of agent-driven changes. Newest entry on top. See `AGENTS.md` §
 
 ---
 
+## 2026-04-28T23:33:29Z WP-W2-04 completed
+- sub-agent: general-purpose
+- files changed: 23 in commit `5d390e4`
+  - new: `src-tauri/sidecar/agent_runtime/` (Python project: pyproject.toml, uv.lock, .python-version, README, .gitignore, `agent_runtime/{__init__,__main__,framing,secrets}.py`, `agent_runtime/workflows/{__init__,daily_summary}.py`, `agent_runtime/tests/{test_framing,test_daily_summary}.py`)
+  - new: `src-tauri/src/sidecar/{mod.rs, agent.rs, framing.rs}`
+  - modified: `Cargo.lock`, `src-tauri/Cargo.toml` (tokio +process,+io-util features), `src-tauri/src/{lib.rs, commands/runs.rs, error.rs}`, `app/src/lib/bindings.ts` (regenerated, 9-line diff in `runsCreate` docstring; signature unchanged)
+- commit SHA: `5d390e4`
+- acceptance: ✅ pass — orchestrator independently re-ran the gates after sub-agent return
+  - `cargo test` → exit 0, **56 passing, 1 ignored** (47 prior + 9 new sidecar tests; the ignored test is the live-Python integration `integration_spawn_then_shutdown_kills_child`, opt-in)
+  - python tests (sub-agent ran via `uv run pytest` in sidecar dir): 13 passing (7 framing round-trip + 6 daily_summary including `no_api_key` path)
+  - `cargo check` → exit 0
+  - `runs:create` now dispatches to sidecar when `SidecarHandle` is in `app.try_state`; happy-path test asserts run row with `status='running'` and zero spans
+  - `RunEvent::ExitRequested` hook calls `SidecarHandle::shutdown()`; `kill_on_drop(true)` is the seatbelt
+  - no_api_key path emits structured span `attrs.error='no_api_key'`, run ends with `status='error'` (asserted by `test_no_api_key_path_emits_error_span_and_ends_in_error`)
+  - frontend regression: `pnpm typecheck/lint/test --run` all green (still 1 file 2 tests)
+  - prototype isolation: `git diff HEAD~1 HEAD` shows zero `Neuron Design/` / `neuron-docs/` / `docs/` / Charter / AGENTS.md / design-spec / terminal-report / migrations files touched
+- key implementation choices
+  - **Event naming**: emits `runs:{id}:span` with a `kind: "created"|"updated"|"closed"` discriminator (NOT three event names). Stays consistent with the WP-W2-03 `:` substitution forced by Tauri 2.10's `IllegalEventName` panic on `.`.
+  - **Stdio framing**: 4-byte big-endian u32 length + UTF-8 JSON body, 16 MiB cap, symmetric on both sides. Codec round-trip-tested on Python and Rust independently.
+  - **LangGraph pin**: `>=0.2,<0.3` per WP §"Notes / risks".
+  - **Python pin**: `.python-version → 3.11` (uv installed Python 3.11.15 in `.venv`); host's 3.14 left out because LangGraph 0.2.x compatibility on 3.14 is unproven.
+  - **API keys**: `keyring.get_password('neuron', 'anthropic')` per Charter §"Hard constraints" #2; never logged.
+  - **Span emission**: explicit from each LangGraph node, NOT via LangChain ChatModel callbacks (per WP §"Sub-agent reminders").
+  - **Mock tool nodes**: `fetch_docs`/`search_web` return canned strings; real MCP tools land in WP-W2-05.
+- bindings regenerated: yes (9-line diff, docstring-only on `runsCreate`)
+- branch: `main` (local; not pushed; **13 commits ahead of origin/main**)
+- next: WP-W2-05 (MCP registry), WP-W2-06 (terminal sidecar), or WP-W2-07 (tracing — depends on WP-W2-04). Three options, all unblocked by this WP.
+
+---
+
 ## 2026-04-28T22:40:30Z WP-W2-03 completed
 - sub-agent: general-purpose (initial pass rate-limited mid-execution; orchestrator-led fix-up pass landed on a fresh general-purpose sub-agent invocation)
 - files changed: 22 in commit `35c4a85`
