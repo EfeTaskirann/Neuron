@@ -1,0 +1,43 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Neuron",
+  "version": "0.1.0",
+  "identifier": "app.neuron.desktop",
+  "build": {
+    "beforeDevCommand": "pnpm --filter @neuron/app dev",
+    "beforeBuildCommand": "pnpm --filter @neuron/app build",
+    "devUrl": "http://localhost:5173",
+    "frontendDist": "../app/dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Neuron",
+        "width": 1280,
+        "height": 800,
+        "minWidth": 960,
+        "minHeight": 600,
+        "resizable": true,
+        "fullscreen": false,
+        "decorations": true,
+        "transparent": false,
+        "theme": "Dark"
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
+  }
+}

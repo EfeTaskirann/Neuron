@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Default capability set for the Neuron main window. WP-W2-01 ships with no Tauri command surface; later WPs (WP-W2-03+) extend this file rather than introducing per-window overrides.",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

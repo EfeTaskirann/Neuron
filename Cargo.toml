@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members = ["src-tauri"]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.78"
+license = "Proprietary"
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+panic = "abort"
+strip = true

@@ -21,6 +21,16 @@ node_modules/
 dist/
 build/
 
+# Rust / Tauri
+target/
+src-tauri/target/
+src-tauri/gen/
+
+# Vite / front-end caches
+app/.vite/
+app/dist/
+coverage/
+
 # Local env (none expected, defensive)
 .env
 .env.local

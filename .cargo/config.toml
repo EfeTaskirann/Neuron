@@ -1,0 +1,48 @@
+# Project-local cargo configuration.
+#
+# Why this exists
+# ===============
+# rustc 1.95+ on x86_64-pc-windows-msvc uses the `find-msvc-tools`
+# crate to discover MSVC tools and Windows SDK lib paths. On a
+# Windows host whose Visual Studio Build Tools 2022 install is missing
+# `oldnames.lib` and `legacy_stdio_definitions.lib` from
+# `VC\Tools\MSVC\<ver>\lib\x64`, the linker fails with
+#   LNK1181: cannot open input file 'oldnames.lib'
+#   LNK1181: cannot open input file 'legacy_stdio_definitions.lib'
+#
+# These libs DO exist on the host, just in alternate sub-directories
+# (`lib\onecore\x64`, `lib\x64\store`). The block below adds those
+# paths to every link.exe invocation so cargo can compile Tauri's
+# Win32 dependency tree end-to-end.
+#
+# Hosts whose MSVC install is complete will see these `/LIBPATH`
+# arguments as harmless duplicates. The Windows SDK paths are also
+# added because rustc reads `KitsRoot10` from the registry, which on
+# this dev box points to `C:\Program Files\Windows Kits\10\` — a
+# folder that contains References + Catalogs but no `Lib/` tree.
+# The actual SDK lib tree lives under
+# `C:\Program Files (x86)\Windows Kits\10\` and the explicit
+# `/LIBPATH` entries below cover that case too.
+#
+# 8.3 short paths (PROGRA~2, MICROS~2) are used because rustflags is
+# split on whitespace; long paths with spaces are not safely escapable
+# through the rustc argv encoding.
+#
+# Future revisits
+# ===============
+# - WP-W2-08 may layer in CI-specific tweaks
+# - When the dev box's MSVC install is repaired or the Windows SDK
+#   registry key is corrected, the SDK-related `/LIBPATH` lines
+#   become no-ops; the MSVC `onecore` and `store` lines remain a
+#   safety net for partial installs.
+# - If a newer MSVC toolset version (>14.44.35207) ships, update the
+#   `1444~1.352` segment to match the new short path.
+
+[target.x86_64-pc-windows-msvc]
+rustflags = [
+  "-Clink-arg=/LIBPATH:C:\\PROGRA~2\\WI3CF2~1\\10\\Lib\\100261~1.0\\ucrt\\x64",
+  "-Clink-arg=/LIBPATH:C:\\PROGRA~2\\WI3CF2~1\\10\\Lib\\100261~1.0\\um\\x64",
+  "-Clink-arg=/LIBPATH:C:\\PROGRA~2\\MICROS~2\\2022\\BUILDT~1\\VC\\Tools\\MSVC\\1444~1.352\\lib\\x64",
+  "-Clink-arg=/LIBPATH:C:\\PROGRA~2\\MICROS~2\\2022\\BUILDT~1\\VC\\Tools\\MSVC\\1444~1.352\\lib\\onecore\\x64",
+  "-Clink-arg=/LIBPATH:C:\\PROGRA~2\\MICROS~2\\2022\\BUILDT~1\\VC\\Tools\\MSVC\\1444~1.352\\lib\\x64\\store",
+]

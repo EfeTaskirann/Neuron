@@ -1,0 +1,24 @@
+{
+  "name": "neuron",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Neuron — Agent Development Environment (Tauri 2 + React 18)",
+  "packageManager": "pnpm@10.33.2",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "dev": "pnpm --filter @neuron/app dev",
+    "build": "pnpm --filter @neuron/app build",
+    "preview": "pnpm --filter @neuron/app preview",
+    "typecheck": "pnpm --filter @neuron/app typecheck",
+    "lint": "pnpm --filter @neuron/app lint",
+    "test": "pnpm --filter @neuron/app test",
+    "tauri": "tauri",
+    "tauri:dev": "tauri dev",
+    "tauri:build": "tauri build"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "2.1.0"
+  }
+}

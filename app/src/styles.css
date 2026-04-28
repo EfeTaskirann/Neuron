@@ -1,0 +1,40 @@
+/*
+ * Neuron — root style entry point.
+ *
+ * WP-W2-01: tokens are imported from the prototype directory while we
+ * scaffold. WP-W2-08 will move `colors_and_type.css` into
+ * `app/src/styles/` and delete `Neuron Design/`. The path lives at the
+ * top of the import chain so the dark-mode `--background` token is
+ * resolvable in tests (jsdom) and at runtime.
+ */
+@import url("../../Neuron Design/colors_and_type.css");
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  min-height: 100vh;
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+}
+
+#root {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.app-hello {
+  font-family: var(--font-display);
+  font-size: var(--text-display);
+  line-height: var(--text-display-lh);
+  letter-spacing: var(--text-display-tr);
+  font-weight: 900;
+  color: var(--foreground);
+  margin: 0;
+}

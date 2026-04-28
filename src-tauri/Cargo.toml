@@ -1,0 +1,26 @@
+[package]
+name = "neuron"
+version = "0.1.0"
+description = "Neuron — Agent Development Environment"
+authors = ["Neuron Contributors"]
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# Tauri 2 needs `cdylib` (system-library bridge) and `staticlib` (mobile)
+# alongside the regular `rlib` so future workspace crates can depend on
+# us during integration tests.
+[lib]
+name = "neuron_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.0", features = [] }
+
+[dependencies]
+# Pinned to the 2.1 minor line per Charter risk register
+# ("Tauri 2 minor-version breaking changes — pin to 2.x.y exact").
+# Future bumps go through an ADR.
+tauri = { version = "2.1", features = [] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
