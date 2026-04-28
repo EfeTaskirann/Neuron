@@ -32,7 +32,7 @@ Create `app/src/hooks/`:
 - `useWorkflow(id)` → `workflows:get` (returns `{ workflow, nodes, edges }`)
 - `useWorkflows.ts` → `workflows:list`
 - `usePanes.ts` → `terminal:list` + subscribes to `pane.{id}.line` events for active pane
-- `useMailbox.ts` → `mailbox:list` (polling every 2s)
+- `useMailbox.ts` → initial fetch via `mailbox:list`; subscribes to `mailbox.new` Tauri events and merges incoming rows into the `['mailbox']` query cache (per ADR-0005 live-updates pattern, ADR-0006 event naming)
 
 Mutations:
 
@@ -96,6 +96,7 @@ Add `xterm` to `app/package.json`. Replace prototype's plain line rendering with
 - [ ] Backend error (e.g., `agents:list` returns AppError) → ErrorBoundary shows retry button
 - [ ] Creating an agent (mutation) instantly reflects in the agents list (cache invalidation works)
 - [ ] Run started in agent runtime appears in inspector with live span updates (`run.{id}.span` events)
+- [ ] `useMailbox` receives new entries via `mailbox.new` events without polling; verified by emitting an entry from another tab/devtools and observing the mailbox view update within ~100ms
 - [ ] No remaining references to `window.NeuronData` / `window.NeuronTerminalData` in `app/src/`
   - Verify with: `grep -r "window.Neuron" app/src/` returns nothing
 - [ ] `Neuron Design/` and `neuron-docs/` directories DELETED
@@ -124,7 +125,7 @@ pnpm tauri dev
 # 10. ls Neuron\ Design neuron-docs   # should error: No such file or directory
 ```
 
-## Migration pattern (per ADR-0005)
+## Migration pattern (per ADR-0005, extends with ADR-0006 event handling)
 
 For each component:
 1. Identify `data.X` reads — list `X` keys
@@ -137,19 +138,21 @@ For each component:
    +const { data: items = [], isLoading, isError } = useX();
    ```
 5. Wrap route in `<ErrorBoundary>` and add empty state
-6. Snapshot test for shape parity (`app/src/__tests__/`)
+6. For hooks that subscribe to live events (per ADR-0006): the hook merges event payloads into the TanStack Query cache via `qc.setQueryData(...)`. Components do not subscribe to events directly.
+7. Snapshot test for shape parity (`app/src/__tests__/`)
 
 ## Risks
 
 - Component code uses `data.X` deeply — destructuring everywhere needs care; do small commits per route
 - Some shape fields unused in component might be missing in backend — diff actively at the bindings level
-- Seed data for "looks correct" smoke test must match prototype's vibe — copy values from `Neuron Design/app/data.js` into a Rust seed function executed by migration `0003_seed.sql` BEFORE this WP deletes the prototype directory
+- Seed data for "looks correct" smoke test must match prototype's vibe — copy values from `Neuron Design/app/data.js` into a Rust seed function executed by migration `0003_seed.sql` BEFORE this WP deletes the prototype directory. This migration is authored as part of WP-W2-08 itself, not WP-W2-02.
 - xterm.js integration on Windows ConPTY: extra care for resize sequences; test with `pnpm tauri dev` not just hot reload
+- `useMailbox` is event-driven (ADR-0006). If the subscription attaches after entries have already been emitted in the same session, hydration via `mailbox:list` on mount covers the gap. Do NOT add a polling fallback "for safety"; it reintroduces the inconsistency ADR-0006 removes.
 
 ## Sub-agent reminders
 
 - This is the LARGEST WP. Do it in commits per route, not one big commit.
-- Read `ADR-0005` BEFORE starting — strict pattern.
+- Read `ADR-0005` AND `ADR-0006` BEFORE starting — strict patterns for data flow and event naming.
 - Do NOT change component class names or DOM structure. Only data source.
 - Do NOT delete `Neuron Design/` until ALL components migrated and acceptance criteria pass.
 - After deletion, the only surviving reference is the design-system-spec.md (root) and AGENT_LOG.md entries.
