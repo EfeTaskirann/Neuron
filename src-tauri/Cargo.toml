@@ -40,6 +40,24 @@ sqlx = { version = "0.8", default-features = false, features = [
 # Module-local error type. Wraps std::io, sqlx, tauri errors so the
 # `db::init` and command results have a single Result<T, AppError>.
 thiserror = "1"
+# WP-W2-03 — typed binding generation for the IPC surface.
+# `specta` defines the shared type system, `tauri-specta` integrates
+# with the Tauri command macro so registration and TS export share one
+# source of truth, and `specta-typescript` is the actual TS emitter.
+# All three crates are still tracking the 2.x release-candidate line
+# (latest available `2.0.0-rc.24` as of this WP). The RCs have been
+# stable in production downstream and the alternative — hand-written
+# bindings — is forbidden by the WP-W2-03 spec because it drifts
+# silently and breaks the WP-W2-08 acceptance gate.
+specta = "=2.0.0-rc.24"
+specta-typescript = "=0.0.11"
+tauri-specta = { version = "=2.0.0-rc.24", features = ["derive", "typescript"] }
+# WP-W2-03 — id generation for the `runs:create` / `terminal:spawn`
+# stubs. ULIDs are time-sortable and 26 chars Crockford-base32, which
+# matches the `r-9c2f1a` shape used by the frontend mock fixtures
+# (the mock uses 6-char hashes; ULID is the production-grade form
+# that subsumes them and orders correctly in the runs index).
+ulid = "1"
 
 [dev-dependencies]
 # Tests build a throwaway DB on disk and need a unique tempdir per test.
@@ -47,3 +65,7 @@ tempfile = "3"
 # `#[tokio::test]` lives in the test runtime, so the macros feature
 # must be visible here too even though `tokio` is also a regular dep.
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
+# Tauri's mock runtime — used by `mailbox::tests` to assert that
+# `mailbox:emit` actually fires a `mailbox.new` event payload.
+# `test` feature gates `tauri::test::*`.
+tauri = { version = "2.1", features = ["test"] }

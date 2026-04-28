@@ -1,0 +1,19 @@
+// Resource script for unit-test binaries on Windows.
+//
+// `tauri-build` ships a Common-Controls v6 manifest with the production
+// exe, but cargo only embeds resources into binaries enumerated in
+// `embed_resource::compile_for(...)`. Test exes therefore default to
+// comctl32 v5, which lacks `TaskDialogIndirect` — and the resulting
+// `STATUS_ENTRYPOINT_NOT_FOUND` (0xC0000139) appears the moment the
+// loader resolves `tauri-runtime-wry`'s dialog imports.
+//
+// We sidestep that by compiling a tiny .rc whose only payload is the
+// same v6 manifest, and asking `embed_resource::compile_for_tests` to
+// link it into every `--test` binary the workspace builds.
+//
+// Reference:
+//   tauri-build-2.5.6/src/windows-app-manifest.xml (canonical source)
+//   embed-resource-3.0.9/src/lib.rs (compile_for_tests)
+
+#define RT_MANIFEST 24
+1 RT_MANIFEST "test-manifest.xml"

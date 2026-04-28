@@ -19,7 +19,8 @@
 //! WP-W2-03 introduces specta-driven binding generation which will
 //! alias the IPC surface back to the colon form.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use specta::Type;
 use sqlx::Row;
 use tauri::State;
 
@@ -27,7 +28,10 @@ use crate::db::DbPool;
 
 /// Health payload returned to the frontend. Field names use
 /// camelCase so the future TS bindings need no remapping.
-#[derive(Debug, Serialize)]
+///
+/// `specta::Type` was added in WP-W2-03 so the type lands in
+/// `bindings.ts` alongside the rest of the command surface.
+#[derive(Debug, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct DbHealth {
     /// Number of user tables in the schema (excludes sqlx + sqlite
@@ -39,6 +43,7 @@ pub struct DbHealth {
 }
 
 #[tauri::command]
+#[specta::specta]
 pub async fn health_db(pool: State<'_, DbPool>) -> Result<DbHealth, String> {
     let pool = pool.inner();
 
