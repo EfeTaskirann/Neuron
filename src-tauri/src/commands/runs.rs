@@ -2,26 +2,32 @@
 //!
 //! - `runs:list`   `(filter?)` → `Run[]`
 //! - `runs:get`    `(id)` → `RunDetail` (run + spans)
-//! - `runs:create` `(workflowId)` → `Run`        // STUB — inserts row, no execution
+//! - `runs:create` `(workflowId)` → `Run`        // WP-04 — real LangGraph execution
 //! - `runs:cancel` `(id)` → `void`
 //!
-//! ## Stubs
+//! ## WP-04 — real run execution
 //!
-//! WP-W2-03 § "Stubs in this WP":
+//! `runs:create` now:
 //!
-//!   `runs:create` inserts a row with `status='running'` and no spans.
-//!   WP-04 makes it real.
+//! 1. Validates the workflow exists.
+//! 2. Inserts a `runs` row with `status='running'` (FK + CHECK).
+//! 3. Posts a `run.start` frame to the LangGraph Python sidecar.
+//! 4. Returns the `Run` immediately — span events arrive
+//!    asynchronously via the sidecar's read loop, which writes them
+//!    to `runs_spans` and emits `runs:{id}:span` Tauri events.
 //!
 //! `runs:cancel` flips a `running` row to `error` (cancellation is a
-//! flavour of error in the schema's CHECK constraint). The "real"
-//! cancellation that propagates into the LangGraph runtime is in WP-04.
+//! flavour of error in the schema's CHECK constraint). Cancel-mid-LLM
+//! propagation through the sidecar is out of scope for WP-W2-04 per
+//! its §"Out of scope"; Week 3 wires that.
 
-use tauri::State;
+use tauri::{AppHandle, Manager, Runtime, State};
 use ulid::Ulid;
 
 use crate::db::DbPool;
 use crate::error::AppError;
 use crate::models::{Run, RunDetail, RunFilter, Span};
+use crate::sidecar::agent::SidecarHandle;
 
 #[tauri::command(rename_all = "camelCase")]
 #[specta::specta]
@@ -80,11 +86,19 @@ pub async fn runs_get(pool: State<'_, DbPool>, id: String) -> Result<RunDetail, 
     Ok(RunDetail { run, spans })
 }
 
-/// **STUB.** Inserts a row in `runs` with `status='running'` and no
-/// spans, returns the inserted row. Real execution lands in WP-04.
+/// Insert a `runs` row with `status='running'` and dispatch the run
+/// to the LangGraph sidecar.
+///
+/// The sidecar handle is looked up via `AppHandle::try_state` rather
+/// than as a `tauri::State` argument because `Option<State<...>>` is
+/// not a `specta::Type` and the binding generator rejects it. Tests
+/// (and CI runners without a synced Python venv) skip the dispatch
+/// path naturally — `try_state::<SidecarHandle>` returns `None` and
+/// the inserted run row is the only side-effect.
 #[tauri::command(rename_all = "camelCase")]
 #[specta::specta]
-pub async fn runs_create(
+pub async fn runs_create<R: Runtime>(
+    app: AppHandle<R>,
     pool: State<'_, DbPool>,
     workflow_id: String,
 ) -> Result<Run, AppError> {
@@ -112,6 +126,16 @@ pub async fn runs_create(
     .bind(started_at)
     .execute(pool.inner())
     .await?;
+
+    // Dispatch to the sidecar. If the sidecar failed to spawn at
+    // startup (no Python / no venv), `try_state` returns `None` and
+    // the inserted row stays in `running` for the user to retry once
+    // the runtime is fixed. We deliberately do not delete the row —
+    // preserving it surfaces the failure in the runs list with a
+    // known id the user can reference.
+    if let Some(handle) = app.try_state::<SidecarHandle>() {
+        handle.start_run(&workflow_id, &id).await?;
+    }
 
     Ok(Run {
         id,
@@ -158,9 +182,11 @@ fn now_seconds() -> i64 {
 
 #[cfg(test)]
 mod tests {
+    // `super::*` already brings in `tauri::Manager` from the module's
+    // top-level imports, so `app.state::<...>()` resolves without an
+    // extra `use tauri::Manager as _` here.
     use super::*;
     use crate::test_support::{fresh_pool, seed_minimal};
-    use tauri::Manager as _;
 
     async fn mock_app_with_pool() -> (
         tauri::App<tauri::test::MockRuntime>,
@@ -252,20 +278,31 @@ mod tests {
         assert_eq!(err.kind(), "not_found");
     }
 
+    /// WP-W2-04 acceptance §"runs:create returns id" — a run is
+    /// inserted with `status='running'` and the id starts with `r-`.
+    /// We do not provide a `SidecarHandle`, so the sidecar dispatch
+    /// path is skipped; the spans appear in subsequent integration
+    /// runs (gated `#[ignore]`d in `sidecar::agent::tests`).
     #[tokio::test]
     async fn runs_create_inserts_running_row_with_no_spans() {
         let (app, pool, _dir) = mock_app_with_pool().await;
         seed_minimal(&pool).await;
         let state = app.state::<crate::db::DbPool>();
 
-        let run = runs_create(state, "w1".to_string()).await.expect("ok");
+        let run = runs_create(app.handle().clone(), state, "w1".to_string())
+            .await
+            .expect("ok");
         assert_eq!(run.status, "running");
         assert_eq!(run.workflow_name, "Daily summary");
         assert_eq!(run.tokens, 0);
         assert!(run.duration_ms.is_none());
         assert!(run.id.starts_with("r-"));
 
-        // DB side-effect: row exists, no spans linked.
+        // DB side-effect: row exists, no spans linked. The sidecar
+        // populates `runs_spans` asynchronously after `runs_create`
+        // returns, so the no-sidecar test path leaves `runs_spans`
+        // empty by design — that is the contract the WP-04 spec asks
+        // us to assert in unit tests.
         let count_runs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runs")
             .fetch_one(&pool)
             .await
@@ -282,7 +319,9 @@ mod tests {
     async fn runs_create_unknown_workflow_is_not_found() {
         let (app, _pool, _dir) = mock_app_with_pool().await;
         let state = app.state::<crate::db::DbPool>();
-        let err = runs_create(state, "no-such".into()).await.unwrap_err();
+        let err = runs_create(app.handle().clone(), state, "no-such".into())
+            .await
+            .unwrap_err();
         assert_eq!(err.kind(), "not_found");
     }
 

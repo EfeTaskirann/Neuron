@@ -39,6 +39,8 @@ use thiserror::Error;
 /// | `InvalidInput`| `invalid_input`| empty required field, bad temp range, etc. |
 /// | `DbError`     | `db_error`     | sqlx/SQLite returned an error              |
 /// | `Internal`    | `internal`     | catch-all; bug or environment failure      |
+/// | `Sidecar`     | `sidecar`      | LangGraph Python sidecar pipe / spawn fail |
+/// | `NoApiKey`    | `no_api_key`   | provider key missing from OS keychain      |
 #[derive(Debug, Clone, Error, Deserialize)]
 #[serde(tag = "kind", content = "message", rename_all = "snake_case")]
 pub enum AppError {
@@ -61,6 +63,20 @@ pub enum AppError {
     #[error("database error: {0}")]
     DbError(String),
 
+    /// LangGraph Python sidecar failed — spawn error, broken stdio
+    /// pipe, JSON decode error, or sidecar process not yet ready when
+    /// a `runs:create` came in. The frontend pattern-matches on
+    /// `kind='sidecar'` to surface a "agent runtime offline" CTA.
+    #[error("sidecar error: {0}")]
+    Sidecar(String),
+
+    /// Provider API key not configured in the OS keychain. The
+    /// `provider` discriminant is the user-visible name shown by the
+    /// "Configure API keys" CTA in Settings (`anthropic`, `openai`).
+    /// The wire form is `{ "kind": "no_api_key", "message": "anthropic" }`.
+    #[error("no API key configured for {0}")]
+    NoApiKey(String),
+
     /// Catch-all for unclassified failures (panics-in-tasks, missing
     /// env, etc.). Frontend treats `internal` as a developer bug.
     #[error("internal error: {0}")]
@@ -78,6 +94,8 @@ impl AppError {
             Self::Conflict(_) => "conflict",
             Self::InvalidInput(_) => "invalid_input",
             Self::DbError(_) => "db_error",
+            Self::Sidecar(_) => "sidecar",
+            Self::NoApiKey(_) => "no_api_key",
             Self::Internal(_) => "internal",
         }
     }
@@ -90,6 +108,8 @@ impl AppError {
             | Self::Conflict(m)
             | Self::InvalidInput(m)
             | Self::DbError(m)
+            | Self::Sidecar(m)
+            | Self::NoApiKey(m)
             | Self::Internal(m) => m,
         }
     }

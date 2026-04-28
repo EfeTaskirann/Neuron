@@ -1,0 +1,47 @@
+[project]
+# Python sidecar for the Neuron LangGraph agent runtime (WP-W2-04).
+#
+# Runs as a long-lived child process supervised by the Rust side
+# (`src-tauri/src/sidecar/agent.rs`). Communicates over stdio using
+# 4-byte big-endian length-prefixed JSON frames — see
+# `agent_runtime/framing.py` for the codec spec.
+#
+# LangGraph version is pinned to the 0.2 minor line per WP-W2-04
+# §"Notes / risks": the 0.2 → 0.3 migration introduces breaking
+# changes that we will gate behind an explicit ADR.
+name = "agent-runtime"
+version = "0.1.0"
+description = "Neuron LangGraph agent runtime sidecar"
+readme = "README.md"
+# 3.11 is the floor per Charter §"Risks". 3.12 also works; 3.14 is
+# unproven for the LangGraph stack so we prefer 3.11–3.12 even though
+# the host's default Python is 3.14.
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "langgraph>=0.2,<0.3",
+    "langchain-anthropic>=0.2,<0.4",
+    "langchain-openai>=0.2,<0.4",
+    "pydantic>=2,<3",
+    # OS keychain — Charter §"Hard constraints" #2: API keys via OS
+    # keychain only. No `.env`, no plaintext.
+    "keyring>=24,<26",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8,<9",
+    "pytest-asyncio>=0.24,<1",
+]
+
+[dependency-groups]
+# Tell uv to install dev deps by default for `uv sync` so the test
+# command works out of the box. The legacy `[tool.uv].dev-dependencies`
+# key is deprecated as of uv 0.11.
+dev = [
+    "pytest>=8,<9",
+    "pytest-asyncio>=0.24,<1",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["agent_runtime/tests"]

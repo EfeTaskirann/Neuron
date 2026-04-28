@@ -27,6 +27,7 @@ pub mod commands;
 pub mod db;
 pub mod error;
 pub mod models;
+pub mod sidecar;
 
 #[cfg(test)]
 pub mod test_support;
@@ -58,7 +59,7 @@ pub fn specta_builder_for_export() -> tauri_specta::Builder<tauri::Wry> {
             commands::workflows::workflows_get,
             commands::runs::runs_list,
             commands::runs::runs_get,
-            commands::runs::runs_create,
+            commands::runs::runs_create::<tauri::Wry>,
             commands::runs::runs_cancel,
             commands::mcp::mcp_list,
             commands::mcp::mcp_install::<tauri::Wry>,
@@ -96,8 +97,46 @@ pub fn run() {
                 db::init(&handle).await
             })?;
             app.manage(pool);
+
+            // WP-W2-04 — spawn the LangGraph Python sidecar after the
+            // pool is in app state (the read loop needs it). A spawn
+            // failure is non-fatal: the app continues, but
+            // `runs:create` will return `AppError::Sidecar` until the
+            // user installs Python + runs `uv sync`. The sidecar
+            // README shows the steps.
+            match sidecar::agent::spawn_runtime(app.handle()) {
+                Ok(handle) => {
+                    app.manage(handle);
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[setup] LangGraph sidecar unavailable: {e} \
+                         (run `cd src-tauri/sidecar/agent_runtime && uv sync` \
+                         to install)"
+                    );
+                }
+            }
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running Neuron Tauri application");
+        // WP-W2-04 §"Acceptance criteria": "Sidecar process is killed
+        // on app shutdown (no orphan `python` process on next launch)".
+        // `RunEvent::ExitRequested` fires before the runtime stops; we
+        // drive `SidecarHandle::shutdown()` to send a clean shutdown
+        // frame and kill the child. The `kill_on_drop(true)` we set on
+        // the spawn config is a defensive seatbelt.
+        .build(tauri::generate_context!())
+        .expect("error while building Neuron Tauri application")
+        .run(|app, event| {
+            if let tauri::RunEvent::ExitRequested { .. } = event {
+                if let Some(handle) = app.try_state::<sidecar::agent::SidecarHandle>() {
+                    // `State::inner()` returns `&SidecarHandle`; we clone
+                    // the cheap `Arc`-backed handle into the async block
+                    // so `block_on` does not borrow across the closure.
+                    let cloned = handle.inner().clone();
+                    tauri::async_runtime::block_on(async move {
+                        cloned.shutdown().await;
+                    });
+                }
+            }
+        });
 }

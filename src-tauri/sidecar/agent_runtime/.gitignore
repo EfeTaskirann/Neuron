@@ -1,0 +1,8 @@
+# Local-only artifacts created by `uv sync` and pytest. The package
+# itself ships from `pyproject.toml` + `uv.lock` + `agent_runtime/`;
+# the venv and bytecode caches are reproducible and noisy, so they
+# stay out of the repo. `uv.lock` IS committed (reproducibility).
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/

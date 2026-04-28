@@ -34,7 +34,16 @@ serde_json = "1.0"
 # Async runtime — Tauri's setup hook is sync, so we drive sqlx via
 # `tauri::async_runtime::block_on` which is itself a tokio runtime.
 # We still depend on tokio directly so test code can use #[tokio::test].
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
+tokio = { version = "1", features = [
+  "rt-multi-thread",
+  "macros",
+  "sync",
+  # WP-W2-04 — sidecar process supervisor uses `tokio::process` to
+  # spawn the LangGraph Python child and `io-util` to drive
+  # length-prefixed frame I/O over its stdio pipes.
+  "process",
+  "io-util",
+] }
 # WP-W2-02 — SQLite via sqlx. `runtime-tokio` matches Tauri's runtime,
 # `sqlite` selects the bundled driver, `macros` enables `sqlx::migrate!`,
 # and `migrate` exposes `Migrator` types used by tests.

@@ -18,8 +18,15 @@ export const commands = {
 } | null) => typedError<Run[], AppErrorWire>(__TAURI_INVOKE("runs_list", { filter })),
 	runsGet: (id: string) => typedError<RunDetail, AppErrorWire>(__TAURI_INVOKE("runs_get", { id })),
 	/**
-	 *  **STUB.** Inserts a row in `runs` with `status='running'` and no
-	 *  spans, returns the inserted row. Real execution lands in WP-04.
+	 *  Insert a `runs` row with `status='running'` and dispatch the run
+	 *  to the LangGraph sidecar.
+	 * 
+	 *  The sidecar handle is looked up via `AppHandle::try_state` rather
+	 *  than as a `tauri::State` argument because `Option<State<...>>` is
+	 *  not a `specta::Type` and the binding generator rejects it. Tests
+	 *  (and CI runners without a synced Python venv) skip the dispatch
+	 *  path naturally — `try_state::<SidecarHandle>` returns `None` and
+	 *  the inserted run row is the only side-effect.
 	 */
 	runsCreate: (workflowId: string) => typedError<Run, AppErrorWire>(__TAURI_INVOKE("runs_create", { workflowId })),
 	runsCancel: (id: string) => typedError<null, AppErrorWire>(__TAURI_INVOKE("runs_cancel", { id })),
