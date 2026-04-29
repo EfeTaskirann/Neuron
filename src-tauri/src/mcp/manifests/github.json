@@ -1,0 +1,15 @@
+{
+  "id": "github",
+  "name": "GitHub",
+  "by": "GitHub",
+  "description": "Issues, PRs, and code search via the GitHub REST + GraphQL APIs.",
+  "installs": 21000,
+  "rating": 4.9,
+  "featured": true,
+  "spawn": {
+    "kind": "npx",
+    "package": "@modelcontextprotocol/server-github",
+    "args_template": []
+  },
+  "requires_secret": "GITHUB_PERSONAL_ACCESS_TOKEN"
+}

@@ -77,6 +77,21 @@ pub enum AppError {
     #[error("no API key configured for {0}")]
     NoApiKey(String),
 
+    /// MCP server JSON-RPC failure — bad frame, unexpected response,
+    /// timeout. Distinct from `Sidecar` because the MCP boundary uses
+    /// newline-delimited JSON-RPC 2.0 instead of WP-W2-04's length-
+    /// prefixed framing, and the user-facing recovery is different
+    /// (re-install the MCP server vs. restart the agent runtime).
+    #[error("mcp protocol error: {0}")]
+    McpProtocol(String),
+
+    /// MCP server failed to spawn — `npx` not on PATH, package
+    /// missing, child died before initialize completed. The frontend
+    /// pattern-matches on `kind='mcp_server_spawn_failed'` to surface
+    /// "Install Node.js / fix PATH" guidance.
+    #[error("mcp server spawn failed: {0}")]
+    McpServerSpawnFailed(String),
+
     /// Catch-all for unclassified failures (panics-in-tasks, missing
     /// env, etc.). Frontend treats `internal` as a developer bug.
     #[error("internal error: {0}")]
@@ -96,6 +111,8 @@ impl AppError {
             Self::DbError(_) => "db_error",
             Self::Sidecar(_) => "sidecar",
             Self::NoApiKey(_) => "no_api_key",
+            Self::McpProtocol(_) => "mcp_protocol",
+            Self::McpServerSpawnFailed(_) => "mcp_server_spawn_failed",
             Self::Internal(_) => "internal",
         }
     }
@@ -110,6 +127,8 @@ impl AppError {
             | Self::DbError(m)
             | Self::Sidecar(m)
             | Self::NoApiKey(m)
+            | Self::McpProtocol(m)
+            | Self::McpServerSpawnFailed(m)
             | Self::Internal(m) => m,
         }
     }

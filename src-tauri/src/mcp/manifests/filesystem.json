@@ -1,0 +1,16 @@
+{
+  "id": "filesystem",
+  "name": "Filesystem",
+  "by": "Anthropic",
+  "description": "Read, write, and search the local filesystem from any agent. Sandboxed per-workspace.",
+  "installs": 12400,
+  "rating": 4.9,
+  "featured": true,
+  "spawn": {
+    "kind": "npx",
+    "package": "@modelcontextprotocol/server-filesystem",
+    "args_template": ["__ROOT__"]
+  },
+  "requires_secret": null,
+  "default_root_kind": "app_data_dir"
+}

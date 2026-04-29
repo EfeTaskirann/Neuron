@@ -1,0 +1,11 @@
+{
+  "id": "slack",
+  "name": "Slack",
+  "by": "Slack",
+  "description": "Send and read messages, create threads, manage channels in your workspace.",
+  "installs": 3200,
+  "rating": 4.5,
+  "featured": false,
+  "spawn": null,
+  "requires_secret": "SLACK_BOT_TOKEN"
+}

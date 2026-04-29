@@ -26,6 +26,7 @@ use tauri::Manager;
 pub mod commands;
 pub mod db;
 pub mod error;
+pub mod mcp;
 pub mod models;
 pub mod sidecar;
 
@@ -64,6 +65,8 @@ pub fn specta_builder_for_export() -> tauri_specta::Builder<tauri::Wry> {
             commands::mcp::mcp_list,
             commands::mcp::mcp_install::<tauri::Wry>,
             commands::mcp::mcp_uninstall::<tauri::Wry>,
+            commands::mcp::mcp_list_tools,
+            commands::mcp::mcp_call_tool::<tauri::Wry>,
             commands::terminal::terminal_list,
             commands::terminal::terminal_spawn,
             commands::terminal::terminal_kill,

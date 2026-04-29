@@ -1,0 +1,11 @@
+{
+  "id": "vector-db",
+  "name": "Vector DB",
+  "by": "Qdrant",
+  "description": "Embed and retrieve from Qdrant, pgvector, or Chroma with one config block.",
+  "installs": 4400,
+  "rating": 4.7,
+  "featured": false,
+  "spawn": null,
+  "requires_secret": "QDRANT_URL"
+}

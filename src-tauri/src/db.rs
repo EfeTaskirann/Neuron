@@ -72,6 +72,7 @@ pub async fn init(app: &AppHandle) -> Result<DbPool, DbError> {
     let pool = open_pool_at(&path).await?;
     MIGRATOR.run(&pool).await?;
     seed_demo_workflow(&pool).await?;
+    seed_mcp_servers(&pool).await?;
     Ok(pool)
 }
 
@@ -92,6 +93,44 @@ async fn seed_demo_workflow(pool: &DbPool) -> Result<(), DbError> {
     )
     .execute(pool)
     .await?;
+    Ok(())
+}
+
+/// Idempotently seed the six MCP servers bundled in
+/// `src/mcp/manifests/`. WP-W2-05 §"Notes / risks":
+///
+/// > Seeded server manifests live in `src-tauri/src/mcp/manifests/` as
+/// > JSON. Loaded by migration `0002_seed_mcp.sql` via Rust seed
+/// > function (not raw SQL — too brittle).
+///
+/// We elide the migration file entirely (the seed is data-dependent
+/// on the JSON manifests) and run a Rust seed function from `init`.
+/// `INSERT OR IGNORE` keeps it safe across relaunches; the user-
+/// facing `installs`/`rating`/`featured`/`installed` values do not
+/// drift on re-seed (we never overwrite them — the user may have
+/// already toggled `installed=1`).
+async fn seed_mcp_servers(pool: &DbPool) -> Result<(), DbError> {
+    let manifests = crate::mcp::manifests::load_all().map_err(|e| {
+        DbError::Sqlx(sqlx::Error::Configuration(
+            format!("MCP manifest load: {e}").into(),
+        ))
+    })?;
+    for m in manifests {
+        sqlx::query(
+            "INSERT OR IGNORE INTO servers \
+             (id, name, by, description, installs, rating, featured, installed) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, 0)",
+        )
+        .bind(&m.id)
+        .bind(&m.name)
+        .bind(&m.by)
+        .bind(&m.description)
+        .bind(m.installs)
+        .bind(m.rating)
+        .bind(m.featured as i64)
+        .execute(pool)
+        .await?;
+    }
     Ok(())
 }
 
@@ -232,6 +271,62 @@ mod tests {
             .await
             .expect("count applied migrations");
         assert_eq!(count, 1, "exactly one migration recorded");
+    }
+
+    /// Acceptance: WP-W2-05 — seed_mcp_servers writes the six bundled
+    /// manifests on first call and is a no-op on subsequent calls.
+    #[tokio::test]
+    async fn seed_mcp_servers_is_idempotent() {
+        let (pool, _dir) = fresh_pool().await;
+        seed_mcp_servers(&pool).await.expect("seed first time");
+        let after_first: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM servers")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(after_first, 6, "all six manifests seeded");
+
+        // Re-running must not duplicate or overwrite — flip one row's
+        // `installed` to 1 first and confirm it survives the re-seed.
+        sqlx::query("UPDATE servers SET installed=1 WHERE id='filesystem'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        seed_mcp_servers(&pool).await.expect("seed second time");
+        let after_second: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM servers")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(after_second, 6, "no duplicates after re-seed");
+        let installed: bool =
+            sqlx::query_scalar("SELECT installed FROM servers WHERE id='filesystem'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(
+            installed,
+            "user-toggled `installed` flag must survive re-seed"
+        );
+
+        // Acceptance: ids match the canonical six.
+        let ids: Vec<String> =
+            sqlx::query_scalar("SELECT id FROM servers ORDER BY id")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        let mut expected = vec![
+            "browser",
+            "filesystem",
+            "github",
+            "postgres",
+            "slack",
+            "vector-db",
+        ];
+        expected.sort();
+        assert_eq!(
+            ids,
+            expected.into_iter().map(String::from).collect::<Vec<_>>(),
+            "six canonical MCP servers"
+        );
     }
 
     /// Acceptance: the pool actually works end-to-end — insert and

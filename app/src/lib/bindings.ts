@@ -33,6 +33,27 @@ export const commands = {
 	mcpList: () => typedError<Server[], AppErrorWire>(__TAURI_INVOKE("mcp_list")),
 	mcpInstall: (id: string) => typedError<Server, AppErrorWire>(__TAURI_INVOKE("mcp_install", { id })),
 	mcpUninstall: (id: string) => typedError<Server, AppErrorWire>(__TAURI_INVOKE("mcp_uninstall", { id })),
+	/**
+	 *  `mcp:listTools(serverId)` — return persisted tools for one server.
+	 *  Empty list for uninstalled or unknown servers (the agent runtime
+	 *  treats that as "no capabilities", which is the correct fallback).
+	 */
+	mcpListTools: (serverId: string) => typedError<Tool[], AppErrorWire>(__TAURI_INVOKE("mcp_list_tools", { serverId })),
+	/**
+	 *  `mcp:callTool(serverId, name, argsJson)` — execute one tool
+	 *  against a freshly-spawned server. `argsJson` is the JSON-stringified
+	 *  argument object; the server validates it against its `inputSchema`
+	 *  and surfaces any schema violation as a structured `isError=true`
+	 *  result.
+	 * 
+	 *  Why a string instead of a typed object: the tool's argument shape
+	 *  is whatever the MCP server declares, which the Rust side has no
+	 *  compile-time knowledge of. Passing JSON as a `String` keeps the
+	 *  `bindings.ts` signature clean (`argsJson: string`) — the caller is
+	 *  expected to do `JSON.stringify(args)` at the boundary, and the
+	 *  frontend `useMcpCallTool` hook (Week 3) will hide that cermony.
+	 */
+	mcpCallTool: (serverId: string, name: string, argsJson: string) => typedError<CallToolResult, AppErrorWire>(__TAURI_INVOKE("mcp_call_tool", { serverId, name, argsJson })),
 	terminalList: () => typedError<Pane[], AppErrorWire>(__TAURI_INVOKE("terminal_list")),
 	/**
 	 *  **STUB.** Inserts a row in `panes` with `status='idle'` and no PTY.
@@ -90,6 +111,16 @@ export type AgentPatch = {
 export type AppErrorWire = {
 	kind: string,
 	message: string,
+};
+
+/**
+ *  Wire shape for `mcp:callTool` returns. Keeps a flat `{content,
+ *  isError}` object so the frontend can rely on a single deserializer
+ *  regardless of which tool was called.
+ */
+export type CallToolResult = {
+	content: ToolContent[],
+	isError: boolean,
 };
 
 /**
@@ -275,6 +306,31 @@ export type Span = {
 	response: string | null,
 	isRunning: boolean,
 };
+
+/**
+ *  One row of `server_tools`. Materialised by [`crate::mcp::registry`]
+ *  during `mcp:install`; consumed by the agent runtime (WP-W2-04) and
+ *  surfaced to the frontend via `mcp:listTools`.
+ * 
+ *  `input_schema_json` is stored as a TEXT column (raw JSON Schema)
+ *  so the frontend can hand it directly to a JSON-Schema validator
+ *  without re-encoding. The wire shape uses `inputSchemaJson` to make
+ *  the schema-vs-string distinction explicit.
+ */
+export type Tool = {
+	serverId: string,
+	name: string,
+	description: string,
+	inputSchemaJson: string,
+};
+
+/**
+ *  One block of a `tools/call` response. Mirrors the MCP spec's
+ *  content array element. We expose `text` natively and pass any
+ *  other shape through as `other` so the UI can render unknown blocks
+ *  best-effort instead of failing the whole call.
+ */
+export type ToolContent = { type: "text"; text: string } | { type: "other" };
 
 export type Workflow = {
 	id: string,

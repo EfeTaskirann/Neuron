@@ -1,0 +1,11 @@
+{
+  "id": "postgres",
+  "name": "PostgreSQL",
+  "by": "Anthropic",
+  "description": "Query relational databases with role-scoped credentials. Read-only by default.",
+  "installs": 8100,
+  "rating": 4.8,
+  "featured": false,
+  "spawn": null,
+  "requires_secret": "POSTGRES_CONNECTION_STRING"
+}

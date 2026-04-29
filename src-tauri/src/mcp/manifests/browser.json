@@ -1,0 +1,11 @@
+{
+  "id": "browser",
+  "name": "Browser",
+  "by": "Anthropic",
+  "description": "Headless Chromium with screenshot, scroll, and click actions. Locked to allowlist.",
+  "installs": 6700,
+  "rating": 4.6,
+  "featured": false,
+  "spawn": null,
+  "requires_secret": null
+}
