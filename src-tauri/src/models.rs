@@ -277,15 +277,46 @@ pub struct Pane {
 }
 
 /// Input shape for `terminal:spawn`. Fields chosen to match what the
-/// WP-06 PTY supervisor will need; only `agentKind` and `cwd` are
-/// strictly required for the WP-03 stub.
-#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+/// WP-06 PTY supervisor needs; `cwd` is the only strictly-required
+/// field — `agentKind` is inferred from `cmd` when omitted, and
+/// `cmd`/`cols`/`rows` fall back to the platform default shell at
+/// `80x24`.
+///
+/// WP-W2-06 added `cmd`/`cols`/`rows`. The legacy WP-03 callers
+/// supplied `agentKind` directly; the field is now optional and
+/// defaults to either the substring match against `cmd` (claude-code /
+/// codex / gemini) or `"shell"` when no inference is possible.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct PaneSpawnInput {
-    pub agent_kind: String,
     pub cwd: String,
+    /// Override the default platform shell. `None` = pick automatically
+    /// (`pwsh.exe`/`powershell.exe` on Windows, `$SHELL` elsewhere).
+    pub cmd: Option<String>,
+    /// Initial PTY column count. `None` = 80.
+    pub cols: Option<u16>,
+    /// Initial PTY row count. `None` = 24.
+    pub rows: Option<u16>,
+    /// Optional explicit agent kind. `None` triggers substring inference
+    /// from `cmd` (`claude-code`/`codex`/`gemini`/`shell`).
+    pub agent_kind: Option<String>,
     pub role: Option<String>,
     pub workspace: Option<String>,
+}
+
+/// One line of pane scrollback as returned by `terminal:lines`. Mirrors
+/// the per-line entries in the in-memory ring buffer and the `pane_lines`
+/// table column set; `seq` is the monotonic per-pane sequence number,
+/// `k` matches the schema's CHECK list (`'sys'|'prompt'|'command'|...`),
+/// and `text` is the LF-terminated line text with CSI cursor-control
+/// stripped (raw bytes still flow through the live Tauri event for
+/// xterm.js rendering in WP-W2-08).
+#[derive(Debug, Clone, Serialize, Deserialize, Type, sqlx::FromRow)]
+#[serde(rename_all = "camelCase")]
+pub struct PaneLine {
+    pub seq: i64,
+    pub k: String,
+    pub text: String,
 }
 
 // ---------------------------------------------------------------------

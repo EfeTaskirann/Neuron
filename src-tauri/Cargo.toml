@@ -74,6 +74,17 @@ tauri-specta = { version = "=2.0.0-rc.24", features = ["derive", "typescript"] }
 # (the mock uses 6-char hashes; ULID is the production-grade form
 # that subsumes them and orders correctly in the runs index).
 ulid = "1"
+# WP-W2-06 — portable PTY for the terminal sidecar. Cross-platform
+# (ConPTY on Windows, openpty/forkpty on Unix) with a synchronous
+# read/write API; we drive the I/O on dedicated tokio blocking tasks
+# (`tokio::task::spawn_blocking`) so the Tauri event loop stays
+# unaffected by long shell-output bursts.
+portable-pty = "0.9"
+# WP-W2-06 — regex matcher for the awaiting-approval state-machine
+# detection (per NEURON_TERMINAL_REPORT § state machine). Three
+# canonical patterns (Claude Code, Codex, Gemini) compiled once at
+# module init via `OnceLock`.
+regex = "1"
 
 [dev-dependencies]
 # Tests build a throwaway DB on disk and need a unique tempdir per test.

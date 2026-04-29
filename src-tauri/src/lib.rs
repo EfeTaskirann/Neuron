@@ -68,8 +68,11 @@ pub fn specta_builder_for_export() -> tauri_specta::Builder<tauri::Wry> {
             commands::mcp::mcp_list_tools,
             commands::mcp::mcp_call_tool::<tauri::Wry>,
             commands::terminal::terminal_list,
-            commands::terminal::terminal_spawn,
+            commands::terminal::terminal_spawn::<tauri::Wry>,
             commands::terminal::terminal_kill,
+            commands::terminal::terminal_write,
+            commands::terminal::terminal_resize,
+            commands::terminal::terminal_lines,
             commands::mailbox::mailbox_list,
             commands::mailbox::mailbox_emit::<tauri::Wry>,
         ])
@@ -119,14 +122,25 @@ pub fn run() {
                     );
                 }
             }
+
+            // WP-W2-06 — install an empty terminal PTY registry. Each
+            // `terminal:spawn` adds a pane to it; the shutdown hook
+            // below tears them all down on app exit so no shell
+            // processes outlive the app on next launch.
+            app.manage(sidecar::terminal::TerminalRegistry::new());
+
             Ok(())
         })
         // WP-W2-04 §"Acceptance criteria": "Sidecar process is killed
         // on app shutdown (no orphan `python` process on next launch)".
+        // WP-W2-06 §"Acceptance criteria": "Killing app cleans all
+        // child PTY processes (no orphans on next launch)".
         // `RunEvent::ExitRequested` fires before the runtime stops; we
-        // drive `SidecarHandle::shutdown()` to send a clean shutdown
-        // frame and kill the child. The `kill_on_drop(true)` we set on
-        // the spawn config is a defensive seatbelt.
+        // drive both supervisors' shutdown paths so neither the Python
+        // sidecar nor any spawned shell outlives the window. The
+        // `kill_on_drop(true)` we set on the agent spawn config is a
+        // defensive seatbelt; `portable_pty::ChildKiller` is the
+        // explicit kill API for terminals.
         .build(tauri::generate_context!())
         .expect("error while building Neuron Tauri application")
         .run(|app, event| {
@@ -138,6 +152,12 @@ pub fn run() {
                     let cloned = handle.inner().clone();
                     tauri::async_runtime::block_on(async move {
                         cloned.shutdown().await;
+                    });
+                }
+                if let Some(registry) = app.try_state::<sidecar::terminal::TerminalRegistry>() {
+                    let cloned = registry.inner().clone();
+                    tauri::async_runtime::block_on(async move {
+                        cloned.shutdown_all().await;
                     });
                 }
             }

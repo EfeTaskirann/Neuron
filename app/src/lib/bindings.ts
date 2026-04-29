@@ -56,11 +56,37 @@ export const commands = {
 	mcpCallTool: (serverId: string, name: string, argsJson: string) => typedError<CallToolResult, AppErrorWire>(__TAURI_INVOKE("mcp_call_tool", { serverId, name, argsJson })),
 	terminalList: () => typedError<Pane[], AppErrorWire>(__TAURI_INVOKE("terminal_list")),
 	/**
-	 *  **STUB.** Inserts a row in `panes` with `status='idle'` and no PTY.
-	 *  Real PTY supervision lands in WP-06.
+	 *  Fork a PTY, spawn the platform default shell (or `input.cmd` if
+	 *  supplied), and return the freshly-inserted `Pane` row. The reader
+	 *  and waiter tasks run on the tokio runtime; output streams via
+	 *  `panes:{id}:line` Tauri events.
 	 */
 	terminalSpawn: (input: PaneSpawnInput) => typedError<Pane, AppErrorWire>(__TAURI_INVOKE("terminal_spawn", { input })),
+	/**
+	 *  Terminate the pane's child process. Idempotent — kill on an already-
+	 *  closed pane updates `panes` row state without erroring (so the UI
+	 *  can fire-and-forget on close). 404 if the pane id was never seen.
+	 */
 	terminalKill: (id: string) => typedError<null, AppErrorWire>(__TAURI_INVOKE("terminal_kill", { id })),
+	/**
+	 *  Send `data` (raw bytes — typically keystrokes) to the pane's PTY
+	 *  stdin. Bytes are written verbatim; the shell handles line editing
+	 *  and echoing.
+	 */
+	terminalWrite: (paneId: string, data: string) => typedError<null, AppErrorWire>(__TAURI_INVOKE("terminal_write", { paneId, data })),
+	/**
+	 *  Resize the PTY (SIGWINCH on Unix, SetConsoleScreenBufferInfoEx on
+	 *  Windows). Frontend callers must throttle to ≤10/sec per the
+	 *  WP-W2-06 risk register; we apply the resize as-is.
+	 */
+	terminalResize: (paneId: string, cols: number, rows: number) => typedError<null, AppErrorWire>(__TAURI_INVOKE("terminal_resize", { paneId, cols, rows })),
+	/**
+	 *  Return the most recent scrollback for a pane. Live panes read from
+	 *  the in-memory ring; closed panes read from `pane_lines` (persisted
+	 *  at pane close). `sinceSeq` (exclusive) lets the UI hydrate
+	 *  incrementally on mount.
+	 */
+	terminalLines: (paneId: string, sinceSeq: number | null) => typedError<PaneLine[], AppErrorWire>(__TAURI_INVOKE("terminal_lines", { paneId, sinceSeq })),
 	mailboxList: (sinceTs: number | null) => typedError<MailboxEntry[], AppErrorWire>(__TAURI_INVOKE("mailbox_list", { sinceTs })),
 	/**
 	 *  Insert one row, return the inserted entry, **and** emit a
@@ -222,13 +248,48 @@ export type Pane = {
 };
 
 /**
+ *  One line of pane scrollback as returned by `terminal:lines`. Mirrors
+ *  the per-line entries in the in-memory ring buffer and the `pane_lines`
+ *  table column set; `seq` is the monotonic per-pane sequence number,
+ *  `k` matches the schema's CHECK list (`'sys'|'prompt'|'command'|...`),
+ *  and `text` is the LF-terminated line text with CSI cursor-control
+ *  stripped (raw bytes still flow through the live Tauri event for
+ *  xterm.js rendering in WP-W2-08).
+ */
+export type PaneLine = {
+	seq: number,
+	k: string,
+	text: string,
+};
+
+/**
  *  Input shape for `terminal:spawn`. Fields chosen to match what the
- *  WP-06 PTY supervisor will need; only `agentKind` and `cwd` are
- *  strictly required for the WP-03 stub.
+ *  WP-06 PTY supervisor needs; `cwd` is the only strictly-required
+ *  field — `agentKind` is inferred from `cmd` when omitted, and
+ *  `cmd`/`cols`/`rows` fall back to the platform default shell at
+ *  `80x24`.
+ * 
+ *  WP-W2-06 added `cmd`/`cols`/`rows`. The legacy WP-03 callers
+ *  supplied `agentKind` directly; the field is now optional and
+ *  defaults to either the substring match against `cmd` (claude-code /
+ *  codex / gemini) or `"shell"` when no inference is possible.
  */
 export type PaneSpawnInput = {
-	agentKind: string,
 	cwd: string,
+	/**
+	 *  Override the default platform shell. `None` = pick automatically
+	 *  (`pwsh.exe`/`powershell.exe` on Windows, `$SHELL` elsewhere).
+	 */
+	cmd: string | null,
+	// Initial PTY column count. `None` = 80.
+	cols: number | null,
+	// Initial PTY row count. `None` = 24.
+	rows: number | null,
+	/**
+	 *  Optional explicit agent kind. `None` triggers substring inference
+	 *  from `cmd` (`claude-code`/`codex`/`gemini`/`shell`).
+	 */
+	agentKind: string | null,
 	role: string | null,
 	workspace: string | null,
 };
