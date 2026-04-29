@@ -71,7 +71,28 @@ pub async fn init(app: &AppHandle) -> Result<DbPool, DbError> {
     let path = dir.join(DB_FILENAME);
     let pool = open_pool_at(&path).await?;
     MIGRATOR.run(&pool).await?;
+    seed_demo_workflow(&pool).await?;
     Ok(pool)
+}
+
+/// Idempotently insert the `daily-summary` workflow row that the
+/// LangGraph Python sidecar (WP-W2-04) hardcodes. Without this row
+/// `runs:create('daily-summary')` fails the workflow-existence check
+/// before it ever reaches the sidecar — which makes the WP-04 manual
+/// smoke test unreachable on a fresh DB. WP-W2-02 deliberately scoped
+/// "seed data" out (deferring to WP-W2-08 fixtures); this is the
+/// minimum viable seed needed to make WP-W2-04's acceptance gate
+/// reachable from the running app, not a general fixture seed.
+///
+/// `INSERT OR IGNORE` keeps it safe across relaunches and across
+/// future WP-W2-08 fixture work that may insert the same row.
+async fn seed_demo_workflow(pool: &DbPool) -> Result<(), DbError> {
+    sqlx::query(
+        "INSERT OR IGNORE INTO workflows (id, name) VALUES ('daily-summary', 'Daily summary')",
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 /// Build a pool against a concrete on-disk path. Split out so tests
