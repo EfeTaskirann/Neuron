@@ -4,6 +4,36 @@ Running journal of agent-driven changes. Newest entry on top. See `AGENTS.md` §
 
 ---
 
+## 2026-04-29T11:36:15Z WP-W2-05 completed
+- sub-agent: general-purpose
+- files changed: 17 in commit `1ffa084`
+  - new module: `src-tauri/src/mcp/{mod,client,registry,manifests}.rs`
+  - new manifests: `src-tauri/src/mcp/manifests/{filesystem,github,postgres,browser,slack,vector-db}.json` (6 servers)
+  - new doc: `src-tauri/MCP.md` (spec version pin `2024-11-05` + `npx` runtime requirement)
+  - modified: `src-tauri/src/commands/mcp.rs` (replaced WP-W2-03 stubs; added `mcpListTools`, `mcpCallTool`), `src-tauri/src/db.rs` (added `seed_mcp_servers`), `src-tauri/src/{error,lib,models}.rs`, `app/src/lib/bindings.ts` (regenerated)
+- commit SHA: `1ffa084`
+- acceptance: ✅ pass — orchestrator independently re-ran the gates after sub-agent return
+  - `cargo test` → exit 0, **75 passed, 2 ignored** (56 prior + 19 new MCP tests; 1 prior `#[ignore]`d + 1 new `integration_filesystem_install_and_call` opt-in)
+  - new tests verify: NDJSON frame round-trip, registry CRUD, seed idempotency, persist-across-pool-reopen, list ordering (featured first), uninstall flow, install + tools/list integration against real `@modelcontextprotocol/server-filesystem`
+  - `cargo check` → exit 0
+  - 19 unit tests + 1 ignored npx integration test pass
+  - `cargo run --bin export-bindings` → bindings.ts regenerated with `mcpListTools`, `mcpCallTool`, `Tool`, `ToolContent`, `CallToolResult` typed wrappers
+  - frontend regression: `pnpm typecheck/lint/test --run` all green (1 file 2 tests)
+  - prototype isolation: `git diff HEAD~1 HEAD` shows zero `Neuron Design/` / `neuron-docs/` / `docs/` / Charter / AGENTS.md / migrations / sidecar / other-command files touched
+- key implementation choices
+  - **Wire format**: NDJSON over stdio (one UTF-8 JSON object per line, `\n`-terminated) per MCP spec — different from WP-W2-04's length-prefixed framing.
+  - **`argsJson: string`** on `mcpCallTool` IPC (not `serde_json::Value`): specta produces broken TS for arbitrary JSON values, so callers `JSON.stringify(args)`. Pragma documented in `commands/mcp.rs`.
+  - **No migration file**: seed is data-dependent on `manifests/*.json`, so `db::seed_mcp_servers` runs from `db::init` after migrations (parallels WP-W2-04's `seed_demo_workflow`). Idempotent via `INSERT OR IGNORE`; user-toggled `installed` flag never overwritten on re-seed.
+  - **Filesystem server fully wired**: install → spawn `npx -y @modelcontextprotocol/server-filesystem <path>` → `tools/list` → persist `server_tools` rows. Other 5 seeded servers (github, postgres, browser, slack, vector-db) surface `mcp_server_spawn_failed` if the user tries to install them — Week 3 wires the full pipeline. The `mcp:list` returns all 6 with metadata regardless.
+  - **No session pool**: each `mcp:callTool` re-spawns the server. Pooling deferred to Week 3 alongside sandbox isolation.
+  - **MCP spec version pinned** to `2024-11-05` in MCP.md (Charter risk register's "spec churn" mitigation).
+  - **Event names**: `mcp:installed` / `mcp:uninstalled` (`:` separator per ADR-0006 carryover; matches WP-W2-03's mailbox precedent).
+- bindings regenerated: yes (new typed wrappers for the 2 new commands + 3 new types)
+- branch: `main` (local; not pushed; **17 commits ahead of `origin/main`**)
+- next: WP-W2-06 (terminal sidecar) or WP-W2-07 (tracing — depends on WP-W2-04, also unblocked)
+
+---
+
 ## 2026-04-28T23:33:29Z WP-W2-04 completed
 - sub-agent: general-purpose
 - files changed: 23 in commit `5d390e4`
