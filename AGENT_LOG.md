@@ -4,6 +4,34 @@ Running journal of agent-driven changes. Newest entry on top. See `AGENTS.md` §
 
 ---
 
+## 2026-04-29T12:50:37Z WP-W2-06 completed
+- sub-agent: general-purpose
+- files changed: 8 in commit `351c234`
+  - new: `src-tauri/src/sidecar/terminal.rs` (TerminalRegistry, ring buffer, regex status detection, CSI stripping, agent-kind inference)
+  - modified: `src-tauri/src/commands/terminal.rs` (replaced WP-W2-03 stubs; added `terminalWrite`, `terminalResize`, `terminalLines`), `src-tauri/src/lib.rs` (registry wiring + `RunEvent::ExitRequested` shutdown hook), `src-tauri/src/models.rs` (`PaneSpawnInput` confirmed, `PaneLine` added), `src-tauri/src/sidecar/mod.rs` (`pub mod terminal`), `src-tauri/Cargo.toml` (+`portable-pty`, +`regex`), `Cargo.lock`, `app/src/lib/bindings.ts` (regenerated)
+- commit SHA: `351c234`
+- acceptance: ✅ pass — orchestrator independently re-ran the gates after sub-agent return
+  - `cargo test` → exit 0, **86 passed, 3 ignored** (75 prior + 11 new terminal tests; 2 prior + 1 new opt-in shell-spawn integration)
+  - new tests verify: ring buffer overflow drops oldest 1,000, CSI stripper preserves text + removes cursor controls, awaiting-approval regex matches Claude/Codex/Gemini canonical prompts, agent-kind inference from cmd, default shell resolution per platform, registry concurrency (no shared mutable state across panes), kill-pane is idempotent for already-dead children, ring-buffer flush on close populates `pane_lines`, since_seq cursor reads from DB after pane close, resize zero-dim rejection, unknown-pane 404
+  - `cargo check` → exit 0
+  - `cargo run --bin export-bindings` → bindings.ts regenerated with `terminalWrite`, `terminalResize`, `terminalLines` typed wrappers
+  - frontend regression: `pnpm typecheck/lint/test --run` all green (1 file 2 tests)
+  - prototype isolation: `git diff HEAD~1 HEAD` shows zero `Neuron Design/` / `neuron-docs/` / `docs/` / Charter / AGENTS.md / migrations / db.rs / mcp / sidecar/agent.rs / other-command files touched
+- key implementation choices
+  - **Event name**: `panes:{id}:line` payload `{ k, text, seq }` (`:` separator per ADR-0006 carryover; matches WP-04's `runs:{id}:span` and WP-05's `mcp:installed/uninstalled`).
+  - **Reader runtime**: `tokio::task::spawn_blocking` because `portable-pty` exposes `std::io::Read` (sync). CRLF normalised to LF for storage; CSI sequences stripped before persisting to `pane_lines`; raw text preserved in live event payload for xterm.js rendering in WP-W2-08.
+  - **Master+writer drop on child exit**: required for Windows ConPTY (the reader pipe is a clone independent of the master Arc). Without dropping, the blocking `read()` never unblocks.
+  - **Default shell resolution** (Windows): `pwsh.exe` if `where.exe pwsh.exe` succeeds, else `powershell.exe`. Resolved at spawn time, not cached.
+  - **Agent-kind inference** from cmd substring: `claude-code`, `codex`, `gemini`, default `shell`. Persisted in `panes.agent_kind`.
+  - **Ring buffer**: 5,000 lines per pane in memory; on overflow drop oldest 1,000; on child exit OR `kill_pane`, flush remaining ring lines to `pane_lines` table for hydration after restart.
+  - **Status state machine**: `idle → starting → running → (awaiting_approval ↔ running) → success | error`; awaiting transitions driven by per-agent regex set on the last 5 lines.
+  - **Idempotent kill**: tolerates Win32 `ERROR_INVALID_PARAMETER (87)` and Unix `ESRCH` so killing a child that exited mid-flight returns Ok.
+- bindings regenerated: yes (3 new typed wrappers + `PaneLine` struct)
+- branch: `main` (local; not pushed; **20 commits ahead of `origin/main`**)
+- next: WP-W2-07 (span/trace persistence — completes the WP-04 event chain) or WP-W2-08 (frontend mock→real wiring — biggest WP, 7 routes + cleanup)
+
+---
+
 ## 2026-04-29T11:36:15Z WP-W2-05 completed
 - sub-agent: general-purpose
 - files changed: 17 in commit `1ffa084`
