@@ -5,7 +5,10 @@
 // placeholders until `useMe()` lands in phase B.
 import { useState } from 'react';
 import { Brandmark, NIcon, type IconName } from './components/icons';
+import { ErrorBoundary } from './components/ErrorBoundary';
 import { useMe } from './hooks/useMe';
+import { AgentsRoute } from './routes/AgentsRoute';
+import { RunsRoute } from './routes/RunsRoute';
 
 type Route = 'canvas' | 'terminal' | 'agents' | 'runs' | 'mcp' | 'settings';
 
@@ -127,6 +130,28 @@ function RouteStub({ route }: { route: Route }): JSX.Element {
   );
 }
 
+// Routes are wrapped in <ErrorBoundary> per ADR-0005: a query
+// failure in any route surfaces a recoverable retry card instead
+// of crashing the entire shell.
+function RouteHost({ route }: { route: Route }): JSX.Element {
+  switch (route) {
+    case 'agents':
+      return (
+        <ErrorBoundary fallbackTitle="Couldn't load agents">
+          <AgentsRoute />
+        </ErrorBoundary>
+      );
+    case 'runs':
+      return (
+        <ErrorBoundary fallbackTitle="Couldn't load runs">
+          <RunsRoute />
+        </ErrorBoundary>
+      );
+    default:
+      return <RouteStub route={route} />;
+  }
+}
+
 export function App(): JSX.Element {
   const [route, setRoute] = useState<Route>('canvas');
   const [collapsed, setCollapsed] = useState(false);
@@ -140,7 +165,7 @@ export function App(): JSX.Element {
       />
       <Topbar route={route} />
       <main className="app-main">
-        <RouteStub route={route} />
+        <RouteHost route={route} />
       </main>
     </div>
   );
