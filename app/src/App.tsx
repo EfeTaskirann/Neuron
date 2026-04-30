@@ -5,6 +5,7 @@
 // placeholders until `useMe()` lands in phase B.
 import { useState } from 'react';
 import { Brandmark, NIcon, type IconName } from './components/icons';
+import { useMe } from './hooks/useMe';
 
 type Route = 'canvas' | 'terminal' | 'agents' | 'runs' | 'mcp' | 'settings';
 
@@ -34,10 +35,14 @@ interface SidebarProps {
 }
 
 function Sidebar({ route, onNavigate, collapsed, onToggle }: SidebarProps): JSX.Element {
-  // Phase A placeholders — `useMe()` replaces these in phase B.
-  const initials = '··';
-  const userName = 'Loading…';
-  const workspaceName = 'Loading…';
+  const { data: me } = useMe();
+  // Loading placeholders — kept terse so the layout doesn't shift
+  // when the hook resolves. Workspace count comes from the backend
+  // (`SELECT COUNT(*) FROM workflows`); no client-side derivation.
+  const initials = me?.user.initials ?? '··';
+  const userName = me?.user.name ?? 'Loading…';
+  const workspaceName = me?.workspace.name ?? 'Loading…';
+  const workspaceCount = me?.workspace.count;
   return (
     <nav className="sidebar" role="navigation">
       <div className="sb-brand" onClick={onToggle} role="button" title="Toggle sidebar">
@@ -50,7 +55,7 @@ function Sidebar({ route, onNavigate, collapsed, onToggle }: SidebarProps): JSX.
           <div className="sb-ws-avatar">{initials}</div>
           <div className="sb-ws-meta">
             <div className="sb-ws-name">{workspaceName}</div>
-            <div className="sb-ws-sub">— workflows</div>
+            <div className="sb-ws-sub">{workspaceCount ?? '—'} workflows</div>
           </div>
           <NIcon name="chevron" size={14} style={{ opacity: 0.5 }} />
         </div>
