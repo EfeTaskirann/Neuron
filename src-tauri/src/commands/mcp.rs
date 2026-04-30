@@ -29,6 +29,7 @@ use tauri::{AppHandle, Emitter, Runtime, State};
 
 use crate::db::DbPool;
 use crate::error::AppError;
+use crate::events;
 use crate::mcp::registry;
 use crate::models::{CallToolResult, Server, Tool, ToolContent};
 
@@ -52,10 +53,10 @@ pub async fn mcp_install<R: Runtime>(
     id: String,
 ) -> Result<Server, AppError> {
     let updated = registry::install(pool.inner(), &app, &id).await?;
-    // Tauri 2.10 rejects `.` in event names; use the colon-separated
-    // shape that the rest of the command surface follows. ADR-0006's
-    // `mcp.installed` is `mcp:installed` on the wire.
-    app.emit("mcp:installed", &updated)?;
+    // Wire-name constant lives in `crate::events` (ADR-0006 § "Wire-
+    // format substitution" — the logical `mcp.installed` is on-wire
+    // `mcp:installed`).
+    app.emit(events::MCP_INSTALLED, &updated)?;
     Ok(updated)
 }
 
@@ -67,7 +68,7 @@ pub async fn mcp_uninstall<R: Runtime>(
     id: String,
 ) -> Result<Server, AppError> {
     let updated = registry::uninstall(pool.inner(), &id).await?;
-    app.emit("mcp:uninstalled", &updated)?;
+    app.emit(events::MCP_UNINSTALLED, &updated)?;
     Ok(updated)
 }
 
@@ -133,22 +134,9 @@ pub async fn mcp_call_tool<R: Runtime>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::fresh_pool;
+    use crate::test_support::{fresh_pool, mock_app_with_pool};
     // `app.state::<DbPool>()` and `app.handle()` come from `Manager`.
     use tauri::Manager as _;
-
-    async fn mock_app_with_pool() -> (
-        tauri::App<tauri::test::MockRuntime>,
-        crate::db::DbPool,
-        tempfile::TempDir,
-    ) {
-        let (pool, dir) = fresh_pool().await;
-        let app = tauri::test::mock_builder()
-            .manage(pool.clone())
-            .build(tauri::test::mock_context(tauri::test::noop_assets()))
-            .expect("mock app");
-        (app, pool, dir)
-    }
 
     /// Seed all six manifest-derived servers (matches what
     /// `db::seed_mcp_servers` does at first run).

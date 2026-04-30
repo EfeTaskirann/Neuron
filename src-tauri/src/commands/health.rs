@@ -25,6 +25,7 @@ use sqlx::Row;
 use tauri::State;
 
 use crate::db::DbPool;
+use crate::error::AppError;
 
 /// Health payload returned to the frontend. Field names use
 /// camelCase so the future TS bindings need no remapping.
@@ -44,7 +45,11 @@ pub struct DbHealth {
 
 #[tauri::command]
 #[specta::specta]
-pub async fn health_db(pool: State<'_, DbPool>) -> Result<DbHealth, String> {
+pub async fn health_db(pool: State<'_, DbPool>) -> Result<DbHealth, AppError> {
+    // Returns `AppError` (not the prior bespoke `String`) so the
+    // wire shape is `{ kind, message }` exactly like every other
+    // command in the surface — the frontend's error-handling path
+    // does not have to special-case this one entry.
     let pool = pool.inner();
 
     let tables: i64 = sqlx::query_scalar(
@@ -53,17 +58,11 @@ pub async fn health_db(pool: State<'_, DbPool>) -> Result<DbHealth, String> {
            AND name NOT LIKE '_sqlx_%'",
     )
     .fetch_one(pool)
-    .await
-    .map_err(|e| format!("health_db: count tables failed: {e}"))?;
+    .await?;
 
-    let row = sqlx::query("PRAGMA foreign_keys")
-        .fetch_one(pool)
-        .await
-        .map_err(|e| format!("health_db: read pragma failed: {e}"))?;
+    let row = sqlx::query("PRAGMA foreign_keys").fetch_one(pool).await?;
     // PRAGMA foreign_keys returns a single nameless integer column.
-    let fk: i64 = row
-        .try_get(0)
-        .map_err(|e| format!("health_db: pragma column missing: {e}"))?;
+    let fk: i64 = row.try_get(0)?;
 
     Ok(DbHealth {
         tables,

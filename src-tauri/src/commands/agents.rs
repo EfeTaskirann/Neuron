@@ -35,6 +35,7 @@ use ulid::Ulid;
 
 use crate::db::DbPool;
 use crate::error::AppError;
+use crate::events;
 use crate::models::{Agent, AgentCreateInput, AgentPatch};
 
 /// Coalesced change payload for the `agents.changed` event.
@@ -44,6 +45,14 @@ struct AgentChanged<'a> {
     id: &'a str,
     op: &'a str,
 }
+
+/// Single source of truth for the column list selected by every
+/// `agents:*` read path. Keeping this as a `const` (rather than three
+/// inlined SQL strings) means a future schema change touches the
+/// projection in exactly one place — and the same list is reused by
+/// `agents:update`'s `RETURNING` clause so the UPDATE-then-RETURN
+/// path can never drift away from the SELECT path.
+const AGENTS_COLS: &str = "id, name, model, temp, role";
 
 // Generic over `R: Runtime` so unit tests can drive the same code path
 // with `tauri::test::MockRuntime`. The IPC handler instantiates this
@@ -56,31 +65,29 @@ struct AgentChanged<'a> {
 // shape `{domain}.{verb}` is preserved by the WP-W2-08 frontend hooks
 // when they subscribe via the `commands` façade.
 fn emit_changed<R: Runtime>(app: &AppHandle<R>, id: &str, op: &str) -> Result<(), AppError> {
-    app.emit("agents:changed", AgentChanged { id, op })
+    app.emit(events::AGENTS_CHANGED, AgentChanged { id, op })
         .map_err(AppError::from)
 }
 
 #[tauri::command]
 #[specta::specta]
 pub async fn agents_list(pool: State<'_, DbPool>) -> Result<Vec<Agent>, AppError> {
-    let rows = sqlx::query_as::<_, Agent>(
-        "SELECT id, name, model, temp, role FROM agents ORDER BY name COLLATE NOCASE",
-    )
-    .fetch_all(pool.inner())
-    .await?;
+    let sql = format!("SELECT {AGENTS_COLS} FROM agents ORDER BY name COLLATE NOCASE");
+    let rows = sqlx::query_as::<_, Agent>(&sql)
+        .fetch_all(pool.inner())
+        .await?;
     Ok(rows)
 }
 
 #[tauri::command(rename_all = "camelCase")]
 #[specta::specta]
 pub async fn agents_get(pool: State<'_, DbPool>, id: String) -> Result<Agent, AppError> {
-    let agent = sqlx::query_as::<_, Agent>(
-        "SELECT id, name, model, temp, role FROM agents WHERE id = ?",
-    )
-    .bind(&id)
-    .fetch_optional(pool.inner())
-    .await?
-    .ok_or_else(|| AppError::NotFound(format!("Agent {id} not found")))?;
+    let sql = format!("SELECT {AGENTS_COLS} FROM agents WHERE id = ?");
+    let agent = sqlx::query_as::<_, Agent>(&sql)
+        .bind(&id)
+        .fetch_optional(pool.inner())
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("Agent {id} not found")))?;
     Ok(agent)
 }
 
@@ -161,7 +168,7 @@ pub async fn agents_update<R: Runtime>(
     }
 
     let sql = format!(
-        "UPDATE agents SET {} WHERE id = ? RETURNING id, name, model, temp, role",
+        "UPDATE agents SET {} WHERE id = ? RETURNING {AGENTS_COLS}",
         sets.join(", ")
     );
     let mut q = sqlx::query_as::<_, Agent>(&sql);
@@ -210,42 +217,13 @@ pub async fn agents_delete<R: Runtime>(
 mod tests {
     use crate::error::AppError;
     use crate::models::{AgentCreateInput, AgentPatch};
-    use crate::test_support::fresh_pool;
+    use crate::test_support::mock_app_with_pool;
     // `app.state::<DbPool>()` is a `Manager`-trait method; bring the
     // trait in scope so the tests resolve it. Aliased to `_` so we
     // don't trip the unused-import lint on test-only builds.
     use tauri::Manager as _;
 
-    /// Direct DB-driven invocation of the command bodies. We avoid
-    /// stand-up of a full `tauri::test::mock_app()` here because the
-    /// commands take `State<DbPool>` + `AppHandle` — the AppHandle is
-    /// only used for `emit`, and the emit_changed helper threads
-    /// through `AppHandle::emit` which is a Manager call. To exercise
-    /// the SQL paths without spinning up a full app, the tests call
-    /// the inner SQL directly via the same queries the commands use.
-    /// The tauri-specta wired versions are exercised in
-    /// `mailbox::tests` (event path) and via `cargo check` /
-    /// `pnpm typecheck` for the type surface.
     use super::*;
-
-    async fn mock_app_with_pool() -> (
-        tauri::App<tauri::test::MockRuntime>,
-        crate::db::DbPool,
-        tempfile::TempDir,
-    ) {
-        // Use `mock_context(noop_assets())` instead of
-        // `tauri::generate_context!()` so the test exe doesn't bundle
-        // the production frontend dist + icons + permissions. The
-        // generated context drags in tens of MB of asset bytes that
-        // trip Windows STATUS_ENTRYPOINT_NOT_FOUND when the test
-        // binary tries to load.
-        let (pool, dir) = fresh_pool().await;
-        let app = tauri::test::mock_builder()
-            .manage(pool.clone())
-            .build(tauri::test::mock_context(tauri::test::noop_assets()))
-            .expect("mock app");
-        (app, pool, dir)
-    }
 
     #[tokio::test]
     async fn agents_list_empty_returns_empty_vec() {

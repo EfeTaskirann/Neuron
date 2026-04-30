@@ -10,11 +10,13 @@
 //!
 //! ## Stable id derivation
 //!
-//! The schema stores mailbox rows append-only and uses `(ts, from_pane,
-//! to_pane)` as the natural key, but the frontend wants a stable
-//! React-list key. SQLite gives us `rowid` per insert which we surface
-//! as `id`. Because two emits on the same `ts` would otherwise collide
-//! in keys, we rely on the implicit autoincrement ordering of `rowid`.
+//! Migration 0002 added an explicit `INTEGER PRIMARY KEY AUTOINCREMENT`
+//! column on `mailbox` (see report.md §K7). The `RETURNING rowid` /
+//! `SELECT rowid AS id` form below resolves to that PK because SQLite
+//! aliases `rowid` to an `INTEGER PRIMARY KEY` column. With
+//! `AUTOINCREMENT`, ids are monotonic and never reused after a
+//! `DELETE`, so the frontend's React keys stay stable across the
+//! mailbox lifecycle.
 
 use serde::Serialize;
 use specta::Type;
@@ -22,11 +24,15 @@ use tauri::{AppHandle, Emitter, Runtime, State};
 
 use crate::db::DbPool;
 use crate::error::AppError;
+use crate::events;
 use crate::models::{MailboxEntry, MailboxEntryInput};
+use crate::time::now_seconds;
 
-/// Optional input used by `mailbox:list` to scope to entries newer
-/// than a given epoch second. Frontends typically pass the latest
-/// `ts` they have cached.
+/// Optional input used by `mailbox:list` to scope to entries strictly
+/// newer than a given epoch second (exclusive). Frontends typically
+/// pass the latest `ts` they have cached so the next `mailbox:list`
+/// returns only deltas. The exclusive shape avoids redelivering rows
+/// at the boundary `ts` on every poll.
 #[derive(Debug, Serialize, Type, Clone, Copy)]
 #[allow(dead_code)]
 struct SinceTsMarker;
@@ -41,7 +47,7 @@ pub async fn mailbox_list(
         Some(t) => {
             sqlx::query_as::<_, MailboxEntry>(
                 "SELECT rowid AS id, ts, from_pane, to_pane, type, summary \
-                 FROM mailbox WHERE ts >= ? ORDER BY ts DESC, rowid DESC",
+                 FROM mailbox WHERE ts > ? ORDER BY ts DESC, rowid DESC",
             )
             .bind(t)
             .fetch_all(pool.inner())
@@ -69,10 +75,10 @@ pub async fn mailbox_emit<R: Runtime>(
     entry: MailboxEntryInput,
 ) -> Result<MailboxEntry, AppError> {
     if entry.from_pane.trim().is_empty() {
-        return Err(AppError::InvalidInput("fromPane must not be empty".into()));
+        return Err(AppError::InvalidInput("from must not be empty".into()));
     }
     if entry.to_pane.trim().is_empty() {
-        return Err(AppError::InvalidInput("toPane must not be empty".into()));
+        return Err(AppError::InvalidInput("to must not be empty".into()));
     }
 
     let ts = now_seconds();
@@ -100,20 +106,10 @@ pub async fn mailbox_emit<R: Runtime>(
     // Per ADR-0006: emit a `mailbox.new` event after the insert. The
     // event payload IS the inserted entry — frontends merge into the
     // TanStack Query cache via `qc.setQueryData(['mailbox'], …)`.
-    //
-    // Tauri 2.10 rejects `.` in event names; the wire form is
-    // `mailbox:new`. The logical name in ADR-0006 reads `mailbox.new`,
-    // and the WP-W2-08 frontend subscribes via the same colon form.
-    app.emit("mailbox:new", &inserted)?;
+    // The wire-name constant lives in `crate::events` (ADR-0006 §
+    // "Wire-format substitution" rationale).
+    app.emit(events::MAILBOX_NEW, &inserted)?;
     Ok(inserted)
-}
-
-fn now_seconds() -> i64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -132,22 +128,9 @@ mod tests {
     //! channel.
 
     use super::*;
-    use crate::test_support::fresh_pool;
+    use crate::test_support::mock_app_with_pool;
     use std::sync::{Arc, Mutex};
     use tauri::{Listener, Manager as _};
-
-    async fn mock_app_with_pool() -> (
-        tauri::App<tauri::test::MockRuntime>,
-        crate::db::DbPool,
-        tempfile::TempDir,
-    ) {
-        let (pool, dir) = fresh_pool().await;
-        let app = tauri::test::mock_builder()
-            .manage(pool.clone())
-            .build(tauri::test::mock_context(tauri::test::noop_assets()))
-            .expect("mock app");
-        (app, pool, dir)
-    }
 
     #[tokio::test]
     async fn mailbox_list_empty_returns_empty_vec() {
@@ -173,6 +156,37 @@ mod tests {
         let recent = mailbox_list(state, Some(150)).await.expect("ok");
         assert_eq!(recent.len(), 1);
         assert_eq!(recent[0].summary, "new");
+    }
+
+    /// Boundary: `sinceTs` is exclusive — when it equals an existing
+    /// row's `ts`, that row is NOT redelivered. Frontends pass their
+    /// cached latest `ts` and expect a strict-greater filter so the
+    /// same row isn't pushed on every poll.
+    #[tokio::test]
+    async fn mailbox_list_since_ts_is_exclusive() {
+        let (app, pool, _dir) = mock_app_with_pool().await;
+        sqlx::query(
+            "INSERT INTO mailbox (ts, from_pane, to_pane, type, summary) VALUES \
+             (100,'p1','p2','task:done','at-100'), \
+             (200,'p1','p2','task:done','at-200')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // sinceTs == 200 must yield an empty list (200 is the latest).
+        let none = mailbox_list(app.state::<crate::db::DbPool>(), Some(200))
+            .await
+            .expect("ok");
+        assert!(none.is_empty(), "ts > 200 must be empty, got {none:?}");
+
+        // sinceTs == 100 must yield the 200-row only (the 100-row is on
+        // the boundary and excluded by `>`).
+        let one = mailbox_list(app.state::<crate::db::DbPool>(), Some(100))
+            .await
+            .expect("ok");
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].summary, "at-200");
     }
 
     #[tokio::test]

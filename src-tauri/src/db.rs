@@ -109,13 +109,25 @@ async fn seed_demo_workflow(pool: &DbPool) -> Result<(), DbError> {
 /// facing `installs`/`rating`/`featured`/`installed` values do not
 /// drift on re-seed (we never overwrite them — the user may have
 /// already toggled `installed=1`).
+///
+/// **Failure handling.** A single corrupted manifest JSON used to
+/// abort the whole startup path (the panic landed in
+/// `tauri::Builder::build().expect(...)`, so the app refused to
+/// launch on every relaunch — see report.md §K6). We now soft-load
+/// the catalog: per-file parse failures are logged via `tracing::warn!`
+/// but the surviving manifests are seeded. Each `mcp:install`
+/// against a failed id will still surface a `ManifestError` to the
+/// caller; the rest of the app stays usable.
 async fn seed_mcp_servers(pool: &DbPool) -> Result<(), DbError> {
-    let manifests = crate::mcp::manifests::load_all().map_err(|e| {
-        DbError::Sqlx(sqlx::Error::Configuration(
-            format!("MCP manifest load: {e}").into(),
-        ))
-    })?;
-    for m in manifests {
+    let report = crate::mcp::manifests::parse_report();
+    for failure in &report.failures {
+        tracing::warn!(
+            file_key = %failure.file_key,
+            error = %failure.error,
+            "skipping bundled MCP manifest"
+        );
+    }
+    for m in &report.manifests {
         sqlx::query(
             "INSERT OR IGNORE INTO servers \
              (id, name, by, description, installs, rating, featured, installed) \
@@ -270,11 +282,16 @@ mod tests {
             .fetch_one(&pool2)
             .await
             .expect("count applied migrations");
-        assert_eq!(count, 1, "exactly one migration recorded");
+        // Migration count grows as the schema evolves. Update this
+        // when adding a new file under `migrations/`.
+        assert_eq!(
+            count, 3,
+            "three migrations recorded (0001 + 0002 + 0003)"
+        );
     }
 
-    /// Acceptance: WP-W2-05 — seed_mcp_servers writes the six bundled
-    /// manifests on first call and is a no-op on subsequent calls.
+    /// Acceptance: WP-W2-05 — seed_mcp_servers writes every bundled
+    /// manifest on first call and is a no-op on subsequent calls.
     #[tokio::test]
     async fn seed_mcp_servers_is_idempotent() {
         let (pool, _dir) = fresh_pool().await;
@@ -283,7 +300,7 @@ mod tests {
             .fetch_one(&pool)
             .await
             .unwrap();
-        assert_eq!(after_first, 6, "all six manifests seeded");
+        assert_eq!(after_first, 12, "all twelve manifests seeded");
 
         // Re-running must not duplicate or overwrite — flip one row's
         // `installed` to 1 first and confirm it survives the re-seed.
@@ -296,7 +313,7 @@ mod tests {
             .fetch_one(&pool)
             .await
             .unwrap();
-        assert_eq!(after_second, 6, "no duplicates after re-seed");
+        assert_eq!(after_second, 12, "no duplicates after re-seed");
         let installed: bool =
             sqlx::query_scalar("SELECT installed FROM servers WHERE id='filesystem'")
                 .fetch_one(&pool)
@@ -307,7 +324,8 @@ mod tests {
             "user-toggled `installed` flag must survive re-seed"
         );
 
-        // Acceptance: ids match the canonical six.
+        // Acceptance: ids match the canonical twelve (data.js#servers
+        // parity per Charter Constraint #1).
         let ids: Vec<String> =
             sqlx::query_scalar("SELECT id FROM servers ORDER BY id")
                 .fetch_all(&pool)
@@ -315,17 +333,23 @@ mod tests {
                 .unwrap();
         let mut expected = vec![
             "browser",
+            "figma",
             "filesystem",
             "github",
+            "linear",
+            "memory",
+            "notion",
             "postgres",
+            "sentry",
             "slack",
+            "stripe",
             "vector-db",
         ];
         expected.sort();
         assert_eq!(
             ids,
             expected.into_iter().map(String::from).collect::<Vec<_>>(),
-            "six canonical MCP servers"
+            "twelve canonical MCP servers"
         );
     }
 

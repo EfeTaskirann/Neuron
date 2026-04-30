@@ -105,3 +105,47 @@ pub async fn seed_pane(pool: &DbPool, id: &str) {
     .await
     .expect("seed pane");
 }
+
+/// Stand up a `tauri::test::MockRuntime` app with a freshly-migrated
+/// pool already in `app.state::<DbPool>()`. Hoisted from the six
+/// per-module copies that previously diverged in subtle ways
+/// (`max_connections`, post-build `manage` order). Single source of
+/// truth — every command-test that does not need extra app-state can
+/// call this directly.
+///
+/// We intentionally use `mock_context(noop_assets())` instead of
+/// `tauri::generate_context!()` so the test exe doesn't bundle the
+/// production frontend dist, icons, and permissions. The generated
+/// context drags in tens of MB of asset bytes that trip Windows
+/// `STATUS_ENTRYPOINT_NOT_FOUND` when the test binary tries to load.
+pub async fn mock_app_with_pool() -> (
+    tauri::App<tauri::test::MockRuntime>,
+    DbPool,
+    tempfile::TempDir,
+) {
+    let (pool, dir) = fresh_pool().await;
+    let app = tauri::test::mock_builder()
+        .manage(pool.clone())
+        .build(tauri::test::mock_context(tauri::test::noop_assets()))
+        .expect("mock app");
+    (app, pool, dir)
+}
+
+/// Same as [`mock_app_with_pool`] but also installs an empty
+/// `TerminalRegistry` in app state — required by the `terminal::*`
+/// command module's tests. Kept as a separate helper rather than
+/// folded into the default so the other five command modules' test
+/// binaries don't pull in the PTY supervisor's dependency tree.
+pub async fn mock_app_with_pool_and_terminal_registry() -> (
+    tauri::App<tauri::test::MockRuntime>,
+    DbPool,
+    tempfile::TempDir,
+) {
+    let (pool, dir) = fresh_pool().await;
+    let app = tauri::test::mock_builder()
+        .manage(pool.clone())
+        .manage(crate::sidecar::terminal::TerminalRegistry::new())
+        .build(tauri::test::mock_context(tauri::test::noop_assets()))
+        .expect("mock app");
+    (app, pool, dir)
+}

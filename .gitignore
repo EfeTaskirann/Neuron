@@ -35,3 +35,14 @@ coverage/
 .env
 .env.local
 *.pem
+
+# Claude/Bridgespace IDE bridge artifacts (never commit)
+.bridgespace/
+
+# SQLite local databases (defensive — runtime DB lives in app data dir)
+*.db
+*.db-journal
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm

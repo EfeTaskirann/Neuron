@@ -14,6 +14,8 @@ pub mod agents;
 pub mod health;
 pub mod mailbox;
 pub mod mcp;
+pub mod me;
 pub mod runs;
 pub mod terminal;
+pub mod util;
 pub mod workflows;

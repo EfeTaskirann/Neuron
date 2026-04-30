@@ -41,7 +41,9 @@ use tokio::sync::Mutex;
 
 use crate::db::DbPool;
 use crate::error::AppError;
+use crate::events;
 use crate::sidecar::framing::{read_frame, write_frame, Frame};
+use crate::tuning::SHUTDOWN_GRACE;
 
 // --------------------------------------------------------------------- //
 // Public handle managed by Tauri state                                   //
@@ -65,6 +67,11 @@ struct Inner {
     /// never poll it for status from this side — the read loop notices
     /// EOF on stdout when the child exits.
     child: Mutex<Option<Child>>,
+    /// JoinHandle for the read-loop task spawned at `spawn_runtime`.
+    /// Kept so `shutdown()` can `await` it (with a bounded grace) and
+    /// drain pending span / `run.completed` frames before the child
+    /// is hard-killed. See report.md §K4.
+    read_loop: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
 }
 
 // --------------------------------------------------------------------- //
@@ -169,21 +176,39 @@ impl SidecarHandle {
         self.send(&payload).await
     }
 
-    /// Tear the sidecar down on app exit. Tries a clean `shutdown`
-    /// frame first, then kills the process if it does not exit
-    /// promptly. Either path leaves the handle unusable.
+    /// Tear the sidecar down on app exit. Sends a clean `shutdown`
+    /// frame, drops stdin so the Python event loop sees EOF, then
+    /// **awaits the read loop with a bounded grace** so any in-flight
+    /// `run.completed` / `span.closed` frames land in SQLite before
+    /// the child is hard-killed. Idempotent: a second call is a
+    /// no-op (slots are already drained).
+    ///
+    /// See report.md §K4: previously this method called `start_kill`
+    /// immediately, dropping pending frames and leaving runs stuck in
+    /// `running` after every app close.
     pub async fn shutdown(&self) {
-        // Best-effort clean shutdown: send the frame and drop stdin so
-        // the child sees EOF. We do not wait for the child to exit
-        // here — the supervisor's read-loop will observe stdout EOF and
-        // log the exit; the `kill_on_drop` we set during spawn means
-        // any remaining process is reaped when the handle goes away.
+        // 1. Best-effort clean shutdown frame.
         let _ = self.send(&json!({"method": "shutdown"})).await;
-        // Drop the stdin pipe so the child's blocking stdin read sees
-        // EOF and the asyncio loop in `__main__.py` exits.
-        let mut stdin_slot = self.inner.stdin.lock().await;
-        *stdin_slot = None;
-        // Kill if still alive; ignore errors (already exited is fine).
+        // 2. Drop stdin so Python's blocking `read_in_executor` sees
+        //    EOF and the asyncio loop in `__main__.py` exits cleanly,
+        //    flushing pending `run.completed` events on its way out.
+        {
+            let mut stdin_slot = self.inner.stdin.lock().await;
+            *stdin_slot = None;
+        }
+        // 3. Wait for the read-loop task to finish — it returns when
+        //    the child closes stdout, which it does once Python's loop
+        //    completes. Bound the wait so a wedged child cannot block
+        //    app exit indefinitely.
+        let read_loop_handle = {
+            let mut slot = self.inner.read_loop.lock().await;
+            slot.take()
+        };
+        if let Some(handle) = read_loop_handle {
+            let _ = tokio::time::timeout(SHUTDOWN_GRACE, handle).await;
+        }
+        // 4. Kill if still alive; tolerated for an already-exited
+        //    child (Win32 `ERROR_INVALID_PARAMETER`, Unix `ESRCH`).
         let mut child_slot = self.inner.child.lock().await;
         if let Some(mut child) = child_slot.take() {
             let _ = child.start_kill();
@@ -228,10 +253,16 @@ pub fn spawn_runtime<R: Runtime>(app: &AppHandle<R>) -> Result<SidecarHandle, Ap
     // `kill_on_drop` is the seatbelt for the case where the Tauri
     // builder panics after we spawned the child but before the
     // setup hook returns — `Child::drop` then sends SIGKILL / TerminateProcess.
+    //
+    // `PYTHONUNBUFFERED=1` forces stdout to flush per-write; without it
+    // Python block-buffers when stdout is a pipe (~4–8 KiB) so small
+    // span frames sit in the buffer until enough volume accumulates,
+    // and the supervisor's read loop appears stalled to the UI.
     let mut child = Command::new(python)
         .arg("-m")
         .arg("agent_runtime")
         .current_dir(&working_dir)
+        .env("PYTHONUNBUFFERED", "1")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         // Inherit stderr so Python tracebacks land in the dev console.
@@ -257,14 +288,18 @@ pub fn spawn_runtime<R: Runtime>(app: &AppHandle<R>) -> Result<SidecarHandle, Ap
         .take()
         .ok_or_else(|| AppError::Sidecar("child stdout pipe missing".into()))?;
 
+    // Spawn the read loop on Tauri's tokio runtime. The loop ends
+    // naturally on stdout EOF (child exited) or on a hard frame error.
+    // Hold the JoinHandle so `SidecarHandle::shutdown` can `await` it
+    // (with a bounded grace) before killing the child.
+    let read_loop_handle =
+        tauri::async_runtime::spawn(read_loop(stdout, pool, app_for_loop));
+
     let inner = Arc::new(Inner {
         stdin: Mutex::new(Some(stdin)),
         child: Mutex::new(Some(child)),
+        read_loop: Mutex::new(Some(read_loop_handle)),
     });
-
-    // Spawn the read loop on Tauri's tokio runtime. The loop ends
-    // naturally on stdout EOF (child exited) or on a hard frame error.
-    tauri::async_runtime::spawn(read_loop(stdout, pool, app_for_loop));
 
     Ok(SidecarHandle { inner })
 }
@@ -313,7 +348,7 @@ async fn read_loop<R: Runtime>(
         let frame = match read_frame(&mut reader).await {
             Ok(f) => f,
             Err(e) => {
-                eprintln!("[sidecar] frame error: {e}");
+                tracing::error!(error = %e, "sidecar frame error");
                 break;
             }
         };
@@ -321,7 +356,7 @@ async fn read_loop<R: Runtime>(
         let body = match frame {
             Frame::Body(b) => b,
             Frame::Eof => {
-                eprintln!("[sidecar] stdout closed; read loop exiting");
+                tracing::info!("sidecar stdout closed; read loop exiting");
                 break;
             }
         };
@@ -329,13 +364,17 @@ async fn read_loop<R: Runtime>(
         let event: SidecarEvent = match serde_json::from_slice(&body) {
             Ok(e) => e,
             Err(e) => {
-                eprintln!("[sidecar] decode error: {e}; body: {:?}", String::from_utf8_lossy(&body));
+                tracing::warn!(
+                    error = %e,
+                    body = %String::from_utf8_lossy(&body),
+                    "sidecar frame decode error"
+                );
                 continue;
             }
         };
 
         if let Err(e) = handle_event(event, &pool, &app).await {
-            eprintln!("[sidecar] handle_event: {e}");
+            tracing::error!(error = %e, "sidecar handle_event failed");
         }
     }
 }
@@ -349,12 +388,12 @@ async fn handle_event<R: Runtime>(
         SidecarEvent::Ready => {
             // Logged for now; Week 3 surfaces this as a "Starting
             // agent" → "Ready" pill in the UI.
-            eprintln!("[sidecar] agent runtime ready");
+            tracing::info!("LangGraph agent runtime ready");
         }
         SidecarEvent::Error { message } => {
-            eprintln!(
-                "[sidecar] sidecar reported error: {}",
-                message.unwrap_or_else(|| "<no message>".into())
+            tracing::warn!(
+                message = %message.unwrap_or_else(|| "<no message>".into()),
+                "sidecar reported non-fatal error"
             );
         }
         SidecarEvent::SpanCreated { run_id, span } => {
@@ -375,7 +414,12 @@ async fn handle_event<R: Runtime>(
             // `runs:{id}:span(closed)` already covers the UI update.
             // Logging the optional error helps dev-time debugging.
             if let Some(msg) = error {
-                eprintln!("[sidecar] run {run_id} ended in {status}: {msg}");
+                tracing::info!(
+                    run_id = %run_id,
+                    status = %status,
+                    error = %msg,
+                    "run completed"
+                );
             }
         }
     }
@@ -435,11 +479,15 @@ async fn finalise_run(pool: &DbPool, run_id: &str, status: &str) -> Result<(), A
         "success" | "error" | "running" => status,
         _ => "error",
     };
+    // Guard against ezme of a user-driven `runs:cancel` (which sets
+    // status='error' before the sidecar finishes). Only finalise rows
+    // still observed as `running`; if the user cancelled mid-flight
+    // their `error` flag survives the late-arriving `RunCompleted`.
     sqlx::query(
         "UPDATE runs SET \
             status      = ?, \
             duration_ms = COALESCE(duration_ms, (CAST(strftime('%s','now') AS INTEGER) - started_at) * 1000) \
-         WHERE id = ?",
+         WHERE id = ? AND status = 'running'",
     )
     .bind(safe_status)
     .bind(run_id)
@@ -457,8 +505,9 @@ fn emit_span_event<R: Runtime>(
     // Frontend subscribes to `runs:{id}:span` per WP-W2-08; the
     // payload's discriminant is `kind`, so a single event name covers
     // all three lifecycle stages without forcing the UI to subscribe
-    // three separate channels.
-    let event_name = format!("runs:{run_id}:span");
+    // three separate channels. The wire-name helper lives in
+    // `crate::events` (ADR-0006 § "Wire-format substitution").
+    let event_name = events::run_span(run_id);
     // Re-encode the span as a JSON Value so the payload is the exact
     // shape the sidecar sent (post-frontend rename).
     let span_value = serde_json::to_value(SerializableWireSpan(span))?;

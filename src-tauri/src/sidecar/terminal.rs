@@ -49,39 +49,16 @@ use ulid::Ulid;
 
 use crate::db::DbPool;
 use crate::error::AppError;
-use crate::models::{Pane, PaneSpawnInput};
+use crate::events;
+use crate::models::{ApprovalBanner, Pane, PaneSpawnInput};
+use crate::tuning::{
+    APPROVAL_WINDOW_LINES, KILL_GRACE, MAX_PENDING_BYTES, READ_CHUNK_BYTES, RING_BUFFER_CAP,
+    RING_BUFFER_DROP, WAIT_POLL,
+};
 
-// --------------------------------------------------------------------- //
-// Tunables                                                              //
-// --------------------------------------------------------------------- //
-
-/// Hard cap on in-memory ring lines per pane. Per WP-W2-06 § "Ring
-/// buffer": "5,000 lines per pane. When exceeded, oldest 1,000 dropped".
-const RING_BUFFER_CAP: usize = 5_000;
-
-/// Number of lines dropped from the front when the ring overflows.
-const RING_BUFFER_DROP: usize = 1_000;
-
-/// How many of the most recent lines are scanned for awaiting-approval
-/// regex matches per output chunk. Per NEURON_TERMINAL_REPORT § state
-/// machine: "simple regex on the last 5 lines".
-const APPROVAL_WINDOW_LINES: usize = 5;
-
-/// Read-buffer size for PTY chunks. 8 KiB is the common pipe buffer
-/// size on every host platform; larger values waste memory for typical
-/// shell output bursts and smaller values incur extra syscalls.
-const READ_CHUNK_BYTES: usize = 8 * 1024;
-
-/// Kill grace period — `kill_pane` issues a kill, then verifies the
-/// child has exited within this window before declaring success. The
-/// `portable_pty::ChildKiller::kill` is best-effort; on Windows the
-/// ConPTY shuts down asynchronously and we want to give the OS a beat.
-const KILL_GRACE: Duration = Duration::from_secs(5);
-
-/// Polling cadence for `try_wait()` in the waiter task. Every 200 ms
-/// matches WP-W2-06's recommendation; lower causes wakeups under
-/// quiescent panes, higher delays the `success`/`error` status flip.
-const WAIT_POLL: Duration = Duration::from_millis(200);
+// Tunables (RING_BUFFER_CAP, RING_BUFFER_DROP, APPROVAL_WINDOW_LINES,
+// READ_CHUNK_BYTES, KILL_GRACE, WAIT_POLL, MAX_PENDING_BYTES) live in
+// `crate::tuning` so the runtime profile is editable in one place.
 
 // --------------------------------------------------------------------- //
 // Pane status discriminants                                             //
@@ -282,10 +259,20 @@ impl TerminalRegistry {
         // can show the spawning pill; the waiter task transitions it
         // through `running` once the child stays alive past the first
         // poll cycle.
+        // RETURNING projects four `NULL AS …` columns for the
+        // mock-shape parity fields (`tokens_in/out/cost_usd/uptime`)
+        // that Pane carries with `#[sqlx(default)]` — without these
+        // explicit projections sqlx's FromRow bails out on
+        // `ColumnNotFound`. `approval` is `#[sqlx(skip)]`, so it's
+        // always defaulted to `None` here regardless of the row
+        // (a fresh pane has no banner yet).
         let pane_row = sqlx::query_as::<_, Pane>(
             "INSERT INTO panes (id, workspace, agent_kind, role, cwd, status, pid) \
              VALUES (?, ?, ?, ?, ?, ?, ?) \
-             RETURNING id, workspace, agent_kind, role, cwd, status, pid, started_at, closed_at",
+             RETURNING id, workspace, agent_kind, role, cwd, status, pid, \
+                       started_at, closed_at, \
+                       NULL AS tokens_in, NULL AS tokens_out, \
+                       NULL AS cost_usd, NULL AS uptime",
         )
         .bind(&pane_id)
         .bind(&workspace)
@@ -590,27 +577,81 @@ impl TerminalRegistry {
         Ok(rows)
     }
 
-    /// Kill every alive pane. Called from the `RunEvent::ExitRequested`
-    /// hook in `lib.rs` so closing the window does not orphan any
-    /// shell processes.
-    pub async fn shutdown_all(&self) {
-        let panes: Vec<Arc<Mutex<PaneState>>> = {
+    /// Kill every alive pane on app exit AND persist its scrollback
+    /// to `pane_lines` synchronously before returning. Called from the
+    /// `RunEvent::ExitRequested` hook in `lib.rs`.
+    ///
+    /// Per pane we:
+    /// 1. Kill the child (via the cloned `ChildKiller`).
+    /// 2. Drop master + writer so any blocking reader can unblock
+    ///    (mandatory for Windows ConPTY).
+    /// 3. Snapshot the in-memory ring buffer.
+    /// 4. `INSERT` each ring line into `pane_lines` inside one tx.
+    /// 5. `UPDATE panes SET status='closed', closed_at=…`.
+    ///
+    /// Steps 4–5 used to be deferred to the per-pane `run_waiter` task
+    /// (via `tauri::async_runtime::spawn`). On app exit those tasks
+    /// rarely won the race against runtime tear-down, so scrollback
+    /// was lost and panes stayed `running` in the DB. See report.md §K1.
+    pub async fn shutdown_all(&self, pool: &DbPool) {
+        let panes: Vec<(String, Arc<Mutex<PaneState>>)> = {
             let mut panes = self.inner.panes.lock().await;
-            panes.drain().map(|(_, v)| v).collect()
+            panes.drain().collect()
         };
 
         if panes.is_empty() {
             return;
         }
 
-        let _ = tokio::task::spawn_blocking(move || {
-            for state in panes {
-                if let Ok(mut guard) = state.lock() {
-                    let _ = guard.killer.kill();
+        for (pane_id, state) in panes {
+            // Sync section: under the per-pane lock, kill the child,
+            // drop pipes, and snapshot the ring. Done on a blocking
+            // thread because `ChildKiller::kill()` and pipe drops can
+            // touch Win32 handles.
+            let snapshot: Vec<RingLine> = match tokio::task::spawn_blocking({
+                let state = Arc::clone(&state);
+                move || -> Vec<RingLine> {
+                    match state.lock() {
+                        Ok(mut guard) => {
+                            let _ = guard.killer.kill();
+                            guard.master.take();
+                            guard.writer.take();
+                            guard.ring.iter().cloned().collect()
+                        }
+                        Err(_) => Vec::new(),
+                    }
                 }
+            })
+            .await
+            {
+                Ok(v) => v,
+                Err(_) => Vec::new(),
+            };
+
+            // Async section: write directly to SQLite from this task
+            // — no detached spawn that the runtime might not run.
+            if let Err(e) = flush_ring_to_db(pool, &pane_id, &snapshot).await {
+                tracing::error!(
+                    pane_id = %pane_id,
+                    error = %e,
+                    "shutdown_all ring flush failed"
+                );
             }
-        })
-        .await;
+            if let Err(e) = sqlx::query(
+                "UPDATE panes SET status = 'closed', closed_at = strftime('%s','now') \
+                 WHERE id = ? AND closed_at IS NULL",
+            )
+            .bind(&pane_id)
+            .execute(pool)
+            .await
+            {
+                tracing::error!(
+                    pane_id = %pane_id,
+                    error = %e,
+                    "shutdown_all finalise failed"
+                );
+            }
+        }
     }
 }
 
@@ -645,7 +686,14 @@ fn run_reader<R: Runtime>(
     agent_kind: String,
 ) {
     let mut buf = vec![0u8; READ_CHUNK_BYTES];
-    let mut pending = String::new(); // line accumulator across chunks
+    // Byte accumulator across chunks. Using `Vec<u8>` (not `String`)
+    // is the K5 fix from report.md: `String::from_utf8_lossy` on each
+    // chunk replaced any multi-byte char that straddled the chunk
+    // boundary with U+FFFD on both sides. Holding raw bytes until we
+    // see a newline `0x0A` byte is safe because UTF-8 continuation
+    // bytes are always ≥ 0x80, so `0x0A` only ever appears as a real
+    // line terminator (never inside a multi-byte sequence).
+    let mut pending: Vec<u8> = Vec::new();
     loop {
         let n = match reader.read(&mut buf) {
             Ok(0) => break, // EOF — child closed PTY
@@ -662,62 +710,82 @@ fn run_reader<R: Runtime>(
                 {
                     break;
                 }
-                eprintln!("[terminal:{pane_id}] read error: {e}");
+                tracing::error!(pane_id = %pane_id, error = %e, "terminal read error");
                 break;
             }
         };
+        pending.extend_from_slice(&buf[..n]);
 
-        // Lossy UTF-8 — preserves multi-byte sequences split across
-        // chunks well enough for line-based handling. Non-UTF-8 bytes
-        // surface as U+FFFD, which the frontend renders as a placeholder;
-        // raw bytes for xterm.js are reserved for the live event payload
-        // (we keep the lossy form for both Live and DB to keep the
-        // contract one-shape; if WP-W2-08 needs raw bytes for xterm.js
-        // it can switch to a binary channel later).
-        let chunk = String::from_utf8_lossy(&buf[..n]);
-        pending.push_str(&chunk);
+        // Drain whole lines on each newline. Each line's bytes are
+        // decoded once we have the full sequence — `from_utf8_lossy`
+        // is now correct because no multi-byte char is split.
+        while let Some(idx) = pending.iter().position(|&b| b == b'\n') {
+            let line_bytes: Vec<u8> = pending.drain(..=idx).collect();
+            let trimmed = trim_terminal_line_end(&line_bytes);
+            emit_decoded_line(
+                &app, &state, &pool, &pane_id, &agent_kind, trimmed, /* maybe_transition */ true,
+            );
+        }
 
-        // Drain whole lines. Last partial line stays in `pending` for
-        // the next chunk. CRLF normalised to LF for storage.
-        loop {
-            match pending.find('\n') {
-                Some(idx) => {
-                    let line: String = pending.drain(..=idx).collect();
-                    let trimmed = line.trim_end_matches(['\n', '\r']);
-                    let text_for_db = strip_csi(trimmed);
-                    let payload = LineEventPayload {
-                        k: "out",
-                        text: trimmed.to_string(),
-                        seq: 0, // filled in below under the lock
-                    };
-                    emit_line(&app, &state, &pane_id, payload, &text_for_db, "out");
-                    maybe_transition_status(
-                        &state,
-                        &app,
-                        &pool,
-                        &pane_id,
-                        &agent_kind,
-                    );
-                }
-                None => break,
-            }
+        // L8: cap unflushed pending so a child emitting megabytes
+        // without a newline cannot exhaust memory. Force-flush as a
+        // partial line and continue.
+        if pending.len() > MAX_PENDING_BYTES {
+            let forced = std::mem::take(&mut pending);
+            let trimmed = trim_terminal_line_end(&forced);
+            emit_decoded_line(
+                &app, &state, &pool, &pane_id, &agent_kind, trimmed, /* maybe_transition */ true,
+            );
         }
     }
 
     // Flush any trailing partial line (shells often emit a prompt
     // without a trailing newline). Treat as an `out` line so the
-    // ring captures it.
+    // ring captures it. No status transition for the trailing flush
+    // (the child has already exited; the waiter will set final status).
     if !pending.is_empty() {
-        let trimmed = pending.trim_end_matches(['\n', '\r']);
+        let trimmed = trim_terminal_line_end(&pending);
         if !trimmed.is_empty() {
-            let text_for_db = strip_csi(trimmed);
-            let payload = LineEventPayload {
-                k: "out",
-                text: trimmed.to_string(),
-                seq: 0,
-            };
-            emit_line(&app, &state, &pane_id, payload, &text_for_db, "out");
+            emit_decoded_line(
+                &app, &state, &pool, &pane_id, &agent_kind, trimmed, /* maybe_transition */ false,
+            );
         }
+    }
+}
+
+/// Strip trailing `\r` / `\n` from a raw byte buffer and decode the
+/// remainder as lossy UTF-8. Embedded `\r` (carriage-return progress
+/// bars) and any control chars within the line are preserved — only
+/// the line terminator is stripped.
+fn trim_terminal_line_end(bytes: &[u8]) -> &[u8] {
+    let end = bytes
+        .iter()
+        .rposition(|&b| b != b'\n' && b != b'\r')
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    &bytes[..end]
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_decoded_line<R: Runtime>(
+    app: &AppHandle<R>,
+    state: &Arc<Mutex<PaneState>>,
+    pool: &DbPool,
+    pane_id: &str,
+    agent_kind: &str,
+    line_bytes: &[u8],
+    transition_status: bool,
+) {
+    let text = String::from_utf8_lossy(line_bytes).into_owned();
+    let text_for_db = strip_csi(&text);
+    let payload = LineEventPayload {
+        k: "out",
+        text,
+        seq: 0, // filled in below under the lock
+    };
+    emit_line(app, state, pane_id, payload, &text_for_db, "out");
+    if transition_status {
+        maybe_transition_status(state, app, pool, pane_id, agent_kind);
     }
 }
 
@@ -756,9 +824,9 @@ fn emit_line<R: Runtime>(
     };
 
     payload.seq = seq;
-    let event = format!("panes:{pane_id}:line");
+    let event = events::pane_line(pane_id);
     if let Err(e) = app.emit(&event, &payload) {
-        eprintln!("[terminal:{pane_id}] emit error: {e}");
+        tracing::error!(pane_id = %pane_id, error = %e, "terminal emit error");
     }
 }
 
@@ -771,6 +839,16 @@ fn emit_line<R: Runtime>(
 /// rarely re-trigger the regex) or exits. We do not auto-clear because
 /// per WP-W2-06 the explicit transition out of `awaiting_approval` is
 /// the user's input, which the frontend models with its own UI.
+///
+/// On the AWAITING transition we also try to extract a structured
+/// `ApprovalBanner` blob (`{tool, target, added, removed}`) from the
+/// trailing window and stamp the JSON into `panes.last_approval_json`
+/// so `terminal_list` can surface `Pane.approval` for the UI's amber
+/// banner strip per `NEURON_TERMINAL_REPORT.md` § Visual contract.
+/// Extraction is best-effort: when regex parsing fails (which is the
+/// common case in Week 2 — agent CLIs do not yet emit a stable
+/// machine-readable approval line) we persist a placeholder blob so
+/// the frontend at least has a non-null banner to render.
 fn maybe_transition_status<R: Runtime>(
     state: &Arc<Mutex<PaneState>>,
     app: &AppHandle<R>,
@@ -778,7 +856,12 @@ fn maybe_transition_status<R: Runtime>(
     pane_id: &str,
     agent_kind: &str,
 ) {
-    let new_status = {
+    enum Transition {
+        Awaiting(ApprovalBanner),
+        Running,
+    }
+
+    let transition = {
         let guard = match state.lock() {
             Ok(g) => g,
             Err(_) => return,
@@ -802,18 +885,123 @@ fn maybe_transition_status<R: Runtime>(
         }
         let combined = tail.join("\n");
         if matches_awaiting_approval(agent_kind, &combined) {
-            status::AWAITING
+            Transition::Awaiting(extract_approval_blob(agent_kind, &combined))
         } else if guard.status == status::STARTING {
-            status::RUNNING
+            Transition::Running
         } else {
             return;
         }
     };
 
-    set_status(state, pool, pane_id, new_status);
+    match transition {
+        Transition::Awaiting(banner) => set_awaiting_approval(state, pool, pane_id, &banner),
+        Transition::Running => set_status(state, pool, pane_id, status::RUNNING),
+    }
     let _ = app; // app is here only to keep the lifetime symmetric
                   // with future event emissions; status transitions
                   // currently surface via the next `terminal:list`.
+}
+
+/// Best-effort extractor for the `ApprovalBanner` blob shown above an
+/// `awaiting_approval` pane. Week 2 minimum: tries one structured
+/// regex against `claude-code` output and falls back to a placeholder
+/// `{tool: "unknown", target: "", added: 0, removed: 0}` for all other
+/// agents (and for claude-code when the structured form does not
+/// match). Real CLIs do not yet emit a stable machine-readable
+/// approval block, so the placeholder is what the UI sees most of the
+/// time — the field merely needs to be non-null to trigger the amber
+/// banner.
+fn extract_approval_blob(agent_kind: &str, text: &str) -> ApprovalBanner {
+    fn placeholder() -> ApprovalBanner {
+        ApprovalBanner {
+            tool: "unknown".into(),
+            target: String::new(),
+            added: 0,
+            removed: 0,
+        }
+    }
+    if agent_kind == "claude-code" {
+        // Brief §1.4: structured form. `(?ms)` so `.` spans newlines.
+        static RE: OnceLock<Regex> = OnceLock::new();
+        let re = RE.get_or_init(|| {
+            Regex::new(
+                r"(?ms)^Tool:\s*(?P<tool>\S+).*?target:\s*(?P<target>\S+).*?\+(?P<add>\d+).*?-(?P<rem>\d+)",
+            )
+            .expect("claude approval blob regex")
+        });
+        if let Some(caps) = re.captures(text) {
+            let tool = caps.name("tool").map(|m| m.as_str().to_string()).unwrap_or_default();
+            let target = caps.name("target").map(|m| m.as_str().to_string()).unwrap_or_default();
+            let added: i64 = caps
+                .name("add")
+                .and_then(|m| m.as_str().parse().ok())
+                .unwrap_or(0);
+            let removed: i64 = caps
+                .name("rem")
+                .and_then(|m| m.as_str().parse().ok())
+                .unwrap_or(0);
+            return ApprovalBanner { tool, target, added, removed };
+        }
+    }
+    placeholder()
+}
+
+/// Flip the pane to `awaiting_approval` AND persist the JSON-encoded
+/// approval banner in one round-trip. Split out from [`set_status`]
+/// because the awaiting transition is the only one with a side
+/// payload — every other transition just rewrites `panes.status`.
+fn set_awaiting_approval(
+    state: &Arc<Mutex<PaneState>>,
+    pool: &DbPool,
+    pane_id: &str,
+    banner: &ApprovalBanner,
+) {
+    {
+        let mut guard = match state.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        if guard.status == status::AWAITING {
+            return;
+        }
+        guard.status = status::AWAITING;
+    }
+
+    // `serde_json::to_string` on a flat 4-field struct cannot fail in
+    // practice, but defensively we keep the pane's status flip even
+    // when serialisation does fail and write a NULL blob — better an
+    // unbannered awaiting pane than a panic in the read loop.
+    let blob = match serde_json::to_string(banner) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            tracing::error!(
+                pane_id = %pane_id,
+                error = %e,
+                "approval blob serialize failed"
+            );
+            None
+        }
+    };
+
+    let pool = pool.clone();
+    let pane_id = pane_id.to_string();
+    tauri::async_runtime::spawn(async move {
+        let res = sqlx::query(
+            "UPDATE panes SET status = 'awaiting_approval', last_approval_json = ? \
+             WHERE id = ?",
+        )
+        .bind(blob.as_deref())
+        .bind(&pane_id)
+        .execute(&pool)
+        .await;
+        if let Err(e) = res {
+            tracing::error!(
+                pane_id = %pane_id,
+                error = %e,
+                "awaiting_approval update failed"
+            );
+        }
+    });
 }
 
 /// Update the pane's in-memory status and the DB row. Logs but does
@@ -845,7 +1033,11 @@ fn set_status(
             .execute(&pool)
             .await;
         if let Err(e) = res {
-            eprintln!("[terminal:{pane_id}] status update failed: {e}");
+            tracing::error!(
+                pane_id = %pane_id,
+                error = %e,
+                "pane status update failed"
+            );
         }
     });
 }
@@ -889,7 +1081,7 @@ fn run_waiter<R: Runtime>(
                 std::thread::sleep(WAIT_POLL);
             }
             Err(e) => {
-                eprintln!("[terminal:{pane_id}] try_wait err: {e}");
+                tracing::error!(pane_id = %pane_id, error = %e, "pane try_wait error");
                 break portable_pty::ExitStatus::with_exit_code(1);
             }
         }
@@ -941,7 +1133,11 @@ fn run_waiter<R: Runtime>(
     let pool_async = pool.clone();
     tauri::async_runtime::spawn(async move {
         if let Err(e) = flush_ring_to_db(&pool_async, &pane_id_async, &snapshot).await {
-            eprintln!("[terminal:{pane_id_async}] ring flush failed: {e}");
+            tracing::error!(
+                pane_id = %pane_id_async,
+                error = %e,
+                "terminal ring flush failed"
+            );
         }
         let res = sqlx::query(
             "UPDATE panes SET status = ?, closed_at = strftime('%s','now') \
@@ -952,7 +1148,11 @@ fn run_waiter<R: Runtime>(
         .execute(&pool_async)
         .await;
         if let Err(e) = res {
-            eprintln!("[terminal:{pane_id_async}] finalise failed: {e}");
+            tracing::error!(
+                pane_id = %pane_id_async,
+                error = %e,
+                "pane finalise failed"
+            );
         }
     });
 
@@ -1301,6 +1501,68 @@ mod tests {
     use crate::test_support::fresh_pool;
     use std::collections::VecDeque;
     use std::time::Duration as StdDuration;
+
+    /// K5 regression: `trim_terminal_line_end` strips trailing CR/LF
+    /// without touching multi-byte UTF-8 chars or embedded `\r` used
+    /// for in-place progress updates.
+    #[test]
+    fn trim_terminal_line_end_preserves_inline_cr_and_multibyte() {
+        // Plain LF.
+        assert_eq!(trim_terminal_line_end(b"hello\n"), b"hello");
+        // CRLF.
+        assert_eq!(trim_terminal_line_end(b"hello\r\n"), b"hello");
+        // Bare CR (some terminal apps).
+        assert_eq!(trim_terminal_line_end(b"hello\r"), b"hello");
+        // Embedded `\r` (progress bar pattern) preserved — only the
+        // trailing terminator is trimmed.
+        assert_eq!(
+            trim_terminal_line_end(b"50%\r60%\n"),
+            b"50%\r60%",
+        );
+        // 3-byte UTF-8 char at end (Greek lowercase delta `δ` = 0xCE 0xB4)
+        // followed by LF — bytes are preserved and decode cleanly.
+        let bytes = &[0xCEu8, 0xB4u8, b'\n'];
+        let trimmed = trim_terminal_line_end(bytes);
+        assert_eq!(trimmed, &[0xCEu8, 0xB4u8]);
+        assert_eq!(String::from_utf8_lossy(trimmed), "δ");
+        // 4-byte UTF-8 char (emoji 🦀 = U+1F980 = F0 9F A6 80) — not
+        // mangled by `from_utf8_lossy` because the whole sequence is
+        // present.
+        let bytes = b"crab \xF0\x9F\xA6\x80\n";
+        let trimmed = trim_terminal_line_end(bytes);
+        assert_eq!(String::from_utf8_lossy(trimmed), "crab 🦀");
+        // All-newline input strips to empty.
+        assert_eq!(trim_terminal_line_end(b"\r\n"), b"");
+        assert_eq!(trim_terminal_line_end(b""), b"");
+    }
+
+    /// K5 regression: a multi-byte UTF-8 char split across two reader
+    /// chunks must NOT be replaced with U+FFFD. Before the fix, the
+    /// `Vec<u8>` accumulator was a `String` and each chunk was decoded
+    /// in isolation, so the trailing byte of chunk 1 and the leading
+    /// byte(s) of chunk 2 were each wrapped in U+FFFD. Now the bytes
+    /// accumulate until a newline is seen and the full sequence is
+    /// decoded together.
+    #[test]
+    fn pending_buffer_concats_split_utf8_before_decode() {
+        // Simulate two reads where a 3-byte char (`δ` = CE B4) is
+        // split: chunk1 ends with CE, chunk2 starts with B4 then LF.
+        let mut pending: Vec<u8> = Vec::new();
+        pending.extend_from_slice(b"a"); // chunk 1 first byte
+        pending.extend_from_slice(&[0xCE]); // chunk 1 last byte (lead)
+        // No newline yet — caller must NOT decode pending.
+        assert!(!pending.iter().any(|&b| b == b'\n'));
+        pending.extend_from_slice(&[0xB4, b'\n']); // chunk 2
+
+        let idx = pending.iter().position(|&b| b == b'\n').expect("nl");
+        let line: Vec<u8> = pending.drain(..=idx).collect();
+        let trimmed = trim_terminal_line_end(&line);
+        let decoded = String::from_utf8_lossy(trimmed);
+        assert_eq!(
+            decoded, "aδ",
+            "split 3-byte sequence must round-trip without U+FFFD"
+        );
+    }
 
     /// Acceptance: ring overflow drops the oldest 1,000 entries.
     #[test]

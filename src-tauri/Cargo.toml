@@ -85,6 +85,12 @@ portable-pty = "0.9"
 # canonical patterns (Claude Code, Codex, Gemini) compiled once at
 # module init via `OnceLock`.
 regex = "1"
+# Operational logger. Replaced ad-hoc `eprintln!` calls with structured
+# `tracing::*` macros so production logs carry pane_id / run_id /
+# error fields. `tracing-subscriber`'s `env-filter` lets us toggle
+# verbosity per module via `RUST_LOG` (e.g. `RUST_LOG=neuron=debug`).
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 # Tests build a throwaway DB on disk and need a unique tempdir per test.

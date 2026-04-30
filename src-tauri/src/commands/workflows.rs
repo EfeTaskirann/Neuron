@@ -60,21 +60,8 @@ pub async fn workflows_get(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::fresh_pool;
+    use crate::test_support::mock_app_with_pool;
     use tauri::Manager as _;
-
-    async fn mock_app_with_pool() -> (
-        tauri::App<tauri::test::MockRuntime>,
-        crate::db::DbPool,
-        tempfile::TempDir,
-    ) {
-        let (pool, dir) = fresh_pool().await;
-        let app = tauri::test::mock_builder()
-            .manage(pool.clone())
-            .build(tauri::test::mock_context(tauri::test::noop_assets()))
-            .expect("mock app");
-        (app, pool, dir)
-    }
 
     #[tokio::test]
     async fn workflows_list_empty_returns_empty_vec() {

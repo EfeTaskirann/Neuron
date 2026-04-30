@@ -32,15 +32,11 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
 use crate::error::AppError;
+use crate::tuning::MCP_REQUEST_TIMEOUT;
 
 /// MCP spec version this client speaks. Pinned per the Charter
 /// risk register; upgrading is an ADR-shaped decision.
 pub const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
-
-/// Read timeout for one request/response round-trip. `npx` cold-start
-/// can be slow on Windows (no cache → npm install → server startup),
-/// so the budget is deliberately generous.
-const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 // --------------------------------------------------------------------- //
 // Domain types — shared with `crate::models` via re-export              //
@@ -63,10 +59,13 @@ pub struct ToolDescriptor {
 
 /// Response shape for `tools/call`. The MCP spec wraps the tool's
 /// output in a `content[]` array of `{type, text|...}` blocks plus an
-/// optional `isError` flag.
+/// optional `isError` flag. `content` is `#[serde(default)]` because
+/// the spec allows it to be absent on side-effect-only tools (e.g.,
+/// `write_file`-style returns of `{"isError":false}`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CallToolOutput {
+    #[serde(default)]
     pub content: Vec<ContentBlock>,
     #[serde(default)]
     pub is_error: bool,
@@ -212,7 +211,31 @@ impl McpClient {
                 "version": env!("CARGO_PKG_VERSION")
             }
         });
-        let _ = self.request("initialize", init_params).await?;
+        let init_result = self.request("initialize", init_params).await?;
+        // MCP spec 2024-11-05 §4.1: the client SHOULD verify the server
+        // reports a compatible protocolVersion. A drift can silently
+        // change the wire shape (e.g., tools/list envelope), so we log
+        // loudly when we see one we did not request. We do not reject
+        // the connection — some upstream servers bump versions while
+        // staying wire-compatible — but the eprintln gives an audit
+        // trail so a future "tools/list returned unexpected shape" bug
+        // is correlatable to the version it shipped against.
+        let server_version = init_result
+            .get("protocolVersion")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if server_version.is_empty() {
+            return Err(AppError::McpProtocol(
+                "initialize response missing protocolVersion".into(),
+            ));
+        }
+        if server_version != MCP_PROTOCOL_VERSION {
+            tracing::warn!(
+                expected = %MCP_PROTOCOL_VERSION,
+                got = %server_version,
+                "MCP protocolVersion mismatch; continuing optimistically"
+            );
+        }
         // Per the spec, the client MUST send `notifications/initialized`
         // after a successful `initialize` response.
         self.notify("notifications/initialized", json!({})).await?;
@@ -234,9 +257,9 @@ impl McpClient {
         let line = serde_json::to_string(&req)?;
         self.write_line(&line).await?;
         // Read until we get a response with the matching id. Bail out
-        // after `REQUEST_TIMEOUT` to avoid a stuck UI thread when the
-        // server crashes mid-call.
-        let deadline = tokio::time::Instant::now() + REQUEST_TIMEOUT;
+        // after `MCP_REQUEST_TIMEOUT` to avoid a stuck UI thread when
+        // the server crashes mid-call.
+        let deadline = tokio::time::Instant::now() + MCP_REQUEST_TIMEOUT;
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
@@ -257,6 +280,13 @@ impl McpClient {
                     "server closed stdout before responding".into(),
                 ));
             };
+            // Some MCP servers (Node line-buffering, slow startup) emit
+            // stray blank lines into stdout. `read_line` already trims
+            // CRLF; an empty `line` here is a keepalive, not a frame —
+            // skip and keep waiting for the real response.
+            if line.is_empty() {
+                continue;
+            }
             let resp: Response = match serde_json::from_str(&line) {
                 Ok(r) => r,
                 Err(e) => {
@@ -268,11 +298,24 @@ impl McpClient {
             };
             if let Some(other_method) = resp.method.as_deref() {
                 // Unsolicited notification — log and keep reading.
-                eprintln!(
-                    "[mcp] ignoring unsolicited notification `{other_method}`: {}",
-                    line.trim()
+                tracing::debug!(
+                    method = %other_method,
+                    line = %line.trim(),
+                    "ignoring unsolicited MCP notification"
                 );
                 continue;
+            }
+            // Surface any error before checking id correlation: per
+            // JSON-RPC 2.0 §5.1, error responses for malformed requests
+            // (parse error, invalid request) carry `id: null`. Since
+            // this client never overlaps requests on a single instance,
+            // any error response in flight is for our most recent
+            // request — even when its echoed id is missing.
+            if let Some(err) = resp.error {
+                return Err(AppError::McpProtocol(format!(
+                    "{method}: {}",
+                    err.message
+                )));
             }
             if resp.id != Some(id) {
                 // Response for a different request — should not happen
@@ -281,12 +324,6 @@ impl McpClient {
                 return Err(AppError::McpProtocol(format!(
                     "response id mismatch: expected {id}, got {:?}",
                     resp.id
-                )));
-            }
-            if let Some(err) = resp.error {
-                return Err(AppError::McpProtocol(format!(
-                    "{method}: {}",
-                    err.message
                 )));
             }
             return Ok(resp.result.unwrap_or(Value::Null));

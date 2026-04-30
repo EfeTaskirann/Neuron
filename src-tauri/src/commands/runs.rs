@@ -28,6 +28,7 @@ use crate::db::DbPool;
 use crate::error::AppError;
 use crate::models::{Run, RunDetail, RunFilter, Span};
 use crate::sidecar::agent::SidecarHandle;
+use crate::time::now_seconds;
 
 #[tauri::command(rename_all = "camelCase")]
 #[specta::specta]
@@ -127,14 +128,31 @@ pub async fn runs_create<R: Runtime>(
     .execute(pool.inner())
     .await?;
 
-    // Dispatch to the sidecar. If the sidecar failed to spawn at
-    // startup (no Python / no venv), `try_state` returns `None` and
-    // the inserted row stays in `running` for the user to retry once
-    // the runtime is fixed. We deliberately do not delete the row —
-    // preserving it surfaces the failure in the runs list with a
-    // known id the user can reference.
-    if let Some(handle) = app.try_state::<SidecarHandle>() {
-        handle.start_run(&workflow_id, &id).await?;
+    // Dispatch to the sidecar. Two distinct error paths:
+    //
+    // 1. Sidecar never came up at app start (`try_state` is `None`):
+    //    Python isn't installed, the venv is unsynced, etc. The user
+    //    cannot do anything about this run, so we mark it `error`
+    //    immediately rather than leaving a phantom `running` row that
+    //    never finalises.
+    // 2. `start_run` write fails (broken pipe — child died between
+    //    spawn and now): same outcome — finalise to `error` and surface
+    //    the underlying error, so the runs list does not stay polluted
+    //    with zombie `running` rows on every failure.
+    let sidecar_result = match app.try_state::<SidecarHandle>() {
+        Some(handle) => handle.start_run(&workflow_id, &id).await,
+        None => Err(AppError::Sidecar(
+            "agent runtime sidecar is not running (run `cd src-tauri/sidecar/agent_runtime && uv sync`)".into(),
+        )),
+    };
+    if let Err(e) = sidecar_result {
+        // Compensating rollback: flip the freshly-inserted `running`
+        // row to `error` atomically. The helper preserves the
+        // `WHERE status = 'running'` guard so a sidecar-driven
+        // success/error finalisation that already landed cannot be
+        // overwritten.
+        let _ = crate::commands::util::finalise_run_with(pool.inner(), &id, "error").await;
+        return Err(e);
     }
 
     Ok(Run {
@@ -152,33 +170,37 @@ pub async fn runs_create<R: Runtime>(
 #[tauri::command(rename_all = "camelCase")]
 #[specta::specta]
 pub async fn runs_cancel(pool: State<'_, DbPool>, id: String) -> Result<(), AppError> {
-    // Only `running` rows are cancellable; anything else is a conflict.
-    let row: Option<(String,)> = sqlx::query_as("SELECT status FROM runs WHERE id = ?")
+    // Atomic conditional flip: only a `running` row transitions to
+    // `cancelled`. Everything else (including `cancelled` itself) is a
+    // conflict. Using a single `UPDATE … WHERE status='running'`
+    // closes the TOCTOU window between SELECT and UPDATE that allowed
+    // the sidecar's `finalise_run` to ezme a just-issued cancel —
+    // see report.md §K3.
+    let result = sqlx::query(
+        "UPDATE runs SET status = 'cancelled' \
+         WHERE id = ? AND status = 'running'",
+    )
+    .bind(&id)
+    .execute(pool.inner())
+    .await?;
+    if result.rows_affected() == 1 {
+        return Ok(());
+    }
+    // No row flipped: either the run does not exist or it is already
+    // in a terminal state. Disambiguate with one extra read so the
+    // caller gets a precise error.
+    let existing: Option<(String,)> = sqlx::query_as("SELECT status FROM runs WHERE id = ?")
         .bind(&id)
         .fetch_optional(pool.inner())
         .await?;
-    let status = row
-        .ok_or_else(|| AppError::NotFound(format!("Run {id} not found")))?
-        .0;
-    if status != "running" {
-        return Err(AppError::Conflict(format!(
+    match existing {
+        None => Err(AppError::NotFound(format!("Run {id} not found"))),
+        Some((status,)) => Err(AppError::Conflict(format!(
             "Run {id} is {status}, not running"
-        )));
+        ))),
     }
-    sqlx::query("UPDATE runs SET status = 'error' WHERE id = ?")
-        .bind(&id)
-        .execute(pool.inner())
-        .await?;
-    Ok(())
 }
 
-fn now_seconds() -> i64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
 
 #[cfg(test)]
 mod tests {
@@ -186,20 +208,7 @@ mod tests {
     // top-level imports, so `app.state::<...>()` resolves without an
     // extra `use tauri::Manager as _` here.
     use super::*;
-    use crate::test_support::{fresh_pool, seed_minimal};
-
-    async fn mock_app_with_pool() -> (
-        tauri::App<tauri::test::MockRuntime>,
-        crate::db::DbPool,
-        tempfile::TempDir,
-    ) {
-        let (pool, dir) = fresh_pool().await;
-        let app = tauri::test::mock_builder()
-            .manage(pool.clone())
-            .build(tauri::test::mock_context(tauri::test::noop_assets()))
-            .expect("mock app");
-        (app, pool, dir)
-    }
+    use crate::test_support::{mock_app_with_pool, seed_minimal};
 
     /// Seed a workflow + run for `runs:list/get/cancel` happy paths.
     async fn seed_run(pool: &crate::db::DbPool, id: &str, status: &str) {
@@ -278,40 +287,43 @@ mod tests {
         assert_eq!(err.kind(), "not_found");
     }
 
-    /// WP-W2-04 acceptance §"runs:create returns id" — a run is
-    /// inserted with `status='running'` and the id starts with `r-`.
-    /// We do not provide a `SidecarHandle`, so the sidecar dispatch
-    /// path is skipped; the spans appear in subsequent integration
-    /// runs (gated `#[ignore]`d in `sidecar::agent::tests`).
+    /// When the LangGraph sidecar is not in app state (no Python,
+    /// unsynced venv, mock-runtime tests), `runs:create` finalises
+    /// the freshly-inserted row to `status='error'` and surfaces a
+    /// `Sidecar` error to the caller. This replaces the prior
+    /// behaviour of leaving a phantom `running` row that never
+    /// finalised — see report.md §K2.
     #[tokio::test]
-    async fn runs_create_inserts_running_row_with_no_spans() {
+    async fn runs_create_without_sidecar_marks_row_error() {
         let (app, pool, _dir) = mock_app_with_pool().await;
         seed_minimal(&pool).await;
         let state = app.state::<crate::db::DbPool>();
 
-        let run = runs_create(app.handle().clone(), state, "w1".to_string())
+        let err = runs_create(app.handle().clone(), state, "w1".to_string())
             .await
-            .expect("ok");
-        assert_eq!(run.status, "running");
-        assert_eq!(run.workflow_name, "Daily summary");
-        assert_eq!(run.tokens, 0);
-        assert!(run.duration_ms.is_none());
-        assert!(run.id.starts_with("r-"));
+            .unwrap_err();
+        assert_eq!(err.kind(), "sidecar");
 
-        // DB side-effect: row exists, no spans linked. The sidecar
-        // populates `runs_spans` asynchronously after `runs_create`
-        // returns, so the no-sidecar test path leaves `runs_spans`
-        // empty by design — that is the contract the WP-04 spec asks
-        // us to assert in unit tests.
-        let count_runs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runs")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        // DB side-effect: row exists with `status='error'` and a
+        // populated `duration_ms`. No spans are linked because we
+        // never dispatched to the sidecar.
+        let (count_runs, error_count, running_count): (i64, i64, i64) = sqlx::query_as(
+            "SELECT \
+                (SELECT COUNT(*) FROM runs), \
+                (SELECT COUNT(*) FROM runs WHERE status='error'), \
+                (SELECT COUNT(*) FROM runs WHERE status='running')",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count_runs, 1);
+        assert_eq!(error_count, 1, "row must be finalised to error");
+        assert_eq!(running_count, 0, "no zombie running rows allowed");
+
         let count_spans: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runs_spans")
             .fetch_one(&pool)
             .await
             .unwrap();
-        assert_eq!(count_runs, 1);
         assert_eq!(count_spans, 0);
     }
 
@@ -326,7 +338,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runs_cancel_transitions_running_to_error() {
+    async fn runs_cancel_transitions_running_to_cancelled() {
         let (app, pool, _dir) = mock_app_with_pool().await;
         seed_run(&pool, "r1", "running").await;
         let state = app.state::<crate::db::DbPool>();
@@ -336,7 +348,24 @@ mod tests {
             .fetch_one(&pool)
             .await
             .unwrap();
-        assert_eq!(status, "error");
+        // Y16: distinguish user cancel from sidecar error in the runs
+        // list. Schema CHECK now allows 'cancelled' as a 4th terminal
+        // state.
+        assert_eq!(status, "cancelled");
+    }
+
+    /// K3 regression: a run that is already `cancelled` (or any
+    /// non-running state) cannot be re-cancelled — the late
+    /// `RunCompleted` event's `finalise_run` UPDATE is gated by
+    /// `WHERE status = 'running'`, so it cannot ezme the cancel.
+    /// `runs:cancel` itself uses the same atomic gate.
+    #[tokio::test]
+    async fn runs_cancel_on_cancelled_run_is_conflict() {
+        let (app, pool, _dir) = mock_app_with_pool().await;
+        seed_run(&pool, "r1", "cancelled").await;
+        let state = app.state::<crate::db::DbPool>();
+        let err = runs_cancel(state, "r1".into()).await.unwrap_err();
+        assert_eq!(err.kind(), "conflict");
     }
 
     #[tokio::test]

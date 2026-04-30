@@ -60,12 +60,15 @@ The brand metaphor is *neurons*: nodes-and-synapses, soft glow feedback, signal 
 ## Hard constraints
 
 1. **Frontend mock shape is the contract.** Backend produces data matching `Neuron Design/app/data.js` and `terminal-data.js` exactly. Backend never asks frontend to change shape.
+   *Exception — display-derived values.* Where the mock encodes a value computed from "now" (e.g. `started: "2 min ago"`, `ts: "12m 02s"`, `uptime: "12m 04s"`), the wire ships the underlying `_at`/`_ms` field per Constraint #8 and the frontend hook layer derives the human string. Component DOM still reads `run.started`, `entry.ts`, `pane.uptime`; only the data-acquisition line changes. This is the single carve-out from this constraint — structural fields (key names, types, presence) remain non-negotiable, and the carve-out is bounded to "now"-dependent display strings only.
 2. **No OAuth passthrough.** API keys live in OS keychain. Never plaintext, never `.env` committed.
 3. **Dark-first.** All net-new UI ships dark. Light parity desirable but never gates a release.
 4. **OKLCH only for colors.** Existing legacy hex inside SVGs may stay; new CSS never introduces hex/HSL.
 5. **No Drizzle / no JS ORM.** ORM lives in Rust (`sqlx`). Frontend never talks to SQLite directly.
 6. **Single demo workflow.** Week 2 ships with one demonstrable workflow; multi-workflow management is iceberg.
 7. **No `--no-verify` commits.** Hooks exist for a reason. If a hook fails, fix the issue.
+8. **Timestamp invariant.** Field names ending in `_at` carry UNIX epoch **seconds** (`started_at`, `created_at`, `closed_at`). Field names ending in `_ms` carry UNIX epoch **milliseconds** (`t0_ms`, `duration_ms`). Any other suffix is a schema bug. Frontend renderers branch on the suffix; no other format ships on the IPC.
+9. **Identifier strategy.** Per ADR-0007: prefixed-ULID for user-created instances (`r-`, `p-`, `a-`), slug for catalog rows from disk, autoincrement integer for append-only logs. New domains pick one of the three.
 
 ## Roles
 

@@ -8,12 +8,16 @@
     "node": ">=20.0.0"
   },
   "scripts": {
-    "dev": "pnpm --filter @neuron/app dev",
-    "build": "pnpm --filter @neuron/app build",
+    "dev": "tauri dev",
+    "dev:web": "pnpm --filter @neuron/app dev",
+    "build": "tauri build",
+    "build:web": "pnpm --filter @neuron/app build",
     "preview": "pnpm --filter @neuron/app preview",
     "typecheck": "pnpm --filter @neuron/app typecheck",
     "lint": "pnpm --filter @neuron/app lint",
     "test": "pnpm --filter @neuron/app test",
+    "gen:bindings": "cargo run --manifest-path src-tauri/Cargo.toml --bin export-bindings",
+    "gen:bindings:check": "cargo run --manifest-path src-tauri/Cargo.toml --bin export-bindings && git diff --exit-code app/src/lib/bindings.ts",
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build"

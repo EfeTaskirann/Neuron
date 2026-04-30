@@ -19,6 +19,8 @@
 //! Adding a row at runtime is out of scope for Week 2 (Charter §"Out
 //! of scope" — no third-party marketplace).
 
+use std::sync::OnceLock;
+
 use serde::{Deserialize, Serialize};
 
 /// Spawn recipe for one MCP server. The Week-2 client only ever
@@ -95,32 +97,100 @@ pub const ALL_MANIFESTS_JSON: &[(&str, &str)] = &[
     ("browser", include_str!("manifests/browser.json")),
     ("slack", include_str!("manifests/slack.json")),
     ("vector-db", include_str!("manifests/vector-db.json")),
+    // Catalog-only stubs added 2026-04-29 for mock-shape parity
+    // (data.js#servers ships twelve rows). All have `spawn: null`,
+    // so `mcp:install` against any of them returns
+    // `McpServerSpawnFailed` until refactor.md G2 lands in Week 3.
+    ("linear", include_str!("manifests/linear.json")),
+    ("notion", include_str!("manifests/notion.json")),
+    ("stripe", include_str!("manifests/stripe.json")),
+    ("sentry", include_str!("manifests/sentry.json")),
+    ("figma", include_str!("manifests/figma.json")),
+    ("memory", include_str!("manifests/memory.json")),
 ];
 
-/// Parse every bundled manifest. Errors carry the offending id so a
-/// future drift (e.g., a JSON typo) points to the right file in CI.
-pub fn load_all() -> Result<Vec<ServerManifest>, ManifestError> {
-    let mut out = Vec::with_capacity(ALL_MANIFESTS_JSON.len());
+/// Outcome of parsing every bundled manifest exactly once. The
+/// successfully-parsed entries land in `manifests`; per-file parse or
+/// id-mismatch failures land in `failures` so a single bad JSON does
+/// not brick the whole catalog at startup. Computed at most once per
+/// process via [`parse_report`].
+#[derive(Debug)]
+pub struct ManifestParseReport {
+    pub manifests: Vec<ServerManifest>,
+    pub failures: Vec<ManifestParseFailure>,
+}
+
+#[derive(Debug)]
+pub struct ManifestParseFailure {
+    /// File-key (the first column of `ALL_MANIFESTS_JSON`).
+    pub file_key: String,
+    pub error: ManifestError,
+}
+
+static REPORT: OnceLock<ManifestParseReport> = OnceLock::new();
+
+fn parse_uncached() -> ManifestParseReport {
+    let mut manifests = Vec::with_capacity(ALL_MANIFESTS_JSON.len());
+    let mut failures = Vec::new();
     for (id, raw) in ALL_MANIFESTS_JSON {
-        let m: ServerManifest = serde_json::from_str(raw)
-            .map_err(|e| ManifestError::Parse((*id).to_string(), e.to_string()))?;
-        if m.id != *id {
-            return Err(ManifestError::IdMismatch {
+        match serde_json::from_str::<ServerManifest>(raw) {
+            Err(e) => failures.push(ManifestParseFailure {
                 file_key: (*id).to_string(),
-                manifest_id: m.id,
-            });
+                error: ManifestError::Parse((*id).to_string(), e.to_string()),
+            }),
+            Ok(m) if m.id != *id => failures.push(ManifestParseFailure {
+                file_key: (*id).to_string(),
+                error: ManifestError::IdMismatch {
+                    file_key: (*id).to_string(),
+                    manifest_id: m.id.clone(),
+                },
+            }),
+            Ok(m) => manifests.push(m),
         }
-        out.push(m);
     }
-    Ok(out)
+    ManifestParseReport {
+        manifests,
+        failures,
+    }
 }
 
-/// Look up one manifest by id.
+/// Parse every bundled manifest exactly once and return a report
+/// listing successes and per-file failures. Soft-loading callers
+/// (e.g. [`crate::db::seed_mcp_servers`]) use this to log failures
+/// while still seeding the survivors — a single bad JSON should not
+/// abort app startup.
+pub fn parse_report() -> &'static ManifestParseReport {
+    REPORT.get_or_init(parse_uncached)
+}
+
+/// Strict load: fail on the first per-file error. Used by tests
+/// asserting the bundled JSONs are pristine and by callers that want
+/// "all-or-nothing" semantics.
+pub fn load_all() -> Result<Vec<ServerManifest>, ManifestError> {
+    let r = parse_report();
+    if let Some(first) = r.failures.first() {
+        return Err(first.error.clone());
+    }
+    Ok(r.manifests.clone())
+}
+
+/// Look up one manifest by id. Returns `Ok(None)` if the id is not in
+/// the catalog or a failed-to-parse manifest's slot. Surface a
+/// `ManifestError` only if **every** call would be unsafe (i.e. if
+/// the requested id specifically failed to parse — callers looking up
+/// an unrelated id can keep working).
 pub fn get(id: &str) -> Result<Option<ServerManifest>, ManifestError> {
-    Ok(load_all()?.into_iter().find(|m| m.id == id))
+    let r = parse_report();
+    if let Some(m) = r.manifests.iter().find(|m| m.id == id) {
+        return Ok(Some(m.clone()));
+    }
+    if let Some(failure) = r.failures.iter().find(|f| f.file_key == id) {
+        return Err(failure.error.clone());
+    }
+    Ok(None)
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum ManifestError {
     #[error("manifest {0} failed to parse: {1}")]
     Parse(String, String),
