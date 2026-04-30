@@ -1,0 +1,11 @@
+{
+  "id": "stripe",
+  "name": "Stripe",
+  "by": "Stripe",
+  "description": "Inspect customers, charges, and subscriptions. Live and test mode supported.",
+  "installs": 1800,
+  "rating": 4.8,
+  "featured": false,
+  "spawn": null,
+  "requires_secret": null
+}

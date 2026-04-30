@@ -1,0 +1,11 @@
+{
+  "id": "linear",
+  "name": "Linear",
+  "by": "Linear",
+  "description": "Create issues, search projects, update statuses across your Linear workspace.",
+  "installs": 2900,
+  "rating": 4.6,
+  "featured": false,
+  "spawn": null,
+  "requires_secret": null
+}

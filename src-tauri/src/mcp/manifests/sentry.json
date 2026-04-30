@@ -1,0 +1,11 @@
+{
+  "id": "sentry",
+  "name": "Sentry",
+  "by": "Sentry",
+  "description": "Pull recent errors, breadcrumbs, and release health into the agent context.",
+  "installs": 1400,
+  "rating": 4.5,
+  "featured": false,
+  "spawn": null,
+  "requires_secret": null
+}

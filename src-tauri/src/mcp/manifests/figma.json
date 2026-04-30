@@ -1,0 +1,11 @@
+{
+  "id": "figma",
+  "name": "Figma",
+  "by": "Figma",
+  "description": "Read frames and components from a file URL; export PNG/SVG to the workspace.",
+  "installs": 3700,
+  "rating": 4.4,
+  "featured": false,
+  "spawn": null,
+  "requires_secret": null
+}

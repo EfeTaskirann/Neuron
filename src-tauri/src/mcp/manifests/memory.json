@@ -1,0 +1,11 @@
+{
+  "id": "memory",
+  "name": "Memory",
+  "by": "Anthropic",
+  "description": "Long-term key-value store scoped to the workspace; safe for cross-run continuity.",
+  "installs": 2100,
+  "rating": 4.6,
+  "featured": false,
+  "spawn": null,
+  "requires_secret": null
+}

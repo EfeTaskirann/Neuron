@@ -1,0 +1,11 @@
+{
+  "id": "notion",
+  "name": "Notion",
+  "by": "Notion",
+  "description": "Read and write pages, databases, and blocks with token-scoped access.",
+  "installs": 5600,
+  "rating": 4.7,
+  "featured": false,
+  "spawn": null,
+  "requires_secret": null
+}
