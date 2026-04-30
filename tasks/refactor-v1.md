@@ -1,8 +1,38 @@
 # Neuron — Refaktör Fırsatları Raporu
 
 **İlk derleme:** 2026-04-29
-**Son güncelleme:** 2026-04-29 (uygulama turu sonrası)
+**Son güncelleme:** 2026-04-30 (4-ajan paketi + 3-commit entegrasyon sonrası)
 **Kapsam:** repo kökü, `src-tauri/`, `app/`, `docs/`, sidecar, migrasyonlar.
+
+---
+
+## 0bis. 2026-04-30 — 4-ajan paketi sonrası ek tur
+
+WP-W2-08 sözleşme kapanışı için 4 paralel sub-agent (B, C, A, D) `tasks/agent-briefs-2026-04-29.md`'deki brief'lerle çalıştırıldı; orchestrator file-level staging ile 3 commit'e entegre etti:
+
+- `7596386` `feat: pre-WP-W2-08 prep (bug-fix + refactor + contract amendments)`
+- `52b270f` `feat: WP-W2-08 sub-agent package — contract closure + ops hygiene`
+- `e1a813c` `chore: regenerate bindings.ts for new wire shapes`
+
+Bu turun §1'e eklediği maddeler:
+
+| # | Madde | Etki | Kanıt |
+|---|---|---|---|
+| **⑤** | `me:get` komutu | Sözleşme | Yeni `commands/me.rs` + `models::{Me, User, Workspace}`. Mock `data.user`/`data.workspace` parity. Workspace count `SELECT COUNT(*) FROM workflows`. |
+| **⑥+⑦** (alias §3.b ve A4-MCP) | MCP catalog 6 → 12 + slug ID realign | Mock parity | 6 yeni stub manifest (linear/notion/stripe/sentry/figma/memory); `Neuron Design/app/data.js` `s1-s12` → slug realign. ADR-0007 §"Author-stable slugs" pekiştirildi. |
+| **③+④** (Pane mock-shape parity) | Pane wire alanları + approval banner | Sözleşme | `Pane`'e 5 alan (`tokensIn/Out/costUsd/uptime` hep `None` per Charter #1 carve-out; `approval` reader-extracted). Yeni `ApprovalBanner`. Migration `0003_panes_approval.sql` `last_approval_json TEXT`. Reader-side regex extraction + `terminal_list` status-guarded parse. |
+| **⑧** | `tuning.rs` — magic constants merkezi | Operasyonel | Yeni `src-tauri/src/tuning.rs`: `SHUTDOWN_GRACE`, `RING_BUFFER_*`, `READ_CHUNK_BYTES`, `MAX_PENDING_BYTES`, `KILL_GRACE`, `WAIT_POLL`, `MCP_REQUEST_TIMEOUT`. Sidecar/MCP source dosyaları `use crate::tuning::*`. |
+| **⑨** | `tracing` adopt + `eprintln!` audit | Gözlemlenebilirlik | `tracing` + `tracing-subscriber` Cargo dep (env-filter). `lib.rs` setup hook subscriber init (`try_init()`, panic-safe). Tüm aktif `eprintln!` (`bin/export-bindings.rs` hariç) `tracing::*`'a çevrildi; field'lar yapılandırılmış (`pane_id`, `run_id`, `error`). |
+| **⑩** | Compensating-action helper | DRY | Yeni `commands/util.rs::finalise_run_with(pool, id, status)`. `runs.rs:139-149` rollback inline'ı bu helper'a indirildi; atomic `WHERE status = 'running'` invariant'ı korundu. |
+| **CHARTER §1 carve-out** | Display-derived istisna metni | Sözleşme | Constraint #1'e subordinate paragraf: `started: "2 min ago"`, `ts: "12m 02s"`, `uptime` gibi "now"-bağımlı string'ler frontend hook'ta derive edilir; backend `_at`/`_ms` epoch ile öder. Tek bounded carve-out — yapısal alanlar (key adları, tipler) kapsam dışı. |
+| **MAILBOX wire keys** | `fromPane`/`toPane` → `from`/`to` | Sözleşme (revert) | Önceki turda eklenen "canonical contract" deviation reverse edildi. `models.rs` Rust field'ları `_pane` suffix'i SQL binding için korur; `#[serde(rename = "from"\|"to")]` wire-side translate eder. |
+| **ADR-0006 separator** | `.` → `:` canonical | Dokümantasyon | "Wire-format substitution" alt-bölümü "Tauri 2.10 separator constraint" olarak yeniden yazıldı; duplicate inventory tablosu silindi; "Amendment log" eklendi. A1 ⏳ → ✅ kapatıldı. |
+
+**§4 "Yeni doğan / büyüyen" listesinden 3 madde** (⑧/⑨/⑩) bu turda çözüldü. Kalan: "`mcp/client.rs` pending request map" hâlâ açık (C5 session pool ile birlikte Week 3'e bekliyor).
+
+**Final regression bu turun sonu:** **102 passed / 0 failed / 3 ignored** (95 → 102, +7 yeni test: 2 me, 3 panes, 2 util). `pnpm typecheck/test/lint` exit 0. `cargo run --bin export-bindings` sonrası `bindings.ts` +120 / -13 (`Pane` 5 alan + `ApprovalBanner` + `Me`/`User`/`Workspace` + `commands.meGet`).
+
+**File-level staging notu:** Pre-package ve 4-ajan diff'leri çoğu modified source dosyada (models.rs, lib.rs, db.rs, sidecar/*, mcp/*, commands/{mod,runs,terminal}.rs) fiziksel olarak iç içeydi; atomic 5-commit split hunk-level staging gerekiyordu. Pratik için A2-modifiye 3-commit yapı kullanıldı (önceki ön-paket + 4-ajan paketi yeni dosyaları + bindings regen). Commit body'leri sınırı şeffaflar.
 
 ---
 

@@ -46,3 +46,6 @@ coverage/
 *.sqlite-journal
 *.sqlite-wal
 *.sqlite-shm
+
+# Local user notes / scratch (not project artifacts)
+report/

@@ -4,6 +4,36 @@ Running journal of agent-driven changes. Newest entry on top. See `AGENTS.md` §
 
 ---
 
+## 2026-04-30T18:32:54Z WP-W2-08 prep + 4-agent followup completed
+- sub-agents: B (mcp catalog), C (me:get), A (panes domain), D (operasyonel hygiene) — dispatched in 4 parallel terminals per `tasks/agent-briefs-2026-04-29.md`
+- commits: `7596386` (pre-package), `52b270f` (4-agent package), `e1a813c` (bindings regen)
+- new files (across the 3 commits):
+  - sub-agent additions: `src-tauri/src/tuning.rs`, `src-tauri/src/commands/util.rs`, `src-tauri/src/commands/me.rs`, `src-tauri/migrations/0003_panes_approval.sql`, 6 MCP manifests (`linear/notion/stripe/sentry/figma/memory.json`), `tasks/agent-briefs-2026-04-29.md`
+  - pre-package additions (bug-fix + refactor + contract amendments): `docs/adr/0007-id-strategy.md`, `docs/adr/0008-sidecar-ipc-framing.md`, `src-tauri/migrations/0002_constraints.sql`, `src-tauri/src/events.rs`, `src-tauri/src/time.rs`, `tasks/refactor-v1.md`, `tasks/report-29-04-26.md`, `tasks/todo.md`
+- modifications: `PROJECT_CHARTER.md` (+Constraints #1 carve-out, #8 timestamp, #9 id), `docs/adr/0006-…md` (`.` → `:` separator amendment), `models.rs` (Mailbox `from`/`to` rename per Charter #1, Pane 5 new fields, `ApprovalBanner` + `Me`/`User`/`Workspace` types), `Neuron Design/app/data.js` (s1-s12 → slug realign), `lib.rs` (`mod tuning`/`util`, subscriber init, `commands::me::me_get` registration), `db.rs` / `sidecar/{agent,terminal}.rs` / `mcp/client.rs` (`eprintln!` → `tracing::*`, constants → `crate::tuning::*`), `commands/runs.rs` (rollback inline → `commands::util::finalise_run_with`), `commands/terminal.rs` (Pane SELECT genişle + status-guarded approval blob parse), `commands/mailbox.rs` (validation messages aligned to wire `from`/`to`), `Cargo.toml` (+`tracing`, +`tracing-subscriber`), regen `app/src/lib/bindings.ts`
+- new commands: `me:get`
+- mcp catalog: 6 → 12 servers (Linear, Notion, Stripe, Sentry, Figma, Memory added as catalog-only stubs)
+- tracing adopted, all active `eprintln!` (test/bin scope hariç) migrated
+- acceptance: ✅ pass — orchestrator independently re-ran the gates after every sub-agent return + after each commit
+  - `cargo test --lib` → exit 0, **102 passed, 3 ignored** (95 prior + 2 me + 3 panes + 2 util)
+  - `cargo check --tests` → exit 0 (4 unrelated `unused_mut` warnings on `mcp/client.rs:570/572`)
+  - `cargo run --bin export-bindings` → bindings.ts regenerated (+120/-13)
+  - `pnpm typecheck` → exit 0
+  - `pnpm test --run` → 1 file 2 tests passed
+  - `pnpm lint --max-warnings=0` → exit 0
+- key implementation choices (this round)
+  - **Charter Constraint #1 carve-out**: display-derived strings (`started: "2 min ago"`, `uptime: "12m 04s"`) ship as raw `_at`/`_ms` fields; frontend hook layer derives the human form. Single bounded carve-out — structural fields remain non-negotiable.
+  - **MailboxEntry wire revert**: `fromPane`/`toPane` → `from`/`to` with `#[serde(rename)]`; Rust fields keep `_pane` for SQL column binding. ADR-0006 separator promoted from `.` to `:` to match Tauri 2.10 reality.
+  - **ApprovalBanner persistence**: `panes.last_approval_json TEXT` (migration 0003); reader-side regex extraction with placeholder fallback; `terminal_list` parses **only when** `status = 'awaiting_approval'`.
+  - **MCP catalog stub pattern**: 6 new catalog-only manifests (`spawn: null`); `mcp:install` against them surfaces `McpServerSpawnFailed` cleanly. `installed: true|false` mock flag mismatch deferred to Week 3 G2.
+  - **`tracing` over `eprintln!`**: setup hook initialises `tracing_subscriber::fmt().with_env_filter(…).try_init()` (panic-safe for tests). `RUST_LOG=neuron=debug` honored.
+  - **File-level staging**: pre-package and 4-agent diffs were physically interleaved in modified source files (models.rs, lib.rs, db.rs, sidecar/*, mcp/*, commands/{mod,runs,terminal}.rs). Atomic 5-commit split would have required hunk-level staging; A2-modified 3-commit split shipped instead. Commit messages disclose the constraint.
+- bindings regenerated: yes (`Pane` 5 fields, `ApprovalBanner`, `Me`/`User`/`Workspace`, `commands.meGet`)
+- branch: `main` (local; not pushed; **3 new commits on top of `7dba715`**)
+- next: WP-W2-07 (span/trace persistence — completes WP-04 event chain; depends only on WP-04) or WP-W2-08 (frontend mock→real wiring — biggest WP, 7 routes + cleanup; now unblocked since pre-package + 4-agent closed all known wire-shape gaps)
+
+---
+
 ## 2026-04-29T12:50:37Z WP-W2-06 completed
 - sub-agent: general-purpose
 - files changed: 8 in commit `351c234`
