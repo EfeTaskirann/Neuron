@@ -4,7 +4,7 @@ import { invoke as __TAURI_INVOKE } from "@tauri-apps/api/core";
 
 /** Commands */
 export const commands = {
-	healthDb: () => typedError<DbHealth, string>(__TAURI_INVOKE("health_db")),
+	healthDb: () => typedError<DbHealth, AppErrorWire>(__TAURI_INVOKE("health_db")),
 	agentsList: () => typedError<Agent[], AppErrorWire>(__TAURI_INVOKE("agents_list")),
 	agentsGet: (id: string) => typedError<Agent, AppErrorWire>(__TAURI_INVOKE("agents_get", { id })),
 	agentsCreate: (input: AgentCreateInput) => typedError<Agent, AppErrorWire>(__TAURI_INVOKE("agents_create", { input })),
@@ -30,6 +30,7 @@ export const commands = {
 	 */
 	runsCreate: (workflowId: string) => typedError<Run, AppErrorWire>(__TAURI_INVOKE("runs_create", { workflowId })),
 	runsCancel: (id: string) => typedError<null, AppErrorWire>(__TAURI_INVOKE("runs_cancel", { id })),
+	meGet: () => typedError<Me, AppErrorWire>(__TAURI_INVOKE("me_get")),
 	mcpList: () => typedError<Server[], AppErrorWire>(__TAURI_INVOKE("mcp_list")),
 	mcpInstall: (id: string) => typedError<Server, AppErrorWire>(__TAURI_INVOKE("mcp_install", { id })),
 	mcpUninstall: (id: string) => typedError<Server, AppErrorWire>(__TAURI_INVOKE("mcp_uninstall", { id })),
@@ -54,6 +55,21 @@ export const commands = {
 	 *  frontend `useMcpCallTool` hook (Week 3) will hide that cermony.
 	 */
 	mcpCallTool: (serverId: string, name: string, argsJson: string) => typedError<CallToolResult, AppErrorWire>(__TAURI_INVOKE("mcp_call_tool", { serverId, name, argsJson })),
+	/**
+	 *  Materialise every pane with mock-shape parity. The five derived
+	 *  fields (`tokens_in/out/cost_usd/uptime/approval`) are filled here
+	 *  rather than via `sqlx::FromRow` because `approval` carries a
+	 *  JSON-on-disk blob: the SQL column is `last_approval_json TEXT`
+	 *  (migration 0003), which is decoded into `ApprovalBanner` only when
+	 *  the pane is currently `awaiting_approval`. Idle / running / closed
+	 *  panes get `Pane.approval = None` even if a stale blob lingers in
+	 *  the column from a previous awaiting cycle.
+	 * 
+	 *  `tokens_in/out/cost_usd/uptime` always project as SQL `NULL` — the
+	 *  Charter Constraint #1 *display-derived carve-out* puts these in
+	 *  the frontend hook (Week 3 will source `tokens_*` and `cost_usd`
+	 *  from `runs_spans`; `uptime` stays display-derived).
+	 */
 	terminalList: () => typedError<Pane[], AppErrorWire>(__TAURI_INVOKE("terminal_list")),
 	/**
 	 *  Fork a PTY, spawn the platform default shell (or `input.cmd` if
@@ -140,6 +156,20 @@ export type AppErrorWire = {
 };
 
 /**
+ *  One approval banner blob. Populated by the terminal reader when
+ *  an `awaiting_approval` regex matches; surfaced to the UI's amber
+ *  banner strip per `NEURON_TERMINAL_REPORT.md`. Mock parity:
+ *  `terminal-data.js#panes[0].approval` —
+ *  `{tool, target, added, removed}`.
+ */
+export type ApprovalBanner = {
+	tool: string,
+	target: string,
+	added: number,
+	removed: number,
+};
+
+/**
  *  Wire shape for `mcp:callTool` returns. Keeps a flat `{content,
  *  isError}` object so the frontend can rely on a single deserializer
  *  regardless of which tool was called.
@@ -182,22 +212,24 @@ export type Edge = {
 };
 
 /**
- *  One row of `mailbox`. Per the WP-W2-03 smoke-test block, input and
- *  output use `fromPane`/`toPane` (not the terminal-data mock's
- *  `from`/`to` shorthand).
+ *  One row of `mailbox`. Wire keys `from`/`to` match the terminal-data
+ *  mock per Charter Constraint #1; Rust fields keep the `_pane` suffix
+ *  for SQL column binding and code clarity (see § "Mailbox wire keys"
+ *  at the top of this module).
  */
 export type MailboxEntry = {
 	/**
-	 *  Synthetic stable id. The schema does not have a column for this
-	 *  because mailbox entries are append-only and indexed by ts; the
-	 *  id is computed from `rowid` so the frontend can key React
-	 *  lists deterministically.
+	 *  Stable autoincrement id from migration 0002
+	 *  (`INTEGER PRIMARY KEY AUTOINCREMENT`). Per ADR-0007 §3, mailbox
+	 *  is the canonical autoincrement-int domain — opaque to
+	 *  consumers, used solely as a React key. Monotonic, never reused
+	 *  after `DELETE`.
 	 */
 	id: number,
 	// Unix epoch seconds.
 	ts: number,
-	fromPane: string,
-	toPane: string,
+	from: string,
+	to: string,
 	// Cross-pane event type, e.g. `task:done`.
 	type: string,
 	summary: string,
@@ -205,13 +237,23 @@ export type MailboxEntry = {
 
 /**
  *  Input shape for `mailbox:emit`. `ts` is filled server-side at
- *  insert time; the frontend just describes the message.
+ *  insert time; the frontend just describes the message. Wire keys
+ *  `from`/`to` per Charter Constraint #1.
  */
 export type MailboxEntryInput = {
-	fromPane: string,
-	toPane: string,
+	from: string,
+	to: string,
 	type: string,
 	summary: string,
+};
+
+/**
+ *  Composite shape returned by `me:get`. Combines `data.user` and
+ *  `data.workspace` so the Sidebar mounts in one round-trip.
+ */
+export type Me = {
+	user: User,
+	workspace: Workspace,
 };
 
 export type Node = {
@@ -229,6 +271,22 @@ export type Node = {
 /**
  *  One row of `panes`. Maps `agent_kind` to `agent` to match the
  *  terminal-data mock's `agent` key.
+ * 
+ *  The trailing five fields (`tokens_in`/`tokens_out`/`cost_usd`/
+ *  `uptime`/`approval`) exist for mock-shape parity per Charter
+ *  Constraint #1; their wire values are sourced as follows:
+ * 
+ *  - `tokens_in`/`tokens_out`/`cost_usd` — Week 2 always ship `None`;
+ *    Week 3 will aggregate them from `runs_spans`.
+ *  - `uptime` — backend always ships `None` per Charter #1
+ *    *display-derived carve-out* (the frontend hook computes the
+ *    `"12m 04s"` string from `started_at`).
+ *  - `approval` — populated by `commands::terminal::terminal_list`
+ *    from `panes.last_approval_json` *only* when `status =
+ *    'awaiting_approval'`. The reader writes the JSON blob in
+ *    `sidecar::terminal` on every regex match; the column is
+ *    intentionally NOT cleared when the pane re-enters `running`,
+ *    so a future debug view can replay the last seen banner.
  */
 export type Pane = {
 	id: string,
@@ -245,6 +303,35 @@ export type Pane = {
 	pid: number | null,
 	startedAt: number,
 	closedAt: number | null,
+	/**
+	 *  Aggregate input tokens consumed by this pane's agent runtime.
+	 *  Week 2: always `None` — populated in Week 3 from `runs_spans`.
+	 */
+	tokensIn: number | null,
+	// Aggregate output tokens. Week 2: always `None`.
+	tokensOut: number | null,
+	// Aggregate USD cost. Week 2: always `None`.
+	costUsd: number | null,
+	/**
+	 *  Display-derived `"12m 04s"` string. Per Charter Constraint #1
+	 *  carve-out: backend ships `None`; the frontend hook computes
+	 *  from `started_at`. Field exists for mock-shape parity only.
+	 */
+	uptime: string | null,
+	/**
+	 *  Approval banner blob extracted from the most recent
+	 *  `awaiting_approval` regex match. `None` when the pane is not
+	 *  currently awaiting approval; the underlying DB column may
+	 *  still hold a stale blob from a previous awaiting cycle so the
+	 *  reader path is resilient to noisy retries.
+	 * 
+	 *  `#[sqlx(skip)]`: `ApprovalBanner` is JSON-on-disk and does not
+	 *  implement `sqlx::Decode`. `terminal_list` reads the raw
+	 *  `last_approval_json` TEXT column via a manual row mapping and
+	 *  hydrates this field after-the-fact; everywhere else (e.g.
+	 *  `terminal_spawn` `RETURNING`) defaults to `None`.
+	 */
+	approval: ApprovalBanner | null,
 };
 
 /**
@@ -393,6 +480,16 @@ export type Tool = {
  */
 export type ToolContent = { type: "text"; text: string } | { type: "other" };
 
+/**
+ *  User profile fields surfaced in the Sidebar avatar / settings.
+ *  Mock parity: `Neuron Design/app/data.js#user`.
+ *  Week 2 hardcoded; Week 3 sources from a settings table.
+ */
+export type User = {
+	initials: string,
+	name: string,
+};
+
 export type Workflow = {
 	id: string,
 	name: string,
@@ -412,6 +509,16 @@ export type WorkflowDetail = {
 	workflow: Workflow,
 	nodes: Node[],
 	edges: Edge[],
+};
+
+/**
+ *  Active workspace metadata. `count` is the number of workflows
+ *  currently saved (denormalised from `SELECT COUNT(*) FROM workflows`).
+ *  Mock parity: `Neuron Design/app/data.js#workspace`.
+ */
+export type Workspace = {
+	name: string,
+	count: number,
 };
 
 /* Tauri Specta runtime */
