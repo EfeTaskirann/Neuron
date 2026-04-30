@@ -67,11 +67,38 @@ const RUNS_OK = {
   ],
 };
 
+const SERVERS_OK = {
+  status: 'ok' as const,
+  data: [
+    {
+      id: 'filesystem',
+      name: 'Filesystem',
+      by: 'modelcontextprotocol',
+      desc: 'Read/write files in a workspace root',
+      installs: 12_400,
+      rating: 4.8,
+      featured: true,
+      installed: true,
+    },
+    {
+      id: 'github',
+      name: 'GitHub',
+      by: 'modelcontextprotocol',
+      desc: 'Repo, issue, and PR access',
+      installs: 8_900,
+      rating: 4.6,
+      featured: false,
+      installed: false,
+    },
+  ],
+};
+
 beforeEach(async () => {
   const { commands } = await import('./lib/bindings');
   vi.mocked(commands.meGet).mockResolvedValue(ME_OK);
   vi.mocked(commands.agentsList).mockResolvedValue(AGENTS_OK);
   vi.mocked(commands.runsList).mockResolvedValue(RUNS_OK);
+  vi.mocked(commands.mcpList).mockResolvedValue(SERVERS_OK);
 });
 
 describe('App shell', () => {
@@ -86,11 +113,10 @@ describe('App shell', () => {
 
   it('clicking a stub-only nav item swaps the active route stub', () => {
     renderApp();
-    // MCP is still a stub in phase B/2; phase B/3 ports it. Clicking
-    // it must surface the placeholder copy.
-    fireEvent.click(screen.getByText('MCP'));
-    const stub = screen.getByTestId('route-stub-mcp');
-    expect(stub).toHaveTextContent(/mcp.*coming soon/i);
+    // Terminal stays a stub through phase B; phase D ports it.
+    fireEvent.click(screen.getByText('Terminal'));
+    const stub = screen.getByTestId('route-stub-terminal');
+    expect(stub).toHaveTextContent(/terminal.*coming soon/i);
   });
 
   it('renders user and workspace from useMe()', async () => {
@@ -134,5 +160,36 @@ describe('RunsRoute', () => {
     fireEvent.click(screen.getByRole('button', { name: /running/i }));
     expect(screen.queryByText('r-1')).not.toBeInTheDocument();
     expect(screen.getByText('r-2')).toBeInTheDocument();
+  });
+});
+
+describe('MCPRoute', () => {
+  it('renders featured + all-servers sections from useServers()', async () => {
+    renderApp();
+    fireEvent.click(screen.getByText('MCP'));
+    await waitFor(() => expect(screen.getAllByText('Filesystem').length).toBeGreaterThan(0));
+    // Filesystem (featured + installed) appears in featured AND all
+    // sections; GitHub (not featured, not installed) only in all.
+    expect(screen.getAllByText('Filesystem').length).toBeGreaterThanOrEqual(2);
+    expect(screen.getByText('GitHub')).toBeInTheDocument();
+    // Installed pill renders for filesystem; install button renders
+    // for github.
+    expect(screen.getAllByText('installed').length).toBeGreaterThanOrEqual(1);
+    expect(screen.getAllByText('Install').length).toBeGreaterThanOrEqual(1);
+  });
+});
+
+describe('SettingsRoute', () => {
+  it('opens on Appearance and switches sections on click', () => {
+    renderApp();
+    fireEvent.click(screen.getByText('Settings'));
+    // Appearance pane is the default — Theme/Accent rows render.
+    expect(screen.getByText('Theme')).toBeInTheDocument();
+    expect(screen.getByText('Accent')).toBeInTheDocument();
+    // Click "Keys" — Appearance content should disappear and the
+    // generic empty state for Keys should render.
+    fireEvent.click(screen.getByText('Keys'));
+    expect(screen.queryByText('Theme')).not.toBeInTheDocument();
+    expect(screen.getByText('Settings for this section.')).toBeInTheDocument();
   });
 });

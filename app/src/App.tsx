@@ -9,6 +9,8 @@ import { ErrorBoundary } from './components/ErrorBoundary';
 import { useMe } from './hooks/useMe';
 import { AgentsRoute } from './routes/AgentsRoute';
 import { RunsRoute } from './routes/RunsRoute';
+import { MCPRoute } from './routes/MCPRoute';
+import { SettingsRoute } from './routes/SettingsRoute';
 
 type Route = 'canvas' | 'terminal' | 'agents' | 'runs' | 'mcp' | 'settings';
 
@@ -145,6 +147,20 @@ function RouteHost({ route }: { route: Route }): JSX.Element {
       return (
         <ErrorBoundary fallbackTitle="Couldn't load runs">
           <RunsRoute />
+        </ErrorBoundary>
+      );
+    case 'mcp':
+      return (
+        <ErrorBoundary fallbackTitle="Couldn't load servers">
+          <MCPRoute />
+        </ErrorBoundary>
+      );
+    case 'settings':
+      // SettingsRoute has no data deps, but ErrorBoundary still
+      // catches render-time bugs while we iterate on the panes.
+      return (
+        <ErrorBoundary fallbackTitle="Settings unavailable">
+          <SettingsRoute />
         </ErrorBoundary>
       );
     default:
