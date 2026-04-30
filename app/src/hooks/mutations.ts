@@ -11,6 +11,8 @@ import {
   type Agent,
   type AgentCreateInput,
   type AgentPatch,
+  type Pane,
+  type PaneSpawnInput,
   type Run,
   type Server,
 } from '../lib/bindings';
@@ -77,5 +79,42 @@ export function useMcpUninstall() {
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['servers'] });
     },
+  });
+}
+
+export function useTerminalSpawn() {
+  const qc = useQueryClient();
+  return useMutation<Pane, Error, PaneSpawnInput>({
+    mutationFn: (input) => unwrap(commands.terminalSpawn(input)),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['panes'] });
+    },
+  });
+}
+
+export function useTerminalKill() {
+  const qc = useQueryClient();
+  return useMutation<null, Error, string>({
+    mutationFn: (id) => unwrap(commands.terminalKill(id)),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['panes'] });
+    },
+  });
+}
+
+// `terminal:write` is a hot-path command — every keystroke hits it.
+// Skip the cache invalidation hop and rely on the live
+// `panes:{id}:line` event to surface echoed output.
+export function useTerminalWrite() {
+  return useMutation<null, Error, { paneId: string; data: string }>({
+    mutationFn: ({ paneId, data }) =>
+      unwrap(commands.terminalWrite(paneId, data)),
+  });
+}
+
+export function useTerminalResize() {
+  return useMutation<null, Error, { paneId: string; cols: number; rows: number }>({
+    mutationFn: ({ paneId, cols, rows }) =>
+      unwrap(commands.terminalResize(paneId, cols, rows)),
   });
 }

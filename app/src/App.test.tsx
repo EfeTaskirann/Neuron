@@ -34,6 +34,31 @@ vi.mock('@tauri-apps/api/event', () => ({
   listen: () => Promise.resolve(() => {}),
 }));
 
+// xterm needs HTMLCanvasElement.getContext and window.matchMedia
+// which jsdom doesn't ship. Stub the whole module so PaneBody
+// mounts as a no-op container; the xterm content itself isn't
+// what we're testing in jsdom.
+vi.mock('@xterm/xterm', () => ({
+  Terminal: class {
+    cols = 80;
+    rows = 24;
+    loadAddon() {}
+    open() {}
+    write() {}
+    onData() {
+      return { dispose: () => {} };
+    }
+    dispose() {}
+  },
+}));
+vi.mock('@xterm/addon-fit', () => ({
+  FitAddon: class {
+    fit() {}
+  },
+}));
+// xterm css import has no jsdom-relevant side-effect; map to empty.
+vi.mock('@xterm/xterm/css/xterm.css', () => ({}));
+
 function renderApp(): void {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   render(
@@ -364,15 +389,13 @@ describe('TerminalRoute', () => {
 
     renderApp();
     fireEvent.click(screen.getByText('Terminal'));
-    // Pane header arrives first (terminal:list); scrollback comes
-    // through a separate query (terminal:lines) that resolves a
-    // tick later. Wait for the lines specifically.
     await screen.findByText('Claude');
     expect(screen.getByText('~/work/neuron')).toBeInTheDocument();
     expect(screen.getByText(/^running$/)).toBeInTheDocument();
-    await screen.findByText('session started');
-    expect(screen.getByText('pnpm test')).toBeInTheDocument();
-    expect(screen.getByText(/all tests passing/)).toBeInTheDocument();
+    // Scrollback content lives inside the xterm canvas (mocked
+    // here as a no-op container), so we don't assert line text.
+    // The status-bar pane count + running pill are still the
+    // best proxy for "the route mounted with our pane data".
     expect(screen.getByText(/1 panes/)).toBeInTheDocument();
     expect(screen.getByText(/1 running/)).toBeInTheDocument();
   });

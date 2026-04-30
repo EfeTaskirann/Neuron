@@ -11,11 +11,21 @@
 // route shows the empty state and the layout switcher; new panes
 // require running a `terminalSpawn` command from devtools or the
 // upcoming Phase E button.
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
+import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+import { Terminal as XTerm } from '@xterm/xterm';
+import { FitAddon } from '@xterm/addon-fit';
+import '@xterm/xterm/css/xterm.css';
 import { NIcon } from '../components/icons';
 import { usePanes } from '../hooks/usePanes';
 import { usePaneLines } from '../hooks/usePaneLines';
 import { useMailbox } from '../hooks/useMailbox';
+import {
+  useTerminalKill,
+  useTerminalResize,
+  useTerminalSpawn,
+  useTerminalWrite,
+} from '../hooks/mutations';
 import type { MailboxEntry, Pane, PaneLine } from '../lib/bindings';
 
 type Layout = '1' | '2v' | '2h' | '2x2' | '3x4';
@@ -55,9 +65,8 @@ export function TerminalRoute(): JSX.Element {
   if (panes.length === 0) {
     return (
       <div className="term-route term-route-empty">
-        <p className="text-muted">
-          No panes yet. Spawn one from the topbar's "+ New pane" button.
-        </p>
+        <p className="text-muted">No panes yet. Spawn one to get started.</p>
+        <NewPaneButton />
       </div>
     );
   }
@@ -65,6 +74,9 @@ export function TerminalRoute(): JSX.Element {
   return (
     <div className="term-route">
       <MailboxPanel />
+      <div className="term-toolbar">
+        <NewPaneButton />
+      </div>
       <div className={`pane-grid layout-${layout}`}>
         {panes.map((p) => (
           <PaneView
@@ -77,6 +89,66 @@ export function TerminalRoute(): JSX.Element {
       </div>
       <TermStatusBar layout={layout} setLayout={setLayout} panes={panes} />
     </div>
+  );
+}
+
+// Inline spawn dialog. Button collapses into a small form; submit
+// calls terminal:spawn with the typed cwd. cmd/cols/rows fall
+// back to the platform default per WP-W2-06's ergonomics.
+function NewPaneButton(): JSX.Element {
+  const spawn = useTerminalSpawn();
+  const [open, setOpen] = useState(false);
+  const [cwd, setCwd] = useState('.');
+
+  if (!open) {
+    return (
+      <button className="btn primary" onClick={() => setOpen(true)}>
+        <NIcon name="plus" size={14} />
+        <span>New pane</span>
+      </button>
+    );
+  }
+  const handleSubmit = (e: FormEvent) => {
+    e.preventDefault();
+    if (!cwd.trim()) return;
+    spawn.mutate(
+      {
+        cwd: cwd.trim(),
+        cmd: null,
+        cols: null,
+        rows: null,
+        agentKind: null,
+        role: null,
+        workspace: null,
+      },
+      {
+        onSuccess: () => {
+          setOpen(false);
+          setCwd('.');
+        },
+      },
+    );
+  };
+  return (
+    <form className="new-pane-form" onSubmit={handleSubmit}>
+      <input
+        autoFocus
+        value={cwd}
+        onChange={(e) => setCwd(e.target.value)}
+        placeholder="cwd (e.g. ~/work)"
+        aria-label="Working directory"
+      />
+      <button type="submit" className="btn primary sm" disabled={spawn.isPending}>
+        {spawn.isPending ? 'Spawning…' : 'Spawn'}
+      </button>
+      <button
+        type="button"
+        className="btn ghost sm"
+        onClick={() => setOpen(false)}
+      >
+        Cancel
+      </button>
+    </form>
   );
 }
 
@@ -163,6 +235,7 @@ const STATUS_LABEL: Record<string, string> = {
 };
 
 function PaneHeader({ pane, agent }: { pane: Pane; agent: AgentInfo }): JSX.Element {
+  const kill = useTerminalKill();
   return (
     <div className="pane-head">
       <div className="pane-head-l">
@@ -185,7 +258,15 @@ function PaneHeader({ pane, agent }: { pane: Pane; agent: AgentInfo }): JSX.Elem
         <button className="icon-btn sm" title="Pop out">
           <NIcon name="layers" size={12} />
         </button>
-        <button className="icon-btn sm" title="Close">
+        <button
+          className="icon-btn sm"
+          title="Close pane"
+          disabled={kill.isPending}
+          onClick={(e) => {
+            e.stopPropagation();
+            kill.mutate(pane.id);
+          }}
+        >
           <NIcon name="close" size={12} />
         </button>
       </div>
@@ -211,54 +292,128 @@ function ApprovalBanner({ approval }: { approval: NonNullable<Pane['approval']> 
   );
 }
 
+// xterm-backed pane body. Snapshot lines (terminal:lines) write
+// once on mount; subsequent panes:{id}:line events stream into
+// xterm directly. Keystrokes go out via terminal:write. Resize is
+// hooked to a ResizeObserver around the container so layout
+// switches and window resizes propagate to the PTY.
+//
+// Backend currently strips ANSI before emitting (see
+// terminal.rs::LineEventPayload — `text` is plain). xterm still
+// gives us a real cursor, scroll, font, and input handling; ANSI
+// rendering follows when the backend event payload changes.
 function PaneBody({ pane }: { pane: Pane }): JSX.Element {
-  const { data: lines = [] } = usePaneLines(pane.id);
-  return (
-    <div className="pane-body">
-      {lines.map((ln) => (
-        <TermLine key={ln.seq} line={ln} />
-      ))}
-      {pane.status === 'running' && (
-        <div className="term-cursor-line">
-          <span className="term-cursor" />
-        </div>
-      )}
-    </div>
-  );
-}
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const xtermRef = useRef<XTerm | null>(null);
+  const fitRef = useRef<FitAddon | null>(null);
+  const writtenSeqsRef = useRef<Set<number>>(new Set());
+  const { data: snapshot } = usePaneLines(pane.id);
+  const writeMut = useTerminalWrite();
+  const resizeMut = useTerminalResize();
 
-function TermLine({ line }: { line: PaneLine }): JSX.Element {
-  if (line.k === 'prompt') {
-    return (
-      <div className="tl prompt">
-        <span className="tl-prompt-sigil">{line.text || '›'}</span>
-      </div>
-    );
-  }
-  if (line.k === 'command') {
-    return (
-      <div className="tl command">
-        <span className="tl-prompt-sigil">›</span> <span className="tl-cmd">{line.text}</span>
-      </div>
-    );
-  }
-  if (line.k === 'thinking') {
-    return (
-      <div className="tl thinking">
-        <span className="tl-think-dot" /> {line.text}
-      </div>
-    );
-  }
-  if (line.k === 'tool') {
-    return (
-      <div className="tl tool">
-        <NIcon name="wrench" size={11} /> <span>{line.text}</span>
-      </div>
-    );
-  }
-  if (line.k === 'err') return <div className="tl err">{line.text}</div>;
-  if (line.k === 'sys') return <div className="tl sys">{line.text}</div>;
-  return <div className="tl out">{line.text}</div>;
+  // Mount xterm once per pane. The PTY lifecycle is independent of
+  // the React render — drop the instance only when the pane id
+  // changes, not on every render.
+  useEffect(() => {
+    if (!containerRef.current) return;
+    const term = new XTerm({
+      fontFamily: 'var(--font-mono), Menlo, Consolas, monospace',
+      fontSize: 12,
+      theme: { background: '#0a0a0f', foreground: '#e6e6ea' },
+      cursorBlink: true,
+      convertEol: true,
+      scrollback: 5000,
+    });
+    const fit = new FitAddon();
+    term.loadAddon(fit);
+    term.open(containerRef.current);
+    try {
+      fit.fit();
+    } catch {
+      // fit() can throw if the container has 0 dimensions during
+      // initial mount; ResizeObserver below picks it up shortly.
+    }
+
+    const onDataDisp = term.onData((data) => {
+      writeMut.mutate({ paneId: pane.id, data });
+    });
+
+    xtermRef.current = term;
+    fitRef.current = fit;
+    return () => {
+      onDataDisp.dispose();
+      term.dispose();
+      xtermRef.current = null;
+      fitRef.current = null;
+      writtenSeqsRef.current.clear();
+    };
+    // pane.id is the only useful dep — write/resize mutations are
+    // stable refs from TanStack Query.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pane.id]);
+
+  // Resize observer: refit xterm when the container size changes,
+  // then propagate the new cols/rows to the PTY.
+  useEffect(() => {
+    if (!containerRef.current) return;
+    const obs = new ResizeObserver(() => {
+      const fit = fitRef.current;
+      const term = xtermRef.current;
+      if (!fit || !term) return;
+      try {
+        fit.fit();
+      } catch {
+        return;
+      }
+      resizeMut.mutate({ paneId: pane.id, cols: term.cols, rows: term.rows });
+    });
+    obs.observe(containerRef.current);
+    return () => obs.disconnect();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pane.id]);
+
+  // Write the snapshot scrollback once it arrives. Track which
+  // seqs we've already written so the live subscription below
+  // doesn't double-render anything that overlapped.
+  useEffect(() => {
+    const term = xtermRef.current;
+    if (!term || !snapshot) return;
+    for (const line of snapshot) {
+      if (writtenSeqsRef.current.has(line.seq)) continue;
+      writtenSeqsRef.current.add(line.seq);
+      term.write(line.text + '\r\n');
+    }
+  }, [snapshot]);
+
+  // Live subscription — write each event payload as a single line.
+  useEffect(() => {
+    let unlisten: UnlistenFn | undefined;
+    let cancelled = false;
+    listen<PaneLine>(`panes:${pane.id}:line`, (event) => {
+      const term = xtermRef.current;
+      if (!term) return;
+      const incoming = event.payload;
+      if (writtenSeqsRef.current.has(incoming.seq)) return;
+      writtenSeqsRef.current.add(incoming.seq);
+      term.write(incoming.text + '\r\n');
+    })
+      .then((fn) => {
+        if (cancelled) {
+          fn();
+        } else {
+          unlisten = fn;
+        }
+      })
+      .catch((err) => {
+        console.warn('[PaneBody] failed to subscribe', err);
+      });
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, [pane.id]);
+
+  return <div className="pane-body pane-body-xterm" ref={containerRef} />;
 }
 
 interface TermStatusBarProps {
