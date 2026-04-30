@@ -11,6 +11,7 @@ import { AgentsRoute } from './routes/AgentsRoute';
 import { RunsRoute } from './routes/RunsRoute';
 import { MCPRoute } from './routes/MCPRoute';
 import { SettingsRoute } from './routes/SettingsRoute';
+import { Canvas } from './routes/Canvas';
 
 type Route = 'canvas' | 'terminal' | 'agents' | 'runs' | 'mcp' | 'settings';
 
@@ -137,6 +138,12 @@ function RouteStub({ route }: { route: Route }): JSX.Element {
 // of crashing the entire shell.
 function RouteHost({ route }: { route: Route }): JSX.Element {
   switch (route) {
+    case 'canvas':
+      return (
+        <ErrorBoundary fallbackTitle="Couldn't load workflow">
+          <Canvas />
+        </ErrorBoundary>
+      );
     case 'agents':
       return (
         <ErrorBoundary fallbackTitle="Couldn't load agents">

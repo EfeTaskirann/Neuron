@@ -13,6 +13,7 @@ vi.mock('./lib/bindings', () => ({
     runsList: vi.fn(),
     mcpList: vi.fn(),
     workflowsList: vi.fn(),
+    workflowsGet: vi.fn(),
   },
 }));
 
@@ -67,6 +68,38 @@ const RUNS_OK = {
   ],
 };
 
+const WORKFLOW_OK = {
+  status: 'ok' as const,
+  data: {
+    workflow: { id: 'daily-summary', name: 'Daily summary', savedAt: 1 },
+    nodes: [
+      {
+        id: 'n1',
+        workflowId: 'daily-summary',
+        kind: 'llm',
+        x: 60,
+        y: 80,
+        title: 'Planner',
+        meta: 'gpt-4o · 1.2k tok',
+        status: 'success',
+      },
+      {
+        id: 'n2',
+        workflowId: 'daily-summary',
+        kind: 'tool',
+        x: 360,
+        y: 40,
+        title: 'fetch_docs',
+        meta: 'tool · 0.34s',
+        status: 'success',
+      },
+    ],
+    edges: [
+      { id: 'e1', workflowId: 'daily-summary', fromNode: 'n1', toNode: 'n2', active: true },
+    ],
+  },
+};
+
 const SERVERS_OK = {
   status: 'ok' as const,
   data: [
@@ -99,6 +132,7 @@ beforeEach(async () => {
   vi.mocked(commands.agentsList).mockResolvedValue(AGENTS_OK);
   vi.mocked(commands.runsList).mockResolvedValue(RUNS_OK);
   vi.mocked(commands.mcpList).mockResolvedValue(SERVERS_OK);
+  vi.mocked(commands.workflowsGet).mockResolvedValue(WORKFLOW_OK);
 });
 
 describe('App shell', () => {
@@ -176,6 +210,20 @@ describe('MCPRoute', () => {
     // for github.
     expect(screen.getAllByText('installed').length).toBeGreaterThanOrEqual(1);
     expect(screen.getAllByText('Install').length).toBeGreaterThanOrEqual(1);
+  });
+});
+
+describe('Canvas', () => {
+  it('renders nodes and edges from useWorkflow()', async () => {
+    renderApp();
+    // Canvas is the default route — content streams in once
+    // workflowsGet resolves.
+    await waitFor(() => expect(screen.getByText('Planner')).toBeInTheDocument());
+    expect(screen.getByText('fetch_docs')).toBeInTheDocument();
+    // Edge renders as <path> inside the canvas-edges svg; class
+    // toggles `active` when active=true.
+    const edges = document.querySelectorAll('.canvas-edge.active');
+    expect(edges.length).toBe(1);
   });
 });
 

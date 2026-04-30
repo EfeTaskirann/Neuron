@@ -72,6 +72,7 @@ pub async fn init(app: &AppHandle) -> Result<DbPool, DbError> {
     let pool = open_pool_at(&path).await?;
     MIGRATOR.run(&pool).await?;
     seed_demo_workflow(&pool).await?;
+    seed_demo_canvas(&pool).await?;
     seed_mcp_servers(&pool).await?;
     Ok(pool)
 }
@@ -93,6 +94,65 @@ async fn seed_demo_workflow(pool: &DbPool) -> Result<(), DbError> {
     )
     .execute(pool)
     .await?;
+    Ok(())
+}
+
+/// Idempotently seed the 6 nodes + 6 edges that constitute the
+/// `daily-summary` canvas. WP-W2-08 §"Risks" called for this fixture
+/// — without it `workflows:get('daily-summary')` returns
+/// `nodes: []`, `edges: []` and the Canvas route renders empty.
+///
+/// Coordinates / labels / statuses copy `Neuron Design/app/canvas.jsx`
+/// verbatim so the rendered canvas matches the design-mock vibe
+/// post-migration. `INSERT OR IGNORE` keeps it safe across relaunches.
+async fn seed_demo_canvas(pool: &DbPool) -> Result<(), DbError> {
+    let nodes: &[(&str, &str, i64, i64, &str, &str, &str)] = &[
+        ("n1", "llm",   60,  80,  "Planner",    "gpt-4o · 1.2k tok",   "success"),
+        ("n2", "tool",  360, 40,  "fetch_docs", "tool · 0.34s",        "success"),
+        ("n3", "tool",  360, 200, "search_web", "tool · 0.52s",        "success"),
+        ("n4", "llm",   660, 110, "Reasoner",   "gpt-4o · 2.4k tok",   "running"),
+        ("n5", "human", 960, 70,  "Approve",    "human · waiting",     "waiting"),
+        ("n6", "logic", 960, 220, "Route",      "logic · idle",        "idle"),
+    ];
+    for (id, kind, x, y, title, meta, status) in nodes {
+        sqlx::query(
+            "INSERT OR IGNORE INTO nodes \
+             (id, workflow_id, kind, x, y, title, meta, status) \
+             VALUES (?, 'daily-summary', ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(id)
+        .bind(kind)
+        .bind(x)
+        .bind(y)
+        .bind(title)
+        .bind(meta)
+        .bind(status)
+        .execute(pool)
+        .await?;
+    }
+
+    // (id, from, to, active)
+    let edges: &[(&str, &str, &str, i64)] = &[
+        ("e1", "n1", "n2", 0),
+        ("e2", "n1", "n3", 0),
+        ("e3", "n2", "n4", 1),
+        ("e4", "n3", "n4", 1),
+        ("e5", "n4", "n5", 0),
+        ("e6", "n4", "n6", 0),
+    ];
+    for (id, from_node, to_node, active) in edges {
+        sqlx::query(
+            "INSERT OR IGNORE INTO edges \
+             (id, workflow_id, from_node, to_node, active) \
+             VALUES (?, 'daily-summary', ?, ?, ?)",
+        )
+        .bind(id)
+        .bind(from_node)
+        .bind(to_node)
+        .bind(active)
+        .execute(pool)
+        .await?;
+    }
     Ok(())
 }
 
@@ -292,6 +352,49 @@ mod tests {
 
     /// Acceptance: WP-W2-05 — seed_mcp_servers writes every bundled
     /// manifest on first call and is a no-op on subsequent calls.
+    /// `seed_demo_canvas` lays down 6 nodes + 6 edges for the
+    /// `daily-summary` workflow exactly once, even when run again
+    /// after a relaunch. The status column on a node may have been
+    /// updated by the runtime in between (e.g. `running`→`success`);
+    /// `INSERT OR IGNORE` must preserve those user-/runtime-driven
+    /// updates rather than reverting to the seed value.
+    #[tokio::test]
+    async fn seed_demo_canvas_is_idempotent() {
+        let (pool, _dir) = fresh_pool().await;
+        seed_demo_workflow(&pool).await.expect("workflow seed");
+        seed_demo_canvas(&pool).await.expect("canvas seed first time");
+
+        let (n, e): (i64, i64) = sqlx::query_as(
+            "SELECT (SELECT COUNT(*) FROM nodes), (SELECT COUNT(*) FROM edges)",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(n, 6);
+        assert_eq!(e, 6);
+
+        // Mutate a node's status in between — re-seed must NOT revert.
+        sqlx::query("UPDATE nodes SET status = 'idle' WHERE id = 'n4'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        seed_demo_canvas(&pool).await.expect("canvas seed second time");
+        let (n2, e2): (i64, i64) = sqlx::query_as(
+            "SELECT (SELECT COUNT(*) FROM nodes), (SELECT COUNT(*) FROM edges)",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(n2, 6, "no duplicate nodes after re-seed");
+        assert_eq!(e2, 6, "no duplicate edges after re-seed");
+        let n4_status: String =
+            sqlx::query_scalar("SELECT status FROM nodes WHERE id='n4'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(n4_status, "idle", "runtime status must survive re-seed");
+    }
+
     #[tokio::test]
     async fn seed_mcp_servers_is_idempotent() {
         let (pool, _dir) = fresh_pool().await;
