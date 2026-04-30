@@ -14,6 +14,7 @@ import { MCPRoute } from './routes/MCPRoute';
 import { SettingsRoute } from './routes/SettingsRoute';
 import { Canvas } from './routes/Canvas';
 import { RunInspector } from './routes/RunInspector';
+import { TerminalRoute } from './routes/Terminal';
 
 type Route = 'canvas' | 'terminal' | 'agents' | 'runs' | 'mcp' | 'settings';
 
@@ -144,6 +145,12 @@ function RouteHost({ route }: { route: Route }): JSX.Element {
       return (
         <ErrorBoundary fallbackTitle="Couldn't load workflow">
           <Canvas />
+        </ErrorBoundary>
+      );
+    case 'terminal':
+      return (
+        <ErrorBoundary fallbackTitle="Couldn't load terminal">
+          <TerminalRoute />
         </ErrorBoundary>
       );
     case 'agents':

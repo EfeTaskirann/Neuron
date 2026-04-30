@@ -15,6 +15,8 @@ vi.mock('./lib/bindings', () => ({
     mcpList: vi.fn(),
     workflowsList: vi.fn(),
     workflowsGet: vi.fn(),
+    terminalList: vi.fn(),
+    terminalLines: vi.fn(),
   },
 }));
 
@@ -189,6 +191,10 @@ beforeEach(async () => {
   vi.mocked(commands.mcpList).mockResolvedValue(SERVERS_OK);
   vi.mocked(commands.workflowsGet).mockResolvedValue(WORKFLOW_OK);
   vi.mocked(commands.runsGet).mockResolvedValue(RUN_DETAIL_OK);
+  // Default: empty panes / empty scrollback so the terminal route
+  // hits its empty-state branch unless a test overrides.
+  vi.mocked(commands.terminalList).mockResolvedValue({ status: 'ok', data: [] });
+  vi.mocked(commands.terminalLines).mockResolvedValue({ status: 'ok', data: [] });
 });
 
 describe('App shell', () => {
@@ -201,13 +207,9 @@ describe('App shell', () => {
     }
   });
 
-  it('clicking a stub-only nav item swaps the active route stub', () => {
-    renderApp();
-    // Terminal stays a stub through phase B; phase D ports it.
-    fireEvent.click(screen.getByText('Terminal'));
-    const stub = screen.getByTestId('route-stub-terminal');
-    expect(stub).toHaveTextContent(/terminal.*coming soon/i);
-  });
+  // No stub-only routes remain after phase D/1 — every nav item
+  // dispatches to a real component. The previous "stub renders"
+  // case is replaced by the per-route assertions below.
 
   it('renders user and workspace from useMe()', async () => {
     renderApp();
@@ -309,6 +311,63 @@ describe('RunInspector', () => {
     expect(screen.getByText('Prompt')).toBeInTheDocument();
     expect(screen.getByText('Response')).toBeInTheDocument();
     expect(screen.getByText('Plan the day')).toBeInTheDocument();
+  });
+});
+
+describe('TerminalRoute', () => {
+  it('renders the empty state when terminal:list returns no panes', async () => {
+    renderApp();
+    fireEvent.click(screen.getByText('Terminal'));
+    await waitFor(() =>
+      expect(screen.getByText(/no panes yet/i)).toBeInTheDocument(),
+    );
+  });
+
+  it('renders a pane card with header and scrollback lines', async () => {
+    const { commands } = await import('./lib/bindings');
+    vi.mocked(commands.terminalList).mockResolvedValueOnce({
+      status: 'ok',
+      data: [
+        {
+          id: 'p-1',
+          workspace: 'personal',
+          agent: 'claude-code',
+          role: null,
+          cwd: '~/work/neuron',
+          status: 'running',
+          pid: 1234,
+          startedAt: Math.floor(Date.now() / 1000) - 60,
+          closedAt: null,
+          tokensIn: null,
+          tokensOut: null,
+          costUsd: null,
+          uptime: null,
+          approval: null,
+        },
+      ],
+    });
+    vi.mocked(commands.terminalLines).mockResolvedValueOnce({
+      status: 'ok',
+      data: [
+        { seq: 1, k: 'sys', text: 'session started' },
+        { seq: 2, k: 'command', text: 'pnpm test' },
+        { seq: 3, k: 'out', text: '✓ all tests passing' },
+      ],
+    });
+
+    renderApp();
+    fireEvent.click(screen.getByText('Terminal'));
+    // Pane header arrives first (terminal:list); scrollback comes
+    // through a separate query (terminal:lines) that resolves a
+    // tick later. Wait for the lines specifically.
+    await screen.findByText('Claude');
+    expect(screen.getByText('~/work/neuron')).toBeInTheDocument();
+    expect(screen.getByText(/^running$/)).toBeInTheDocument();
+    await screen.findByText('session started');
+    expect(screen.getByText('pnpm test')).toBeInTheDocument();
+    expect(screen.getByText(/all tests passing/)).toBeInTheDocument();
+    expect(screen.getByText(/1 panes/)).toBeInTheDocument();
+    expect(screen.getByText(/1 running/)).toBeInTheDocument();
   });
 });
 
