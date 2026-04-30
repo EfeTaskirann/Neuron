@@ -188,6 +188,14 @@ pub struct Span {
     pub prompt: Option<String>,
     pub response: Option<String>,
     pub is_running: bool,
+    /// Tree depth derived from `parent_span_id` at read time via the
+    /// recursive CTE in `runs:get`. Not stored. `#[sqlx(default)]`
+    /// guards against ad-hoc SELECTs that omit the computed column;
+    /// no `serde(default)` because `Span` is never deserialised from
+    /// JSON (events use `WireSpan`), and we want the TypeScript field
+    /// to stay required for frontend consumers.
+    #[sqlx(default)]
+    pub indent: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]

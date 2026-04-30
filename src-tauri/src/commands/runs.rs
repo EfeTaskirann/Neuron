@@ -76,9 +76,30 @@ pub async fn runs_get(pool: State<'_, DbPool>, id: String) -> Result<RunDetail, 
     .await?
     .ok_or_else(|| AppError::NotFound(format!("Run {id} not found")))?;
 
+    // Indent is computed at read time per WP-W2-07 §"Notes" — a
+    // `WITH RECURSIVE` walk from each root (parent_span_id IS NULL)
+    // counts depth. The `LEFT JOIN` + `COALESCE(t.indent, 0)` handles
+    // orphan spans whose parent_span_id points outside the tree (e.g.,
+    // a sidecar emitted child before parent landed) without dropping
+    // them from the result set. The `run_id` predicate inside the
+    // recursive arm prevents traversal escaping into other runs.
     let spans = sqlx::query_as::<_, Span>(
-        "SELECT id, run_id, parent_span_id, name, type, t0_ms, duration_ms, attrs_json, prompt, response, is_running \
-         FROM runs_spans WHERE run_id = ? ORDER BY t0_ms",
+        "WITH RECURSIVE span_tree(id, indent) AS ( \
+            SELECT id, 0 FROM runs_spans \
+                WHERE run_id = ?1 AND parent_span_id IS NULL \
+            UNION ALL \
+            SELECT rs.id, st.indent + 1 \
+                FROM runs_spans rs \
+                JOIN span_tree st ON rs.parent_span_id = st.id \
+                WHERE rs.run_id = ?1 \
+         ) \
+         SELECT s.id, s.run_id, s.parent_span_id, s.name, s.type, \
+                s.t0_ms, s.duration_ms, s.attrs_json, s.prompt, s.response, \
+                s.is_running, COALESCE(t.indent, 0) AS indent \
+         FROM runs_spans s \
+         LEFT JOIN span_tree t ON t.id = s.id \
+         WHERE s.run_id = ?1 \
+         ORDER BY s.t0_ms",
     )
     .bind(&id)
     .fetch_all(pool.inner())
@@ -375,5 +396,102 @@ mod tests {
         let state = app.state::<crate::db::DbPool>();
         let err = runs_cancel(state, "r1".into()).await.unwrap_err();
         assert_eq!(err.kind(), "conflict");
+    }
+
+    /// WP-W2-07: `runs:get` walks the `parent_span_id` chain and tags
+    /// each span with its tree depth. A 3-level chain (root → child →
+    /// grandchild) yields indents 0, 1, 2.
+    #[tokio::test]
+    async fn runs_get_computes_indent_from_parent_tree() {
+        let (app, pool, _dir) = mock_app_with_pool().await;
+        seed_run(&pool, "r1", "running").await;
+        sqlx::query(
+            "INSERT INTO runs_spans (id, run_id, parent_span_id, name, type, t0_ms) VALUES \
+             ('s1','r1', NULL, 'orchestrator.run', 'logic', 100), \
+             ('s2','r1', 's1',  'llm.plan',        'llm',   200), \
+             ('s3','r1', 's2',  'logic.route',     'logic', 300)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let state = app.state::<crate::db::DbPool>();
+        let detail = runs_get(state, "r1".to_string()).await.expect("ok");
+        let by_id: std::collections::HashMap<_, _> = detail
+            .spans
+            .iter()
+            .map(|s| (s.id.as_str(), s.indent))
+            .collect();
+        assert_eq!(by_id["s1"], 0, "root indent");
+        assert_eq!(by_id["s2"], 1, "child indent");
+        assert_eq!(by_id["s3"], 2, "grandchild indent");
+    }
+
+    /// A span whose `parent_span_id` points to a row in a *different*
+    /// run satisfies the schema FK but lives outside this run's tree.
+    /// The CTE's `WHERE rs.run_id = ?1` predicate prevents traversal
+    /// from picking it up, so the LEFT JOIN + COALESCE must keep the
+    /// span in the result with indent 0 rather than dropping it.
+    #[tokio::test]
+    async fn runs_get_orphan_span_gets_indent_zero() {
+        let (app, pool, _dir) = mock_app_with_pool().await;
+        seed_run(&pool, "r1", "running").await;
+        // Sibling run with its own span, which becomes an
+        // out-of-tree parent target for r1's orphan.
+        sqlx::query(
+            "INSERT INTO runs (id, workflow_id, workflow_name, started_at, status) \
+             VALUES ('r2','w1','Daily summary',2,'running')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO runs_spans (id, run_id, parent_span_id, name, type, t0_ms) VALUES \
+             ('s-far','r2', NULL, 'far-root', 'logic', 50), \
+             ('s-orphan','r1', 's-far', 'orphaned-into-r2', 'llm', 100)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let state = app.state::<crate::db::DbPool>();
+        let detail = runs_get(state, "r1".to_string()).await.expect("ok");
+        assert_eq!(detail.spans.len(), 1, "must not include r2's span");
+        assert_eq!(detail.spans[0].id, "s-orphan");
+        assert_eq!(
+            detail.spans[0].indent, 0,
+            "out-of-run parent → indent 0 (LEFT JOIN COALESCE), not dropped"
+        );
+    }
+
+    /// Two sibling roots both get indent 0; their respective children
+    /// both get indent 1. Confirms the CTE handles forests, not just
+    /// single trees.
+    #[tokio::test]
+    async fn runs_get_two_root_spans_both_indent_zero() {
+        let (app, pool, _dir) = mock_app_with_pool().await;
+        seed_run(&pool, "r1", "running").await;
+        sqlx::query(
+            "INSERT INTO runs_spans (id, run_id, parent_span_id, name, type, t0_ms) VALUES \
+             ('a','r1', NULL, 'root-a',  'logic', 10), \
+             ('b','r1', NULL, 'root-b',  'logic', 20), \
+             ('a1','r1','a',  'child-a', 'llm',   30), \
+             ('b1','r1','b',  'child-b', 'llm',   40)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let state = app.state::<crate::db::DbPool>();
+        let detail = runs_get(state, "r1".to_string()).await.expect("ok");
+        let by_id: std::collections::HashMap<_, _> = detail
+            .spans
+            .iter()
+            .map(|s| (s.id.as_str(), s.indent))
+            .collect();
+        assert_eq!(by_id["a"], 0);
+        assert_eq!(by_id["b"], 0);
+        assert_eq!(by_id["a1"], 1);
+        assert_eq!(by_id["b1"], 1);
     }
 }

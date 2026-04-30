@@ -406,6 +406,10 @@ async fn handle_event<R: Runtime>(
         }
         SidecarEvent::SpanClosed { run_id, span } => {
             update_span(pool, &span).await?;
+            // WP-W2-07: aggregates roll up on each span close so the
+            // inspector's run-level token/cost totals advance as work
+            // completes, not just at run finalisation.
+            crate::commands::util::update_run_aggregates(pool, &run_id).await?;
             emit_span_event(app, &run_id, "closed", &span)?;
         }
         SidecarEvent::RunCompleted { run_id, status, error } => {
@@ -530,7 +534,7 @@ impl<'a> Serialize for SerializableWireSpan<'a> {
         // the sidecar emits, so a direct passthrough is sufficient.
         use serde::ser::SerializeStruct;
         let s = self.0;
-        let mut st = ser.serialize_struct("Span", 11)?;
+        let mut st = ser.serialize_struct("Span", 12)?;
         st.serialize_field("id", &s.id)?;
         st.serialize_field("runId", &s.run_id)?;
         st.serialize_field("parentSpanId", &s.parent_span_id)?;
@@ -542,6 +546,10 @@ impl<'a> Serialize for SerializableWireSpan<'a> {
         st.serialize_field("prompt", &s.prompt)?;
         st.serialize_field("response", &s.response)?;
         st.serialize_field("isRunning", &s.is_running)?;
+        // Indent is computed at read time by `runs:get`; events
+        // never carry a meaningful depth, so emit 0 and let
+        // `useRun` (WP-W2-08) recompute against the in-memory tree.
+        st.serialize_field("indent", &0_i64)?;
         st.end()
     }
 }
@@ -682,6 +690,68 @@ mod tests {
         assert_eq!(row.4.as_deref(), Some("hi")); // COALESCE preserved
         assert_eq!(row.5.as_deref(), Some("done"));
         assert_eq!(row.6, 0);
+    }
+
+    /// WP-W2-07: closing a span via the same UPDATE path used by the
+    /// read loop must trigger `update_run_aggregates`, lifting
+    /// `runs.tokens` / `runs.cost_usd` off their initial zeros. We
+    /// exercise the helpers directly (not `handle_event`) because
+    /// `emit_span_event` requires a Tauri runtime; the SpanClosed
+    /// arm's logic is `update_span` + `update_run_aggregates` +
+    /// `emit_span_event`, and the first two are what this WP changes.
+    #[tokio::test]
+    async fn span_close_triggers_run_aggregate_update() {
+        let (pool, _dir) = fresh_pool().await;
+        seed_minimal(&pool).await;
+        sqlx::query(
+            "INSERT INTO runs (id, workflow_id, workflow_name, started_at, status, tokens, cost_usd) \
+             VALUES ('r-agg','w1','Daily summary',1,'running',0,0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Insert + close a span carrying tokens / cost in attrs_json.
+        let opening = WireSpan {
+            id: "s-llm".into(),
+            run_id: "r-agg".into(),
+            parent_span_id: None,
+            name: "llm.plan".into(),
+            span_type: "llm".into(),
+            t0_ms: 0,
+            duration_ms: None,
+            attrs_json: "{}".into(),
+            prompt: None,
+            response: None,
+            is_running: true,
+        };
+        insert_span(&pool, &opening).await.expect("insert");
+
+        let closed = WireSpan {
+            id: "s-llm".into(),
+            run_id: "r-agg".into(),
+            parent_span_id: None,
+            name: "llm.plan".into(),
+            span_type: "llm".into(),
+            t0_ms: 0,
+            duration_ms: Some(2400),
+            attrs_json: r#"{"tokens_in":412,"tokens_out":88,"cost":0.0124}"#.into(),
+            prompt: None,
+            response: None,
+            is_running: false,
+        };
+        update_span(&pool, &closed).await.expect("update");
+        crate::commands::util::update_run_aggregates(&pool, "r-agg")
+            .await
+            .expect("aggregate");
+
+        let (tokens, cost): (i64, f64) =
+            sqlx::query_as("SELECT tokens, cost_usd FROM runs WHERE id='r-agg'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(tokens, 412 + 88);
+        assert!((cost - 0.0124).abs() < 1e-9);
     }
 
     #[tokio::test]

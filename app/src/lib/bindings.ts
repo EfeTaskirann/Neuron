@@ -453,6 +453,15 @@ export type Span = {
 	prompt: string | null,
 	response: string | null,
 	isRunning: boolean,
+	/**
+	 *  Tree depth derived from `parent_span_id` at read time via the
+	 *  recursive CTE in `runs:get`. Not stored. `#[sqlx(default)]`
+	 *  guards against ad-hoc SELECTs that omit the computed column;
+	 *  no `serde(default)` because `Span` is never deserialised from
+	 *  JSON (events use `WireSpan`), and we want the TypeScript field
+	 *  to stay required for frontend consumers.
+	 */
+	indent: number,
 };
 
 /**
