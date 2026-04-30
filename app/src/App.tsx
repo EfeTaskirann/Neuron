@@ -7,11 +7,13 @@ import { useState } from 'react';
 import { Brandmark, NIcon, type IconName } from './components/icons';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { useMe } from './hooks/useMe';
+import { useRuns } from './hooks/useRuns';
 import { AgentsRoute } from './routes/AgentsRoute';
 import { RunsRoute } from './routes/RunsRoute';
 import { MCPRoute } from './routes/MCPRoute';
 import { SettingsRoute } from './routes/SettingsRoute';
 import { Canvas } from './routes/Canvas';
+import { RunInspector } from './routes/RunInspector';
 
 type Route = 'canvas' | 'terminal' | 'agents' | 'runs' | 'mcp' | 'settings';
 
@@ -178,8 +180,18 @@ function RouteHost({ route }: { route: Route }): JSX.Element {
 export function App(): JSX.Element {
   const [route, setRoute] = useState<Route>('canvas');
   const [collapsed, setCollapsed] = useState(false);
+  const [showInspector, setShowInspector] = useState(true);
+  // Pick the most recent run as the inspector's default subject.
+  // `runs:list` is already sorted started_at DESC server-side.
+  const { data: runs = [] } = useRuns();
+  const inspectorRunId = runs[0]?.id ?? null;
+  const inspectorOpen = route === 'canvas' && showInspector;
   return (
-    <div className={`app-shell${collapsed ? ' collapsed' : ''}`}>
+    <div
+      className={`app-shell${collapsed ? ' collapsed' : ''}${
+        inspectorOpen ? ' has-inspector' : ''
+      }`}
+    >
       <Sidebar
         route={route}
         onNavigate={setRoute}
@@ -190,6 +202,13 @@ export function App(): JSX.Element {
       <main className="app-main">
         <RouteHost route={route} />
       </main>
+      {inspectorOpen && (
+        <aside className="app-inspector">
+          <ErrorBoundary fallbackTitle="Couldn't load run">
+            <RunInspector runId={inspectorRunId} onClose={() => setShowInspector(false)} />
+          </ErrorBoundary>
+        </aside>
+      )}
     </div>
   );
 }

@@ -11,10 +11,19 @@ vi.mock('./lib/bindings', () => ({
     meGet: vi.fn(),
     agentsList: vi.fn(),
     runsList: vi.fn(),
+    runsGet: vi.fn(),
     mcpList: vi.fn(),
     workflowsList: vi.fn(),
     workflowsGet: vi.fn(),
   },
+}));
+
+// Tauri event listener is only meaningful inside the desktop app;
+// in jsdom the native bridge is missing. The mock returns a real
+// Promise resolving to a no-op unsubscribe so useRun's
+// `.then(unlisten)` chain doesn't choke on undefined.
+vi.mock('@tauri-apps/api/event', () => ({
+  listen: () => Promise.resolve(() => {}),
 }));
 
 function renderApp(): void {
@@ -100,6 +109,52 @@ const WORKFLOW_OK = {
   },
 };
 
+const RUN_DETAIL_OK = {
+  status: 'ok' as const,
+  data: {
+    run: {
+      id: 'r-1',
+      workflow: 'Daily summary',
+      workflowId: 'daily-summary',
+      startedAt: Math.floor(Date.now() / 1000) - 120,
+      dur: 2400,
+      tokens: 3824,
+      cost: 0.0124,
+      status: 'success',
+    },
+    spans: [
+      {
+        id: 's-1',
+        runId: 'r-1',
+        parentSpanId: null,
+        name: 'orchestrator.run',
+        type: 'llm',
+        t0Ms: 0,
+        durationMs: 2400,
+        attrsJson: '{"agent":"Reasoner","model":"gpt-4o"}',
+        prompt: null,
+        response: null,
+        isRunning: false,
+        indent: 0,
+      },
+      {
+        id: 's-2',
+        runId: 'r-1',
+        parentSpanId: 's-1',
+        name: 'llm.plan',
+        type: 'llm',
+        t0Ms: 40,
+        durationMs: 680,
+        attrsJson: '{"tokens_in":412,"tokens_out":168,"cost":0.0024}',
+        prompt: 'Plan the day',
+        response: 'Step 1, 2, 3',
+        isRunning: false,
+        indent: 1,
+      },
+    ],
+  },
+};
+
 const SERVERS_OK = {
   status: 'ok' as const,
   data: [
@@ -133,6 +188,7 @@ beforeEach(async () => {
   vi.mocked(commands.runsList).mockResolvedValue(RUNS_OK);
   vi.mocked(commands.mcpList).mockResolvedValue(SERVERS_OK);
   vi.mocked(commands.workflowsGet).mockResolvedValue(WORKFLOW_OK);
+  vi.mocked(commands.runsGet).mockResolvedValue(RUN_DETAIL_OK);
 });
 
 describe('App shell', () => {
@@ -224,6 +280,35 @@ describe('Canvas', () => {
     // toggles `active` when active=true.
     const edges = document.querySelectorAll('.canvas-edge.active');
     expect(edges.length).toBe(1);
+  });
+});
+
+describe('RunInspector', () => {
+  // Inspector resolution is a 2-step async chain: useRuns settles
+  // first (gives the most recent run), then useRun fires and
+  // resolves the snapshot. `findByText` retries on async settle
+  // and has a generous default — orchestrator.run also renders in
+  // both the span-row and the sheet, so getAllByText is safer.
+  it('renders span timeline from useRun()', async () => {
+    renderApp();
+    const orchestratorMatches = await screen.findAllByText(
+      'orchestrator.run',
+      {},
+      { timeout: 5000 },
+    );
+    expect(orchestratorMatches.length).toBeGreaterThanOrEqual(1);
+    expect(screen.getByText('llm.plan')).toBeInTheDocument();
+    expect(screen.getByText(/3,824 tokens/)).toBeInTheDocument();
+    expect(screen.getByText(/\$0\.0124/)).toBeInTheDocument();
+  });
+
+  it('shows the prompt/response sheet for the selected llm span', async () => {
+    renderApp();
+    await screen.findByText('llm.plan', {}, { timeout: 5000 });
+    fireEvent.click(screen.getByText('llm.plan'));
+    expect(screen.getByText('Prompt')).toBeInTheDocument();
+    expect(screen.getByText('Response')).toBeInTheDocument();
+    expect(screen.getByText('Plan the day')).toBeInTheDocument();
   });
 });
 
