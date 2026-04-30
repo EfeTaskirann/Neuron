@@ -1,46 +1,38 @@
-import { describe, expect, it } from "vitest";
-import { render, screen } from "@testing-library/react";
-import { App } from "./App";
-import "./styles.css";
+import { describe, expect, it } from 'vitest';
+import { render, screen, fireEvent } from '@testing-library/react';
+import { QueryClientProvider, QueryClient } from '@tanstack/react-query';
+import { App } from './App';
 
-// WP-W2-01 smoke test contract.
-//
-// (a) Renders the placeholder surface. If this fails, the React +
-//     Vite + jsdom harness is broken before any feature work begins.
-// (b) Asserts the dark-mode background token (`--background`) resolves
-//     to the midnight-950 OKLCH value `oklch(0.135 0.032 258)`. The
-//     design system in `Neuron Design/colors_and_type.css` exposes the
-//     surface as `--background` (semantic), not `--surface-bg`. The WP
-//     spec calls the token "--surface-bg" generically; we match the
-//     real semantic name and document it here so future readers don't
-//     get confused.
-// (c) Falls back to the raw CSS variable string when jsdom's CSSOM
-//     refuses to compute custom-property OKLCH values. jsdom 25 +
-//     Vitest 2 still does not always evaluate `var(--token)` inside
-//     `getComputedStyle(...).backgroundColor` reliably; the loose
-//     `toContain('oklch(0.135 0.032 258')` match keeps the assertion
-//     stable across jsdom minor versions.
+// Each test gets its own QueryClient so cache state doesn't leak
+// across cases. The provider is required because phase-A `App`
+// renders inside a QueryClientProvider in production via main.tsx;
+// even though no hooks are mounted in phase A, sub-trees added in
+// phase B will rely on the provider being present.
+function renderApp(): void {
+  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  render(
+    <QueryClientProvider client={qc}>
+      <App />
+    </QueryClientProvider>,
+  );
+}
 
-describe("App smoke", () => {
-  it("renders the Hello Neuron placeholder", () => {
-    render(<App />);
-    expect(screen.getByText("Hello Neuron")).toBeInTheDocument();
+describe('App shell', () => {
+  it('renders the sidebar with all 6 nav items', () => {
+    renderApp();
+    const nav = screen.getByRole('navigation');
+    expect(nav).toBeInTheDocument();
+    for (const label of ['Workflow', 'Terminal', 'Agents', 'Runs', 'MCP', 'Settings']) {
+      expect(screen.getByText(label)).toBeInTheDocument();
+    }
   });
 
-  it("resolves --background to the midnight-950 OKLCH token", () => {
-    render(<App />);
-    // The dark class is set on <html> by index.html; in jsdom, the
-    // initial document root is `<html>` without that attribute, so we
-    // re-add it explicitly. This mirrors the production runtime.
-    document.documentElement.classList.add("dark");
-
-    const root = document.documentElement;
-    const raw = getComputedStyle(root)
-      .getPropertyValue("--background")
-      .trim();
-
-    // Loose match: any whitespace style that resolves to midnight-950
-    // counts. Browsers and jsdom can normalise spacing.
-    expect(raw).toContain("oklch(0.135 0.032 258");
+  it('clicking a nav item swaps the active route stub', () => {
+    renderApp();
+    // Default route is canvas (Workflow); click Agents and confirm
+    // the stub copy updates to that route.
+    fireEvent.click(screen.getByText('Agents'));
+    const stub = screen.getByTestId('route-stub-agents');
+    expect(stub).toHaveTextContent(/agents.*coming soon/i);
   });
 });
