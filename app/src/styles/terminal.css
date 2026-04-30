@@ -281,3 +281,53 @@
 }
 .ls-btn:hover { color: var(--foreground); }
 .ls-btn.active { background: var(--surface-3); color: var(--neuron-violet-300); }
+
+/* Mailbox panel — slim header strip above the pane grid that
+   surfaces cross-pane events from useMailbox(). Hidden when the
+   list is empty (component returns null). */
+.mailbox-panel {
+  border-bottom: 1px solid var(--border);
+  background: var(--surface-1);
+  padding: 6px 12px 8px;
+  font-size: 12px;
+}
+.mailbox-head {
+  display: flex; align-items: center; gap: 8px;
+  color: var(--muted-foreground);
+  margin-bottom: 4px;
+}
+.mailbox-title { font-weight: 600; }
+.mailbox-toggle {
+  margin-left: auto;
+  border: 0; background: transparent; cursor: pointer;
+  color: var(--neuron-violet-300); font-size: 11px;
+}
+.mailbox-toggle:hover { color: var(--neuron-violet-200); }
+.mailbox-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 2px; }
+.mailbox-row {
+  display: grid;
+  grid-template-columns: 36px auto 12px auto auto 1fr;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 4px;
+  border-radius: var(--radius-sm);
+}
+.mailbox-row:hover { background: var(--surface-2); }
+.mailbox-ts { color: var(--muted-foreground); font-variant-numeric: tabular-nums; }
+.mailbox-from, .mailbox-to {
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0 4px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+.mailbox-type {
+  color: var(--neuron-violet-300);
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+.mailbox-summary {
+  color: var(--foreground);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}

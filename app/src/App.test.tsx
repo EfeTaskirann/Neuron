@@ -17,6 +17,7 @@ vi.mock('./lib/bindings', () => ({
     workflowsGet: vi.fn(),
     terminalList: vi.fn(),
     terminalLines: vi.fn(),
+    mailboxList: vi.fn(),
   },
 }));
 
@@ -195,6 +196,7 @@ beforeEach(async () => {
   // hits its empty-state branch unless a test overrides.
   vi.mocked(commands.terminalList).mockResolvedValue({ status: 'ok', data: [] });
   vi.mocked(commands.terminalLines).mockResolvedValue({ status: 'ok', data: [] });
+  vi.mocked(commands.mailboxList).mockResolvedValue({ status: 'ok', data: [] });
 });
 
 describe('App shell', () => {
@@ -368,6 +370,77 @@ describe('TerminalRoute', () => {
     expect(screen.getByText(/all tests passing/)).toBeInTheDocument();
     expect(screen.getByText(/1 panes/)).toBeInTheDocument();
     expect(screen.getByText(/1 running/)).toBeInTheDocument();
+  });
+});
+
+describe('Mailbox', () => {
+  it('renders nothing when mailbox:list returns empty', async () => {
+    const { commands } = await import('./lib/bindings');
+    vi.mocked(commands.terminalList).mockResolvedValueOnce({
+      status: 'ok',
+      data: [
+        {
+          id: 'p-x',
+          workspace: 'personal',
+          agent: 'shell',
+          role: null,
+          cwd: '~',
+          status: 'idle',
+          pid: null,
+          startedAt: 1,
+          closedAt: null,
+          tokensIn: null,
+          tokensOut: null,
+          costUsd: null,
+          uptime: null,
+          approval: null,
+        },
+      ],
+    });
+    renderApp();
+    fireEvent.click(screen.getByText('Terminal'));
+    await screen.findByText('Shell'); // pane header arrives
+    expect(screen.queryByText(/Mailbox/i)).not.toBeInTheDocument();
+  });
+
+  it('renders mailbox entries from useMailbox()', async () => {
+    const { commands } = await import('./lib/bindings');
+    vi.mocked(commands.terminalList).mockResolvedValueOnce({
+      status: 'ok',
+      data: [
+        {
+          id: 'p-x',
+          workspace: 'personal',
+          agent: 'shell',
+          role: null,
+          cwd: '~',
+          status: 'idle',
+          pid: null,
+          startedAt: 1,
+          closedAt: null,
+          tokensIn: null,
+          tokensOut: null,
+          costUsd: null,
+          uptime: null,
+          approval: null,
+        },
+      ],
+    });
+    vi.mocked(commands.mailboxList).mockResolvedValueOnce({
+      status: 'ok',
+      data: [
+        { id: 1, ts: Math.floor(Date.now() / 1000) - 30, from: 'planner', to: 'reasoner', type: 'task:done', summary: 'Plan complete' },
+        { id: 2, ts: Math.floor(Date.now() / 1000) - 60, from: 'reasoner', to: 'human', type: 'await:approve', summary: 'Approve diff' },
+      ],
+    });
+    renderApp();
+    fireEvent.click(screen.getByText('Terminal'));
+    await screen.findByText(/Mailbox · 2/);
+    expect(screen.getByText('planner')).toBeInTheDocument();
+    // 'reasoner' appears twice (to of entry-1, from of entry-2).
+    expect(screen.getAllByText('reasoner').length).toBe(2);
+    expect(screen.getByText('Plan complete')).toBeInTheDocument();
+    expect(screen.getByText('Approve diff')).toBeInTheDocument();
   });
 });
 
