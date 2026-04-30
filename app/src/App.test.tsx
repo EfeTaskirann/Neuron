@@ -18,6 +18,11 @@ vi.mock('./lib/bindings', () => ({
     terminalList: vi.fn(),
     terminalLines: vi.fn(),
     mailboxList: vi.fn(),
+    agentsCreate: vi.fn(),
+    agentsDelete: vi.fn(),
+    mcpInstall: vi.fn(),
+    mcpUninstall: vi.fn(),
+    runsCreate: vi.fn(),
   },
 }));
 
@@ -370,6 +375,79 @@ describe('TerminalRoute', () => {
     expect(screen.getByText(/all tests passing/)).toBeInTheDocument();
     expect(screen.getByText(/1 panes/)).toBeInTheDocument();
     expect(screen.getByText(/1 running/)).toBeInTheDocument();
+  });
+});
+
+describe('Mutations', () => {
+  it('clicking + New agent reveals an inline form that calls agentsCreate', async () => {
+    const { commands } = await import('./lib/bindings');
+    vi.mocked(commands.agentsCreate).mockResolvedValueOnce({
+      status: 'ok',
+      data: { id: 'a-3', name: 'Researcher', model: 'gpt-4o', temp: 0.4, role: 'Reads docs' },
+    });
+
+    renderApp();
+    fireEvent.click(screen.getByText('Agents'));
+    await waitFor(() => expect(screen.getByText('Planner')).toBeInTheDocument());
+    // The "+ New agent" button is the only one with that text
+    // before the form mounts. After click it gets replaced by the
+    // form, where the same words appear inside <strong> — so we
+    // look up the button explicitly.
+    fireEvent.click(screen.getByRole('button', { name: /new agent/i }));
+    // Find the form inputs by placeholder — `getAllByRole('textbox')`
+    // also picks up the topbar search field, which would shift
+    // indices and silently target the wrong input.
+    const nameInput = screen.getByPlaceholderText('Planner') as HTMLInputElement;
+    const roleInput = screen.getByPlaceholderText('Plans the day') as HTMLInputElement;
+    fireEvent.change(nameInput, { target: { value: 'Researcher' } });
+    fireEvent.change(roleInput, { target: { value: 'Reads docs' } });
+    expect(nameInput.value).toBe('Researcher');
+    // Submit the form directly — clicking a type=submit button
+    // doesn't reliably propagate to onSubmit in jsdom.
+    fireEvent.submit(nameInput.closest('form')!);
+    await waitFor(() => expect(commands.agentsCreate).toHaveBeenCalled());
+    const callArg = vi.mocked(commands.agentsCreate).mock.calls[0]![0];
+    expect(callArg).toMatchObject({ name: 'Researcher', role: 'Reads docs' });
+  });
+
+  it('clicking Install on an MCP row calls mcpInstall and disables the button', async () => {
+    const { commands } = await import('./lib/bindings');
+    vi.mocked(commands.mcpInstall).mockResolvedValueOnce({
+      status: 'ok',
+      data: { ...SERVERS_OK.data[1]!, installed: true },
+    });
+
+    renderApp();
+    fireEvent.click(screen.getByText('MCP'));
+    await waitFor(() => expect(screen.getByText('GitHub')).toBeInTheDocument());
+    // Multiple Install buttons (featured + row); clicking any one
+    // fires the mutation with the matching server id.
+    const installButtons = screen.getAllByText('Install');
+    fireEvent.click(installButtons[0]!);
+    await waitFor(() => expect(commands.mcpInstall).toHaveBeenCalled());
+    expect(vi.mocked(commands.mcpInstall).mock.calls[0]![0]).toBe('github');
+  });
+
+  it('topbar Run button on canvas calls runsCreate("daily-summary")', async () => {
+    const { commands } = await import('./lib/bindings');
+    vi.mocked(commands.runsCreate).mockResolvedValueOnce({
+      status: 'ok',
+      data: {
+        id: 'r-new',
+        workflow: 'Daily summary',
+        workflowId: 'daily-summary',
+        startedAt: Math.floor(Date.now() / 1000),
+        dur: null,
+        tokens: 0,
+        cost: 0,
+        status: 'running',
+      },
+    });
+    renderApp();
+    // Default route is canvas; topbar Run button is visible.
+    fireEvent.click(screen.getByRole('button', { name: /^Run$/i }));
+    await waitFor(() => expect(commands.runsCreate).toHaveBeenCalled());
+    expect(vi.mocked(commands.runsCreate).mock.calls[0]![0]).toBe('daily-summary');
   });
 });
 

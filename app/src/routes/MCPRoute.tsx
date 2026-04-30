@@ -4,6 +4,7 @@
 // consumer needs them (none planned for Week 2).
 import { NIcon, NodeGlyph } from '../components/icons';
 import { useServers } from '../hooks/useServers';
+import { useMcpInstall, useMcpUninstall } from '../hooks/mutations';
 import type { Server } from '../lib/bindings';
 
 export function MCPRoute(): JSX.Element {
@@ -47,6 +48,9 @@ export function MCPRoute(): JSX.Element {
 }
 
 function ServerCard({ s, featured }: { s: Server; featured?: boolean }): JSX.Element {
+  const install = useMcpInstall();
+  const uninstall = useMcpUninstall();
+  const busy = install.isPending || uninstall.isPending;
   return (
     <div className={`server-card${featured ? ' featured' : ''}`}>
       <div className="server-card-head">
@@ -59,11 +63,22 @@ function ServerCard({ s, featured }: { s: Server; featured?: boolean }): JSX.Ele
         </div>
         <div className="server-spacer" />
         {s.installed ? (
-          <span className="pill st-installed">installed</span>
+          <button
+            className="btn ghost sm"
+            disabled={busy}
+            onClick={() => uninstall.mutate(s.id)}
+            title="Uninstall server"
+          >
+            <span className="pill st-installed">installed</span>
+          </button>
         ) : (
-          <button className="btn primary sm">
+          <button
+            className="btn primary sm"
+            disabled={busy}
+            onClick={() => install.mutate(s.id)}
+          >
             <NIcon name="download" size={11} />
-            <span>Install</span>
+            <span>{install.isPending ? 'Installing…' : 'Install'}</span>
           </button>
         )}
       </div>
@@ -81,6 +96,9 @@ function ServerCard({ s, featured }: { s: Server; featured?: boolean }): JSX.Ele
 }
 
 function ServerRow({ s }: { s: Server }): JSX.Element {
+  const install = useMcpInstall();
+  const uninstall = useMcpUninstall();
+  const busy = install.isPending || uninstall.isPending;
   return (
     <div className="server-row">
       <div className="server-icon sm">
@@ -98,9 +116,22 @@ function ServerRow({ s }: { s: Server }): JSX.Element {
         <span>★ {s.rating}</span>
       </div>
       {s.installed ? (
-        <span className="pill st-installed">installed</span>
+        <button
+          className="btn ghost sm"
+          disabled={busy}
+          onClick={() => uninstall.mutate(s.id)}
+          title="Uninstall server"
+        >
+          <span className="pill st-installed">installed</span>
+        </button>
       ) : (
-        <button className="btn ghost sm">Install</button>
+        <button
+          className="btn ghost sm"
+          disabled={busy}
+          onClick={() => install.mutate(s.id)}
+        >
+          {install.isPending ? 'Installing…' : 'Install'}
+        </button>
       )}
     </div>
   );

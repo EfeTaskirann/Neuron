@@ -1230,3 +1230,29 @@ kbd {
     transition-duration: 150ms !important;
   }
 }
+
+/* WP-W2-08 phase E — inline new-agent form. Fits the existing
+   .agent-card vibe rather than a separate modal. */
+.agent-card-new { gap: 6px; }
+.agent-form-row {
+  display: grid;
+  grid-template-columns: 64px 1fr;
+  align-items: center;
+  gap: 8px;
+}
+.agent-form-row > span {
+  font-size: 11px;
+  color: var(--muted-foreground);
+}
+.agent-form-row > input {
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 4px 8px;
+  font-size: 12px;
+  color: var(--foreground);
+}
+.agent-form-row > input:focus {
+  outline: none;
+  border-color: var(--neuron-violet-400);
+}

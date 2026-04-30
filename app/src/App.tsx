@@ -8,6 +8,7 @@ import { Brandmark, NIcon, type IconName } from './components/icons';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { useMe } from './hooks/useMe';
 import { useRuns } from './hooks/useRuns';
+import { useRunCreate } from './hooks/mutations';
 import { AgentsRoute } from './routes/AgentsRoute';
 import { RunsRoute } from './routes/RunsRoute';
 import { MCPRoute } from './routes/MCPRoute';
@@ -101,6 +102,7 @@ function Sidebar({ route, onNavigate, collapsed, onToggle }: SidebarProps): JSX.
 }
 
 function Topbar({ route }: { route: Route }): JSX.Element {
+  const runCreate = useRunCreate();
   return (
     <header className="topbar">
       <div className="topbar-l">
@@ -118,10 +120,21 @@ function Topbar({ route }: { route: Route }): JSX.Element {
       </div>
 
       <div className="topbar-r">
-        <button className="btn primary">
-          <NIcon name="plus" size={14} />
-          <span>New</span>
-        </button>
+        {route === 'canvas' ? (
+          <button
+            className="btn primary"
+            disabled={runCreate.isPending}
+            onClick={() => runCreate.mutate('daily-summary')}
+          >
+            <NIcon name="play" size={12} />
+            <span>{runCreate.isPending ? 'Starting…' : 'Run'}</span>
+          </button>
+        ) : (
+          <button className="btn primary">
+            <NIcon name="plus" size={14} />
+            <span>New</span>
+          </button>
+        )}
       </div>
     </header>
   );
