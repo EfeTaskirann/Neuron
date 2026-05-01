@@ -4,6 +4,12 @@
 import js from "@eslint/js";
 import globals from "globals";
 import tseslint from "typescript-eslint";
+// `react-hooks/exhaustive-deps` is referenced via
+// `eslint-disable-next-line` comments inside `routes/Terminal.tsx`
+// (WP-W2-08 phase E xterm wiring); without the plugin loaded those
+// comments resolve to "rule not found" errors and break the lint
+// gate. Loaded here so the existing disable directives validate.
+import reactHooks from "eslint-plugin-react-hooks";
 
 export default [
   {
@@ -24,6 +30,12 @@ export default [
   js.configs.recommended,
   ...tseslint.configs.recommended,
   {
+    plugins: {
+      "react-hooks": reactHooks,
+    },
+    rules: {
+      ...reactHooks.configs.recommended.rules,
+    },
     languageOptions: {
       ecmaVersion: 2022,
       sourceType: "module",

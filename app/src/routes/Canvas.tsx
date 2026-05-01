@@ -22,8 +22,12 @@ export function Canvas({ workflowId = 'daily-summary', onSelectNode }: CanvasPro
   const { data, isLoading, isError, error } = useWorkflow(workflowId);
   const [selected, setSelected] = useState<string | null>(null);
 
-  const nodes = data?.nodes ?? [];
-  const edges = data?.edges ?? [];
+  // Stabilize the `?? []` fallback through useMemo so the byId
+  // memo's dep stays referentially stable when `data` is undefined.
+  // Without this, `nodes` is a fresh array on every render and the
+  // `byId` useMemo never actually memoizes.
+  const nodes = useMemo(() => data?.nodes ?? [], [data?.nodes]);
+  const edges = useMemo(() => data?.edges ?? [], [data?.edges]);
   const byId = useMemo(
     () => Object.fromEntries(nodes.map((n) => [n.id, n])),
     [nodes],

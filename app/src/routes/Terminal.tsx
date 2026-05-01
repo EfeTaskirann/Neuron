@@ -322,6 +322,11 @@ function PaneBody({ pane }: { pane: Pane }): JSX.Element {
   // changes, not on every render.
   useEffect(() => {
     if (!containerRef.current) return;
+    // Copy the ref's current Set into a local so the cleanup uses the
+    // exact instance captured at mount time (per react-hooks rule). For
+    // a `useRef<Set>` whose .current never reassigns this is equivalent,
+    // but the lint rule is right to flag the pattern in general.
+    const writtenSeqs = writtenSeqsRef.current;
     const term = new XTerm({
       fontFamily: 'var(--font-mono), Menlo, Consolas, monospace',
       fontSize: 12,
@@ -351,7 +356,7 @@ function PaneBody({ pane }: { pane: Pane }): JSX.Element {
       term.dispose();
       xtermRef.current = null;
       fitRef.current = null;
-      writtenSeqsRef.current.clear();
+      writtenSeqs.clear();
       seenSnapshotLenRef.current = 0;
     };
     // pane.id is the only useful dep — write/resize mutations are
