@@ -4,6 +4,37 @@ Running journal of agent-driven changes. Newest entry on top. See `AGENTS.md` §
 
 ---
 
+## 2026-05-02T01:05Z WP-W3-06 completed
+
+- sub-agent: general-purpose
+- files changed: 12 (7 new, 5 modified)
+  - new: `src-tauri/src/telemetry/{mod.rs, sampling.rs, otlp.rs, exporter.rs, tests.rs}`, `src-tauri/src/telemetry/tests/fixtures/expected.json`, `src-tauri/migrations/0005_span_export.sql`
+  - modified: `src-tauri/Cargo.toml` (+`rand 0.8`, `sha2 0.10`, `reqwest =0.12.23` rustls-tls, `mockito 1` dev), `Cargo.lock`, `src-tauri/src/lib.rs` (`mod telemetry;` + setup hook), `src-tauri/src/sidecar/agent.rs` (`insert_span` writes `sampled_in`), `src-tauri/src/db.rs` (migration count 4 → 5)
+- commit SHA: `33e0403`
+- acceptance: ✅ pass — orchestrator independently re-ran every gate
+  - `cargo check` → exit 0
+  - `cargo test --lib` → exit 0, **153 passed, 0 failed, 4 ignored** (135 prior + 18 new)
+  - `pnpm gen:bindings:check` → exit 0 (zero diff — no Tauri command added in this WP)
+  - `pnpm typecheck`, `pnpm test --run` (17/17), `pnpm lint` → all exit 0
+- key implementation choices
+  - **No `opentelemetry` SDK dep**: hand-crafted OTLP/JSON v1.3 envelope per WP §3. SDK adoption deferred (the wire format is small and stable; SDK pulls a much larger dep tree).
+  - **Deterministic trace/span IDs**: `sha256(run_id)[..16]` and `sha256(span_id)[..8]` hex. Re-exports of the same row produce identical IDs so collectors dedupe by `(traceId, spanId)`. Hash choice locked in a `const`.
+  - **4xx sentinel `-1`**: malformed batches flagged with `exported_at = -1` so they cannot block the queue forever. Partial index `WHERE exported_at IS NULL` naturally skips the sentinel.
+  - **`reqwest` rustls-tls only**: keeps OpenSSL off the dep tree, relevant for upcoming WP-W3-10 self-contained bundle. Pinned `=0.12.23` exact.
+  - **Per-span sampling**: simpler than per-run; per-run sampling deferred (would require tracking decision keyed by `run_id` for the lifetime of the run — sidecar-protocol work).
+  - **`gen_ai.prompt` / `gen_ai.completion` truncation @ 1 KiB**: collectors reject oversized attribute strings; truncation prevents whole-batch loss.
+  - **`mockito` over `wiremock`**: chosen by sub-agent for simpler async test setup. Each test uses `Server::new_async().await` for parallel-safe isolation.
+  - **No new `AppError` variant**: transport errors wrap as `AppError::Internal("OTLP transport: ...")`; HTTP-status errors are Ok-path with `tracing::warn!`. Reuses existing surface.
+- bindings regenerated: no (zero diff intended — no Tauri command added)
+- branch: `main` (local; not pushed)
+- known caveats / followups
+  - Endpoint + ratio sourced from env vars in this WP. A small follow-up commit (≤30 lines) wires `settings:get('otel.endpoint')` / `settings:get('otel.sampling.ratio')` into `crate::telemetry` once we want runtime configurability via the Settings UI.
+  - In-flight spans (`duration_ms IS NULL`) are NOT exported. WP-W3-04's cancel propagation will need to mark cancelled spans with a `duration_ms` so they can be exported with `status.code = ERROR`.
+  - Trim sweep ("delete spans older than N days") is a separate concern, not in this WP.
+- next: WP-W3-02 (MCP session pool + cancel safety) or WP-W3-04 (agent runtime cancel + streaming) — both depend only on WP-W3-01 which is done. Author whichever the owner prefers next.
+
+---
+
 ## 2026-05-02T00:45Z WP-W3-01 completed (Week 3 kickoff)
 
 - sub-agent: general-purpose
