@@ -219,22 +219,32 @@ fn resolve_app_data_dir<R: Runtime>(app: &AppHandle<R>) -> Result<String, AppErr
     Ok(dir.to_string_lossy().into_owned())
 }
 
-/// Resolve any environment variables a manifest declares. Week 2
-/// plumbs these from the OS environment (`std::env::var`); Week 3 will
-/// route through the OS keychain per Charter §"Hard constraints" #2.
-/// A missing required secret surfaces as
-/// [`AppError::NoApiKey`] so the frontend can render the "Configure
-/// API keys" CTA the same way it does for provider tokens.
+/// Resolve any environment variables a manifest declares.
+///
+/// WP-W3-01 routed this through `crate::secrets::get_secret`, which
+/// honors the documented resolution order (env override
+/// `NEURON_<KEY>` for tests/dev → OS keychain). The historical
+/// `requires_secret: "GITHUB_PERSONAL_ACCESS_TOKEN"` flow keeps
+/// working from a developer's shell (the env-override branch
+/// covers it) while production reads now go through the platform
+/// credential store per Charter §"Hard constraints" #2.
+///
+/// A missing required secret still surfaces as [`AppError::NoApiKey`]
+/// so the frontend can render the "Configure API keys" CTA the
+/// same way it does for provider tokens. An empty keychain value
+/// is treated as missing, matching the historical
+/// `Ok(v) if !v.is_empty()` guard the env-override branch carried
+/// forward.
 fn resolve_env(manifest: &ServerManifest) -> Result<HashMap<String, String>, AppError> {
     let mut env = HashMap::new();
     if let Some(secret_key) = manifest.requires_secret.as_deref() {
-        match std::env::var(secret_key) {
-            Ok(v) if !v.is_empty() => {
+        match crate::secrets::get_secret(secret_key)? {
+            Some(v) if !v.is_empty() => {
                 env.insert(secret_key.to_string(), v);
             }
             _ => {
                 return Err(AppError::NoApiKey(format!(
-                    "{} (env var {secret_key} not set)",
+                    "{} (secret {secret_key} not configured)",
                     manifest.id
                 )))
             }

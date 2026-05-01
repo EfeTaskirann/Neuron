@@ -29,6 +29,7 @@ pub mod error;
 pub mod events;
 pub mod mcp;
 pub mod models;
+pub mod secrets;
 pub mod sidecar;
 pub mod time;
 pub mod tuning;
@@ -92,6 +93,15 @@ pub fn specta_builder_for_export() -> tauri_specta::Builder<tauri::Wry> {
             // mailbox
             commands::mailbox::mailbox_list,
             commands::mailbox::mailbox_emit::<tauri::Wry>,
+            // secrets
+            commands::secrets::secrets_set,
+            commands::secrets::secrets_has,
+            commands::secrets::secrets_delete,
+            // settings
+            commands::settings::settings_get,
+            commands::settings::settings_set,
+            commands::settings::settings_delete,
+            commands::settings::settings_list,
         ])
         // Register the AppError once on the builder so the type lands
         // in `bindings.ts` as a referenceable shape rather than being

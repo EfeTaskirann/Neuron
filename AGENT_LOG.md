@@ -4,6 +4,37 @@ Running journal of agent-driven changes. Newest entry on top. See `AGENTS.md` §
 
 ---
 
+## 2026-05-02T00:45Z WP-W3-01 completed (Week 3 kickoff)
+
+- sub-agent: general-purpose
+- files changed: 12 (4 new, 8 modified)
+  - new: `src-tauri/src/secrets.rs`, `src-tauri/src/commands/secrets.rs`, `src-tauri/src/commands/settings.rs`, `src-tauri/migrations/0004_settings.sql`
+  - modified: `src-tauri/Cargo.toml` + `Cargo.lock` (`keyring = "=3.6.3"` per-target deps), `src-tauri/src/lib.rs` (mod + 7 commands), `src-tauri/src/commands/{mod.rs, me.rs}`, `src-tauri/src/db.rs` (test rename + count bump 11→12, migration count 3→4), `src-tauri/src/mcp/registry.rs` (`resolve_env` → `crate::secrets::get_secret`), `app/src/lib/bindings.ts` (regen +28)
+- commit SHAs:
+  - `621b02c` `chore(lint): wire react-hooks plugin and fix surfaced warnings` — pre-W3-01 lint gate fix (52575ca's eslint-disable directives referenced an unloaded plugin; this commit also fixes two genuine warnings the rule then surfaced in `Canvas.tsx` and `Terminal.tsx` cleanup ref capture)
+  - `<W3-01 commit SHA>` `feat: WP-W3-01 keychain + settings table` — the WP itself
+- acceptance: ✅ pass — orchestrator independently re-ran every gate after sub-agent return
+  - `cargo check` → exit 0
+  - `cargo test --lib` → exit 0, **135 passed, 0 failed, 4 ignored** (110 prior + 25 new = +25)
+  - `pnpm gen:bindings` → 7 new commands (`secretsSet/Has/Delete`, `settingsGet/Set/Delete/List`); `secretsGet` deliberately absent
+  - `pnpm typecheck`, `pnpm test --run` (17/17), `pnpm lint` → all exit 0 (lint pass requires `621b02c` first)
+- key implementation choices
+  - **`secrets:get` is NOT a command**: per WP-W3-01 §3 design decision, secret values never cross the IPC boundary. Only `secrets:has` (boolean presence) is exposed. Consumers (`mcp:install`, `runs:create`) read directly via `crate::secrets::get_secret`.
+  - **Service name parity with Python**: Rust `keyring::Entry::new("neuron", key)` matches `agent_runtime/secrets.py:SERVICE = "neuron"`. One `secrets:set('anthropic', ...)` write is readable by both Rust MCP runtime and Python agent runtime.
+  - **`keyring` per-target deps**: 3.x requires opt-in to a backend feature. Three `[target.'cfg(...)'.dependencies]` blocks (Windows / macOS / Linux) so each platform pulls only its native backend. Pinned to `=3.6.3`.
+  - **Generic API**: per the 2026-05-01 owner decision, no Rust enum or const list of provider names. The `crate::secrets::*` API is generic over `key: &str` so future providers (`gemini`/`groq`/`together`) land as Settings-UI dropdown changes, not API changes.
+  - **Settings table is `WITHOUT ROWID`** — small key/value table; saves a btree level on lookup.
+  - **Dot-namespaced keys**: `user.name`, `workspace.name`, future `otel.endpoint`, `theme.mode`. The namespace becomes a fixed enum once W3-09 narrows capabilities; for now the column is plain TEXT.
+- bindings regenerated: yes (+28 lines, 7 new commands)
+- branch: `main` (local; not pushed; 2 new commits on top of `a8866de`)
+- known caveats / followups
+  - Tauri capability for `secrets:*` and `settings:*` rides on tauri-specta's invoke handler; no `capabilities/default.json` change in this WP. Explicit allowlist enumeration is W3-09.
+  - `settings:list` returns specta-tuple wire shape `[string, string][]`. If the W3-09 Settings UI prefers `{key, value}[]`, that's a one-line model refactor.
+  - W3-06 (telemetry export, parallel-authored in `a8866de`) is unblocked and ready for sub-agent dispatch.
+- next: WP-W3-06 (telemetry export — OTLP/JSON sweep + insert-time sampling)
+
+---
+
 ## 2026-04-30T18:32:54Z WP-W2-08 prep + 4-agent followup completed
 - sub-agents: B (mcp catalog), C (me:get), A (panes domain), D (operasyonel hygiene) — dispatched in 4 parallel terminals per `tasks/agent-briefs-2026-04-29.md`
 - commits: `7596386` (pre-package), `52b270f` (4-agent package), `e1a813c` (bindings regen)

@@ -109,6 +109,34 @@ export const commands = {
 	 *  `mailbox.new` Tauri event with that entry as payload (ADR-0006).
 	 */
 	mailboxEmit: (entry: MailboxEntryInput) => typedError<MailboxEntry, AppErrorWire>(__TAURI_INVOKE("mailbox_emit", { entry })),
+	/**
+	 *  Write a secret to the OS keychain. Empty `value` is rejected so
+	 *  the keychain never holds a sentinel "" that `has_secret` would
+	 *  then have to second-guess.
+	 */
+	secretsSet: (key: string, value: string) => typedError<null, AppErrorWire>(__TAURI_INVOKE("secrets_set", { key, value })),
+	/**
+	 *  Cheap presence probe. Honors the env-override path so
+	 *  `NEURON_<KEY>=…` exported into a developer's shell counts as
+	 *  "configured" without writing to the keychain first.
+	 */
+	secretsHas: (key: string) => typedError<boolean, AppErrorWire>(__TAURI_INVOKE("secrets_has", { key })),
+	/**
+	 *  Delete the keychain entry. Idempotent — a missing entry is not
+	 *  an error so the frontend's "Forget API key" CTA can be wired
+	 *  without a guard.
+	 */
+	secretsDelete: (key: string) => typedError<null, AppErrorWire>(__TAURI_INVOKE("secrets_delete", { key })),
+	settingsGet: (key: string) => typedError<string | null, AppErrorWire>(__TAURI_INVOKE("settings_get", { key })),
+	settingsSet: (key: string, value: string) => typedError<null, AppErrorWire>(__TAURI_INVOKE("settings_set", { key, value })),
+	settingsDelete: (key: string) => typedError<null, AppErrorWire>(__TAURI_INVOKE("settings_delete", { key })),
+	/**
+	 *  Return every setting as `(key, value)` pairs sorted by key.
+	 *  Used by the W3-08 Settings route's "Advanced" panel; the
+	 *  updated_at column is intentionally omitted from the wire shape
+	 *  to keep the typegen surface trivial.
+	 */
+	settingsList: () => typedError<([string, string])[], AppErrorWire>(__TAURI_INVOKE("settings_list")),
 };
 
 /* Types */

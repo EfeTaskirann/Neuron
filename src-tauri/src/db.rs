@@ -255,9 +255,12 @@ mod tests {
         (pool, dir)
     }
 
-    /// Acceptance: all 11 schema tables exist after migration.
+    /// Acceptance: all expected schema tables exist after migration.
+    /// The list grows as migrations land — keep `expected` sorted
+    /// alphabetically and update both arms (the array + length
+    /// assertion) when adding a new file under `migrations/`.
     #[tokio::test]
-    async fn migration_creates_all_eleven_tables() {
+    async fn migration_creates_all_expected_tables() {
         let (pool, _dir) = fresh_pool().await;
         let names: Vec<String> = sqlx::query_scalar(
             "SELECT name FROM sqlite_master \
@@ -279,6 +282,7 @@ mod tests {
             "runs_spans",
             "server_tools",
             "servers",
+            "settings",
             "workflows",
         ];
         assert_eq!(
@@ -287,7 +291,7 @@ mod tests {
             "schema tables drift — re-run `cargo sqlx prepare` after \
              updating migrations and update this test"
         );
-        assert_eq!(names.len(), 11);
+        assert_eq!(names.len(), 12);
     }
 
     /// Acceptance: every connection the pool hands out enforces FKs.
@@ -345,8 +349,8 @@ mod tests {
         // Migration count grows as the schema evolves. Update this
         // when adding a new file under `migrations/`.
         assert_eq!(
-            count, 3,
-            "three migrations recorded (0001 + 0002 + 0003)"
+            count, 4,
+            "four migrations recorded (0001 + 0002 + 0003 + 0004)"
         );
     }
 

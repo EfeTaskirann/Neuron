@@ -92,6 +92,28 @@ regex = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# WP-W3-01 — OS keychain backend for the `crate::secrets` module.
+# Pinned to an exact 3.x patch (latest 3.x at authoring time) per
+# Charter risk register ("pin minor versions for stability"). The
+# 3.x line splits backend support into per-OS feature flags so the
+# library is unusable without selecting one — we therefore declare
+# the dep in three separate `target.'cfg(...)'.dependencies` blocks
+# rather than the top-level `[dependencies]`, so each platform
+# pulls only its native backend (no DBus on Windows, no
+# windows-sys on macOS). Service name `"neuron"` (used inside
+# `crate::secrets`) is shared with the Python sidecar
+# (`agent_runtime/secrets.py`) so a key written via
+# `secrets:set('anthropic', ...)` from Rust round-trips to Python.
+
+[target.'cfg(windows)'.dependencies]
+keyring = { version = "=3.6.3", features = ["windows-native"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "=3.6.3", features = ["apple-native"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "=3.6.3", features = ["linux-native", "sync-secret-service"] }
+
 [dev-dependencies]
 # Tests build a throwaway DB on disk and need a unique tempdir per test.
 tempfile = "3"
