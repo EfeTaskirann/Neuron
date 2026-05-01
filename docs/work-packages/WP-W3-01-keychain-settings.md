@@ -236,6 +236,11 @@ guard) AFTER regenerating once.
 - [ ] All Week-2 tests still pass (regression: 110 + new tests)
 - [ ] No `eprintln!` introduced (use `tracing::*` per WP-W2-04)
 - [ ] No new `unsafe` block
+- [ ] Provider key smoke covers `anthropic` and `openai` only
+      (WP-W3-overview.md owner decision 2026-05-01); NO Rust enum
+      or const list of provider names — the API stays generic so
+      a future WP can add `gemini`/`groq`/`together` by editing
+      the Settings UI dropdown only
 
 ## Verification commands
 

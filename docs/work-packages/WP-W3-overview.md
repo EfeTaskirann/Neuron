@@ -47,7 +47,7 @@ matching WP file is authored.
 | WP-W3-06 | Telemetry export (OTel collector + sampling) | TBD | not-started | — | M |
 | WP-W3-07 | Pane aggregates from spans | TBD | not-started | WP-W3-06 | S |
 | WP-W3-08 | Multi-workflow editor + fixture system | TBD | not-started | — | L |
-| WP-W3-09 | Capabilities tightening + E2E (Playwright) | TBD | not-started | 02,03,04,06,08 | S |
+| WP-W3-09 | Capabilities tightening + E2E (Playwright) | TBD | not-started | 02,03,04,06,08 | M |
 | WP-W3-10 | PyOxidizer Python embed | TBD | not-started | WP-W3-04 | L |
 
 Sizes (rough, in sub-agent days): S = 0.5–1 day, M = 1–2 days,
@@ -209,20 +209,40 @@ command surface is final":
   this to the actual command list, plus per-window restrictions if
   multi-window lands.
 - **E2E**: WP-W2-01 deferred Tauri-window automation (Playwright +
-  WebDriver) to Week 3. W3-09 adds a smoke E2E that exercises the
-  manual smoke list in WP-W2-08:Verification.
+  WebDriver) to Week 3. W3-09 adds **full automation** of the
+  WP-W2-08 §"Verification" manual smoke list (all 10 items), per
+  the 2026-05-01 owner decision. The "no human runs the smoke
+  list ever again" payoff sizes this WP at M; full smoke covers
+  every route's golden path so regressions surface before merge,
+  not in production.
 
 **Source**: refactor-v1.md E1 + WP-W2-01 §"Out of scope".
 
-### WP-W3-10 — PyOxidizer Python embed
+### WP-W3-10 — Python embed (python-build-standalone)
 
 Charter Risks table line 1: "Week 2 requires system Python 3.11+;
-PyOxidizer in Week 3". W3-10 swaps `Command::new("python")` for an
-embedded interpreter so the desktop bundle is self-contained. This
-is parallelizable with the rest of Week 3 because it doesn't change
-the protocol — only how the Python child is started.
+embed in Week 3". W3-10 swaps `Command::new("python")` for a
+bundled interpreter so the desktop installer is self-contained.
 
-**Source**: Charter Risks.
+Per the 2026-05-01 orchestrator decision, the primary plan is
+`python-build-standalone` (the prebuilt CPython tarballs Astral
+ships and uv consumes), NOT PyOxidizer. The build flow:
+
+1. `tauri-build` downloads the matching standalone tarball for
+   each target triple at bundle time.
+2. The Python tree lands under `<bundle>/python/` next to the
+   Neuron binary.
+3. `sidecar::agent::resolve_python` gains a fourth resolution
+   step (after the existing env override / venv / PATH chain):
+   the bundled standalone interpreter at the platform-conventional
+   relative path. Bundled wins over PATH so a system Python
+   mismatch can't break the agent runtime.
+
+This is parallelizable with the rest of Week 3 because it doesn't
+change the protocol — only how the Python child is started.
+
+**Source**: Charter Risks (updated by this commit to allow
+either embed strategy).
 
 ## Authoring sequence
 
@@ -248,21 +268,55 @@ re-litigate:
 - ❌ Husky / pre-commit hook tooling (refactor-v1.md E2 — needs
   its own ADR before it lands)
 
-## Open questions (need owner answer before kickoff)
+## Owner decisions (resolved)
 
-1. **Provider list for W3-01 keychain**: just `anthropic` + `openai`
-   per the existing Python sidecar, or also `gemini` /
-   `groq` / `together` so the agent runtime can swap providers
-   without a re-keying step?
-2. **W3-08 scope on canvas editing**: edge-add and node-add only,
-   or full undo/redo + multi-select? Affects size estimate (M vs L+).
-3. **W3-09 E2E coverage breadth**: smoke (one happy path per
-   route) or full WP-W2-08 §10 manual smoke list automated? The
-   second roughly doubles the WP size.
-4. **W3-10 PyOxidizer vs alternatives**: PyOxidizer's
-   maintenance status has been wobbly. Is `python-build-standalone`
-   (used by uv) acceptable as a fallback? Cheaper; loses true
-   single-binary embed.
+Recorded here so per-WP authors don't re-litigate. Date noted on
+each because Week 3 scope is allowed to evolve as we learn —
+re-opening any of these is a scope amendment that lands in
+`AGENT_LOG.md`.
 
-These four answers gate the per-WP authoring; the orchestrator
-will stop and ask before writing the affected WP file.
+1. **Provider list for W3-01 keychain** (resolved 2026-05-01):
+   Ship with `anthropic` + `openai` only. Additional providers
+   (`gemini`, `groq`, `together`, …) handled by a future
+   follow-up WP that just adds rows in the Settings UI dropdown
+   — the `crate::secrets` API is generic over `key: &str` so no
+   API change is needed when expanding. Document the two-provider
+   default in the WP-W3-01 acceptance test list.
+
+2. **W3-09 E2E coverage** (resolved 2026-05-01):
+   Full automation. Every line in WP-W2-08 §"Verification"
+   manual-smoke list (10 items) runs as a Playwright + Tauri
+   WebDriver test. **Size estimate: S → M** (table updated). The
+   doubled cost buys "no human runs the smoke list ever again",
+   which is the right trade for a desktop app shipping monthly.
+
+3. **W3-10 Python embed strategy** (resolved 2026-05-01,
+   orchestrator's call):
+   `python-build-standalone` (the runtime uv ships) is the
+   primary plan, **not PyOxidizer**. Rationale:
+   - PyOxidizer's last release was 2024-02; maintenance has
+     visibly slowed. Betting Week-3 work on it is a trailing-
+     edge dependency choice.
+   - `python-build-standalone` is actively maintained by Astral
+     (uv's owner); we already use uv for the agent_runtime venv
+     so the build tooling is in place.
+   - Trade-off: bundle size is 50–80 MB larger than a true
+     PyOxidizer embed. Given Tauri's ~10 MB baseline this still
+     keeps Neuron well under the Electron-equivalent footprint
+     (~150 MB+). Acceptable.
+
+   The W3-10 WP file (when authored) will revisit if Astral
+   ships a smaller variant by then. Charter Risks table line
+   1 is updated in this commit to read "PyOxidizer or
+   `python-build-standalone` in Week 3" — no decision lock-in.
+
+## Open questions (still gating)
+
+4. **W3-08 scope on canvas editing**: single-node add / edit /
+   delete / rename + run only (M-sized), or also multi-select
+   (shift-click, marquee, Ctrl+A) and undo/redo (L+)? Multi-select
+   pays off once user workflows exceed ~10 nodes. Owner deferred
+   the call until W3-08 authoring is closer.
+
+The remaining question gates per-WP authoring for W3-08 only.
+The orchestrator can ship W3-01 → W3-07 and W3-09/10 without it.

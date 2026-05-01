@@ -52,7 +52,7 @@ in [`WP-W3-overview.md`](./WP-W3-overview.md).
 | WP-W3-06 | Telemetry export (OTel collector + sampling) | not-started | — | M |
 | WP-W3-07 | Pane aggregates from spans | not-started | WP-W3-06 | S |
 | WP-W3-08 | Multi-workflow editor + fixture system | not-started | — | L |
-| WP-W3-09 | Capabilities tightening + E2E (Playwright) | not-started | 02,03,04,06,08 | S |
+| WP-W3-09 | Capabilities tightening + E2E (Playwright) | not-started | 02,03,04,06,08 | M |
 | WP-W3-10 | PyOxidizer Python embed | not-started | WP-W3-04 | L |
 
 ### Dependency graph

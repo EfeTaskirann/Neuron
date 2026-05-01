@@ -93,7 +93,7 @@ The brand metaphor is *neurons*: nodes-and-synapses, soft glow feedback, signal 
 
 | Risk | Impact | Mitigation |
 |---|---|---|
-| LangGraph Python sidecar packaging | High — desktop bundle bloat | Week 2 requires system Python 3.11+; PyOxidizer in Week 3 |
+| LangGraph Python sidecar packaging | High — desktop bundle bloat | Week 2 requires system Python 3.11+; embed (python-build-standalone or PyOxidizer) in Week 3 — see WP-W3-overview |
 | portable-pty Windows quirks | Medium — terminal regressions | Pin crate version, test in CI matrix later |
 | Frontend mock drift during migration | High — breaks UI | Strict shape parity test in WP-W2-08 acceptance |
 | SQLite schema migration reverse-incompatibility | Medium | Test up + down for every migration |
