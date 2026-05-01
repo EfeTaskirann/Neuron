@@ -1,0 +1,49 @@
+{
+  "resourceSpans": [
+    {
+      "resource": {
+        "attributes": [
+          {
+            "key": "service.name",
+            "value": { "stringValue": "neuron" }
+          }
+        ]
+      },
+      "scopeSpans": [
+        {
+          "scope": { "name": "neuron-agent-runtime" },
+          "spans": [
+            {
+              "traceId": "99ea096ae86ac121d25e036eba0b2a76",
+              "spanId": "6a840baf5d8c3ff2",
+              "name": "planner",
+              "kind": 1,
+              "startTimeUnixNano": "1000000000",
+              "endTimeUnixNano": "51000000000",
+              "attributes": [
+                { "key": "node", "value": { "stringValue": "planner" } },
+                { "key": "tokens_in", "value": { "intValue": "120" } },
+                { "key": "gen_ai.prompt", "value": { "stringValue": "Plan the day." } },
+                { "key": "gen_ai.completion", "value": { "stringValue": "1) coffee 2) ship" } }
+              ],
+              "status": { "code": 1 }
+            },
+            {
+              "traceId": "99ea096ae86ac121d25e036eba0b2a76",
+              "spanId": "450222bcc3475b01",
+              "parentSpanId": "6a840baf5d8c3ff2",
+              "name": "tool.fetch",
+              "kind": 1,
+              "startTimeUnixNano": "60000000000",
+              "endTimeUnixNano": "85000000000",
+              "attributes": [
+                { "key": "error", "value": { "stringValue": "boom" } }
+              ],
+              "status": { "code": 2 }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

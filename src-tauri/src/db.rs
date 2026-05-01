@@ -349,8 +349,8 @@ mod tests {
         // Migration count grows as the schema evolves. Update this
         // when adding a new file under `migrations/`.
         assert_eq!(
-            count, 4,
-            "four migrations recorded (0001 + 0002 + 0003 + 0004)"
+            count, 5,
+            "five migrations recorded (0001 + 0002 + 0003 + 0004 + 0005)"
         );
     }
 

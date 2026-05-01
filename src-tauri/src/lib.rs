@@ -31,6 +31,7 @@ pub mod mcp;
 pub mod models;
 pub mod secrets;
 pub mod sidecar;
+pub mod telemetry;
 pub mod time;
 pub mod tuning;
 
@@ -169,6 +170,28 @@ pub fn run() {
             // below tears them all down on app exit so no shell
             // processes outlive the app on next launch.
             app.manage(sidecar::terminal::TerminalRegistry::new());
+
+            // WP-W3-06 — start the OTLP export sweep iff the
+            // collector endpoint is configured. The loop is silent
+            // (no panic / warn) when the env var is unset; users who
+            // don't wire a collector get the same behaviour as
+            // before this WP landed.
+            if let Ok(endpoint) = std::env::var("NEURON_OTEL_ENDPOINT") {
+                let endpoint = endpoint.trim().to_string();
+                if !endpoint.is_empty() {
+                    let pool_for_export = app
+                        .state::<db::DbPool>()
+                        .inner()
+                        .clone();
+                    tauri::async_runtime::spawn(async move {
+                        crate::telemetry::start_export_loop(
+                            pool_for_export,
+                            endpoint,
+                        )
+                        .await;
+                    });
+                }
+            }
 
             Ok(())
         })

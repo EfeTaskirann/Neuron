@@ -432,10 +432,20 @@ async fn handle_event<R: Runtime>(
 
 async fn insert_span(pool: &DbPool, span: &WireSpan) -> Result<(), AppError> {
     let is_running = if span.is_running { 1_i64 } else { 0_i64 };
+    // WP-W3-06: sampling decision is per-span and made at insert
+    // time, not at export time, so the export sweep can rely on a
+    // simple `WHERE sampled_in = 1` filter and the partial index
+    // `idx_runs_spans_export_pending` does its job. The default is
+    // 1 (always include) when `NEURON_OTEL_SAMPLING_RATIO` is unset.
+    let sampled_in = if crate::telemetry::sampling::sampled_in() {
+        1_i64
+    } else {
+        0_i64
+    };
     sqlx::query(
         "INSERT INTO runs_spans \
-         (id, run_id, parent_span_id, name, type, t0_ms, duration_ms, attrs_json, prompt, response, is_running) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         (id, run_id, parent_span_id, name, type, t0_ms, duration_ms, attrs_json, prompt, response, is_running, sampled_in) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&span.id)
     .bind(&span.run_id)
@@ -448,6 +458,7 @@ async fn insert_span(pool: &DbPool, span: &WireSpan) -> Result<(), AppError> {
     .bind(span.prompt.as_deref())
     .bind(span.response.as_deref())
     .bind(is_running)
+    .bind(sampled_in)
     .execute(pool)
     .await?;
     Ok(())

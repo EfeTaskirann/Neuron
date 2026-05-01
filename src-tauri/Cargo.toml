@@ -92,6 +92,24 @@ regex = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# WP-W3-06 — OTel span export. `rand` drives the per-span sampling
+# decision in `crate::telemetry::sampling`; we use the 0.8 line
+# because that's the latest minor with the `random()` free function
+# the sampling helper relies on. `sha2` produces deterministic
+# trace/span ids from `run_id`/`span_id` (truncated SHA-256 → hex)
+# so the same row hashed twice always yields the same OTLP id, and
+# the collector can correlate retries.
+rand = "0.8"
+sha2 = "0.10"
+# WP-W3-06 — OTLP/HTTP transport. Pinned to the 0.12 minor per WP
+# spec ("Pin `0.12.x` exact"). `default-features = false` strips
+# native-tls and the system-proxy probe; `rustls-tls` keeps OpenSSL
+# off the dep tree (Charter risk register: "no system OpenSSL on
+# Windows installers"). `json` enables the `.json(...)` helper
+# used by `crate::telemetry::exporter` so we don't hand-encode the
+# Content-Type header.
+reqwest = { version = "=0.12.23", default-features = false, features = ["json", "rustls-tls"] }
+
 # WP-W3-01 — OS keychain backend for the `crate::secrets` module.
 # Pinned to an exact 3.x patch (latest 3.x at authoring time) per
 # Charter risk register ("pin minor versions for stability"). The
@@ -124,3 +142,10 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
 # `mailbox:emit` actually fires a `mailbox.new` event payload.
 # `test` feature gates `tauri::test::*`.
 tauri = { version = "2.1", features = ["test"] }
+# WP-W3-06 — stub HTTP server for `crate::telemetry::exporter`
+# tests. Picked over `wiremock` because the API is a bit simpler
+# (single `Server::new_async()` per test, no async setup gymnastics)
+# and the dep tree is smaller. `Server::new_async` returns a
+# pinned-to-this-test mock so parallel tests do not collide on a
+# global registry.
+mockito = "1"
