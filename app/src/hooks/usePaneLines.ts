@@ -29,7 +29,12 @@ export function usePaneLines(paneId: string | null | undefined) {
     listen<PaneLine>(channel, (event) => {
       const incoming = event.payload;
       qc.setQueryData<PaneLine[]>(['panes', paneId, 'lines'], (prev = []) => {
-        if (prev.some((l) => l.seq === incoming.seq)) return prev;
+        // Backend is the single writer per pane; `seq` is monotonic
+        // ascending. A tail check rejects duplicates AND late arrivals
+        // in O(1), avoiding the O(n²) cost of a full `.some()` scan
+        // when scrollback grows into the thousands.
+        const last = prev[prev.length - 1];
+        if (last && incoming.seq <= last.seq) return prev;
         return [...prev, incoming];
       });
     })

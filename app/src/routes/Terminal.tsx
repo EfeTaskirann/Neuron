@@ -306,7 +306,13 @@ function PaneBody({ pane }: { pane: Pane }): JSX.Element {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const xtermRef = useRef<XTerm | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
+  // `writtenSeqsRef` guards against the snapshot/live race (a live
+  // event may arrive before the snapshot resolves). `seenSnapshotLenRef`
+  // is the high-water mark into the cached snapshot array — it keeps
+  // the snapshot effect from re-iterating the entire scrollback on
+  // every new line event (was O(n) per event, now O(new tail)).
   const writtenSeqsRef = useRef<Set<number>>(new Set());
+  const seenSnapshotLenRef = useRef(0);
   const { data: snapshot } = usePaneLines(pane.id);
   const writeMut = useTerminalWrite();
   const resizeMut = useTerminalResize();
@@ -346,6 +352,7 @@ function PaneBody({ pane }: { pane: Pane }): JSX.Element {
       xtermRef.current = null;
       fitRef.current = null;
       writtenSeqsRef.current.clear();
+      seenSnapshotLenRef.current = 0;
     };
     // pane.id is the only useful dep — write/resize mutations are
     // stable refs from TanStack Query.
@@ -353,9 +360,15 @@ function PaneBody({ pane }: { pane: Pane }): JSX.Element {
   }, [pane.id]);
 
   // Resize observer: refit xterm when the container size changes,
-  // then propagate the new cols/rows to the PTY.
+  // then propagate the new cols/rows to the PTY. Window drags fire
+  // ResizeObserver every animation frame; `fit()` stays inline so
+  // the visual snaps immediately, but the IPC `terminal:resize` is
+  // trailing-debounced so the PTY only sees the final size.
   useEffect(() => {
     if (!containerRef.current) return;
+    let pendingTimer: ReturnType<typeof setTimeout> | null = null;
+    let lastCols = -1;
+    let lastRows = -1;
     const obs = new ResizeObserver(() => {
       const fit = fitRef.current;
       const term = xtermRef.current;
@@ -365,24 +378,48 @@ function PaneBody({ pane }: { pane: Pane }): JSX.Element {
       } catch {
         return;
       }
-      resizeMut.mutate({ paneId: pane.id, cols: term.cols, rows: term.rows });
+      // Skip the IPC entirely if the cell grid didn't actually change
+      // — happens often when the wrapper resizes by a sub-cell amount.
+      if (term.cols === lastCols && term.rows === lastRows) return;
+      lastCols = term.cols;
+      lastRows = term.rows;
+      if (pendingTimer != null) clearTimeout(pendingTimer);
+      pendingTimer = setTimeout(() => {
+        pendingTimer = null;
+        const t = xtermRef.current;
+        if (!t) return;
+        resizeMut.mutate({ paneId: pane.id, cols: t.cols, rows: t.rows });
+      }, 80);
     });
     obs.observe(containerRef.current);
-    return () => obs.disconnect();
+    return () => {
+      obs.disconnect();
+      if (pendingTimer != null) clearTimeout(pendingTimer);
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pane.id]);
 
-  // Write the snapshot scrollback once it arrives. Track which
-  // seqs we've already written so the live subscription below
-  // doesn't double-render anything that overlapped.
+  // Write the snapshot scrollback once it arrives, then incrementally
+  // append new tail entries pushed by `usePaneLines`'s cache update.
+  // The watermark avoids re-scanning the entire snapshot array (which
+  // could be tens of thousands of lines) on every line event — a hot
+  // path for any active terminal. `writtenSeqsRef` still gates the
+  // initial-write loop so a snapshot/live race can't double-render.
   useEffect(() => {
     const term = xtermRef.current;
     if (!term || !snapshot) return;
-    for (const line of snapshot) {
+    // Snapshot length shrank — cache was reset (refetch / pane swap);
+    // restart from index 0.
+    if (snapshot.length < seenSnapshotLenRef.current) {
+      seenSnapshotLenRef.current = 0;
+    }
+    for (let i = seenSnapshotLenRef.current; i < snapshot.length; i++) {
+      const line = snapshot[i]!;
       if (writtenSeqsRef.current.has(line.seq)) continue;
       writtenSeqsRef.current.add(line.seq);
       term.write(line.text + '\r\n');
     }
+    seenSnapshotLenRef.current = snapshot.length;
   }, [snapshot]);
 
   // Live subscription — write each event payload as a single line.
