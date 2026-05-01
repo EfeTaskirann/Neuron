@@ -12,7 +12,7 @@ Running journal of agent-driven changes. Newest entry on top. See `AGENTS.md` §
   - modified: `src-tauri/Cargo.toml` + `Cargo.lock` (`keyring = "=3.6.3"` per-target deps), `src-tauri/src/lib.rs` (mod + 7 commands), `src-tauri/src/commands/{mod.rs, me.rs}`, `src-tauri/src/db.rs` (test rename + count bump 11→12, migration count 3→4), `src-tauri/src/mcp/registry.rs` (`resolve_env` → `crate::secrets::get_secret`), `app/src/lib/bindings.ts` (regen +28)
 - commit SHAs:
   - `621b02c` `chore(lint): wire react-hooks plugin and fix surfaced warnings` — pre-W3-01 lint gate fix (52575ca's eslint-disable directives referenced an unloaded plugin; this commit also fixes two genuine warnings the rule then surfaced in `Canvas.tsx` and `Terminal.tsx` cleanup ref capture)
-  - `<W3-01 commit SHA>` `feat: WP-W3-01 keychain + settings table` — the WP itself
+  - `a351cd2` `feat: WP-W3-01 keychain (Rust) + settings table` — the WP itself
 - acceptance: ✅ pass — orchestrator independently re-ran every gate after sub-agent return
   - `cargo check` → exit 0
   - `cargo test --lib` → exit 0, **135 passed, 0 failed, 4 ignored** (110 prior + 25 new = +25)
