@@ -154,6 +154,17 @@ export const commands = {
 	 *  (no `ANTHROPIC_API_KEY` injected) per `binding::subscription_env`.
 	 */
 	swarmTestInvoke: (profileId: string, userMessage: string) => typedError<InvokeResult, AppErrorWire>(__TAURI_INVOKE("swarm_test_invoke", { profileId, userMessage })),
+	/**
+	 *  Drive a 3-stage swarm job to completion (WP-W3-12a §4).
+	 * 
+	 *  Walks `scout` → `planner` → `backend-builder` against the
+	 *  substrate from W3-11, returning the aggregated `JobOutcome`. The
+	 *  IPC blocks until the FSM finishes (Done / Failed). Two calls with
+	 *  the same `workspace_id` serialize — the second returns
+	 *  `AppError::WorkspaceBusy`. Two calls with different `workspace_id`s
+	 *  run in parallel.
+	 */
+	swarmRunJob: (workspaceId: string, goal: string) => typedError<JobOutcome, AppErrorWire>(__TAURI_INVOKE("swarm_run_job", { workspaceId, goal })),
 };
 
 /* Types */
@@ -269,6 +280,51 @@ export type InvokeResult = {
 	totalCostUsd: number,
 	turnCount: number,
 };
+
+/**
+ *  Final outcome returned by `swarm:run_job`. Mirrors `Job` minus
+ *  the lifecycle bookkeeping fields the IPC caller doesn't need
+ *  (no `state` mid-run, no `created_at_ms` since the wall-clock
+ *  data is encoded in `total_duration_ms`).
+ */
+export type JobOutcome = {
+	jobId: string,
+	// Always `Done` or `Failed` — the FSM never returns mid-state.
+	finalState: JobState,
+	stages: StageResult[],
+	// `Some` on `Failed`, `None` on `Done`.
+	lastError: string | null,
+	// Sum of `StageResult.total_cost_usd` across `stages`.
+	totalCostUsd: number,
+	// Sum of `StageResult.duration_ms` across `stages`.
+	totalDurationMs: number,
+};
+
+/**
+ *  Lifecycle states of a swarm job. Per WP §2:
+ * 
+ *  - `Init` — newly minted, before the first transition fires.
+ *  - `Scout` / `Plan` / `Build` — the three happy-path stages.
+ *  - `Review` / `Test` — reserved for W3-12d (reviewer +
+ *    integration-tester profiles); FSM never enters them in 12a.
+ *  - `Done` / `Failed` — terminal.
+ * 
+ *  `Hash` + `Eq` are derived so the FSM can build small lookup
+ *  tables keyed on the state if it ever needs to (W3-12d).
+ */
+export type JobState = "init" | "scout" | "plan" | "build" | 
+/**
+ *  Reserved for W3-12d. FSM never enters this state in W3-12a;
+ *  the next-state function asserts unreachable in debug builds.
+ */
+"review" | 
+// Reserved for W3-12d. Same as `Review`.
+"test" | "done" | 
+/**
+ *  Terminal failure state. Carries the last error in
+ *  `Job.last_error`.
+ */
+"failed";
 
 /**
  *  One row of `mailbox`. Wire keys `from`/`to` match the terminal-data
@@ -572,6 +628,47 @@ export type Span = {
 	 *  to stay required for frontend consumers.
 	 */
 	indent: number,
+};
+
+/**
+ *  Output of one completed FSM stage. Append-only — the FSM pushes
+ *  one entry per stage that produced a result (success path) and
+ *  stops on the first failure (which still records the failed
+ *  stage's name in `Job.last_error` but does NOT push a `StageResult`
+ *  for the failed stage in W3-12a — see `CoordinatorFsm::run_job`).
+ */
+export type StageResult = {
+	/**
+	 *  Which lifecycle stage produced this result. One of
+	 *  `Scout` / `Plan` / `Build` in 12a.
+	 */
+	state: JobState,
+	/**
+	 *  `Profile.id` of the specialist that ran the stage —
+	 *  `"scout"` / `"planner"` / `"backend-builder"`.
+	 */
+	specialistId: string,
+	/**
+	 *  The specialist's final assistant text (the `result` event's
+	 *  `result` field; running deltas already concatenated).
+	 */
+	assistantText: string,
+	/**
+	 *  Subprocess session id (`system.init` event). Useful for
+	 *  W3-12b's chat-history persistence.
+	 */
+	sessionId: string,
+	/**
+	 *  Cost reported by the `claude` `result.success` event. Sums
+	 *  into `JobOutcome.total_cost_usd`.
+	 */
+	totalCostUsd: number,
+	/**
+	 *  Wall-clock duration of this stage's invoke, measured around
+	 *  the `transport.invoke` await. Sums into
+	 *  `JobOutcome.total_duration_ms`.
+	 */
+	durationMs: number,
 };
 
 /**

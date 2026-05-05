@@ -27,6 +27,7 @@
 //! config, profile permission-mode enforcement) belong to W3-12+.
 
 pub mod binding;
+pub mod coordinator;
 pub mod profile;
 pub mod transport;
 
@@ -37,7 +38,11 @@ pub use binding::{
     build_specialist_args, resolve_claude_binary, subscription_env,
     ClaudeBinary,
 };
+pub use coordinator::{
+    CoordinatorFsm, Job, JobOutcome, JobRegistry, JobState, StageResult,
+    MAX_RETRIES,
+};
 pub use profile::{
     PermissionMode, Profile, ProfileRegistry, ProfileSource,
 };
-pub use transport::{InvokeResult, SubprocessTransport};
+pub use transport::{InvokeResult, SubprocessTransport, Transport};

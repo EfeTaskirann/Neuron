@@ -96,16 +96,61 @@ pub struct InvokeResult {
     pub turn_count: u32,
 }
 
+/// Abstraction over "spawn a one-shot specialist call and return its
+/// `result` event" so the FSM (WP-W3-12a) can drive the chain against
+/// either the real subprocess or a deterministic mock without
+/// `cargo build --tests` paying the cost of a `claude` round-trip.
+///
+/// Stable Rust's `async fn` in traits (1.75+) does not support
+/// `dyn Trait` without the third-party `async-trait` macro. To keep
+/// the dep tree pinned per Charter ("no new dep without
+/// justification"), the FSM is generic over `T: Transport`
+/// (`CoordinatorFsm<T>`) and the production IPC wiring picks
+/// `SubprocessTransport` at construction time. Tests substitute
+/// `MockTransport` (defined under `#[cfg(test)] mod mock_transport`
+/// further down) without touching the production code path.
+pub trait Transport: Send + Sync {
+    /// Spawn one specialist invoke and wait up to `timeout` for the
+    /// `result` event. Implementations must clean up any spawned
+    /// child if the future is dropped (`SubprocessTransport` relies
+    /// on `kill_on_drop(true)` for this).
+    fn invoke<R: Runtime>(
+        &self,
+        app: &AppHandle<R>,
+        profile: &Profile,
+        user_message: &str,
+        timeout: Duration,
+    ) -> impl std::future::Future<Output = Result<InvokeResult, AppError>>
+           + Send;
+}
+
 /// Phase 1 transport. Stateless type — every `invoke` spawns its own
 /// child. W3-13 may add a pooled variant alongside.
 pub struct SubprocessTransport;
 
 impl SubprocessTransport {
+    /// Build a stateless transport. Provided so call-sites that
+    /// previously held no value (`SubprocessTransport::invoke(...)`
+    /// was an inherent associated fn pre-W3-12a) have a canonical
+    /// constructor when transitioning to the trait method.
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for SubprocessTransport {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Transport for SubprocessTransport {
     /// Spawn `claude` with `profile`'s persona, send `user_message`
     /// once, wait up to `timeout` for the `result` event. The
     /// subprocess is killed on `Child::drop` via `kill_on_drop(true)`
     /// and explicitly via `child.kill().await` on the bail paths.
-    pub async fn invoke<R: Runtime>(
+    async fn invoke<R: Runtime>(
+        &self,
         app: &AppHandle<R>,
         profile: &Profile,
         user_message: &str,
@@ -670,18 +715,107 @@ mod tests {
         let registry =
             ProfileRegistry::load_from(None).expect("registry load");
         let scout = registry.get("scout").expect("scout exists");
-        let result = SubprocessTransport::invoke(
-            app.handle(),
-            scout,
-            "Say exactly: 'scout-ok' and nothing else.",
-            Duration::from_secs(60),
-        )
-        .await
-        .expect("invoke ok");
+        let transport = SubprocessTransport::new();
+        let result = transport
+            .invoke(
+                app.handle(),
+                scout,
+                "Say exactly: 'scout-ok' and nothing else.",
+                Duration::from_secs(60),
+            )
+            .await
+            .expect("invoke ok");
         assert!(
             result.assistant_text.contains("scout-ok"),
             "expected `scout-ok` in assistant text, got: {}",
             result.assistant_text
         );
+    }
+}
+
+// --------------------------------------------------------------------- //
+// Mock transport — used by `swarm::coordinator::fsm::tests` to drive    //
+// the FSM without spawning real `claude` subprocesses. Lives under      //
+// `#[cfg(test)]` so the type never leaks into release artifacts.        //
+// --------------------------------------------------------------------- //
+
+#[cfg(test)]
+pub(crate) mod mock_transport {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::Mutex as StdMutex;
+    use tokio::sync::Mutex as AsyncMutex;
+
+    /// One scripted response per `profile.id`. Tests build a map at
+    /// construction time and the FSM consumes one entry per stage.
+    pub(crate) struct MockResponse {
+        /// Either a canned `InvokeResult` or an error string that
+        /// becomes `AppError::SwarmInvoke(...)`.
+        pub result: Result<InvokeResult, AppError>,
+        /// Optional per-stage sleep so duration_ms tests can assert
+        /// non-zero wall-clock time without flakiness.
+        pub sleep: Option<Duration>,
+    }
+
+    /// Deterministic transport for unit tests. Records every prompt
+    /// it sees so prompt-template tests can assert exact substrings.
+    pub(crate) struct MockTransport {
+        responses: HashMap<String, MockResponse>,
+        /// Append-only log of `(profile_id, prompt)` pairs in the
+        /// order the FSM dispatched them.
+        seen: StdMutex<Vec<(String, String)>>,
+        /// Async-lock guard used to fail tests that ask for a
+        /// profile id with no scripted response — keeps the panic
+        /// path on the same task that triggered it.
+        _guard: AsyncMutex<()>,
+    }
+
+    impl MockTransport {
+        pub(crate) fn new(
+            responses: HashMap<String, MockResponse>,
+        ) -> Self {
+            Self {
+                responses,
+                seen: StdMutex::new(Vec::new()),
+                _guard: AsyncMutex::new(()),
+            }
+        }
+
+        /// Snapshot of every `(profile_id, prompt)` pair the FSM has
+        /// dispatched so far, in order.
+        pub(crate) fn seen(&self) -> Vec<(String, String)> {
+            self.seen
+                .lock()
+                .expect("mock seen lock poisoned")
+                .clone()
+        }
+    }
+
+    impl Transport for MockTransport {
+        async fn invoke<R: Runtime>(
+            &self,
+            _app: &AppHandle<R>,
+            profile: &Profile,
+            user_message: &str,
+            _timeout: Duration,
+        ) -> Result<InvokeResult, AppError> {
+            // Record the prompt before doing anything else so even
+            // tests that expect an error still see the input.
+            self.seen
+                .lock()
+                .expect("mock seen lock poisoned")
+                .push((profile.id.clone(), user_message.to_string()));
+
+            let entry = self.responses.get(&profile.id).ok_or_else(|| {
+                AppError::SwarmInvoke(format!(
+                    "MockTransport: no scripted response for `{}`",
+                    profile.id
+                ))
+            })?;
+            if let Some(sleep) = entry.sleep {
+                tokio::time::sleep(sleep).await;
+            }
+            entry.result.clone()
+        }
     }
 }

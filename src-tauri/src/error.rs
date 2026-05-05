@@ -117,6 +117,20 @@ pub enum AppError {
     #[error("operation timed out: {0}")]
     Timeout(String),
 
+    /// WP-W3-12a — `swarm:run_job` was called with a `workspace_id`
+    /// that already has an in-flight job. Per the owner directive
+    /// 2026-05-05 ("aynı proje için yeni bir 9 kişilik ekibi
+    /// çalıştırmama izin vermesin"), same workspace serializes;
+    /// different workspaces run in parallel. Carries both the
+    /// workspace_id the caller supplied and the job_id of the
+    /// currently-running job so the UI can surface "wait for job X
+    /// to finish" without an extra IPC round-trip.
+    #[error("workspace `{workspace_id}` busy with job `{in_flight_job_id}`")]
+    WorkspaceBusy {
+        workspace_id: String,
+        in_flight_job_id: String,
+    },
+
     /// Catch-all for unclassified failures (panics-in-tasks, missing
     /// env, etc.). Frontend treats `internal` as a developer bug.
     #[error("internal error: {0}")]
@@ -141,13 +155,19 @@ impl AppError {
             Self::ClaudeBinaryMissing(_) => "claude_binary_missing",
             Self::SwarmInvoke(_) => "swarm_invoke",
             Self::Timeout(_) => "timeout",
+            Self::WorkspaceBusy { .. } => "workspace_busy",
             Self::Internal(_) => "internal",
         }
     }
 
-    /// Human-readable detail. Same content as the `Display` impl's
-    /// payload but without the variant prefix.
-    pub fn message(&self) -> &str {
+    /// Human-readable detail. For the single-string variants this is
+    /// the inner payload verbatim; for `WorkspaceBusy` (struct
+    /// variant) we synthesize the same text the `Display` impl
+    /// produces. Returning `Cow<str>` keeps callers cheap on the
+    /// common single-string path while still letting the struct
+    /// variant render without leaking owned memory.
+    pub fn message(&self) -> std::borrow::Cow<'_, str> {
+        use std::borrow::Cow;
         match self {
             Self::NotFound(m)
             | Self::Conflict(m)
@@ -160,7 +180,13 @@ impl AppError {
             | Self::ClaudeBinaryMissing(m)
             | Self::SwarmInvoke(m)
             | Self::Timeout(m)
-            | Self::Internal(m) => m,
+            | Self::Internal(m) => Cow::Borrowed(m.as_str()),
+            Self::WorkspaceBusy {
+                workspace_id,
+                in_flight_job_id,
+            } => Cow::Owned(format!(
+                "workspace `{workspace_id}` busy with job `{in_flight_job_id}`"
+            )),
         }
     }
 }
@@ -173,7 +199,7 @@ impl Serialize for AppError {
         // typescript exporter for the `content` field.
         let mut s = serializer.serialize_struct("AppError", 2)?;
         s.serialize_field("kind", self.kind())?;
-        s.serialize_field("message", self.message())?;
+        s.serialize_field("message", self.message().as_ref())?;
         s.end()
     }
 }

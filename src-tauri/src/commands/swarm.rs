@@ -25,7 +25,10 @@ use tauri::{AppHandle, Manager, Runtime};
 use crate::error::AppError;
 use crate::models::ProfileSummary;
 use crate::swarm::profile::ProfileSource;
-use crate::swarm::{InvokeResult, ProfileRegistry, SubprocessTransport};
+use crate::swarm::{
+    CoordinatorFsm, InvokeResult, JobOutcome, JobRegistry, ProfileRegistry,
+    SubprocessTransport, Transport,
+};
 
 /// 60-second budget for `swarm:test_invoke`. WP §4 calls for this as
 /// the default; the Windows AV cold-start risk noted in WP §"Notes"
@@ -98,13 +101,91 @@ pub async fn swarm_test_invoke<R: Runtime>(
     let profile = registry.get(&profile_id).ok_or_else(|| {
         AppError::NotFound(format!("swarm profile `{profile_id}`"))
     })?;
-    SubprocessTransport::invoke(
-        &app,
-        profile,
-        &user_message,
-        SWARM_INVOKE_TIMEOUT,
-    )
-    .await
+    let transport = SubprocessTransport::new();
+    transport
+        .invoke(&app, profile, &user_message, SWARM_INVOKE_TIMEOUT)
+        .await
+}
+
+/// Default per-stage budget for `swarm:run_job`. Matches
+/// `SWARM_INVOKE_TIMEOUT` (60s, the W3-11 default) and can be
+/// overridden per-process via `NEURON_SWARM_STAGE_TIMEOUT_SEC`.
+const SWARM_STAGE_TIMEOUT_DEFAULT: Duration = Duration::from_secs(60);
+
+/// Resolve the per-stage timeout. WP-W3-12a §3 calls for a
+/// `NEURON_SWARM_STAGE_TIMEOUT_SEC` env override; non-numeric or
+/// zero values fall back to the default with a structured warning so
+/// a typo isn't silently ignored.
+fn stage_timeout() -> Duration {
+    const ENV: &str = "NEURON_SWARM_STAGE_TIMEOUT_SEC";
+    match std::env::var(ENV) {
+        Ok(raw) if !raw.trim().is_empty() => match raw.trim().parse::<u64>() {
+            Ok(0) => {
+                tracing::warn!(
+                    %ENV,
+                    "value `0` is not a valid stage timeout; falling back to default"
+                );
+                SWARM_STAGE_TIMEOUT_DEFAULT
+            }
+            Ok(secs) => Duration::from_secs(secs),
+            Err(e) => {
+                tracing::warn!(
+                    %ENV,
+                    raw = %raw,
+                    error = %e,
+                    "stage timeout override is not a non-negative integer; using default"
+                );
+                SWARM_STAGE_TIMEOUT_DEFAULT
+            }
+        },
+        _ => SWARM_STAGE_TIMEOUT_DEFAULT,
+    }
+}
+
+/// Drive a 3-stage swarm job to completion (WP-W3-12a §4).
+///
+/// Walks `scout` → `planner` → `backend-builder` against the
+/// substrate from W3-11, returning the aggregated `JobOutcome`. The
+/// IPC blocks until the FSM finishes (Done / Failed). Two calls with
+/// the same `workspace_id` serialize — the second returns
+/// `AppError::WorkspaceBusy`. Two calls with different `workspace_id`s
+/// run in parallel.
+#[tauri::command(rename_all = "camelCase")]
+#[specta::specta]
+pub async fn swarm_run_job<R: Runtime>(
+    app: AppHandle<R>,
+    workspace_id: String,
+    goal: String,
+) -> Result<JobOutcome, AppError> {
+    if workspace_id.trim().is_empty() {
+        return Err(AppError::InvalidInput(
+            "workspaceId must not be empty".into(),
+        ));
+    }
+    if goal.trim().is_empty() {
+        return Err(AppError::InvalidInput(
+            "goal must not be empty".into(),
+        ));
+    }
+
+    let workspace_dir = workspace_agents_dir(&app)?;
+    let profiles = std::sync::Arc::new(
+        ProfileRegistry::load_from(workspace_dir.as_deref())?,
+    );
+    let registry = app
+        .try_state::<std::sync::Arc<JobRegistry>>()
+        .ok_or_else(|| {
+            AppError::Internal(
+                "swarm JobRegistry missing from app state — \
+                 lib.rs::setup did not call app.manage()"
+                    .into(),
+            )
+        })?
+        .inner()
+        .clone();
+    let transport = SubprocessTransport::new();
+    let fsm = CoordinatorFsm::new(profiles, transport, registry, stage_timeout());
+    fsm.run_job(&app, workspace_id, goal).await
 }
 
 /// Resolve `<app_data_dir>/agents`. Returns `None` (no error) when

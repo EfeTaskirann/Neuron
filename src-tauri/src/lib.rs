@@ -107,6 +107,7 @@ pub fn specta_builder_for_export() -> tauri_specta::Builder<tauri::Wry> {
             // swarm
             commands::swarm::swarm_profiles_list::<tauri::Wry>,
             commands::swarm::swarm_test_invoke::<tauri::Wry>,
+            commands::swarm::swarm_run_job::<tauri::Wry>,
         ])
         // Register the AppError once on the builder so the type lands
         // in `bindings.ts` as a referenceable shape rather than being
@@ -174,6 +175,17 @@ pub fn run() {
             // below tears them all down on app exit so no shell
             // processes outlive the app on next launch.
             app.manage(sidecar::terminal::TerminalRegistry::new());
+
+            // WP-W3-12a — install the in-memory swarm `JobRegistry`
+            // so `swarm:run_job` can serialize per-workspace calls.
+            // `Arc` so multiple concurrent commands share the same
+            // lock state; cloning the `Arc` is cheap. W3-12b
+            // replaces this with a SQLite-backed registry on the
+            // same surface.
+            let job_registry = std::sync::Arc::new(
+                crate::swarm::coordinator::JobRegistry::new(),
+            );
+            app.manage(job_registry);
 
             // WP-W3-06 — start the OTLP export sweep iff the
             // collector endpoint is configured. The loop is silent
