@@ -4,6 +4,46 @@ Running journal of agent-driven changes. Newest entry on top. See `AGENTS.md` §
 
 ---
 
+## 2026-05-05T20:50Z WP-W3-12a completed
+
+- dispatch: **single sub-agent** (W3-11's hybrid cadence retired for this WP — orchestrator drafted the WP + tasks file, sub-agent implemented the entire Rust + bindings surface).
+- sub-agent: general-purpose
+- files changed: 12 in commit `5890841`
+  - new — Rust: `src-tauri/src/swarm/coordinator/{mod,fsm,job}.rs`
+  - new — planning: `docs/work-packages/WP-W3-12a-coordinator-fsm-skeleton.md`, `tasks/swarm-phase-2a.md`
+  - modified: `docs/work-packages/WP-W3-overview.md` (W3-11 status flipped to done; W3-12a/b/c/d row stubs added; dep graph updated), `src-tauri/src/swarm/{mod,transport}.rs` (`Transport` trait extraction; `SubprocessTransport` impls it; new `MockTransport` under `#[cfg(test)]`), `src-tauri/src/commands/swarm.rs` (+`swarm_run_job` + `stage_timeout()` env-var helper), `src-tauri/src/error.rs` (+`WorkspaceBusy` struct variant; `message()` now returns `Cow<'_, str>`), `src-tauri/src/lib.rs` (`JobRegistry` `app.manage`d; new command registered), `app/src/lib/bindings.ts` (regen +1 command, +3 types: `JobOutcome`, `JobState`, `StageResult`)
+- commit SHA: `5890841`
+- acceptance: ✅ pass — orchestrator independently re-ran every gate after sub-agent return; OWNER additionally drove the manual integration smoke (3-stage real-claude chain, 120s, `Done`)
+  - `cargo check` → exit 0
+  - `cargo test --lib` → exit 0, **205 passed; 0 failed; 6 ignored** (181 prior + 24 new = +24 unit; +1 ignored integration)
+  - `pnpm gen:bindings` → exit 0; bindings.ts gained `swarmRunJob`, `JobOutcome`, `JobState`, `StageResult`
+  - `pnpm gen:bindings:check` → exit 1 PRE-COMMIT (expected). POST-`5890841` it exits 0.
+  - `pnpm typecheck` → exit 0
+  - `pnpm test --run` → exit 0 (17/17 frontend tests)
+  - `pnpm lint` → exit 0
+  - **owner-driven manual integration smoke** (after two false-start iterations, see "key implementation choices" below): 3-stage chain `scout → planner → backend-builder` against real `claude` binary on Windows + Pro/Max OAuth; canonical goal `"Find the impl ProfileRegistry block in profile.rs and add a one-line public method ... right after the existing list method. Just the method."` → `outcome.final_state == Done` in 120.11s. Builder produced the expected one-line method; reverted from the WP commit (out-of-scope smoke artifact).
+- key implementation choices
+  - **Pure Rust FSM, no Coordinator LLM** (Option A per architectural report §5.1). Smallest validation surface; trivial upgrade path to Option B (single-shot Coordinator brain) at W3-12d as a 1-2 file refactor.
+  - **`async fn in trait` (Rust 1.78+ stable)** — no `async-trait` dep added. `CoordinatorFsm<T: Transport>` is generic over the trait; `SubprocessTransport` and `MockTransport` both impl it. `cargo tree | grep async-trait` confirmed no transitive dep would be free.
+  - **Per-workspace lock policy** (owner directive 2026-05-05): same `workspace_id` → second call rejected pre-flight with `AppError::WorkspaceBusy{workspace_id, in_flight_job_id}` (Err side, NOT a Failed-state outcome — pre-flight rejection is a different surface from in-flight stage failure). Different `workspace_id` → parallel. `JobRegistry` holds two mutex-guarded maps; consistent acquisition order (locks → jobs) prevents deadlock. `WorkspaceGuard` Drop impl ensures `release_workspace` fires even on panic.
+  - **3-state happy path only** (SCOUT → PLAN → BUILD → DONE). `Review` and `Test` variants exist on `JobState` but are unreachable in 12a; `next_state` `debug_assert!`s on them so a future code change that leaks them surfaces in test builds. W3-12d activates them once `reviewer.md` / `integration-tester.md` profiles + Verdict schema land.
+  - **`Job` type NOT exported in bindings**: specta only emits types reachable from registered command signatures. `Job` is internal-only in 12a (no IPC returns it; `JobOutcome` carries the equivalent payload sans bookkeeping fields). Adding a forced export would leak an unused type to the frontend; W3-12c naturally pulls `Job` into the wire surface via a future `swarm:list_jobs` command.
+  - **`AppError::message()` signature change**: was `&str`, now `Cow<'_, str>` to synthesize the formatted message for the `WorkspaceBusy` struct variant. Existing variants still hand back `Cow::Borrowed` (zero-cost). All call sites work unchanged via `Cow`'s auto-deref.
+  - **Stage-failure record-or-not policy**: chose NOT to push a `StageResult` for the failing stage. Documented in `Job` struct doc-comment and `fsm_*_failure_*` test assertions. `fsm_scout_failure_short_circuits` asserts `stages.is_empty()`.
+  - **`render_scout_prompt` content fix** (post-integration): Phase 2a draft specified "scout receives goal verbatim", but real-claude integration test on 2026-05-05 showed Scout burning its 6-turn budget when goal was a "do X" task (Scout's persona forbids writes; verbatim "do X" creates contract conflict). Wrapped goal as investigation: `"Aşağıdaki görev için kod tabanını araştır ... SEN KOD YAZMIYORSUN"`. Manual chain validation from earlier the same day used this exact framing organically — the WP shipped with codified prompt matching that empirical finding. Unit test renamed `prompt_template_scout_passes_goal_verbatim` → `prompt_template_scout_wraps_goal_as_investigation` and updated to assert the investigation framing.
+  - **Default per-stage timeout for integration test bumped to 180s** (`NEURON_SWARM_STAGE_TIMEOUT_SEC` override). Production default stays 60s. Reason: Windows + antivirus cold-cache first-spawn of `claude.cmd` can spend 30-60s on AV alone; first attempt at 60s/stage caused a Builder-stage timeout (104.47s, observed 2026-05-05).
+- bindings regenerated: yes (+1 command, +3 types)
+- branch: `main` (local; not pushed; **50 commits ahead of `origin/main`** post-`5890841`)
+- known caveats / followups
+  - **No DB persistence**. App restart loses every in-flight job. W3-12b adds SQLite-backed `JobRegistry` on the same trait surface; in-memory impl stays for tests.
+  - **No streaming**. `swarm:run_job` blocks the caller for 30-180s. Frontend has no progress UI yet — the W3-12c subscription channel + `useSwarmJob` hook close that gap.
+  - **No cancel**. Killing the IPC promise has no effect on the spawned `claude` children mid-job. W3-12c lands cancel propagation alongside streaming.
+  - **REVIEW/TEST inert**. Code defines them but they're unreachable; W3-12d activates them.
+  - **W3-04 (LangGraph cancel + streaming) still deferred** per Owner decision #4 in `WP-W3-overview.md`; re-evaluate at W3-08 close.
+- next: WP-W3-12b (SQLite persistence + restart recovery), or WP-W3-12c (streaming Tauri events + frontend hook + cancel mid-job). 12b/12c can land in either order; 12d depends on at least 12a (this WP) and ideally 12b.
+
+---
+
 ## 2026-05-05T18:48Z WP-W3-11 completed
 
 - dispatch: **hybrid** (orchestrator scaffold + Charter, sub-agent parser/transport/tests). First time the `AGENTS.md` "one sub-agent per WP" cadence was split — recorded in `tasks/swarm-phase-1.md` §"Dispatch decision" so future per-WP authors can refer to it.
