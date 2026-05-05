@@ -18,12 +18,14 @@
 //! `result` event arrives. W3-12 introduces the streaming variant
 //! that emits per-event Tauri events for the multi-pane UI.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use tauri::{AppHandle, Manager, Runtime};
 
 use crate::error::AppError;
 use crate::models::ProfileSummary;
+use crate::swarm::coordinator::JobState;
 use crate::swarm::profile::ProfileSource;
 use crate::swarm::{
     CoordinatorFsm, InvokeResult, JobOutcome, JobRegistry, ProfileRegistry,
@@ -188,6 +190,75 @@ pub async fn swarm_run_job<R: Runtime>(
     fsm.run_job(&app, workspace_id, goal).await
 }
 
+/// Signal cancellation for an in-flight swarm job (WP-W3-12c §4).
+///
+/// Looks up `job_id` in the `JobRegistry`. Returns:
+///
+/// - `Ok(())` if the job was in-flight and the cancel signal was
+///   delivered. The FSM observes the signal at the next `select!`
+///   point, emits `Cancelled` then `Finished`, and finalizes the
+///   job as `Failed` with `last_error = "cancelled by user"`.
+/// - `Err(AppError::NotFound)` if no job with the given id exists
+///   in the registry.
+/// - `Err(AppError::Conflict)` if the job is already terminal
+///   (`Done`/`Failed`) — including a previous cancel that has
+///   already finalized.
+///
+/// Idempotency: a second cancel against the same in-flight job
+/// either returns `Ok(())` (signal sent again, FSM ignores it
+/// once finalized) or `Err(Conflict)` if the FSM has already
+/// removed the cancel notify on its tail. The race is benign;
+/// callers should treat both as "cancel acknowledged".
+#[tauri::command(rename_all = "camelCase")]
+#[specta::specta]
+pub async fn swarm_cancel_job<R: Runtime>(
+    app: AppHandle<R>,
+    job_id: String,
+) -> Result<(), AppError> {
+    if job_id.trim().is_empty() {
+        return Err(AppError::InvalidInput(
+            "jobId must not be empty".into(),
+        ));
+    }
+
+    let registry = app
+        .try_state::<Arc<JobRegistry>>()
+        .ok_or_else(|| {
+            AppError::Internal(
+                "swarm JobRegistry missing from app state — \
+                 lib.rs::setup did not call app.manage()"
+                    .into(),
+            )
+        })?
+        .inner()
+        .clone();
+
+    // 1. Look up the job. Unknown id → NotFound.
+    let job = registry.get(&job_id).ok_or_else(|| {
+        AppError::NotFound(format!("swarm job `{job_id}`"))
+    })?;
+    // 2. Terminal jobs cannot be cancelled. The FSM has already
+    //    removed the cancel notify by the time `state` flips, so
+    //    we surface the precondition explicitly.
+    if matches!(job.state, JobState::Done | JobState::Failed) {
+        return Err(AppError::Conflict(format!(
+            "swarm job `{job_id}` is already terminal ({:?})",
+            job.state
+        )));
+    }
+    // 3. Signal cancel. NotFound here means the job finalized
+    //    between step 1 and step 3 — race; treat as Conflict so
+    //    the caller sees a single "already terminal" semantic
+    //    regardless of which side of the race they hit.
+    match registry.signal_cancel(&job_id) {
+        Ok(()) => Ok(()),
+        Err(AppError::NotFound(_)) => Err(AppError::Conflict(format!(
+            "swarm job `{job_id}` is already terminal"
+        ))),
+        Err(other) => Err(other),
+    }
+}
+
 /// Resolve `<app_data_dir>/agents`. Returns `None` (no error) when
 /// the directory does not exist — workspace overrides are optional
 /// per WP §2. Errors reaching `app_data_dir` itself are real (the
@@ -276,5 +347,234 @@ mod tests {
         .await
         .expect_err("empty rejected");
         assert_eq!(err.kind(), "invalid_input");
+    }
+
+    // ---------------------------------------------------------------- //
+    // WP-W3-12c — swarm:cancel_job tests                                //
+    // ---------------------------------------------------------------- //
+
+    /// Cancel against a job_id that the registry has never seen
+    /// surfaces `NotFound`.
+    #[tokio::test]
+    async fn cancel_unknown_job_id_returns_not_found() {
+        let (app, _pool, _dir) = mock_app_with_pool().await;
+        let registry = Arc::new(JobRegistry::new());
+        app.manage(registry);
+        let err = swarm_cancel_job(app.handle().clone(), "j-nonexistent".into())
+            .await
+            .expect_err("unknown rejected");
+        assert_eq!(err.kind(), "not_found");
+    }
+
+    /// Cancel against an empty job_id surfaces `InvalidInput`.
+    #[tokio::test]
+    async fn cancel_empty_job_id_returns_invalid_input() {
+        let (app, _pool, _dir) = mock_app_with_pool().await;
+        let registry = Arc::new(JobRegistry::new());
+        app.manage(registry);
+        let err = swarm_cancel_job(app.handle().clone(), "".into())
+            .await
+            .expect_err("empty rejected");
+        assert_eq!(err.kind(), "invalid_input");
+    }
+
+    /// Cancel against a job that has already completed (Done /
+    /// Failed) surfaces `Conflict`.
+    #[tokio::test]
+    async fn cancel_already_terminal_returns_conflict() {
+        use crate::swarm::coordinator::Job;
+        let (app, _pool, _dir) = mock_app_with_pool().await;
+        let registry = Arc::new(JobRegistry::new());
+        // Insert a terminal job by hand — bypasses the FSM but
+        // exercises the same registry surface the real FSM writes.
+        let job = Job {
+            id: "j-done".into(),
+            goal: "g".into(),
+            created_at_ms: 0,
+            state: JobState::Done,
+            retry_count: 0,
+            stages: Vec::new(),
+            last_error: None,
+        };
+        registry
+            .try_acquire_workspace("ws-done", job)
+            .expect("acquire");
+        app.manage(registry);
+        let err = swarm_cancel_job(app.handle().clone(), "j-done".into())
+            .await
+            .expect_err("terminal rejected");
+        assert_eq!(err.kind(), "conflict");
+    }
+
+    /// Cancel against a Failed job also surfaces `Conflict`
+    /// (terminal == Done OR Failed; cancelled jobs ride the Failed
+    /// path).
+    #[tokio::test]
+    async fn cancel_failed_job_returns_conflict() {
+        use crate::swarm::coordinator::Job;
+        let (app, _pool, _dir) = mock_app_with_pool().await;
+        let registry = Arc::new(JobRegistry::new());
+        let job = Job {
+            id: "j-failed".into(),
+            goal: "g".into(),
+            created_at_ms: 0,
+            state: JobState::Failed,
+            retry_count: 0,
+            stages: Vec::new(),
+            last_error: Some("boom".into()),
+        };
+        registry
+            .try_acquire_workspace("ws-failed", job)
+            .expect("acquire");
+        app.manage(registry);
+        let err = swarm_cancel_job(app.handle().clone(), "j-failed".into())
+            .await
+            .expect_err("terminal rejected");
+        assert_eq!(err.kind(), "conflict");
+    }
+
+    /// In-flight job (state is one of Init/Scout/Plan/Build) but
+    /// no cancel notify registered → `Conflict` (race: the FSM
+    /// removed the notify on its tail before the IPC reached
+    /// `signal_cancel`). The command translates `NotFound` from
+    /// `signal_cancel` into `Conflict` on this branch so the
+    /// caller sees a single "already terminal" semantic.
+    #[tokio::test]
+    async fn cancel_in_flight_without_notify_returns_conflict() {
+        use crate::swarm::coordinator::Job;
+        let (app, _pool, _dir) = mock_app_with_pool().await;
+        let registry = Arc::new(JobRegistry::new());
+        let job = Job {
+            id: "j-mid".into(),
+            goal: "g".into(),
+            created_at_ms: 0,
+            state: JobState::Build,
+            retry_count: 0,
+            stages: Vec::new(),
+            last_error: None,
+        };
+        registry
+            .try_acquire_workspace("ws-mid", job)
+            .expect("acquire");
+        // Note: no register_cancel call — simulates the race where
+        // the FSM tail has already unregistered.
+        app.manage(registry);
+        let err = swarm_cancel_job(app.handle().clone(), "j-mid".into())
+            .await
+            .expect_err("race rejected");
+        assert_eq!(err.kind(), "conflict");
+    }
+
+    /// In-flight job with cancel notify registered → cancel
+    /// signals successfully. We register the notify by hand so the
+    /// test doesn't need to spin up the full FSM.
+    #[tokio::test]
+    async fn cancel_in_flight_with_notify_returns_ok() {
+        use crate::swarm::coordinator::Job;
+        let (app, _pool, _dir) = mock_app_with_pool().await;
+        let registry = Arc::new(JobRegistry::new());
+        let job = Job {
+            id: "j-live".into(),
+            goal: "g".into(),
+            created_at_ms: 0,
+            state: JobState::Scout,
+            retry_count: 0,
+            stages: Vec::new(),
+            last_error: None,
+        };
+        registry
+            .try_acquire_workspace("ws-live", job)
+            .expect("acquire");
+        let notify = Arc::new(tokio::sync::Notify::new());
+        registry
+            .register_cancel("j-live", Arc::clone(&notify))
+            .expect("register");
+        app.manage(registry);
+
+        // Subscribe to the notify *before* we signal so we can
+        // assert the cancel actually woke a waiter.
+        let waiter = tokio::spawn(async move {
+            notify.notified().await;
+        });
+        tokio::task::yield_now().await;
+
+        swarm_cancel_job(app.handle().clone(), "j-live".into())
+            .await
+            .expect("ok");
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("waiter wakes within 1s")
+            .expect("waiter task panicked");
+    }
+
+    /// Double-cancel against the same in-flight job — the second
+    /// call must surface `Conflict` or `NotFound` (race-dependent
+    /// on whether the FSM tail has unregistered the notify yet).
+    /// We hand-build the registry state without an FSM so the
+    /// race is deterministic: after the first signal, we manually
+    /// unregister the cancel notify (simulating the FSM tail) and
+    /// flip the job to Failed before issuing the second signal.
+    #[tokio::test]
+    async fn cancel_double_signal_second_returns_error() {
+        use crate::swarm::coordinator::Job;
+        let (app, _pool, _dir) = mock_app_with_pool().await;
+        let registry = Arc::new(JobRegistry::new());
+        let job = Job {
+            id: "j-double".into(),
+            goal: "g".into(),
+            created_at_ms: 0,
+            state: JobState::Scout,
+            retry_count: 0,
+            stages: Vec::new(),
+            last_error: None,
+        };
+        registry
+            .try_acquire_workspace("ws-double", job)
+            .expect("acquire");
+        let notify = Arc::new(tokio::sync::Notify::new());
+        registry
+            .register_cancel("j-double", Arc::clone(&notify))
+            .expect("register");
+        app.manage(Arc::clone(&registry));
+
+        // First cancel — succeeds.
+        swarm_cancel_job(app.handle().clone(), "j-double".into())
+            .await
+            .expect("first cancel ok");
+
+        // Simulate the FSM tail: flip to Failed and unregister
+        // the notify. Order matches what the real FSM does in
+        // `finalize_cancelled` + the `CancelGuard` Drop.
+        registry
+            .update("j-double", |j| {
+                j.state = JobState::Failed;
+                j.last_error = Some("cancelled by user".into());
+            })
+            .expect("update");
+        registry.unregister_cancel("j-double");
+
+        // Second cancel — must fail. Conflict (terminal) is the
+        // expected branch, but a NotFound from a different race
+        // is also acceptable per the WP contract.
+        let err = swarm_cancel_job(app.handle().clone(), "j-double".into())
+            .await
+            .expect_err("second cancel rejected");
+        assert!(
+            matches!(err, AppError::Conflict(_) | AppError::NotFound(_)),
+            "second cancel must be Conflict or NotFound; got: {err:?}"
+        );
+    }
+
+    /// `swarm_cancel_job` requires the JobRegistry in app state.
+    /// Missing state surfaces `Internal`. Defensive; the real
+    /// `lib.rs::setup` always registers the registry.
+    #[tokio::test]
+    async fn cancel_without_registry_state_returns_internal() {
+        let (app, _pool, _dir) = mock_app_with_pool().await;
+        // Intentionally do NOT manage(JobRegistry).
+        let err = swarm_cancel_job(app.handle().clone(), "j-anything".into())
+            .await
+            .expect_err("no registry rejected");
+        assert_eq!(err.kind(), "internal");
     }
 }

@@ -20,10 +20,11 @@
 //! a deadlock.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 use specta::Type;
+use tokio::sync::Notify;
 
 use crate::error::AppError;
 
@@ -147,6 +148,12 @@ pub struct JobRegistry {
     /// `workspace_id` → `job_id` of the in-flight job currently
     /// holding the workspace. Removed on `release_workspace`.
     workspace_locks: Mutex<HashMap<String, String>>,
+    /// WP-W3-12c — per-job cancellation notify. The FSM `select!`s
+    /// each stage future against this notify; `swarm:cancel_job`
+    /// looks up the entry by `job_id` and calls `notify_one()`.
+    /// The map is registered on FSM start and removed on terminal
+    /// transition (Done / Failed / Cancelled).
+    cancel_notifies: Mutex<HashMap<String, Arc<Notify>>>,
 }
 
 impl JobRegistry {
@@ -155,6 +162,7 @@ impl JobRegistry {
         Self {
             jobs: Mutex::new(HashMap::new()),
             workspace_locks: Mutex::new(HashMap::new()),
+            cancel_notifies: Mutex::new(HashMap::new()),
         }
     }
 
@@ -269,6 +277,146 @@ impl JobRegistry {
         let jobs = self.jobs.lock().expect("jobs mutex poisoned");
         jobs.values().cloned().collect()
     }
+
+    // ------------------------------------------------------------- //
+    // WP-W3-12c — cancel-notify surface                              //
+    // ------------------------------------------------------------- //
+    //
+    // LOCK ORDER: `workspace_locks → cancel_notifies → jobs`. The
+    // three methods below each hold *only* the `cancel_notifies`
+    // mutex while running; they never acquire `workspace_locks` or
+    // `jobs` while holding it, so they cannot deadlock against the
+    // existing acquire/release/update/get methods (which hold at
+    // most one of the three at a time).
+
+    /// Register a cancellation `Notify` for the in-flight `job_id`.
+    /// The FSM owns the `Arc` for the duration of the run; the
+    /// registry holds a clone so `signal_cancel` can call
+    /// `notify_one()` without bouncing through the FSM.
+    ///
+    /// Returns `Err(AppError::Conflict)` if a notify is already
+    /// registered for this `job_id` — protects against the
+    /// (impossible-in-practice in 12c) double-register race.
+    pub fn register_cancel(
+        &self,
+        job_id: &str,
+        notify: Arc<Notify>,
+    ) -> Result<(), AppError> {
+        let mut notifies = self
+            .cancel_notifies
+            .lock()
+            .expect("cancel_notifies mutex poisoned");
+        if notifies.contains_key(job_id) {
+            return Err(AppError::Conflict(format!(
+                "swarm job `{job_id}` already has a cancel notify registered"
+            )));
+        }
+        notifies.insert(job_id.to_string(), notify);
+        Ok(())
+    }
+
+    /// Idempotent remove of the cancel notify for `job_id`. Called
+    /// on every FSM tail (success, failure, cancellation) plus by
+    /// the `CancelGuard` Drop seatbelt — calling twice (or against
+    /// an unknown id) is a no-op.
+    pub fn unregister_cancel(&self, job_id: &str) {
+        let mut notifies = self
+            .cancel_notifies
+            .lock()
+            .expect("cancel_notifies mutex poisoned");
+        notifies.remove(job_id);
+    }
+
+    /// Signal cancellation for the given `job_id`. Looks up the
+    /// `Notify` and calls `notify_one()`; the entry is left in the
+    /// map (the FSM removes it when it observes the cancel).
+    ///
+    /// - `Ok(())` if a notify was registered and signaled.
+    /// - `Err(AppError::NotFound)` if no notify is registered for
+    ///   this `job_id` — i.e. the job is unknown, terminal, or had
+    ///   its cancel already de-registered by the FSM tail.
+    pub fn signal_cancel(&self, job_id: &str) -> Result<(), AppError> {
+        let notifies = self
+            .cancel_notifies
+            .lock()
+            .expect("cancel_notifies mutex poisoned");
+        match notifies.get(job_id) {
+            Some(notify) => {
+                notify.notify_one();
+                Ok(())
+            }
+            None => Err(AppError::NotFound(format!(
+                "swarm job `{job_id}` has no in-flight cancel notify"
+            ))),
+        }
+    }
+}
+
+// --------------------------------------------------------------------- //
+// WP-W3-12c — streaming event surface                                    //
+// --------------------------------------------------------------------- //
+
+/// Per-job lifecycle event streamed to `swarm:job:{job_id}:event`.
+///
+/// One event name carries every transition in the FSM via a
+/// `kind` tag (matches W3-06's `runs:{id}:span` pattern). Frontend
+/// subscribers register one listener per job and switch on `kind`.
+///
+/// Order on the happy path:
+///
+///   `started → stage_started(scout) → stage_completed(scout)
+///           → stage_started(plan)  → stage_completed(plan)
+///           → stage_started(build) → stage_completed(build)
+///           → finished`
+///
+/// On a stage error: `stage_started(stage) → finished` (no
+/// `stage_completed` for the failing stage).
+///
+/// On cancellation: `… → stage_started(stage) → cancelled → finished`.
+#[derive(Debug, Clone, Serialize, Type)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SwarmJobEvent {
+    /// Fires once at FSM start, after the workspace lock is
+    /// acquired and the cancel notify is registered, before any
+    /// stage spawns.
+    Started {
+        job_id: String,
+        workspace_id: String,
+        goal: String,
+        created_at_ms: i64,
+    },
+    /// Fires before every stage's `transport.invoke` is awaited.
+    /// `state` is the upcoming lifecycle stage (Scout / Plan /
+    /// Build); `prompt_preview` is the first 200 *chars* of the
+    /// rendered prompt (char-bounded so multi-byte Turkish text
+    /// is never split mid-codepoint).
+    StageStarted {
+        job_id: String,
+        state: JobState,
+        specialist_id: String,
+        prompt_preview: String,
+    },
+    /// Fires after a stage's `StageResult` is built and pushed to
+    /// the registry, on the success path only.
+    StageCompleted {
+        job_id: String,
+        stage: StageResult,
+    },
+    /// Fires once at the FSM tail, regardless of outcome
+    /// (Done / Failed / Cancelled). `outcome.final_state` is one
+    /// of `Done` or `Failed`; cancelled jobs ride the `Failed`
+    /// path with `last_error = Some("cancelled by user")`.
+    Finished {
+        job_id: String,
+        outcome: JobOutcome,
+    },
+    /// Fires when the FSM observes the cancel `Notify` mid-stage,
+    /// before the job is finalized as `Failed`. The next event on
+    /// this channel is always `Finished`.
+    Cancelled {
+        job_id: String,
+        cancelled_during: JobState,
+    },
 }
 
 impl Default for JobRegistry {
@@ -494,6 +642,81 @@ mod tests {
                 .expect_err(&format!("`{bad:?}` should be rejected"));
             assert_eq!(err.kind(), "invalid_input");
         }
+    }
+
+    // ---------------------------------------------------------------
+    // WP-W3-12c — cancel-notify surface tests
+    // ---------------------------------------------------------------
+
+    /// Registering a cancel notify for a job_id twice surfaces
+    /// `Conflict` — protects against the (theoretical) double-
+    /// register that would silently shadow the original Notify.
+    #[test]
+    fn register_cancel_duplicate_returns_conflict() {
+        let reg = JobRegistry::new();
+        let n1 = Arc::new(tokio::sync::Notify::new());
+        reg.register_cancel("j-c1", Arc::clone(&n1))
+            .expect("first register ok");
+        let n2 = Arc::new(tokio::sync::Notify::new());
+        let err = reg
+            .register_cancel("j-c1", n2)
+            .expect_err("second register rejected");
+        assert_eq!(err.kind(), "conflict");
+    }
+
+    /// `unregister_cancel` is idempotent — calling against a
+    /// missing id is a no-op (mirrors `release_workspace`'s
+    /// contract so the FSM tail + Drop guard can both fire).
+    #[test]
+    fn unregister_cancel_is_idempotent() {
+        let reg = JobRegistry::new();
+        let n = Arc::new(tokio::sync::Notify::new());
+        reg.register_cancel("j-u1", Arc::clone(&n))
+            .expect("register ok");
+        reg.unregister_cancel("j-u1");
+        // Second unregister: no panic, no error surface.
+        reg.unregister_cancel("j-u1");
+        // Stale id (never registered): also a no-op.
+        reg.unregister_cancel("j-never");
+    }
+
+    /// `signal_cancel` against an unknown job_id surfaces
+    /// `NotFound` — distinguishes "never started" from "already
+    /// finished" only by virtue of the FSM unregistering on tail.
+    #[test]
+    fn signal_cancel_unknown_returns_not_found() {
+        let reg = JobRegistry::new();
+        let err = reg
+            .signal_cancel("j-nope")
+            .expect_err("unknown rejected");
+        assert_eq!(err.kind(), "not_found");
+    }
+
+    /// `signal_cancel` wakes a waiter on the registered Notify.
+    /// We register, await `notified()` from one task, signal from
+    /// another, and assert the waiter task observes the wake-up.
+    #[tokio::test]
+    async fn signal_cancel_wakes_registered_notify() {
+        let reg = Arc::new(JobRegistry::new());
+        let notify = Arc::new(tokio::sync::Notify::new());
+        reg.register_cancel("j-w1", Arc::clone(&notify))
+            .expect("register ok");
+
+        let waiter_notify = Arc::clone(&notify);
+        let waiter = tokio::spawn(async move {
+            waiter_notify.notified().await;
+        });
+
+        // Give the waiter a tick to register its waker.
+        tokio::task::yield_now().await;
+
+        reg.signal_cancel("j-w1").expect("signal ok");
+        // The wait must complete promptly; bound it so a regression
+        // surfaces as a test failure rather than a hang.
+        tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+            .await
+            .expect("waiter did not wake within 1s")
+            .expect("waiter task panicked");
     }
 
     /// The `WorkspaceGuard` (defined in `fsm.rs`) calls

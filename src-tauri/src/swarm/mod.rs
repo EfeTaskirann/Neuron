@@ -40,7 +40,7 @@ pub use binding::{
 };
 pub use coordinator::{
     CoordinatorFsm, Job, JobOutcome, JobRegistry, JobState, StageResult,
-    MAX_RETRIES,
+    SwarmJobEvent, MAX_RETRIES,
 };
 pub use profile::{
     PermissionMode, Profile, ProfileRegistry, ProfileSource,

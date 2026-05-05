@@ -165,6 +165,28 @@ export const commands = {
 	 *  run in parallel.
 	 */
 	swarmRunJob: (workspaceId: string, goal: string) => typedError<JobOutcome, AppErrorWire>(__TAURI_INVOKE("swarm_run_job", { workspaceId, goal })),
+	/**
+	 *  Signal cancellation for an in-flight swarm job (WP-W3-12c §4).
+	 * 
+	 *  Looks up `job_id` in the `JobRegistry`. Returns:
+	 * 
+	 *  - `Ok(())` if the job was in-flight and the cancel signal was
+	 *    delivered. The FSM observes the signal at the next `select!`
+	 *    point, emits `Cancelled` then `Finished`, and finalizes the
+	 *    job as `Failed` with `last_error = "cancelled by user"`.
+	 *  - `Err(AppError::NotFound)` if no job with the given id exists
+	 *    in the registry.
+	 *  - `Err(AppError::Conflict)` if the job is already terminal
+	 *    (`Done`/`Failed`) — including a previous cancel that has
+	 *    already finalized.
+	 * 
+	 *  Idempotency: a second cancel against the same in-flight job
+	 *  either returns `Ok(())` (signal sent again, FSM ignores it
+	 *  once finalized) or `Err(Conflict)` if the FSM has already
+	 *  removed the cancel notify on its tail. The race is benign;
+	 *  callers should treat both as "cancel acknowledged".
+	 */
+	swarmCancelJob: (jobId: string) => typedError<null, AppErrorWire>(__TAURI_INVOKE("swarm_cancel_job", { jobId })),
 };
 
 /* Types */
@@ -670,6 +692,59 @@ export type StageResult = {
 	 */
 	durationMs: number,
 };
+
+/**
+ *  Per-job lifecycle event streamed to `swarm:job:{job_id}:event`.
+ * 
+ *  One event name carries every transition in the FSM via a
+ *  `kind` tag (matches W3-06's `runs:{id}:span` pattern). Frontend
+ *  subscribers register one listener per job and switch on `kind`.
+ * 
+ *  Order on the happy path:
+ * 
+ *    `started → stage_started(scout) → stage_completed(scout)
+ *            → stage_started(plan)  → stage_completed(plan)
+ *            → stage_started(build) → stage_completed(build)
+ *            → finished`
+ * 
+ *  On a stage error: `stage_started(stage) → finished` (no
+ *  `stage_completed` for the failing stage).
+ * 
+ *  On cancellation: `… → stage_started(stage) → cancelled → finished`.
+ */
+export type SwarmJobEvent = 
+/**
+ *  Fires once at FSM start, after the workspace lock is
+ *  acquired and the cancel notify is registered, before any
+ *  stage spawns.
+ */
+{ kind: "started"; job_id: string; workspace_id: string; goal: string; created_at_ms: number } | 
+/**
+ *  Fires before every stage's `transport.invoke` is awaited.
+ *  `state` is the upcoming lifecycle stage (Scout / Plan /
+ *  Build); `prompt_preview` is the first 200 *chars* of the
+ *  rendered prompt (char-bounded so multi-byte Turkish text
+ *  is never split mid-codepoint).
+ */
+{ kind: "stage_started"; job_id: string; state: JobState; specialist_id: string; prompt_preview: string } | 
+/**
+ *  Fires after a stage's `StageResult` is built and pushed to
+ *  the registry, on the success path only.
+ */
+{ kind: "stage_completed"; job_id: string; stage: StageResult } | 
+/**
+ *  Fires once at the FSM tail, regardless of outcome
+ *  (Done / Failed / Cancelled). `outcome.final_state` is one
+ *  of `Done` or `Failed`; cancelled jobs ride the `Failed`
+ *  path with `last_error = Some("cancelled by user")`.
+ */
+{ kind: "finished"; job_id: string; outcome: JobOutcome } | 
+/**
+ *  Fires when the FSM observes the cancel `Notify` mid-stage,
+ *  before the job is finalized as `Failed`. The next event on
+ *  this channel is always `Finished`.
+ */
+{ kind: "cancelled"; job_id: string; cancelled_during: JobState };
 
 /**
  *  One row of `server_tools`. Materialised by [`crate::mcp::registry`]

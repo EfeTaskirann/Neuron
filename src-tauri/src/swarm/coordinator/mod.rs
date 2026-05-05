@@ -23,4 +23,6 @@ pub mod fsm;
 pub mod job;
 
 pub use fsm::{CoordinatorFsm, MAX_RETRIES};
-pub use job::{Job, JobOutcome, JobRegistry, JobState, StageResult};
+pub use job::{
+    Job, JobOutcome, JobRegistry, JobState, StageResult, SwarmJobEvent,
+};

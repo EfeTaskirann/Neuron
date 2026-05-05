@@ -108,11 +108,19 @@ pub fn specta_builder_for_export() -> tauri_specta::Builder<tauri::Wry> {
             commands::swarm::swarm_profiles_list::<tauri::Wry>,
             commands::swarm::swarm_test_invoke::<tauri::Wry>,
             commands::swarm::swarm_run_job::<tauri::Wry>,
+            commands::swarm::swarm_cancel_job::<tauri::Wry>,
         ])
         // Register the AppError once on the builder so the type lands
         // in `bindings.ts` as a referenceable shape rather than being
         // inlined into every command's Result.
         .typ::<crate::error::AppError>()
+        // WP-W3-12c — `SwarmJobEvent` is the payload of the
+        // `swarm:job:{id}:event` Tauri event channel. Specta only
+        // walks types reachable from registered commands; events
+        // are a side channel, so we register the type explicitly
+        // so frontend listeners can deserialize the payload with
+        // strict types instead of `unknown`.
+        .typ::<crate::swarm::coordinator::SwarmJobEvent>()
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]

@@ -41,6 +41,17 @@ pub fn pane_line(pane_id: &str) -> String {
     format!("panes:{pane_id}:line")
 }
 
+/// `swarm:job:{id}:event` — per-job streaming lifecycle event for
+/// the swarm coordinator FSM (WP-W3-12c). Payload is a tagged
+/// `SwarmJobEvent` enum with a `kind` discriminator covering
+/// `started` / `stage_started` / `stage_completed` / `finished` /
+/// `cancelled`. Frontend subscribes per-job; one event name covers
+/// every transition so a single listener captures the full stream.
+#[inline]
+pub fn swarm_job_event(job_id: &str) -> String {
+    format!("swarm:job:{job_id}:event")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -57,6 +68,7 @@ mod tests {
     fn parametric_event_names_interpolate_id() {
         assert_eq!(run_span("r-01ABC"), "runs:r-01ABC:span");
         assert_eq!(pane_line("p-01XYZ"), "panes:p-01XYZ:line");
+        assert_eq!(swarm_job_event("j-01ABC"), "swarm:job:j-01ABC:event");
     }
 
     /// ADR-0006: Tauri 2.10 rejects `.` in event names. The
@@ -75,7 +87,9 @@ mod tests {
         }
         let dyn_run = run_span("r-1");
         let dyn_pane = pane_line("p-1");
+        let dyn_swarm = swarm_job_event("j-1");
         assert!(!dyn_run.contains('.'));
         assert!(!dyn_pane.contains('.'));
+        assert!(!dyn_swarm.contains('.'));
     }
 }
