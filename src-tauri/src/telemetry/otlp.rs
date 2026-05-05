@@ -87,6 +87,22 @@ pub struct StoredSpan {
     pub response: Option<String>,
 }
 
+/// Knobs for [`build_envelope`]. Default-deny on every field: a
+/// caller has to opt in to send anything beyond the structural span
+/// shape (name, ids, timing, attrs).
+///
+/// `include_prompt_response` is the security-sensitive one — when
+/// `false` we drop `gen_ai.prompt` / `gen_ai.completion` attributes
+/// entirely so accidental misconfigurations of `NEURON_OTEL_ENDPOINT`
+/// (third-party SaaS, plain-HTTP collector, dev box) never exfiltrate
+/// raw LLM input/output. Callers that genuinely want prompt content
+/// on the wire flip this via the `NEURON_OTEL_INCLUDE_PROMPTS=1` env
+/// var, parsed once at exporter startup.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ExportOptions {
+    pub include_prompt_response: bool,
+}
+
 /// Hash a string into a hex prefix of the requested *byte* length.
 /// SHA-256 is overkill but guarantees collision resistance across
 /// the lifetime of the app, and it's already in the dep tree via
@@ -122,11 +138,14 @@ pub fn span_id_for(span_id: &str) -> String {
 /// vector of database `id`s that the caller flips to `exported_at`
 /// on a 2xx. The pair is returned together so the exporter doesn't
 /// have to walk the spans twice.
-pub fn build_envelope(spans: &[StoredSpan]) -> Result<(Value, Vec<String>), AppError> {
+pub fn build_envelope(
+    spans: &[StoredSpan],
+    opts: ExportOptions,
+) -> Result<(Value, Vec<String>), AppError> {
     let mut otlp_spans = Vec::with_capacity(spans.len());
     let mut ids = Vec::with_capacity(spans.len());
     for s in spans {
-        otlp_spans.push(span_to_otlp(s)?);
+        otlp_spans.push(span_to_otlp(s, opts)?);
         ids.push(s.id.clone());
     }
 
@@ -154,7 +173,7 @@ pub fn build_envelope(spans: &[StoredSpan]) -> Result<(Value, Vec<String>), AppE
 /// Skipped behaviours (per WP §"Out of scope"):
 /// - resource attributes beyond `service.name` (handled at envelope level)
 /// - `Span.events` / `Span.links` (unused by Neuron's runtime)
-fn span_to_otlp(s: &StoredSpan) -> Result<Value, AppError> {
+fn span_to_otlp(s: &StoredSpan, opts: ExportOptions) -> Result<Value, AppError> {
     // Time fields — OTLP wants `*UnixNano` as a string-typed uint64
     // (the proto's `fixed64` JSON encoding is a string to dodge
     // JS-number precision loss). `t0_ms * 1_000_000` widens the ms
@@ -177,14 +196,22 @@ fn span_to_otlp(s: &StoredSpan) -> Result<Value, AppError> {
 
     // gen_ai.prompt / gen_ai.completion semconv — truncate to keep
     // the envelope bounded. WP §"Scope": "truncated to 1 KiB".
-    if let Some(p) = &s.prompt {
-        attrs.push(string_attr("gen_ai.prompt", &truncate_chars(p, ATTR_TEXT_CAP)));
-    }
-    if let Some(r) = &s.response {
-        attrs.push(string_attr(
-            "gen_ai.completion",
-            &truncate_chars(r, ATTR_TEXT_CAP),
-        ));
+    //
+    // Default-deny: only emit prompt/response when the operator has
+    // explicitly opted in via `NEURON_OTEL_INCLUDE_PROMPTS=1`. A
+    // misconfigured `NEURON_OTEL_ENDPOINT` (third-party SaaS, plain
+    // HTTP, dev box) must not exfiltrate raw LLM input/output by
+    // default — see security-review M1.
+    if opts.include_prompt_response {
+        if let Some(p) = &s.prompt {
+            attrs.push(string_attr("gen_ai.prompt", &truncate_chars(p, ATTR_TEXT_CAP)));
+        }
+        if let Some(r) = &s.response {
+            attrs.push(string_attr(
+                "gen_ai.completion",
+                &truncate_chars(r, ATTR_TEXT_CAP),
+            ));
+        }
     }
 
     let mut span = Map::new();

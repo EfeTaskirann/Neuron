@@ -23,7 +23,7 @@ use sqlx::Row;
 
 use crate::db::DbPool;
 use crate::error::AppError;
-use crate::telemetry::otlp::{build_envelope, StoredSpan};
+use crate::telemetry::otlp::{build_envelope, ExportOptions, StoredSpan};
 
 /// How many rows per batch. 200 is well below SQLite's IN-clause
 /// expansion limit (default 999) and keeps the OTLP envelope small
@@ -46,6 +46,55 @@ pub const POST_TIMEOUT: Duration = Duration::from_secs(10);
 /// `exported_at IS NULL`.
 const EXPORT_FAILED_SENTINEL: i64 = -1;
 
+/// Maximum number of bytes we'll read out of a non-2xx collector
+/// response before truncating. The text is only used for log
+/// context; an unbounded `resp.text()` here would let a hostile or
+/// misconfigured collector ship a multi-GB chunk into our memory.
+/// 8 KiB carries plenty of error context (typical OTLP error
+/// responses are <1 KiB) without exposing us to that risk.
+const RESPONSE_LOG_CAP: usize = 8 * 1024;
+
+/// Env var that flips prompt/response inclusion in the OTLP
+/// envelope from default-deny to opt-in. Anything other than
+/// `"1"` / `"true"` (case-insensitive) is treated as off so a
+/// stray non-empty value doesn't accidentally enable exfiltration.
+const INCLUDE_PROMPTS_ENV: &str = "NEURON_OTEL_INCLUDE_PROMPTS";
+
+/// Read [`INCLUDE_PROMPTS_ENV`] and resolve it to a boolean using
+/// the strict allow-list above.
+fn include_prompts_from_env() -> bool {
+    match std::env::var(INCLUDE_PROMPTS_ENV) {
+        Ok(v) => matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true"),
+        Err(_) => false,
+    }
+}
+
+/// Drain a non-2xx response body up to [`RESPONSE_LOG_CAP`] bytes
+/// for logging. Stops streaming once the cap is reached so a hostile
+/// collector cannot force us to allocate unbounded memory by replying
+/// with a multi-GB error body. Bytes past the cap are dropped on the
+/// floor — the underlying connection is closed when the response is
+/// dropped.
+async fn read_capped_text(mut resp: reqwest::Response) -> String {
+    let mut buf: Vec<u8> = Vec::new();
+    while buf.len() < RESPONSE_LOG_CAP {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => {
+                let remaining = RESPONSE_LOG_CAP - buf.len();
+                let take = chunk.len().min(remaining);
+                buf.extend_from_slice(&chunk[..take]);
+                if take < chunk.len() {
+                    // Hit the cap mid-chunk — bail.
+                    break;
+                }
+            }
+            Ok(None) => break,
+            Err(_) => break,
+        }
+    }
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
 /// Lazily-initialised singleton `reqwest::Client`. Re-using one
 /// `Client` across sweeps lets the connection pool keep warm
 /// connections to the collector. Per WP §"HTTP client".
@@ -59,8 +108,47 @@ fn http_client() -> &'static Client {
     })
 }
 
+/// Validate the configured OTLP endpoint at startup.
+///
+/// - Rejects (returns `Err`) anything reqwest cannot parse as a URL,
+///   or schemes other than `http` / `https`. The export loop is
+///   skipped when this fails — span rows still accumulate in SQLite
+///   but no POST is ever issued, so a misconfigured env var becomes
+///   a loud "no exports happening" condition rather than a silent
+///   firehose to a wrong host.
+/// - Warns (returns `Ok`) when scheme is plain `http` and the host
+///   is **not** loopback. Plain HTTP to a public collector ships
+///   span attributes (and, with `NEURON_OTEL_INCLUDE_PROMPTS=1`,
+///   prompt content) in the clear; we won't refuse the configuration
+///   because some local-network collectors are HTTP-only by design,
+///   but the user should see the warning in their logs.
+pub fn validate_endpoint(endpoint: &str) -> Result<(), String> {
+    let url = reqwest::Url::parse(endpoint)
+        .map_err(|e| format!("not a valid URL: {e}"))?;
+    let scheme = url.scheme();
+    if scheme != "http" && scheme != "https" {
+        return Err(format!(
+            "unsupported scheme '{scheme}' (only http / https are accepted)"
+        ));
+    }
+    if scheme == "http" {
+        let host = url.host_str().unwrap_or("");
+        let is_loopback = matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]");
+        if !is_loopback {
+            tracing::warn!(
+                endpoint = %endpoint,
+                "OTLP endpoint is plain HTTP to a non-loopback host — span \
+                 attributes (and prompt content if NEURON_OTEL_INCLUDE_PROMPTS=1) \
+                 will travel in the clear"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Long-running sweep loop. Spawned by `lib.rs::setup` iff the
-/// `NEURON_OTEL_ENDPOINT` env var resolved to a non-empty string.
+/// `NEURON_OTEL_ENDPOINT` env var resolved to a non-empty string
+/// AND [`validate_endpoint`] accepted it.
 pub async fn start_export_loop(pool: DbPool, endpoint: String) {
     tracing::info!(endpoint = %endpoint, "OTLP export loop started");
     loop {
@@ -92,7 +180,10 @@ pub async fn export_one_batch(
         return Ok(0);
     }
 
-    let (envelope, ids) = build_envelope(&spans)?;
+    let opts = ExportOptions {
+        include_prompt_response: include_prompts_from_env(),
+    };
+    let (envelope, ids) = build_envelope(&spans, opts)?;
 
     let resp = match http_client()
         .post(endpoint)
@@ -117,7 +208,7 @@ pub async fn export_one_batch(
         // Permanent failure — collector rejected the payload. Mark
         // the rows so we don't keep retrying a bad envelope every
         // 30 seconds for the rest of the app's lifetime.
-        let body = resp.text().await.unwrap_or_default();
+        let body = read_capped_text(resp).await;
         tracing::warn!(
             status = %status,
             body = %body,
@@ -128,7 +219,7 @@ pub async fn export_one_batch(
         Ok(ids.len())
     } else {
         // 5xx — transient. Leave the rows alone.
-        let body = resp.text().await.unwrap_or_default();
+        let body = read_capped_text(resp).await;
         tracing::warn!(
             status = %status,
             body = %body,

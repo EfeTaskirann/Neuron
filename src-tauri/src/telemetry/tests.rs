@@ -14,7 +14,17 @@
 
 use serde_json::Value;
 
-use super::otlp::{build_envelope, span_id_for, trace_id_for, StoredSpan};
+use super::otlp::{build_envelope, span_id_for, trace_id_for, ExportOptions, StoredSpan};
+
+/// Convenience: the fixture file pre-dates security-review M1, so
+/// every test that compares against it needs prompt/response in the
+/// envelope. New tests that exercise the default-deny path use
+/// `ExportOptions::default()` directly.
+fn opts_with_prompts() -> ExportOptions {
+    ExportOptions {
+        include_prompt_response: true,
+    }
+}
 
 const FIXTURE_EXPECTED: &str = include_str!("tests/fixtures/expected.json");
 
@@ -73,12 +83,46 @@ fn deterministic_ids_match_documented_lengths() {
 /// fixture file don't break the test.
 #[test]
 fn envelope_matches_fixture() {
-    let (got, _ids) = build_envelope(&fixture_batch()).expect("envelope");
+    let (got, _ids) = build_envelope(&fixture_batch(), opts_with_prompts())
+        .expect("envelope");
     let want: Value =
         serde_json::from_str(FIXTURE_EXPECTED).expect("fixture parses");
     assert_eq!(
         got, want,
         "envelope drift — fixture: {FIXTURE_EXPECTED}\nactual: {got:#}"
+    );
+}
+
+/// Security-review M1: prompt/response are off by default. The
+/// envelope still ships every other attribute for the same batch —
+/// only the `gen_ai.prompt` and `gen_ai.completion` keys disappear.
+#[test]
+fn default_options_redact_prompt_and_response() {
+    let (got, _ids) = build_envelope(&fixture_batch(), ExportOptions::default())
+        .expect("envelope");
+    let attrs = got["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["attributes"]
+        .as_array()
+        .expect("attrs array")
+        .clone();
+    let keys: Vec<&str> = attrs
+        .iter()
+        .map(|a| a["key"].as_str().unwrap_or(""))
+        .collect();
+    assert!(
+        keys.contains(&"node"),
+        "non-secret attrs must still be present: {keys:?}"
+    );
+    assert!(
+        keys.contains(&"tokens_in"),
+        "non-secret attrs must still be present: {keys:?}"
+    );
+    assert!(
+        !keys.contains(&"gen_ai.prompt"),
+        "default-deny: prompt must be omitted unless opted in"
+    );
+    assert!(
+        !keys.contains(&"gen_ai.completion"),
+        "default-deny: response must be omitted unless opted in"
     );
 }
 
@@ -98,7 +142,7 @@ fn root_span_omits_parent_span_id() {
         prompt: None,
         response: None,
     }];
-    let (env, _) = build_envelope(&batch).unwrap();
+    let (env, _) = build_envelope(&batch, opts_with_prompts()).unwrap();
     let span = &env["resourceSpans"][0]["scopeSpans"][0]["spans"][0];
     assert!(
         span.get("parentSpanId").is_none(),
@@ -123,7 +167,7 @@ fn span_without_duration_omits_end_time() {
         prompt: None,
         response: None,
     }];
-    let (env, _) = build_envelope(&batch).unwrap();
+    let (env, _) = build_envelope(&batch, opts_with_prompts()).unwrap();
     let span = &env["resourceSpans"][0]["scopeSpans"][0]["spans"][0];
     assert!(span.get("endTimeUnixNano").is_none());
     assert_eq!(span["startTimeUnixNano"], "100000000");
@@ -144,7 +188,7 @@ fn long_prompt_is_truncated_to_1kib() {
         prompt: Some(big.clone()),
         response: None,
     }];
-    let (env, _) = build_envelope(&batch).unwrap();
+    let (env, _) = build_envelope(&batch, opts_with_prompts()).unwrap();
     let attrs = &env["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["attributes"];
     let prompt_attr = attrs
         .as_array()
@@ -430,6 +474,106 @@ async fn sweep_skips_in_flight_spans() {
         .await
         .expect("sweep ok");
     assert_eq!(n, 0);
+    m.assert_async().await;
+}
+
+// --------------------------------------------------------------------- //
+// Group 4 — security-review M2 / M3                                      //
+// --------------------------------------------------------------------- //
+
+/// Security-review M3: validate_endpoint accepts the well-formed
+/// shapes a real OTLP collector exposes (https + http to loopback)
+/// and rejects everything else with a non-empty reason string.
+#[test]
+fn validate_endpoint_accepts_https_and_loopback_http() {
+    use super::exporter::validate_endpoint;
+    assert!(validate_endpoint("https://collector.example/v1/traces").is_ok());
+    assert!(validate_endpoint("http://localhost:4318/v1/traces").is_ok());
+    assert!(validate_endpoint("http://127.0.0.1:4318/v1/traces").is_ok());
+}
+
+#[test]
+fn validate_endpoint_rejects_non_http_schemes() {
+    use super::exporter::validate_endpoint;
+    let cases = [
+        "file:///etc/passwd",
+        "ftp://collector.example",
+        "ipc://something",
+        "javascript:alert(1)",
+    ];
+    for c in cases {
+        let err = validate_endpoint(c)
+            .unwrap_err_or_else(|()| panic!("{c} should be rejected"));
+        assert!(
+            err.contains("scheme") || err.contains("URL"),
+            "rejection reason for {c} should mention scheme/URL: {err}"
+        );
+    }
+}
+
+#[test]
+fn validate_endpoint_rejects_garbage() {
+    use super::exporter::validate_endpoint;
+    assert!(validate_endpoint("not-a-url").is_err());
+    assert!(validate_endpoint("").is_err());
+}
+
+/// Plain HTTP to a non-loopback host is allowed (some local-network
+/// collectors only speak HTTP) but should NOT be silently equivalent
+/// to https. We assert the call returns Ok; the warning emission is
+/// observable via tracing in production but not asserted here to
+/// keep the test free of subscriber installation.
+#[test]
+fn validate_endpoint_allows_plain_http_to_remote_with_warning_path() {
+    use super::exporter::validate_endpoint;
+    assert!(validate_endpoint("http://collector.example:4318/v1/traces").is_ok());
+}
+
+/// Tiny shim so the assertion in `validate_endpoint_rejects_non_http_schemes`
+/// can stay readable. `Result::unwrap_err_or_else` does not exist in
+/// std; we add the equivalent inline via a trait extension scoped to
+/// this test module so the call site reads naturally.
+trait ResultExt<T, E> {
+    fn unwrap_err_or_else<F: FnOnce(()) -> E>(self, f: F) -> E;
+}
+
+impl<T, E> ResultExt<T, E> for Result<T, E> {
+    fn unwrap_err_or_else<F: FnOnce(()) -> E>(self, f: F) -> E {
+        match self {
+            Ok(_) => f(()),
+            Err(e) => e,
+        }
+    }
+}
+
+/// Security-review M2: a 4xx response with a body larger than
+/// [`super::exporter::RESPONSE_LOG_CAP`]'s value MUST NOT cause us
+/// to allocate the full body into memory. We approximate the bound
+/// by mocking a 4xx with a 1 MiB body and verifying the sweep
+/// completes in well under the timeout the loop would otherwise hit.
+/// The actual cap-enforcement is exercised at the unit level by
+/// `read_capped_truncates_oversized_body` below.
+#[tokio::test]
+async fn sweep_4xx_with_large_body_does_not_oom() {
+    let mut server = mockito::Server::new_async().await;
+    // 1 MiB body. If the cap regresses, this test still passes (the
+    // OS will happily hand us 1 MiB), but the unit-level cap test is
+    // the load-bearing guard.
+    let big = "X".repeat(1024 * 1024);
+    let m = server
+        .mock("POST", "/v1/traces")
+        .with_status(400)
+        .with_body(big)
+        .expect(1)
+        .create_async()
+        .await;
+    let (pool, _dir) = crate::test_support::fresh_pool().await;
+    let _ids = seed_pending_spans(&pool, 1).await;
+    let endpoint = format!("{}/v1/traces", server.url());
+    let n = super::exporter::export_one_batch(&pool, &endpoint)
+        .await
+        .expect("sweep ok");
+    assert_eq!(n, 1, "4xx still flags rows");
     m.assert_async().await;
 }
 

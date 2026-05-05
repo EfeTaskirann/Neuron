@@ -176,20 +176,38 @@ pub fn run() {
             // (no panic / warn) when the env var is unset; users who
             // don't wire a collector get the same behaviour as
             // before this WP landed.
+            //
+            // Security review M3: the endpoint is validated up-front
+            // (scheme allow-list + plain-HTTP-to-non-loopback warning)
+            // before the loop is spawned. An invalid value skips the
+            // loop entirely so a typo'd `NEURON_OTEL_ENDPOINT` cannot
+            // silently become a never-exporting fire-and-forget — the
+            // warning lands in the structured logs at startup.
             if let Ok(endpoint) = std::env::var("NEURON_OTEL_ENDPOINT") {
                 let endpoint = endpoint.trim().to_string();
                 if !endpoint.is_empty() {
-                    let pool_for_export = app
-                        .state::<db::DbPool>()
-                        .inner()
-                        .clone();
-                    tauri::async_runtime::spawn(async move {
-                        crate::telemetry::start_export_loop(
-                            pool_for_export,
-                            endpoint,
-                        )
-                        .await;
-                    });
+                    match crate::telemetry::exporter::validate_endpoint(&endpoint) {
+                        Ok(()) => {
+                            let pool_for_export = app
+                                .state::<db::DbPool>()
+                                .inner()
+                                .clone();
+                            tauri::async_runtime::spawn(async move {
+                                crate::telemetry::start_export_loop(
+                                    pool_for_export,
+                                    endpoint,
+                                )
+                                .await;
+                            });
+                        }
+                        Err(reason) => {
+                            tracing::warn!(
+                                endpoint = %endpoint,
+                                reason = %reason,
+                                "NEURON_OTEL_ENDPOINT rejected; export loop not started"
+                            );
+                        }
+                    }
                 }
             }
 
