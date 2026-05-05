@@ -18,6 +18,7 @@ pub mod me;
 pub mod runs;
 pub mod secrets;
 pub mod settings;
+pub mod swarm;
 pub mod terminal;
 pub mod util;
 pub mod workflows;

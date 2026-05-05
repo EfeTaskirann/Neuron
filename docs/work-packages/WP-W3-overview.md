@@ -48,7 +48,8 @@ matching WP file is authored.
 | WP-W3-07 | Pane aggregates from spans | TBD | not-started | WP-W3-06 | S |
 | WP-W3-08 | Multi-workflow editor + fixture system | TBD | not-started | — | L |
 | WP-W3-09 | Capabilities tightening + E2E (Playwright) | TBD | not-started | 02,03,04,06,08 | M |
-| WP-W3-10 | PyOxidizer Python embed | TBD | not-started | WP-W3-04 | L |
+| WP-W3-10 | PyOxidizer Python embed | TBD | not-started | (W3-04 deferred — see Owner decision #4) | L |
+| WP-W3-11 | Swarm runtime foundation (claude subprocess substrate) | TBD | not-started | WP-W3-01 | M |
 
 Sizes (rough, in sub-agent days): S = 0.5–1 day, M = 1–2 days,
 L = 3+ days. Anything L is a candidate to split before kickoff.
@@ -60,18 +61,26 @@ WP-W3-01 (keychain + settings)
    │
    ├──► WP-W3-02 (MCP pool + cancel safety) ──► WP-W3-03 (MCP install UX)
    │                                                 │
-   └──► WP-W3-04 (agent cancel + streaming) ──► WP-W3-05 (approval UI)
-                                                 │
-                                                 ▼
-WP-W3-06 (OTel + sampling) ──► WP-W3-07 (pane aggregates)
-                                                 │
-                                                 ▼
-WP-W3-08 (workflow editor + fixtures)            │
-                                                 │
-                                                 ▼
-                                       WP-W3-09 (capabilities + E2E)
-                                                 │
-WP-W3-10 (PyOxidizer) ──── parallel ─────────────┘
+   ├──► WP-W3-04 (LangGraph cancel + streaming) ──► WP-W3-05 (approval UI)
+   │       [DEFERRED 2026-05-05 per Owner decision #4 —
+   │        re-evaluate at W3-08 close]               │
+   │                                                  ▼
+   │   WP-W3-06 (OTel + sampling) ──► WP-W3-07 (pane aggregates)
+   │                                                  │
+   │                                                  ▼
+   │   WP-W3-08 (workflow editor + fixtures)          │
+   │                                                  │
+   │                                                  ▼
+   │                                       WP-W3-09 (capabilities + E2E)
+   │                                                  │
+   ├──► WP-W3-10 (Python embed) ───── parallel ───────┘
+   │       [no longer blocks on W3-04 per Owner decision #4]
+   │
+   └──► WP-W3-11 (Swarm runtime foundation) ──► W3-12 (Coordinator FSM)
+                                              ──► W3-13 (Verdict + retry + broadcast)
+                                              ──► W3-14 (Swarm multi-pane UI)
+                  [W3-12 / W3-13 / W3-14 are placeholders;
+                   per-WP files authored when W3-11 lands]
 ```
 
 W3-09 is the late-cycle WP because it freezes the command surface
@@ -309,6 +318,43 @@ re-opening any of these is a scope amendment that lands in
    ships a smaller variant by then. Charter Risks table line
    1 is updated in this commit to read "PyOxidizer or
    `python-build-standalone` in Week 3" — no decision lock-in.
+
+4. **Swarm runtime introduction + W3-04 deferral** (resolved
+   2026-05-05): a new agent runtime — `claude` CLI subprocess
+   pool, see WP-W3-11 — is added alongside LangGraph (NOT
+   replacing it). Rationale:
+   - LangGraph sidecar continues to power the scripted "Daily
+     summary" demo (button-triggered, fixed graph, currently
+     the only scripted workflow). Charter Phases row "Week 2
+     release gate" depends on it; we don't break that.
+   - Swarm runtime serves a different feature shape:
+     chat-triggered, Coordinator-decided multi-agent flow with
+     `.md` profile-driven specialists. The user-facing pitch is
+     "şefli ekip", not "scripted workflow". Different shape
+     means different runtime.
+   - The two runtimes share SQLite (runs/spans tables) but never
+     cross-import. Phase 1 substrate (WP-W3-11) explicitly
+     forbids the import — recorded in §"Sub-agent reminders".
+   - **W3-04 deferred** (LangGraph cancel + streaming): priority
+     drops because (a) Swarm gets cancel + streaming as a first-
+     class concern via W3-12+, (b) Daily summary is a 30-second
+     scripted job — no user-facing demand for cancel yet, (c)
+     only one scripted workflow exists; cancel ergonomics matter
+     once W3-08 (workflow editor) ships and a non-trivial pile
+     of long-running workflows can be authored. **Re-evaluate
+     W3-04 at W3-08 close.** The status table above marks it
+     `not-started` (unchanged) but its dependency edge into
+     W3-10 is broken.
+   - **W3-10 reframed**: no longer blocks on W3-04 — Python
+     embed work proceeds independently so the bundle stays
+     self-contained even if W3-04 sleeps long-term. The
+     dependency graph above is updated.
+
+   The architectural ground truth for Swarm is the
+   `report/Neuron Multi-Agent Orchestration` report and
+   WP-W3-11. Future swarm WPs (W3-12 Coordinator FSM, W3-13
+   verdict + retry + broadcast, W3-14 multi-pane UI) reference
+   them.
 
 ## Open questions (still gating)
 

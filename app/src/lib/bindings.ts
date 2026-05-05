@@ -137,6 +137,23 @@ export const commands = {
 	 *  to keep the typegen surface trivial.
 	 */
 	settingsList: () => typedError<([string, string])[], AppErrorWire>(__TAURI_INVOKE("settings_list")),
+	/**
+	 *  Return every profile the registry knows about. Bundled defaults
+	 *  always present (3 entries on a fresh install); workspace files
+	 *  shadow bundled ones with the same `id`. Body and `source_path`
+	 *  are stripped per `ProfileSummary`'s contract.
+	 */
+	swarmProfilesList: () => typedError<ProfileSummary[], AppErrorWire>(__TAURI_INVOKE("swarm_profiles_list")),
+	/**
+	 *  Spawn `claude` against the named profile, send `user_message`
+	 *  once, return the parsed `result` event. Acceptance gate for
+	 *  WP-W3-11 — proves the subprocess pipe is healthy end-to-end.
+	 * 
+	 *  60-second timeout absorbs Windows AV cold-start cost on first
+	 *  spawn (per WP §"Notes / risks"). Subscription env is preserved
+	 *  (no `ANTHROPIC_API_KEY` injected) per `binding::subscription_env`.
+	 */
+	swarmTestInvoke: (profileId: string, userMessage: string) => typedError<InvokeResult, AppErrorWire>(__TAURI_INVOKE("swarm_test_invoke", { profileId, userMessage })),
 };
 
 /* Types */
@@ -237,6 +254,20 @@ export type Edge = {
 	 *  natively (`sqlx_sqlite::types::bool`).
 	 */
 	active: boolean,
+};
+
+/**
+ *  Output of one successful `SubprocessTransport::invoke`.
+ * 
+ *  `total_cost_usd` is what `claude` reports in the `result` event;
+ *  `turn_count` reflects the number of model turns the child consumed
+ *  before finishing (≤ `Profile.max_turns`).
+ */
+export type InvokeResult = {
+	sessionId: string,
+	assistantText: string,
+	totalCostUsd: number,
+	turnCount: number,
 };
 
 /**
@@ -407,6 +438,57 @@ export type PaneSpawnInput = {
 	agentKind: string | null,
 	role: string | null,
 	workspace: string | null,
+};
+
+/**
+ *  Permission posture handed to the spawned `claude` subprocess.
+ * 
+ *  Phase 1 (this WP) treats the value as a binary gate inside
+ *  `binding::build_specialist_args`:
+ * 
+ *  - `Plan` → `--permission-mode plan` (no `--dangerously-skip-permissions`).
+ *  - everything else → `--dangerously-skip-permissions` (so the
+ *    smoke command can run without a UI prompt).
+ * 
+ *  W3-12 introduces a per-tool allow / deny mapping; until then the
+ *  richer `AcceptEdits` / `AcceptAll` distinction is metadata only.
+ */
+export type PermissionMode = 
+// Read-only / planning posture — `--permission-mode plan`.
+"plan" | 
+// Auto-accept Edit / Write tool calls.
+"acceptEdits" | 
+/**
+ *  Auto-accept everything including Bash. Phase 1 gate is the same
+ *  as `AcceptEdits`; W3-12 splits the two.
+ */
+"acceptAll";
+
+/**
+ *  IPC-friendly subset of `crate::swarm::profile::Profile` returned by
+ *  `swarm:profiles_list`. Strips the persona `body` (potentially
+ *  kilobyte-class markdown) and the on-disk `source_path` so the
+ *  frontend listing surface is cheap to fetch and stays free of
+ *  host-filesystem leaks. The `source` discriminant lets the UI label
+ *  each row as bundled-default vs. user-edited workspace override.
+ * 
+ *  The full `Profile` (incl. body) is loaded server-side on every
+ *  `swarm:test_invoke`; the list command is purely a directory.
+ */
+export type ProfileSummary = {
+	id: string,
+	version: string,
+	role: string,
+	description: string,
+	permissionMode: PermissionMode,
+	maxTurns: number,
+	allowedTools: string[],
+	/**
+	 *  `"bundled"` for profiles embedded via `include_dir!`,
+	 *  `"workspace"` for files dropped under
+	 *  `<app_data_dir>/agents/`.
+	 */
+	source: string,
 };
 
 /**

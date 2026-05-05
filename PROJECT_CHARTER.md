@@ -30,6 +30,7 @@ The brand metaphor is *neurons*: nodes-and-synapses, soft glow feedback, signal 
 | Frontend | React 18 + TS, Vite | Migration from CDN React; matches mock | 0004 |
 | Frontend data | TanStack Query v5 | Cache + invalidate; clean mock → real swap | 0005 |
 | Agent runtime | LangGraph (Python sidecar) | Mature stateful graph runtime | — |
+| Swarm runtime | `claude` CLI subprocess pool | Local-only multi-agent orchestration; subscription OAuth (Pro/Max); coexists with LangGraph sidecar (different feature shape — see WP-W3-11) | — |
 | MCP integration | Anthropic MCP (Rust client) | Spec-canonical | — |
 | Terminal sidecar | `portable-pty` (Rust) | Cross-platform PTY, no extra runtime | — |
 | Tracing | Custom OTel-style spans → SQLite | Self-hosted, no external collector | — |

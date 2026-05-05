@@ -92,6 +92,31 @@ pub enum AppError {
     #[error("mcp server spawn failed: {0}")]
     McpServerSpawnFailed(String),
 
+    /// WP-W3-11 — `claude` CLI binary could not be located on this
+    /// host. The message embeds the resolution chain (env override
+    /// probed, `which::which` result, platform-specific fallbacks
+    /// inspected) plus a CTA pointing at the official setup docs.
+    /// Frontend pattern-matches on `kind='claude_binary_missing'` to
+    /// surface a "run `claude login` / install Claude Code" banner.
+    #[error("claude binary missing: {0}")]
+    ClaudeBinaryMissing(String),
+
+    /// WP-W3-11 — the `claude` subprocess emitted a `result` event of
+    /// subtype `error`, or exited non-zero before producing a
+    /// `result.success`. The nested string carries either the model-
+    /// reported reason or the stderr ring tail surfaced by
+    /// `SubprocessTransport::invoke`.
+    #[error("swarm invoke error: {0}")]
+    SwarmInvoke(String),
+
+    /// WP-W3-11 — a wrapped operation ran past its budget. Currently
+    /// emitted only by `SubprocessTransport::invoke` when the stdout
+    /// read loop's `tokio::time::timeout` expires; the child is
+    /// killed via `kill_on_drop` on the way out. Future WPs may
+    /// reuse this for any other budget-bound wait.
+    #[error("operation timed out: {0}")]
+    Timeout(String),
+
     /// Catch-all for unclassified failures (panics-in-tasks, missing
     /// env, etc.). Frontend treats `internal` as a developer bug.
     #[error("internal error: {0}")]
@@ -113,6 +138,9 @@ impl AppError {
             Self::NoApiKey(_) => "no_api_key",
             Self::McpProtocol(_) => "mcp_protocol",
             Self::McpServerSpawnFailed(_) => "mcp_server_spawn_failed",
+            Self::ClaudeBinaryMissing(_) => "claude_binary_missing",
+            Self::SwarmInvoke(_) => "swarm_invoke",
+            Self::Timeout(_) => "timeout",
             Self::Internal(_) => "internal",
         }
     }
@@ -129,6 +157,9 @@ impl AppError {
             | Self::NoApiKey(m)
             | Self::McpProtocol(m)
             | Self::McpServerSpawnFailed(m)
+            | Self::ClaudeBinaryMissing(m)
+            | Self::SwarmInvoke(m)
+            | Self::Timeout(m)
             | Self::Internal(m) => m,
         }
     }

@@ -31,6 +31,7 @@ pub mod mcp;
 pub mod models;
 pub mod secrets;
 pub mod sidecar;
+pub mod swarm;
 pub mod telemetry;
 pub mod time;
 pub mod tuning;
@@ -103,6 +104,9 @@ pub fn specta_builder_for_export() -> tauri_specta::Builder<tauri::Wry> {
             commands::settings::settings_set,
             commands::settings::settings_delete,
             commands::settings::settings_list,
+            // swarm
+            commands::swarm::swarm_profiles_list::<tauri::Wry>,
+            commands::swarm::swarm_test_invoke::<tauri::Wry>,
         ])
         // Register the AppError once on the builder so the type lands
         // in `bindings.ts` as a referenceable shape rather than being

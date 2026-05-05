@@ -123,6 +123,18 @@ reqwest = { version = "=0.12.23", default-features = false, features = ["json", 
 # (`agent_runtime/secrets.py`) so a key written via
 # `secrets:set('anthropic', ...)` from Rust round-trips to Python.
 
+# WP-W3-11 — Swarm runtime substrate.
+# `include_dir` embeds the bundled `.md` agent profiles (scout,
+# planner, backend-builder) into the binary so the app ships with
+# a working profile registry out of the box. 0.7.x is the
+# stable line; pin exact per Charter risk register.
+include_dir = "=0.7.4"
+# `which` resolves the `claude` CLI binary path from PATH +
+# platform-conventional fallback locations. The 4.x line is the
+# active maintained branch; 6.x bumped MSRV beyond what we ship
+# elsewhere. Pin exact.
+which = "=4.4.2"
+
 [target.'cfg(windows)'.dependencies]
 keyring = { version = "=3.6.3", features = ["windows-native"] }
 
