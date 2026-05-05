@@ -4,6 +4,49 @@ Running journal of agent-driven changes. Newest entry on top. See `AGENTS.md` §
 
 ---
 
+## 2026-05-05T18:48Z WP-W3-11 completed
+
+- dispatch: **hybrid** (orchestrator scaffold + Charter, sub-agent parser/transport/tests). First time the `AGENTS.md` "one sub-agent per WP" cadence was split — recorded in `tasks/swarm-phase-1.md` §"Dispatch decision" so future per-WP authors can refer to it.
+- sub-agent: general-purpose (Rust code + tests + lib.rs wiring + bindings regen)
+- files changed: 19 in commit `f1596f8`
+  - new — Rust: `src-tauri/src/swarm/{mod,binding,profile,transport}.rs`, `src-tauri/src/commands/swarm.rs`
+  - new — bundled profiles: `src-tauri/src/swarm/agents/{scout,planner,backend-builder}.md` (orchestrator-authored, embedded via `include_dir!`)
+  - new — planning: `docs/work-packages/WP-W3-11-swarm-foundation.md`, `tasks/swarm-phase-1.md`
+  - modified: `PROJECT_CHARTER.md` (+Swarm runtime row in tech-stack table), `docs/work-packages/WP-W3-overview.md` (+W3-11 status row, +Owner decision #4 documenting Swarm/LangGraph coexist + W3-04 deferral + W3-10 unblock), `src-tauri/Cargo.toml` (+`include_dir = "=0.7.4"`, +`which = "=4.4.2"`), `Cargo.lock`, `src-tauri/src/{lib,error,models,commands/mod}.rs`, `app/src/lib/bindings.ts` (regen +5 entries: `swarmProfilesList`, `swarmTestInvoke`, `ProfileSummary`, `InvokeResult`, `PermissionMode`)
+- commit SHA: `f1596f8`
+- acceptance: ✅ pass — orchestrator independently re-ran every gate after sub-agent return; OWNER additionally drove the manual integration smoke
+  - `cargo check` → exit 0
+  - `cargo test --lib` → exit 0, **181 passed; 0 failed; 5 ignored** (163 prior + 18 new = +18)
+  - `pnpm gen:bindings` → exit 0; bindings.ts gained 5 typed entries
+  - `pnpm gen:bindings:check` → exit 1 PRE-COMMIT (expected; the `git diff --exit-code` guard reports the not-yet-committed regen). POST-`f1596f8` it exits 0.
+  - `pnpm typecheck` → exit 0
+  - `pnpm test --run` → exit 0 (17/17 frontend tests)
+  - `pnpm lint` → exit 0
+  - **owner-driven manual integration smoke**: `cargo test --manifest-path src-tauri/Cargo.toml --lib -- swarm::transport::tests::integration_smoke_invoke --ignored` → exit 0, real `claude` binary spawned, bundled `scout` profile loaded via `include_dir!`, NDJSON `Say exactly: 'scout-ok' and nothing else.` round-tripped over stream-json, assertion on `result.assistant_text.contains("scout-ok")` passed in **7.59s** on Windows (PowerShell, Pro/Max OAuth)
+- key implementation choices
+  - **Substrate scope only.** Per WP §"Out of scope": Coordinator state machine, persistent Coordinator chat, multi-pane UI, Verdict schema + JSON parser, retry loop, broadcast/fan-out, MCP per-agent config, DB persistence, streaming, and BYOK transport are all deferred to W3-12+. This WP is the transport + profile loader + smoke command, nothing more.
+  - **Persistent vs. per-invoke split** (architectural report §3.3): Coordinator persistence is a W3-12 concern; this WP only ships the per-invoke side via `SubprocessTransport::invoke`. Single Tauri command (`swarm:test_invoke`) returns one `InvokeResult` per call.
+  - **Subscription auth preservation**. `subscription_env()` strips `ANTHROPIC_API_KEY` / `USE_BEDROCK` / `USE_VERTEX` / `USE_FOUNDRY` so the spawned `claude` child inherits the user's Pro/Max OAuth token via `~/.claude/` rather than a per-token API path. Defensive `Command::env_remove(...)` calls are layered on top of the cleaned env-map because `envs()` merges into rather than replaces the inherited slate.
+  - **`--append-system-prompt-file`, NOT `--system-prompt-file`** (replace mode). The replace flag would erase Claude Code's built-in tool-use behavior (`Read`, `Grep`, etc.); the append form keeps defaults and stacks the persona on top. Asserted in `binding::tests::specialist_args_contain_required_flags`.
+  - **`Plan` permission_mode → `--permission-mode plan`, no `--dangerously-skip-permissions`.** Per WP §3 binary gate: Plan-mode profiles (Scout, Planner) cannot trigger writes; non-Plan profiles (BackendBuilder) get `--dangerously-skip-permissions` since the headless smoke command has no UI to surface approval prompts. Asserted in `binding::tests::plan_mode_skips_dangerous_flag`.
+  - **Hand-rolled YAML frontmatter parser**. No `gray_matter` / `serde_yaml` dep — the parser is ~50 lines and avoids a transitive `pest`/`yaml-rust` chain. The `id` validation regex `^[a-z][a-z0-9-]{1,40}$` and the 3-part dotted `version` parse are unit-tested.
+  - **Three bundled profiles** (per Owner decision 2026-05-05): `scout` + `planner` + `backend-builder`. Even before the W3-12 Coordinator FSM lands, the user can drive a `scout → planner → builder` mini-flow manually by chaining three `swarm:test_invoke` calls — Phase 1 substrate is exercised against multiple personas, not a single one.
+  - **Profile dir is `app_data_dir/agents/`** (per Owner decision 2026-05-05), NOT `~/.neuron/agents`. A clean reinstall wipes user-edited profiles together with the rest of the install state — no orphan dotfile survives uninstall.
+  - **Cross-runtime hygiene**. `swarm/` never imports from `sidecar/agent.rs` or `agent_runtime/`. LangGraph (scripted "Daily summary" workflow) and Swarm (chat-driven agent-team) share the SQLite store but are otherwise independent runtimes.
+  - **`ProfileRegistry::load_from(workspace_dir: Option<&Path>)`** signature — the bundled walk is hardcoded inside the registry via `include_dir!`, not passed as a virtual `&[PathBuf]` entry. Cleaner than the WP §2 draft signature; sub-agent surfaced this in the orchestrator dispatch prompt and the orchestrator approved.
+  - **`PermissionMode` parser dual-form**. Accepts both `acceptEdits` (camel) and `accept-edits` (kebab). The bundled `backend-builder.md` ships camel; the WP body used kebab. Tolerating both removes a foot-gun for users authoring workspace overrides. Unit-tested.
+- bindings regenerated: yes (+5 typed entries: 2 commands, 3 types)
+- branch: `main` (local; not pushed; **48 commits ahead of `origin/main`**)
+- known caveats / followups
+  - **Charter "Status: Active — Week 2"** is now stale (we are mid-Week-3). Not amended in this WP (out of scope); next planning-housekeeping commit can flip it.
+  - **Profile body persona reminders** ("Bu Claude Code'un sıradan davranışı değil — sen Coordinator değil, Specialist'sin") are imperative-style Turkish; the W3-13 era may add an EN parallel for international users. Phase 1 ships TR-only matching the owner's working language.
+  - **Tmp file lifecycle**: `app_data_dir/swarm/tmp/<ulid>.md` is deleted on the happy path, preserved on error. No retention policy yet — long-term a sweep removes >24h-old files. Deferred to W3-12.
+  - **No DB persistence**: `swarm:test_invoke` is stateless. Migration `0006_swarm_jobs.sql` is reserved for W3-12 once the FSM has somewhere to write (job rows, transcripts, retry history).
+  - **W3-04 (LangGraph cancel + streaming) deferred**: per Owner decision #4 in `WP-W3-overview.md`, re-evaluate at W3-08 close. W3-10 (Python embed) is reframed as not-blocked-on-W3-04.
+- next: WP-W3-12 (Coordinator state machine + persistent chat + DB persistence + streaming events), or any of the deferred W3 backlog (W3-02 MCP pool, W3-03 MCP install UX, W3-05 approval UI, W3-07 pane aggregates, W3-08 workflow editor, W3-09 capabilities + E2E, W3-10 Python embed). All depend only on already-shipped WPs.
+
+---
+
 ## 2026-05-02T01:05Z WP-W3-06 completed
 
 - sub-agent: general-purpose
