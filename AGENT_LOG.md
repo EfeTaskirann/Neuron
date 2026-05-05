@@ -4,6 +4,47 @@ Running journal of agent-driven changes. Newest entry on top. See `AGENTS.md` §
 
 ---
 
+## 2026-05-05T22:15Z WP-W3-12c completed
+
+- dispatch: **single sub-agent** (orchestrator drafted WP + tasks file, sub-agent implemented backend Rust + bindings; orchestrator drove BOTH integration smokes per 2026-05-05 owner directive "terminalden smoke testlerini ayrıca sen yapabiliyorsan eğer onları da senin yapmanı istiyorum")
+- sub-agent: general-purpose
+- files changed: 11 in commit `3cb6be1`
+  - new — planning: `docs/work-packages/WP-W3-12c-streaming-events-cancel.md`, `tasks/swarm-phase-2c.md`
+  - modified: `docs/work-packages/WP-W3-overview.md` (W3-12a flipped to done; W3-12c row scope rephrased), `src-tauri/src/events.rs` (+`swarm_job_event(id)` helper), `src-tauri/src/swarm/coordinator/{mod,job,fsm}.rs` (+`SwarmJobEvent` enum, +cancel_notifies map and 3 methods, +`run_job_with_id` test helper, restructured `run_job` with `tokio::select!` per stage, `CancelGuard` Drop seatbelt, `finalize_cancelled`, `emit_swarm_event`), `src-tauri/src/swarm/mod.rs` (re-export), `src-tauri/src/commands/swarm.rs` (+`swarm_cancel_job`), `src-tauri/src/lib.rs` (+command registration, +`SwarmJobEvent` `.typ::<...>()` export), `app/src/lib/bindings.ts` (regen +1 command, +1 union type with 5 kinds)
+- commit SHA: `3cb6be1`
+- acceptance: ✅ pass — orchestrator independently re-ran every gate after sub-agent return; orchestrator additionally drove BOTH manual integration smokes (W3-12a happy path + W3-12c cancel)
+  - `cargo check` → exit 0
+  - `cargo test --lib` → exit 0, **223 passed; 0 failed; 7 ignored** (205 prior + 18 new unit; 6 prior ignored + 1 new ignored integration)
+  - `pnpm gen:bindings` → exit 0; bindings.ts gained `swarmCancelJob` + `SwarmJobEvent` union
+  - `pnpm gen:bindings:check` → exit 1 PRE-COMMIT (expected). POST-`3cb6be1` it exits 0.
+  - `pnpm typecheck` → exit 0
+  - `pnpm test --run` → exit 0 (17/17 frontend tests)
+  - `pnpm lint` → exit 0
+  - **orchestrator-driven manual integration smokes** (Windows + Pro/Max OAuth):
+    - `integration_fsm_drives_real_claude_chain` (W3-12a regression) → Done in **114.57s** ✅
+    - `integration_cancel_during_real_claude_chain` (W3-12c) → Failed with `last_error="cancelled by user"` in **41.23s** ✅; `Cancelled` event captured with `cancelled_during` in {Scout, Plan, Build} per the race-tolerant assertion. (Initial transient 0.14s anomaly run was not reproducible; sequential `--test-threads=1` rerun gave the conclusive 41.23s real-claude exercise.)
+- key implementation choices
+  - **Single per-job event channel with `kind` discriminator** (`swarm:job:{id}:event` payload tagged Started/StageStarted/StageCompleted/Finished/Cancelled). Mirrors W3-06's `runs:{id}:span` precedent. The alternative (5 separate event names) would have forced N listener registrations per job; the discriminator approach uses one.
+  - **`tokio::sync::Notify` for cancel** (no new dep). `tokio_util::CancellationToken` would have been idiomatic but pulls a transitive dep; the manual notify pattern is ~3 lines and works identically for our use.
+  - **Lock order extended** to `workspace_locks → cancel_notifies → jobs`. The three methods on the new map (`register_cancel`/`unregister_cancel`/`signal_cancel`) each hold only one mutex while running, so they cannot deadlock against existing two-mutex methods.
+  - **`CancelGuard` Drop seatbelt** mirrors `WorkspaceGuard` — guarantees `unregister_cancel` fires even on panic / early return inside `run_job_inner`. Belt and braces alongside the explicit unregister at the FSM tail.
+  - **`prompt_preview` is char-bounded, not byte-bounded** — Turkish-language profile bodies are multibyte; byte-slicing risks splitting a UTF-8 codepoint and panicking at runtime.
+  - **`run_job_with_id` test-only entry point** (`#[cfg(test)]`) lets unit tests pre-register a Tauri event listener before the FSM mints its ULID. Without it, the listener registration races the first event emission and tests would intermittently miss `Started`/first `StageStarted`. Production callers stay on `run_job` which mints its own job_id and forwards to `run_job_inner(None, …)`.
+  - **`SwarmJobEvent` `.typ::<...>()` registered explicitly** in `specta_builder_for_export` even though it's not a command return type. Specta only walks types reachable from registered command signatures; without explicit registration `bindings.ts` would have shipped `SwarmJobEvent` as `unknown` to frontend listeners.
+  - **Cancel of terminal job → `Conflict`, of unknown job → `NotFound`**. Idempotent re-cancel of an already-cancelled job races the registry observation: the FSM may have already finalized state by the time the second cancel arrives. Test accepts either error kind via `assert!(matches!(...))`.
+  - **No frontend code in this WP** beyond `bindings.ts` regen. The React `useSwarmJob` hook + multi-pane subscription UI is W3-14.
+- bindings regenerated: yes (+1 command, +1 union type with 5 kinds)
+- branch: `main` (local; not pushed; **52 commits ahead of `origin/main`** post-`3cb6be1`)
+- known caveats / followups
+  - **No DB persistence**. App restart still loses every in-flight job (W3-12b adds SQLite-backed `JobRegistry` on the same trait surface).
+  - **No frontend hook**. UI integration (subscribe + cancel-button) lands in W3-14.
+  - **No token-level streaming**. Stage-level events only; mid-stage progress is invisible. A future W3-12c+ could extend `SwarmJobEvent` with `AssistantDelta` if owner prioritizes.
+  - **Cancel doesn't propagate to subprocess gracefully**. `kill_on_drop(true)` from W3-11 means dropping the future kills the child OS-level. On Windows, this is async; the test asserts "within 2s" rather than synchronous.
+  - **Resume after cancel** is a W3-12d concern via the retry surface; cancel always finalizes as Failed in 12c.
+- next: WP-W3-12b (SQLite persistence + restart recovery), then WP-W3-12d (REVIEW/TEST states + reviewer/integration-tester profiles + Verdict schema + retry feedback + Coordinator LLM brain), then WP-W3-14 (React UI hook + multi-pane). 12b and 12d are independent of each other; 12d ideally lands after 12b so retry transcripts persist.
+
+---
+
 ## 2026-05-05T20:50Z WP-W3-12a completed
 
 - dispatch: **single sub-agent** (W3-11's hybrid cadence retired for this WP — orchestrator drafted the WP + tasks file, sub-agent implemented the entire Rust + bindings surface).
