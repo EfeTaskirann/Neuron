@@ -4,6 +4,46 @@ Running journal of agent-driven changes. Newest entry on top. See `AGENTS.md` §
 
 ---
 
+## 2026-05-07T01:00Z WP-W3-12k3 completed — 9-agent vision UX-COMPLETE (chat panel live)
+
+- dispatch: **single sub-agent**; frontend-only WP; no real-claude smoke (mock tests + W3-12k-1's parser tests cover the surface).
+- sub-agent: general-purpose
+- files changed: 9 in commit `f5f4dca`
+  - new: `docs/work-packages/WP-W3-12k3-orchestrator-chat-panel.md`, `app/src/components/OrchestratorChatPanel.{tsx,test.tsx}`, `app/src/hooks/useOrchestratorDecide.{ts,test.tsx}`
+  - modified: `app/src/routes/SwarmRoute.{tsx,test.tsx}`, `app/src/styles/swarm.css`, `docs/work-packages/WP-W3-overview.md` (W3-12k1 flipped done; W3-12k3 in-flight then done)
+  - deleted: `app/src/components/SwarmGoalForm.tsx`
+- commit SHA: `f5f4dca`
+- acceptance: ✅ pass
+  - `cargo check` → exit 0 (regression)
+  - `cargo test --lib` → exit 0, **364 passed; 0 failed; 12 ignored** (unchanged from W3-12k1)
+  - `pnpm gen:bindings:check` → exit 0 (no Rust changes, W3-12k1 already exported the IPC types)
+  - `pnpm typecheck` → exit 0
+  - `pnpm test --run` → exit 0, **45 passed** (34 prior + 11 new across 7 files)
+  - `pnpm lint` → exit 0
+- key implementation choices
+  - **9-agent vision is now UX-COMPLETE**. Architectural report §2.1's full hierarchy is live: Orchestrator (chat) → Coordinator (FSM brain) → Scout / Planner / BackendBuilder / FrontendBuilder / BackendReviewer / FrontendReviewer / IntegrationTester. Click "Swarm" in sidebar → chat panel + recent jobs list.
+  - **Local React state for chat history.** Each session is fresh; reload = empty chat. Persistence (W3-12k-2) is the next polish.
+  - **Three message bubble shapes**: `user` (right-aligned violet-tinted), `orchestrator` (left-aligned with action-specific tint: surface-2 for direct_reply / amber for clarify / green for dispatch), `job` (pill with click-through to SwarmJobDetail).
+  - **Dispatch chains automatically into `useRunSwarmJob`**. Submit handler awaits `useOrchestratorDecide`, then if action=dispatch, awaits `useRunSwarmJob` with the refined goal text. Both bubbles appear in the history.
+  - **Click on job-pill calls `onSelectJob(jobId)`**, which the parent `SwarmRoute` wires to `setSelectedJobId`. Right pane (SwarmJobDetail) loads the job. Reuses W3-14's existing detail surface.
+  - **`SwarmGoalForm.tsx` deleted** as orphan post-swap. The W3-14 `.swarm-goal-form` CSS rules stay in swarm.css (harmless dead CSS; future polish to clean).
+  - **Animated thinking dots** via 3 `<span>`s + `swarm-chat-thinking` keyframe (0/200/400ms cascade). Visually signals "agent composing" while either mutation is pending.
+  - **`max-height: 52vh` on `.swarm-chat`** caps the chat area on tall windows so the recent-jobs list stays visible. Pragmatic addition not in WP spec.
+  - **Charter §"Hard constraints" #4 honored**: all new CSS uses `var(--*)` tokens + `color-mix()` in oklch space. No hex / HSL literals.
+  - **No bindings regen**: W3-12k1 already exported `OrchestratorAction`, `OrchestratorOutcome`, `swarmOrchestratorDecide`. Frontend just consumes them.
+- bindings regenerated: no (no Rust changes)
+- branch: `main` (pushed; **0 commits ahead of `origin/main`** post-`f5f4dca`)
+- known caveats / followups
+  - **No conversation memory.** A user typing two messages back-to-back gets two independent Orchestrator decisions. W3-12k-2 adds SQLite-backed history + history-aware Orchestrator prompts.
+  - **No streaming.** One-shot per message; bubble appears all-at-once. Acceptable since Orchestrator responses are typically short (single sentence).
+  - **`bindings.ts` regen warning** about LF→CRLF on commit — Windows-side cosmetic; no behavior impact.
+  - **Chat history loss on app reload.** Until W3-12k-2 ships, refresh = empty chat. Document in user-facing release note.
+  - **Empty-state explainer** prompts user with "Chat with the Swarm Orchestrator. Ask questions or describe what you want to build." Bilingual considerations deferred — most W3 UX text is English; persona bodies are Turkish.
+  - **`.swarm-goal-form` CSS rules orphaned** after SwarmGoalForm deletion. Cosmetic; small follow-up to clean.
+- next: W3-12k-2 (persistent Orchestrator session — SQLite chat-message table + multi-message context wiring into the persona prompt). Post-12k-2 the 9-agent vision is fully production-ready. Then back to deferred polish backlog ("geliştirilmesi gereken birçok noktası var").
+
+---
+
 ## 2026-05-07T00:55Z WP-W3-12k1 completed — 9th agent (Orchestrator) profile + brain shipped
 
 - dispatch: **single sub-agent**; no integration smoke (mock tests sufficient per WP §5)
