@@ -29,6 +29,7 @@ use sqlx::Row;
 use crate::db::DbPool;
 use crate::error::AppError;
 
+use super::decision::CoordinatorDecision;
 use super::job::{
     Job, JobDetail, JobState, JobSummary, StageResult,
 };
@@ -128,10 +129,12 @@ pub(super) async fn insert_stage(
     created_at_ms: i64,
 ) -> Result<(), AppError> {
     let verdict_json = serialize_verdict(stage.verdict.as_ref())?;
+    let decision_json =
+        serialize_decision(stage.coordinator_decision.as_ref())?;
     sqlx::query(
         "INSERT INTO swarm_stages \
-         (job_id, idx, state, specialist_id, assistant_text, session_id, total_cost_usd, duration_ms, created_at_ms, verdict_json) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         (job_id, idx, state, specialist_id, assistant_text, session_id, total_cost_usd, duration_ms, created_at_ms, verdict_json, decision_json) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(job_id)
     .bind(idx as i64)
@@ -143,6 +146,7 @@ pub(super) async fn insert_stage(
     .bind(stage.duration_ms as i64)
     .bind(created_at_ms)
     .bind(verdict_json)
+    .bind(decision_json)
     .execute(pool)
     .await?;
     Ok(())
@@ -296,7 +300,7 @@ async fn fetch_stages(
 ) -> Result<Vec<StageResult>, AppError> {
     let rows = sqlx::query(
         "SELECT idx, state, specialist_id, assistant_text, session_id, \
-                total_cost_usd, duration_ms, verdict_json \
+                total_cost_usd, duration_ms, verdict_json, decision_json \
          FROM swarm_stages \
          WHERE job_id = ? \
          ORDER BY idx ASC",
@@ -313,8 +317,11 @@ async fn fetch_stages(
         let total_cost_usd: f64 = row.try_get("total_cost_usd")?;
         let duration_ms_i: i64 = row.try_get("duration_ms")?;
         let verdict_json: Option<String> = row.try_get("verdict_json")?;
+        let decision_json: Option<String> = row.try_get("decision_json")?;
         let state = JobState::from_db_str(&state_str)?;
         let verdict = deserialize_verdict(verdict_json.as_deref())?;
+        let coordinator_decision =
+            deserialize_decision(decision_json.as_deref())?;
         out.push(StageResult {
             state,
             specialist_id,
@@ -323,6 +330,7 @@ async fn fetch_stages(
             total_cost_usd,
             duration_ms: duration_ms_i.max(0) as u64,
             verdict,
+            coordinator_decision,
         });
     }
     Ok(out)
@@ -471,6 +479,40 @@ fn deserialize_verdict(
     }
 }
 
+/// Serialize an optional `CoordinatorDecision` to JSON for column
+/// storage (W3-12f). `None` round-trips to `Ok(None)` (the column
+/// stays NULL). Mirrors `serialize_verdict` in shape.
+fn serialize_decision(
+    decision: Option<&CoordinatorDecision>,
+) -> Result<Option<String>, AppError> {
+    match decision {
+        None => Ok(None),
+        Some(d) => serde_json::to_string(d)
+            .map(Some)
+            .map_err(|e| AppError::Internal(format!(
+                "swarm: failed to serialize CoordinatorDecision: {e}"
+            ))),
+    }
+}
+
+/// Deserialize an optional JSON column back to a `CoordinatorDecision`
+/// (W3-12f). `None` (NULL column) round-trips to `Ok(None)`; a
+/// non-null column that fails to parse surfaces as
+/// `AppError::Internal` so a corrupted DB never silently drops a
+/// decision.
+fn deserialize_decision(
+    raw: Option<&str>,
+) -> Result<Option<CoordinatorDecision>, AppError> {
+    match raw {
+        None => Ok(None),
+        Some(s) => serde_json::from_str::<CoordinatorDecision>(s)
+            .map(Some)
+            .map_err(|e| AppError::Internal(format!(
+                "swarm: failed to deserialize CoordinatorDecision from DB: {e}"
+            ))),
+    }
+}
+
 /// Truncate `s` to at most `max_chars` Unicode characters. Bounded
 /// by `chars()` (not bytes) so multi-byte Turkish text is never
 /// split mid-codepoint. Returns the original string when it's
@@ -515,6 +557,7 @@ mod tests {
             total_cost_usd: cost,
             duration_ms: dur,
             verdict: None,
+            coordinator_decision: None,
         }
     }
 
@@ -1035,6 +1078,7 @@ mod tests {
                 total_cost_usd: 0.001,
                 duration_ms: 12,
                 verdict: Some(approved_review_clone),
+                coordinator_decision: None,
             });
             j.state = JobState::Failed;
             j.last_verdict = Some(rejected_test_clone);
@@ -1056,6 +1100,89 @@ mod tests {
             Some(&approved_review)
         );
         assert_eq!(detail.last_error, None);
+    }
+
+    /// WP-W3-12f — a Classify stage with a populated
+    /// `coordinator_decision` round-trips through the registry →
+    /// SQLite → store reload. The decision must reappear with
+    /// bit-for-bit fidelity (route + reasoning).
+    #[tokio::test]
+    async fn coordinator_decision_persists_across_app_restart() {
+        use crate::swarm::coordinator::decision::{
+            CoordinatorDecision, CoordinatorRoute,
+        };
+        let (pool, _dir) = fresh_pool().await;
+        let reg = JobRegistry::with_pool(pool.clone());
+        reg.try_acquire_workspace(
+            "ws-decision",
+            fixture_job("j-decision", "g", 0),
+        )
+        .await
+        .expect("acquire");
+
+        let decision = CoordinatorDecision {
+            route: CoordinatorRoute::ResearchOnly,
+            reasoning: "explain-only goal; Scout findings cover it".into(),
+        };
+        let decision_clone = decision.clone();
+        reg.update("j-decision", |j| {
+            // First a Scout stage with no decision (canonical shape).
+            j.stages.push(StageResult {
+                state: JobState::Scout,
+                specialist_id: "scout".into(),
+                assistant_text: "scout findings".into(),
+                session_id: "s-sc".into(),
+                total_cost_usd: 0.001,
+                duration_ms: 10,
+                verdict: None,
+                coordinator_decision: None,
+            });
+            // Then a Classify stage with the decision stamped on.
+            j.stages.push(StageResult {
+                state: JobState::Classify,
+                specialist_id: "coordinator".into(),
+                assistant_text: serde_json::to_string(&decision_clone)
+                    .unwrap(),
+                session_id: "s-cls".into(),
+                total_cost_usd: 0.001,
+                duration_ms: 5,
+                verdict: None,
+                coordinator_decision: Some(decision_clone),
+            });
+            j.state = JobState::Done;
+        })
+        .await
+        .expect("update");
+
+        let detail = get_job_detail(&pool, "j-decision")
+            .await
+            .expect("query")
+            .expect("Some");
+        assert_eq!(detail.stages.len(), 2);
+        assert!(detail.stages[0].coordinator_decision.is_none());
+        assert_eq!(
+            detail.stages[1].coordinator_decision.as_ref(),
+            Some(&decision)
+        );
+        assert_eq!(detail.stages[1].state, JobState::Classify);
+    }
+
+    /// Migration 0008 adds `decision_json` to `swarm_stages`.
+    /// Cheap schema-pragma probe so future migration drift surfaces
+    /// here rather than mid-write.
+    #[tokio::test]
+    async fn migration_0008_adds_decision_column() {
+        let (pool, _dir) = fresh_pool().await;
+        let stage_cols: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM pragma_table_info('swarm_stages')",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("pragma swarm_stages");
+        assert!(
+            stage_cols.iter().any(|c| c == "decision_json"),
+            "swarm_stages.decision_json missing; cols={stage_cols:?}"
+        );
     }
 
     /// Migration 0007 actually adds the two new columns. Cheap

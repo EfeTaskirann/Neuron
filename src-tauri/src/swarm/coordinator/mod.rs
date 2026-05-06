@@ -13,6 +13,11 @@
 //! survive an app restart (orphan rows flip to Failed on the next
 //! `recover_orphans` sweep). W3-12d adds the Verdict gate +
 //! reviewer/integration-tester profiles + retry feedback loop.
+//! W3-12f wires the single-shot Coordinator brain (Option B routing)
+//! between Scout and Plan: a 6th bundled profile (`coordinator.md`)
+//! emits a JSON `CoordinatorDecision` that picks `ResearchOnly`
+//! (skip the rest of the chain — Scout's findings are the
+//! deliverable) or `ExecutePlan` (continue Plan/Build/Review/Test).
 //!
 //! Cross-runtime hygiene: this module never imports from
 //! `crate::sidecar::agent` (the LangGraph Python sidecar) or
@@ -20,11 +25,13 @@
 //! independent; sharing process state across them is a Coordinator
 //! brain concern (W3-13+).
 
+pub mod decision;
 pub mod fsm;
 pub mod job;
 pub(crate) mod store;
 pub mod verdict;
 
+pub use decision::{parse_decision, CoordinatorDecision, CoordinatorRoute};
 pub use fsm::{CoordinatorFsm, MAX_RETRIES};
 pub use job::{
     Job, JobDetail, JobOutcome, JobRegistry, JobState, JobSummary,

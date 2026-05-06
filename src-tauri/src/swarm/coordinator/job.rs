@@ -34,15 +34,22 @@ use tokio::sync::Notify;
 use crate::db::DbPool;
 use crate::error::AppError;
 
+use super::decision::CoordinatorDecision;
 use super::store;
 use super::verdict::Verdict;
 
 /// Lifecycle states of a swarm job. Per WP §2:
 ///
 /// - `Init` — newly minted, before the first transition fires.
-/// - `Scout` / `Plan` / `Build` — the three happy-path stages.
-/// - `Review` / `Test` — reserved for W3-12d (reviewer +
-///   integration-tester profiles); FSM never enters them in 12a.
+/// - `Scout` — read-only investigation stage.
+/// - `Classify` — single-shot Coordinator brain decision (W3-12f);
+///   sits between Scout and Plan so the FSM can short-circuit on
+///   research-only goals. The variant is reachable on every job;
+///   ResearchOnly takes the Done short-circuit, ExecutePlan falls
+///   through to Plan.
+/// - `Plan` / `Build` — the next two happy-path stages on the
+///   ExecutePlan branch.
+/// - `Review` / `Test` — Verdict-gated quality stages (W3-12d).
 /// - `Done` / `Failed` — terminal.
 ///
 /// `Hash` + `Eq` are derived so the FSM can build small lookup
@@ -54,12 +61,16 @@ use super::verdict::Verdict;
 pub enum JobState {
     Init,
     Scout,
+    /// Coordinator brain routing decision (W3-12f). Single-shot; the
+    /// FSM enters this state once per job between Scout and Plan.
+    Classify,
     Plan,
     Build,
-    /// Reserved for W3-12d. FSM never enters this state in W3-12a;
-    /// the next-state function asserts unreachable in debug builds.
+    /// Verdict gate (W3-12d). FSM enters this state after Build on
+    /// the ExecutePlan branch.
     Review,
-    /// Reserved for W3-12d. Same as `Review`.
+    /// Verdict gate (W3-12d). FSM enters this state after a
+    /// Review-approved verdict.
     Test,
     Done,
     /// Terminal failure state. Carries the last error in
@@ -76,6 +87,7 @@ impl JobState {
         match self {
             JobState::Init => "init",
             JobState::Scout => "scout",
+            JobState::Classify => "classify",
             JobState::Plan => "plan",
             JobState::Build => "build",
             JobState::Review => "review",
@@ -92,6 +104,7 @@ impl JobState {
         match s {
             "init" => Ok(JobState::Init),
             "scout" => Ok(JobState::Scout),
+            "classify" => Ok(JobState::Classify),
             "plan" => Ok(JobState::Plan),
             "build" => Ok(JobState::Build),
             "review" => Ok(JobState::Review),
@@ -145,6 +158,12 @@ pub struct StageResult {
     /// key) deserialize unchanged.
     #[serde(default)]
     pub verdict: Option<Verdict>,
+    /// Parsed Coordinator brain decision (W3-12f). Populated only
+    /// for the `Classify` stage — every other stage leaves this
+    /// `None`. `serde(default)` lets older persisted JSON (no
+    /// `coordinator_decision` key) deserialize unchanged.
+    #[serde(default)]
+    pub coordinator_decision: Option<CoordinatorDecision>,
 }
 
 /// One in-flight (or completed) swarm job. The registry indexes by
@@ -854,6 +873,21 @@ pub enum SwarmJobEvent {
         triggered_by: JobState,
         verdict: Verdict,
     },
+    /// Fires once per job after the Classify stage's `StageCompleted`
+    /// (W3-12f), carrying the parsed `CoordinatorDecision`. The next
+    /// event on this channel is either a `StageStarted(Plan)` (when
+    /// `route == ExecutePlan`) or a `Finished` (when `route ==
+    /// ResearchOnly`, since the FSM short-circuits to Done).
+    ///
+    /// Optional for cache shape — the same decision rides along on
+    /// the prior `StageCompleted`'s `stage.coordinator_decision`
+    /// field, so frontend reducers may treat this event as a no-op
+    /// (the W3-14 UI uses it to render the route pill before the
+    /// next stage starts).
+    DecisionMade {
+        job_id: String,
+        decision: CoordinatorDecision,
+    },
 }
 
 impl Default for JobRegistry {
@@ -892,6 +926,7 @@ mod tests {
         for state in [
             JobState::Init,
             JobState::Scout,
+            JobState::Classify,
             JobState::Plan,
             JobState::Build,
             JobState::Review,
@@ -925,6 +960,7 @@ mod tests {
         for state in [
             JobState::Init,
             JobState::Scout,
+            JobState::Classify,
             JobState::Plan,
             JobState::Build,
             JobState::Review,
@@ -956,6 +992,7 @@ mod tests {
         for s in [
             JobState::Init,
             JobState::Scout,
+            JobState::Classify,
             JobState::Plan,
             JobState::Build,
             JobState::Review,
@@ -1276,6 +1313,7 @@ mod tests {
                 issues: Vec::new(),
                 summary: "s".into(),
             }),
+            coordinator_decision: None,
         }
     }
 
@@ -1327,6 +1365,7 @@ mod tests {
             total_cost_usd: 0.0,
             duration_ms: 0,
             verdict: None,
+            coordinator_decision: None,
         });
         job.stages.push(stage_with_verdict(JobState::Review, false));
         assert_eq!(job.last_rejecting_gate(), Some(JobState::Review));

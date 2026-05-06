@@ -275,6 +275,35 @@ export type CallToolResult = {
 };
 
 /**
+ *  Single-shot routing decision the Coordinator emits after Scout.
+ *  Stamped onto the Classify stage's `StageResult.coordinator_decision`
+ *  and surfaced to the UI via `SwarmJobEvent::DecisionMade`.
+ * 
+ *  `reasoning` is a one-sentence rationale per the OUTPUT CONTRACT;
+ *  the FSM treats it as informational only — the routing branch
+ *  keys off `route` alone.
+ */
+export type CoordinatorDecision = {
+	route: CoordinatorRoute,
+	reasoning: string,
+};
+
+/**
+ *  Routing rail the Coordinator picks for the job. Wire form is
+ *  snake_case (`"research_only"` / `"execute_plan"`) so the
+ *  frontend bindings match the persona OUTPUT CONTRACT verbatim.
+ * 
+ *  - `ResearchOnly` — short-circuit the FSM after Classify; Scout's
+ *    findings are the deliverable. Used for "explain X / what does
+ *    Y do" style goals where the full 5-stage chain would burn cost
+ *    producing empty Plan/Build outputs.
+ *  - `ExecutePlan` — fall through to the canonical Plan / Build /
+ *    Review / Test chain. The default-fail-open target when the
+ *    Coordinator output is unparseable.
+ */
+export type CoordinatorRoute = "research_only" | "execute_plan";
+
+/**
  *  Health payload returned to the frontend. Field names use
  *  camelCase so the future TS bindings need no remapping.
  * 
@@ -379,21 +408,35 @@ export type JobOutcome = {
  *  Lifecycle states of a swarm job. Per WP §2:
  * 
  *  - `Init` — newly minted, before the first transition fires.
- *  - `Scout` / `Plan` / `Build` — the three happy-path stages.
- *  - `Review` / `Test` — reserved for W3-12d (reviewer +
- *    integration-tester profiles); FSM never enters them in 12a.
+ *  - `Scout` — read-only investigation stage.
+ *  - `Classify` — single-shot Coordinator brain decision (W3-12f);
+ *    sits between Scout and Plan so the FSM can short-circuit on
+ *    research-only goals. The variant is reachable on every job;
+ *    ResearchOnly takes the Done short-circuit, ExecutePlan falls
+ *    through to Plan.
+ *  - `Plan` / `Build` — the next two happy-path stages on the
+ *    ExecutePlan branch.
+ *  - `Review` / `Test` — Verdict-gated quality stages (W3-12d).
  *  - `Done` / `Failed` — terminal.
  * 
  *  `Hash` + `Eq` are derived so the FSM can build small lookup
  *  tables keyed on the state if it ever needs to (W3-12d).
  */
-export type JobState = "init" | "scout" | "plan" | "build" | 
+export type JobState = "init" | "scout" | 
 /**
- *  Reserved for W3-12d. FSM never enters this state in W3-12a;
- *  the next-state function asserts unreachable in debug builds.
+ *  Coordinator brain routing decision (W3-12f). Single-shot; the
+ *  FSM enters this state once per job between Scout and Plan.
+ */
+"classify" | "plan" | "build" | 
+/**
+ *  Verdict gate (W3-12d). FSM enters this state after Build on
+ *  the ExecutePlan branch.
  */
 "review" | 
-// Reserved for W3-12d. Same as `Review`.
+/**
+ *  Verdict gate (W3-12d). FSM enters this state after a
+ *  Review-approved verdict.
+ */
 "test" | "done" | 
 /**
  *  Terminal failure state. Carries the last error in
@@ -773,6 +816,13 @@ export type StageResult = {
 	 *  key) deserialize unchanged.
 	 */
 	verdict?: Verdict | null,
+	/**
+	 *  Parsed Coordinator brain decision (W3-12f). Populated only
+	 *  for the `Classify` stage — every other stage leaves this
+	 *  `None`. `serde(default)` lets older persisted JSON (no
+	 *  `coordinator_decision` key) deserialize unchanged.
+	 */
+	coordinatorDecision?: CoordinatorDecision | null,
 };
 
 /**
@@ -848,7 +898,21 @@ export type SwarmJobEvent =
  *  Subsequent `StageStarted` / `StageCompleted` events on this
  *  channel belong to the new attempt.
  */
-{ kind: "retry_started"; job_id: string; attempt: number; max_retries: number; triggered_by: JobState; verdict: Verdict };
+{ kind: "retry_started"; job_id: string; attempt: number; max_retries: number; triggered_by: JobState; verdict: Verdict } | 
+/**
+ *  Fires once per job after the Classify stage's `StageCompleted`
+ *  (W3-12f), carrying the parsed `CoordinatorDecision`. The next
+ *  event on this channel is either a `StageStarted(Plan)` (when
+ *  `route == ExecutePlan`) or a `Finished` (when `route ==
+ *  ResearchOnly`, since the FSM short-circuits to Done).
+ * 
+ *  Optional for cache shape — the same decision rides along on
+ *  the prior `StageCompleted`'s `stage.coordinator_decision`
+ *  field, so frontend reducers may treat this event as a no-op
+ *  (the W3-14 UI uses it to render the route pill before the
+ *  next stage starts).
+ */
+{ kind: "decision_made"; job_id: string; decision: CoordinatorDecision };
 
 /**
  *  One row of `server_tools`. Materialised by [`crate::mcp::registry`]

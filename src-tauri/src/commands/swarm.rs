@@ -357,11 +357,11 @@ mod tests {
     use crate::test_support::mock_app_with_pool;
 
     /// Acceptance: on a fresh install (no `<app_data_dir>/agents/`),
-    /// `swarm:profiles_list` returns exactly the five bundled
-    /// profiles (W3-12d added reviewer + integration-tester) in
-    /// deterministic order.
+    /// `swarm:profiles_list` returns exactly the six bundled profiles
+    /// (W3-12d added reviewer + integration-tester; W3-12f added the
+    /// coordinator brain) in deterministic order.
     #[tokio::test]
-    async fn profiles_list_returns_five_bundled() {
+    async fn profiles_list_returns_six_bundled() {
         let (app, _pool, _dir) = mock_app_with_pool().await;
         let summaries = swarm_profiles_list(app.handle().clone())
             .await
@@ -372,6 +372,7 @@ mod tests {
             ids,
             vec![
                 "backend-builder",
+                "coordinator",
                 "integration-tester",
                 "planner",
                 "reviewer",

@@ -63,6 +63,14 @@ export function applySwarmEventToJobDetail(
         retryCount: event.attempt - 1,
         lastVerdict: event.verdict,
       };
+    case 'decision_made':
+      // W3-12f: the Coordinator brain just classified the job
+      // (ResearchOnly vs ExecutePlan). The decision already lands
+      // on the prior `stage_completed`'s
+      // `stage.coordinator_decision` field, so this event is a
+      // no-op for the cache shape. The W3-14 UI uses the event
+      // to render the route pill before the next stage starts.
+      return prev;
     default: {
       const _exhaustive: never = event;
       void _exhaustive;

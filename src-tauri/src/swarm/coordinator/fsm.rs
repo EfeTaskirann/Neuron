@@ -38,6 +38,7 @@ use crate::events;
 use crate::swarm::profile::{Profile, ProfileRegistry};
 use crate::swarm::transport::Transport;
 
+use super::decision::{parse_decision, CoordinatorDecision, CoordinatorRoute};
 use super::job::{
     Job, JobOutcome, JobRegistry, JobState, StageResult, SwarmJobEvent,
 };
@@ -63,6 +64,11 @@ pub const REVIEWER_ID: &str = "reviewer";
 /// Reviewer verdict; emits a JSON Verdict the FSM gates on for
 /// the final transition to `Done`.
 pub const TESTER_ID: &str = "integration-tester";
+/// Coordinator brain profile id (W3-12f). Runs once per job between
+/// Scout and Plan; emits a JSON `CoordinatorDecision` that picks
+/// between `ResearchOnly` (short-circuit to Done) and `ExecutePlan`
+/// (continue the canonical chain).
+pub const COORDINATOR_ID: &str = "coordinator";
 
 /// SCOUT stage prompt template — wraps the goal as an
 /// investigation request. WP §3 originally specified "goal
@@ -135,6 +141,27 @@ proje türüne göre). Verdict'i şu JSON şemasında ver, başka hiçbir \
 \n\
 {{ \"approved\": <bool>, \"issues\": [...], \"summary\": \"...\" }}\n";
 
+/// CLASSIFY stage prompt template (W3-12f §5). The Coordinator
+/// brain reads goal + Scout findings and returns a JSON
+/// `CoordinatorDecision`. Substitutions: `{goal}`, `{scout_output}`.
+///
+/// The OUTPUT CONTRACT in the persona body is the authoritative
+/// shape spec; this prompt restates it briefly so the LLM hits the
+/// JSON-only response path even when the persona body is long.
+/// `{{` / `}}` are literal braces (escape for `format!`-style; we
+/// use `.replace` here so the curly braces stand verbatim in the
+/// rendered output).
+const CLASSIFY_PROMPT_TEMPLATE: &str = "Hedef:\n\
+\n\
+{goal}\n\
+\n\
+Scout bulguları:\n\
+\n\
+{scout_output}\n\
+\n\
+Bu hedef için uygun rotayı seç. Çıktı sadece bir JSON objesi olmalı:\n\
+{{ \"route\": \"research_only\" | \"execute_plan\", \"reasoning\": \"...\" }}\n";
+
 /// PLAN stage prompt template used on the retry path (W3-12e §4).
 /// Carries the previous plan + the rejecting Verdict's issues so the
 /// Planner can produce a corrected plan rather than starting from
@@ -178,6 +205,15 @@ fn render_plan_prompt(goal: &str, scout_output: &str) -> String {
 /// Render the BUILD prompt by substituting `{plan_output}`.
 fn render_build_prompt(plan_output: &str) -> String {
     BUILD_PROMPT_TEMPLATE.replace("{plan_output}", plan_output)
+}
+
+/// Render the CLASSIFY prompt by substituting `{goal}` and
+/// `{scout_output}` (W3-12f). Free fn so the prompt-template test
+/// can call it without instantiating a full FSM.
+fn render_classify_prompt(goal: &str, scout_output: &str) -> String {
+    CLASSIFY_PROMPT_TEMPLATE
+        .replace("{goal}", goal)
+        .replace("{scout_output}", scout_output)
 }
 
 /// Render the REVIEW prompt by substituting `{goal}`, `{plan}`, and
@@ -293,8 +329,15 @@ fn verdict_issues_as_bullets(issues: &[VerdictIssue]) -> String {
 pub(crate) fn next_state(current: JobState, ok: bool) -> JobState {
     match (current, ok) {
         (JobState::Init, _) => JobState::Scout,
-        (JobState::Scout, true) => JobState::Plan,
+        (JobState::Scout, true) => JobState::Classify,
         (JobState::Scout, false) => JobState::Failed,
+        // W3-12f: Classify is the Coordinator brain decision point.
+        // `(Classify, true)` assumes ExecutePlan; the run loop owns
+        // the ResearchOnly → Done short-circuit because that branch
+        // depends on the parsed `CoordinatorDecision.route` rather
+        // than the invoke's bool outcome.
+        (JobState::Classify, true) => JobState::Plan,
+        (JobState::Classify, false) => JobState::Failed,
         (JobState::Plan, true) => JobState::Build,
         (JobState::Plan, false) => JobState::Failed,
         (JobState::Build, true) => JobState::Review,
@@ -497,6 +540,19 @@ impl<T: Transport> CoordinatorFsm<T> {
                 ))
             })?
             .clone();
+        // W3-12f: Coordinator brain — resolved up front so a missing
+        // profile fails the job before any stage spawns. The
+        // brain runs exactly once per job (in the Classify stage
+        // between Scout and Plan).
+        let coordinator = self
+            .profiles
+            .get(COORDINATOR_ID)
+            .ok_or_else(|| {
+                AppError::NotFound(format!(
+                    "swarm profile `{COORDINATOR_ID}` (required for FSM)"
+                ))
+            })?
+            .clone();
 
         // 6. Emit `Started` once the workspace lock + cancel notify
         //    are both in place.
@@ -565,6 +621,117 @@ impl<T: Transport> CoordinatorFsm<T> {
                 return self.emit_finished_and_build(app, &job_id);
             }
         };
+
+        // CLASSIFY stage (W3-12f) — single-shot Coordinator brain.
+        // Runs exactly once per job between Scout and Plan. The
+        // parsed `CoordinatorDecision` decides whether the FSM
+        // short-circuits to Done (ResearchOnly) or falls through to
+        // the Plan/Build/Review/Test chain (ExecutePlan).
+        //
+        // Default-fail-open contract: an unparseable Coordinator
+        // output is logged at `warn` and falls through to
+        // ExecutePlan. Misclassifying a research-only goal as
+        // execute is "wasted ~$0.10 on empty Plan/Build outputs";
+        // misclassifying an execute goal as research-only is "the
+        // user thinks the job succeeded but no code was written".
+        // We default to the safer (more expensive) branch.
+        let classify_prompt =
+            render_classify_prompt(&goal, &scout_text);
+        let decision = match self
+            .run_stage_with_cancel(
+                app,
+                JobState::Classify,
+                &coordinator,
+                &classify_prompt,
+                &job_id,
+                &notify,
+            )
+            .await
+        {
+            StageOutcome::Ok(stage) => {
+                let decision = match parse_decision(&stage.assistant_text) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        tracing::warn!(
+                            %job_id,
+                            error = %e,
+                            "swarm: Coordinator decision unparseable; defaulting to ExecutePlan"
+                        );
+                        CoordinatorDecision {
+                            route: CoordinatorRoute::ExecutePlan,
+                            reasoning: format!(
+                                "fallback: brain output unparseable ({e})"
+                            ),
+                        }
+                    }
+                };
+                // Stamp the parsed (or fallback) decision onto the
+                // StageResult so it lands in `swarm_stages.decision_json`
+                // via the registry's SQL write-through. We emit
+                // `StageCompleted` with the decision-bearing stage so
+                // the W3-14 UI sees the canonical shape.
+                let stage_with_decision = StageResult {
+                    coordinator_decision: Some(decision.clone()),
+                    ..stage
+                };
+                emit_swarm_event(
+                    app,
+                    &job_id,
+                    &SwarmJobEvent::StageCompleted {
+                        job_id: job_id.clone(),
+                        stage: stage_with_decision.clone(),
+                    },
+                );
+                self.registry
+                    .update(&job_id, |j| {
+                        j.stages.push(stage_with_decision);
+                    })
+                    .await?;
+                emit_swarm_event(
+                    app,
+                    &job_id,
+                    &SwarmJobEvent::DecisionMade {
+                        job_id: job_id.clone(),
+                        decision: decision.clone(),
+                    },
+                );
+                decision
+            }
+            StageOutcome::Err(e) => {
+                self.finalize_failed(
+                    &job_id,
+                    &workspace_id,
+                    Some(e.to_string()),
+                )
+                .await?;
+                return self.emit_finished_and_build(app, &job_id);
+            }
+            StageOutcome::Cancelled => {
+                self.finalize_cancelled(&job_id, &workspace_id).await?;
+                return self.emit_finished_and_build(app, &job_id);
+            }
+        };
+
+        // Branch on the decision. ResearchOnly short-circuits the
+        // chain — Scout's findings are the deliverable. ExecutePlan
+        // falls through to the canonical Plan/Build/Review/Test
+        // retry loop below.
+        match decision.route {
+            CoordinatorRoute::ResearchOnly => {
+                self.registry
+                    .update(&job_id, |j| {
+                        j.state = JobState::Done;
+                    })
+                    .await?;
+                self.registry
+                    .release_workspace(&workspace_id, &job_id)
+                    .await;
+                return self.emit_finished_and_build(app, &job_id);
+            }
+            CoordinatorRoute::ExecutePlan => {
+                // Fall through to the canonical retry loop.
+            }
+        }
 
         // 7b. Plan/Build/Review/Test loop. The first iteration runs
         //     with the canonical Plan prompt; subsequent iterations
@@ -1080,6 +1247,12 @@ impl<T: Transport> CoordinatorFsm<T> {
                             // directly so the verdict field never
                             // gets touched on those paths).
                             verdict: None,
+                            // Populated downstream by the Classify
+                            // branch in `run_job_inner` once the
+                            // Coordinator output has been parsed
+                            // (W3-12f). Every other stage leaves
+                            // this `None`.
+                            coordinator_decision: None,
                         })
                     }
                     Err(e) => StageOutcome::Err(e),
@@ -1402,6 +1575,40 @@ mod tests {
     }
 
     /// Canned MockResponse whose `assistant_text` is a valid
+    /// `CoordinatorDecision` JSON with `route=execute_plan`. The
+    /// W3-12f Coordinator brain runs once per job between Scout and
+    /// Plan; the default mock keeps the existing 5-stage chain
+    /// intact by always voting ExecutePlan.
+    fn execute_plan_decision_response() -> MockResponse {
+        MockResponse {
+            result: Ok(InvokeResult {
+                session_id: "sess-coord".into(),
+                assistant_text:
+                    r#"{"route":"execute_plan","reasoning":"mock"}"#.into(),
+                total_cost_usd: 0.0,
+                turn_count: 1,
+            }),
+            sleep: None,
+        }
+    }
+
+    /// Canned MockResponse whose `assistant_text` is a valid
+    /// `CoordinatorDecision` JSON with `route=research_only`. Used
+    /// by W3-12f tests that exercise the short-circuit branch.
+    fn research_only_decision_response() -> MockResponse {
+        MockResponse {
+            result: Ok(InvokeResult {
+                session_id: "sess-coord-r".into(),
+                assistant_text:
+                    r#"{"route":"research_only","reasoning":"mock"}"#.into(),
+                total_cost_usd: 0.0,
+                turn_count: 1,
+            }),
+            sleep: None,
+        }
+    }
+
+    /// Canned MockResponse whose `assistant_text` is a valid
     /// Verdict JSON with `approved=false` and one high-severity
     /// issue. Used by the verdict-rejection FSM tests.
     fn rejected_verdict_response(issue_msg: &str) -> MockResponse {
@@ -1424,6 +1631,12 @@ mod tests {
     /// scout / planner / builder return `ok_response(text, cost)`;
     /// reviewer + tester return approved verdicts. Used by tests
     /// that assert on the full chain reaching Done.
+    ///
+    /// W3-12f: the FSM now runs a Classify stage between Scout and
+    /// Plan, so the response set also seeds the Coordinator with an
+    /// ExecutePlan decision — this preserves the existing 5-stage
+    /// flow in tests that do not care about the brain branch
+    /// (stages.len() becomes 6 because Classify is appended).
     fn happy_5_stage_responses(
         scout_text: &str,
         plan_text: &str,
@@ -1438,6 +1651,7 @@ mod tests {
         r.insert(BUILDER_ID.into(), ok_response(build_text, build_cost));
         r.insert(REVIEWER_ID.into(), ok_verdict_response(0.0));
         r.insert(TESTER_ID.into(), ok_verdict_response(0.0));
+        r.insert(COORDINATOR_ID.into(), execute_plan_decision_response());
         r
     }
 
@@ -1460,8 +1674,9 @@ mod tests {
         bundled_registry()
     }
 
-    /// Mock-driven happy path: all five stages OK; reviewer +
-    /// tester emit `approved=true` verdicts.
+    /// Mock-driven happy path: all six stages OK (W3-12f layered
+    /// Classify between Scout and Plan); reviewer + tester emit
+    /// `approved=true` verdicts; coordinator votes ExecutePlan.
     #[tokio::test]
     async fn fsm_walks_five_stages_on_approved_path() {
         let (app, _pool, _dir) = mock_app_with_pool().await;
@@ -1488,27 +1703,30 @@ mod tests {
             .await
             .expect("happy path returns Ok");
         assert_eq!(outcome.final_state, JobState::Done);
-        assert_eq!(outcome.stages.len(), 5);
+        assert_eq!(outcome.stages.len(), 6);
         assert!(outcome.last_error.is_none());
         assert!(outcome.last_verdict.is_none());
         assert!(outcome.total_cost_usd > 0.0);
         assert!(
             (outcome.total_cost_usd - 0.06).abs() < 1e-9,
-            "cost sum off (scout+plan+build only since verdicts free): {}",
+            "cost sum off (scout+plan+build only since verdicts/coordinator free): {}",
             outcome.total_cost_usd
         );
-        // Stage state ordering matches the FSM's fixed sequence.
+        // Stage state ordering matches the FSM's fixed sequence
+        // post-W3-12f: Scout → Classify → Plan → Build → Review → Test.
         assert_eq!(outcome.stages[0].state, JobState::Scout);
-        assert_eq!(outcome.stages[1].state, JobState::Plan);
-        assert_eq!(outcome.stages[2].state, JobState::Build);
-        assert_eq!(outcome.stages[3].state, JobState::Review);
-        assert_eq!(outcome.stages[4].state, JobState::Test);
+        assert_eq!(outcome.stages[1].state, JobState::Classify);
+        assert_eq!(outcome.stages[2].state, JobState::Plan);
+        assert_eq!(outcome.stages[3].state, JobState::Build);
+        assert_eq!(outcome.stages[4].state, JobState::Review);
+        assert_eq!(outcome.stages[5].state, JobState::Test);
         // Verdict populated on Review/Test, None on the others.
         assert!(outcome.stages[0].verdict.is_none());
         assert!(outcome.stages[1].verdict.is_none());
         assert!(outcome.stages[2].verdict.is_none());
+        assert!(outcome.stages[3].verdict.is_none());
         assert!(
-            outcome.stages[3]
+            outcome.stages[4]
                 .verdict
                 .as_ref()
                 .map(|v| v.approved)
@@ -1516,12 +1734,22 @@ mod tests {
             "review verdict should be approved"
         );
         assert!(
-            outcome.stages[4]
+            outcome.stages[5]
                 .verdict
                 .as_ref()
                 .map(|v| v.approved)
                 .unwrap_or(false),
             "test verdict should be approved"
+        );
+        // Coordinator decision lands on the Classify stage; every
+        // other stage leaves it None.
+        assert!(outcome.stages[1].coordinator_decision.is_some());
+        assert_eq!(
+            outcome.stages[1]
+                .coordinator_decision
+                .as_ref()
+                .map(|d| d.route),
+            Some(CoordinatorRoute::ExecutePlan)
         );
 
         // Workspace lock released — second job on same workspace
@@ -1570,13 +1798,17 @@ mod tests {
             .contains("scout boom"));
     }
 
-    /// Planner failure → only scout stage recorded, then Failed.
+    /// Planner failure → scout + classify stages recorded, then Failed.
+    /// W3-12f: classify lands between scout and plan; planner is the
+    /// fourth dispatch and the failure surface still records 2
+    /// successful stages (scout + classify).
     #[tokio::test]
     async fn fsm_planner_failure_short_circuits() {
         let (app, _pool, _dir) = mock_app_with_pool().await;
         let mut responses: HashMap<String, MockResponse> = HashMap::new();
         responses
             .insert(SCOUT_ID.into(), ok_response("scout ok", 0.01));
+        responses.insert(COORDINATOR_ID.into(), execute_plan_decision_response());
         responses.insert(PLANNER_ID.into(), err_response("planner boom"));
         responses
             .insert(BUILDER_ID.into(), ok_response("unused", 0.0));
@@ -1591,8 +1823,9 @@ mod tests {
             .await
             .expect("FSM returns Ok with Failed outcome");
         assert_eq!(outcome.final_state, JobState::Failed);
-        assert_eq!(outcome.stages.len(), 1);
+        assert_eq!(outcome.stages.len(), 2);
         assert_eq!(outcome.stages[0].state, JobState::Scout);
+        assert_eq!(outcome.stages[1].state, JobState::Classify);
         assert!(outcome
             .last_error
             .as_deref()
@@ -1600,13 +1833,17 @@ mod tests {
             .contains("planner boom"));
     }
 
-    /// Builder failure → scout + planner stages recorded, then Failed.
+    /// Builder failure → scout + classify + planner stages recorded,
+    /// then Failed.
+    /// W3-12f: classify lands between scout and plan, so the partial
+    /// stage count rises from 2 to 3.
     #[tokio::test]
     async fn fsm_builder_failure_returns_partial_stages() {
         let (app, _pool, _dir) = mock_app_with_pool().await;
         let mut responses: HashMap<String, MockResponse> = HashMap::new();
         responses
             .insert(SCOUT_ID.into(), ok_response("scout ok", 0.01));
+        responses.insert(COORDINATOR_ID.into(), execute_plan_decision_response());
         responses
             .insert(PLANNER_ID.into(), ok_response("plan ok", 0.02));
         responses.insert(BUILDER_ID.into(), err_response("builder boom"));
@@ -1621,9 +1858,10 @@ mod tests {
             .await
             .expect("FSM returns Ok with Failed outcome");
         assert_eq!(outcome.final_state, JobState::Failed);
-        assert_eq!(outcome.stages.len(), 2);
+        assert_eq!(outcome.stages.len(), 3);
         assert_eq!(outcome.stages[0].state, JobState::Scout);
-        assert_eq!(outcome.stages[1].state, JobState::Plan);
+        assert_eq!(outcome.stages[1].state, JobState::Classify);
+        assert_eq!(outcome.stages[2].state, JobState::Plan);
         assert!(outcome
             .last_error
             .as_deref()
@@ -1663,10 +1901,11 @@ mod tests {
             "X", "Y", "Z", 0.0, 0.0, 0.0,
         );
         // Override scout/plan/build to the canonical strings the
-        // assertions look at; verdicts come from the helper.
+        // assertions look at; verdicts + coordinator come from the helper.
         responses.insert(SCOUT_ID.into(), ok_response("X", 0.0));
         responses.insert(PLANNER_ID.into(), ok_response("Y", 0.0));
         responses.insert(BUILDER_ID.into(), ok_response("Z", 0.0));
+        responses.insert(COORDINATOR_ID.into(), execute_plan_decision_response());
         // Build the mock with a holder so we can read `seen()` after
         // run_job — `MockTransport` only exposes `seen()` through
         // `&self`, so we keep a raw reference via Arc.
@@ -1718,6 +1957,7 @@ mod tests {
         );
         responses.insert(PLANNER_ID.into(), ok_response("plan", 0.0));
         responses.insert(BUILDER_ID.into(), ok_response("build", 0.0));
+        responses.insert(COORDINATOR_ID.into(), execute_plan_decision_response());
         let mock = Arc::new(MockTransport::new(responses));
         let fsm = CoordinatorFsm::new(
             synthetic_registry(),
@@ -1755,6 +1995,7 @@ mod tests {
         responses
             .insert(PLANNER_ID.into(), ok_response("plan-text", 0.0));
         responses.insert(BUILDER_ID.into(), ok_response("b", 0.0));
+        responses.insert(COORDINATOR_ID.into(), execute_plan_decision_response());
         let mock = Arc::new(MockTransport::new(responses));
         let fsm = CoordinatorFsm::new(
             synthetic_registry(),
@@ -1784,6 +2025,7 @@ mod tests {
     /// Per-stage duration is measured around the invoke await.
     /// Mock injects a 50ms sleep per stage; assert each
     /// `StageResult.duration_ms >= 50`.
+    /// W3-12f: 6 stages now (Scout, Classify, Plan, Build, Review, Test).
     #[tokio::test]
     async fn fsm_records_per_stage_duration() {
         let (app, _pool, _dir) = mock_app_with_pool().await;
@@ -1828,6 +2070,21 @@ mod tests {
                 },
             );
         }
+        // Coordinator brain (W3-12f) — sleep 50ms so its duration_ms
+        // also clears the threshold.
+        responses.insert(
+            COORDINATOR_ID.into(),
+            MockResponse {
+                result: Ok(InvokeResult {
+                    session_id: "s-coord".into(),
+                    assistant_text:
+                        r#"{"route":"execute_plan","reasoning":"mock"}"#.into(),
+                    total_cost_usd: 0.0,
+                    turn_count: 1,
+                }),
+                sleep,
+            },
+        );
         let fsm = CoordinatorFsm::new(
             synthetic_registry(),
             MockTransport::new(responses),
@@ -1838,7 +2095,7 @@ mod tests {
             .run_job(app.handle(), "ws-dur".into(), "g".into())
             .await
             .expect("ok");
-        assert_eq!(outcome.stages.len(), 5);
+        assert_eq!(outcome.stages.len(), 6);
         for stage in &outcome.stages {
             assert!(
                 stage.duration_ms >= 50,
@@ -1847,8 +2104,8 @@ mod tests {
                 stage.duration_ms
             );
         }
-        // Total duration is at least 5*50=250ms.
-        assert!(outcome.total_duration_ms >= 250);
+        // Total duration is at least 6*50=300ms.
+        assert!(outcome.total_duration_ms >= 300);
     }
 
     /// W3-12d activated Review/Test in `next_state`. Both the OK
@@ -1959,8 +2216,9 @@ mod tests {
             outcome.final_state,
             outcome.last_error
         );
-        // W3-12d: 5 stages (scout / plan / build / review / test).
-        assert_eq!(outcome.stages.len(), 5);
+        // W3-12f: 6 stages on the ExecutePlan branch (scout / classify
+        // / plan / build / review / test).
+        assert_eq!(outcome.stages.len(), 6);
     }
 
     // ----------------------------------------------------------------
@@ -2045,8 +2303,9 @@ mod tests {
                 .fetch_one(&test_pool)
                 .await
                 .expect("count stages");
-        // W3-12d: 5 stage rows on the happy path.
-        assert_eq!(stage_count, 5, "five stage rows persisted");
+        // W3-12f: 6 stage rows on the ExecutePlan happy path
+        // (scout / classify / plan / build / review / test).
+        assert_eq!(stage_count, 6, "six stage rows persisted");
         let lock_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM swarm_workspace_locks",
         )
@@ -2233,10 +2492,10 @@ mod tests {
         )
     }
 
-    /// Pool-backed happy path: the FSM walks all five stages
-    /// against a SQLite-backed registry; on completion the
-    /// `swarm_jobs` row is `done`, five `swarm_stages` rows, no
-    /// `swarm_workspace_locks`.
+    /// Pool-backed happy path: the FSM walks all six stages
+    /// (Scout/Classify/Plan/Build/Review/Test) against a
+    /// SQLite-backed registry; on completion the `swarm_jobs` row
+    /// is `done`, six `swarm_stages` rows, no `swarm_workspace_locks`.
     #[tokio::test]
     async fn fsm_happy_path_walks_five_stages_with_pool() {
         let (app, _pool, _dir) = mock_app_with_pool().await;
@@ -2260,7 +2519,7 @@ mod tests {
             .await
             .expect("ok");
         assert_eq!(outcome.final_state, JobState::Done);
-        assert_eq!(outcome.stages.len(), 5);
+        assert_eq!(outcome.stages.len(), 6);
 
         let job_count: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM swarm_jobs WHERE state = 'done'")
@@ -2273,9 +2532,9 @@ mod tests {
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        assert_eq!(stage_count, 5);
+        assert_eq!(stage_count, 6);
         // The Review and Test stage rows carry verdict_json; the
-        // others are NULL (Scout/Plan/Build never run a verdict).
+        // others are NULL (Scout/Classify/Plan/Build never run a verdict).
         let verdict_rows: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM swarm_stages WHERE verdict_json IS NOT NULL",
         )
@@ -2283,6 +2542,15 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(verdict_rows, 2, "review + test stages carry verdict_json");
+        // The Classify stage row carries decision_json; every other
+        // row stays NULL.
+        let decision_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM swarm_stages WHERE decision_json IS NOT NULL",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(decision_rows, 1, "classify stage carries decision_json");
         let lock_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM swarm_workspace_locks",
         )
@@ -2341,14 +2609,17 @@ mod tests {
         assert_eq!(lock_count, 0);
     }
 
-    /// Pool-backed planner failure: scout stage row persists,
-    /// plan/build do not. Final job state is `failed`, lock cleared.
+    /// Pool-backed planner failure: scout + classify stage rows
+    /// persist, plan/build do not. Final job state is `failed`,
+    /// lock cleared. W3-12f: classify lands between scout and plan,
+    /// so the partial stage count rises from 1 to 2.
     #[tokio::test]
     async fn fsm_planner_failure_persists_partial_stages_with_pool() {
         let (app, _pool, _dir) = mock_app_with_pool().await;
         let (registry, pool, _reg_dir) = pool_backed_registry().await;
         let mut responses: HashMap<String, MockResponse> = HashMap::new();
         responses.insert(SCOUT_ID.into(), ok_response("scout", 0.01));
+        responses.insert(COORDINATOR_ID.into(), execute_plan_decision_response());
         responses.insert(PLANNER_ID.into(), err_response("plan boom"));
         responses.insert(BUILDER_ID.into(), ok_response("u", 0.0));
         let fsm = CoordinatorFsm::new(
@@ -2362,14 +2633,14 @@ mod tests {
             .await
             .expect("ok");
         assert_eq!(outcome.final_state, JobState::Failed);
-        assert_eq!(outcome.stages.len(), 1);
+        assert_eq!(outcome.stages.len(), 2);
 
         let stage_count: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM swarm_stages")
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        assert_eq!(stage_count, 1, "scout stage row persisted");
+        assert_eq!(stage_count, 2, "scout + classify stage rows persisted");
         let stage_state: String = sqlx::query_scalar(
             "SELECT state FROM swarm_stages WHERE idx = 0",
         )
@@ -2377,6 +2648,13 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(stage_state, "scout");
+        let classify_state: String = sqlx::query_scalar(
+            "SELECT state FROM swarm_stages WHERE idx = 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(classify_state, "classify");
         let lock_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM swarm_workspace_locks",
         )
@@ -2395,6 +2673,7 @@ mod tests {
         let (registry, pool, _reg_dir) = pool_backed_registry().await;
         // Make build slow so cancel can land mid-stage.
         let mut responses: HashMap<String, MockResponse> = HashMap::new();
+        responses.insert(COORDINATOR_ID.into(), execute_plan_decision_response());
         responses.insert(SCOUT_ID.into(), MockResponse {
             result: Ok(InvokeResult {
                 session_id: "s".into(),
@@ -2501,6 +2780,7 @@ mod tests {
         let (app, _pool, _dir) = mock_app_with_pool().await;
         let mut responses: HashMap<String, MockResponse> = HashMap::new();
         responses.insert(SCOUT_ID.into(), ok_response("s", 0.0));
+        responses.insert(COORDINATOR_ID.into(), execute_plan_decision_response());
         responses.insert(PLANNER_ID.into(), ok_response("p", 0.0));
         responses.insert(BUILDER_ID.into(), ok_response("b", 0.0));
         responses.insert(
@@ -2527,9 +2807,10 @@ mod tests {
             .expect("FSM returns Ok with Failed outcome");
         assert_eq!(outcome.final_state, JobState::Failed);
         // W3-12e: Reviewer rejecting on every attempt exhausts the
-        // retry budget. Stages: scout (1) + 3 × (plan/build/review)
-        // (= 9) = 10. Test never ran. retry_count = MAX_RETRIES.
-        assert_eq!(outcome.stages.len(), 10);
+        // retry budget. Stages: scout (1) + classify (1) + 3 ×
+        // (plan/build/review) (= 9) = 11. Test never ran.
+        // retry_count = MAX_RETRIES.
+        assert_eq!(outcome.stages.len(), 11);
         let final_review = outcome
             .stages
             .iter()
@@ -2558,6 +2839,7 @@ mod tests {
         let (app, _pool, _dir) = mock_app_with_pool().await;
         let mut responses: HashMap<String, MockResponse> = HashMap::new();
         responses.insert(SCOUT_ID.into(), ok_response("s", 0.0));
+        responses.insert(COORDINATOR_ID.into(), execute_plan_decision_response());
         responses.insert(PLANNER_ID.into(), ok_response("p", 0.0));
         responses.insert(BUILDER_ID.into(), ok_response("b", 0.0));
         responses.insert(REVIEWER_ID.into(), ok_verdict_response(0.0));
@@ -2579,10 +2861,10 @@ mod tests {
             .expect("FSM returns Ok with Failed outcome");
         assert_eq!(outcome.final_state, JobState::Failed);
         // W3-12e: Tester rejecting on every attempt exhausts the
-        // retry budget. Stages: scout (1) + 3 ×
-        // (plan/build/review/test) (= 12) = 13. retry_count =
+        // retry budget. Stages: scout (1) + classify (1) + 3 ×
+        // (plan/build/review/test) (= 12) = 14. retry_count =
         // MAX_RETRIES.
-        assert_eq!(outcome.stages.len(), 13);
+        assert_eq!(outcome.stages.len(), 14);
         let final_test = outcome
             .stages
             .iter()
@@ -2601,11 +2883,14 @@ mod tests {
     /// fenced, not a balanced object). FSM finalizes Failed with
     /// `last_error` mentioning "could not parse Verdict".
     /// `last_verdict` stays None — there's no structured verdict.
+    /// W3-12f: classify lands between scout and plan, so the stage
+    /// count rises from 4 to 5.
     #[tokio::test]
     async fn fsm_review_unparseable_finalizes_failed() {
         let (app, _pool, _dir) = mock_app_with_pool().await;
         let mut responses: HashMap<String, MockResponse> = HashMap::new();
         responses.insert(SCOUT_ID.into(), ok_response("s", 0.0));
+        responses.insert(COORDINATOR_ID.into(), execute_plan_decision_response());
         responses.insert(PLANNER_ID.into(), ok_response("p", 0.0));
         responses.insert(BUILDER_ID.into(), ok_response("b", 0.0));
         responses.insert(
@@ -2628,11 +2913,12 @@ mod tests {
         assert_eq!(outcome.final_state, JobState::Failed);
         // Review stage IS appended (the run_verdict_stage helper
         // emits StageCompleted on the parse-error path so the W3-14
-        // UI sees the raw assistant_text). Stage count = 4.
-        assert_eq!(outcome.stages.len(), 4);
-        assert_eq!(outcome.stages[3].state, JobState::Review);
+        // UI sees the raw assistant_text). Stage count = 5
+        // (Scout/Classify/Plan/Build/Review).
+        assert_eq!(outcome.stages.len(), 5);
+        assert_eq!(outcome.stages[4].state, JobState::Review);
         // No structured verdict — parse failed.
-        assert!(outcome.stages[3].verdict.is_none());
+        assert!(outcome.stages[4].verdict.is_none());
         assert!(outcome.last_verdict.is_none());
         assert!(
             outcome
@@ -2647,12 +2933,14 @@ mod tests {
 
     /// Builder errors → no review/test stages run, regression
     /// against the W3-12a failure shape but extended for 5-stage
-    /// flow.
+    /// flow. W3-12f: classify lands between scout and plan, so the
+    /// successful-stage count rises from 2 to 3.
     #[tokio::test]
     async fn fsm_review_skipped_when_build_fails() {
         let (app, _pool, _dir) = mock_app_with_pool().await;
         let mut responses: HashMap<String, MockResponse> = HashMap::new();
         responses.insert(SCOUT_ID.into(), ok_response("s", 0.0));
+        responses.insert(COORDINATOR_ID.into(), execute_plan_decision_response());
         responses.insert(PLANNER_ID.into(), ok_response("p", 0.0));
         responses.insert(BUILDER_ID.into(), err_response("builder boom"));
         // These are never consumed since Builder errors first.
@@ -2671,12 +2959,12 @@ mod tests {
             .await
             .expect("FSM returns Ok with Failed outcome");
         assert_eq!(outcome.final_state, JobState::Failed);
-        // Scout + Plan succeeded; Build erred; Review/Test never run.
-        assert_eq!(outcome.stages.len(), 2);
+        // Scout + Classify + Plan succeeded; Build erred; Review/Test never run.
+        assert_eq!(outcome.stages.len(), 3);
         for stage in &outcome.stages {
             assert!(matches!(
                 stage.state,
-                JobState::Scout | JobState::Plan
+                JobState::Scout | JobState::Classify | JobState::Plan
             ));
             assert!(stage.verdict.is_none());
         }
@@ -2736,16 +3024,27 @@ mod tests {
             outcome.last_error,
             outcome.last_verdict,
         );
-        assert_eq!(outcome.stages.len(), 5);
+        // W3-12f: 6 stages on ExecutePlan (scout/classify/plan/build/review/test).
+        // The Coordinator brain should pick `execute_plan` for the
+        // canonical "add a method" goal.
+        assert_eq!(outcome.stages.len(), 6);
     }
 
-    /// Sanity: the registry indeed has the five FSM specialist
+    /// Sanity: the registry indeed has the six FSM specialist
     /// ids — guards against future renames in the bundled `.md`
-    /// files breaking the FSM contract silently.
+    /// files breaking the FSM contract silently. W3-12f added the
+    /// Coordinator brain as the 6th profile.
     #[test]
     fn bundled_registry_has_five_specialist_ids() {
         let reg = bundled_registry();
-        for id in [SCOUT_ID, PLANNER_ID, BUILDER_ID, REVIEWER_ID, TESTER_ID] {
+        for id in [
+            SCOUT_ID,
+            PLANNER_ID,
+            BUILDER_ID,
+            REVIEWER_ID,
+            TESTER_ID,
+            COORDINATOR_ID,
+        ] {
             assert!(
                 reg.get(id).is_some(),
                 "bundled profile `{id}` missing"
@@ -2772,6 +3071,7 @@ mod tests {
     const KIND_STAGE_COMPLETED: &str = "stage_completed";
     const KIND_FINISHED: &str = "finished";
     const KIND_CANCELLED: &str = "cancelled";
+    const KIND_DECISION_MADE: &str = "decision_made";
 
     /// One captured event payload from the `swarm:job:{id}:event`
     /// channel. We keep both the parsed JSON value and the raw
@@ -2857,9 +3157,9 @@ mod tests {
     /// to the streaming-event tests — those rely on
     /// `run_job_with_id` so the listener attaches before any emit.
     ///
-    /// W3-12d: the set now covers all five stages — reviewer +
-    /// tester emit `approved=true` verdicts so the FSM reaches
-    /// Done.
+    /// W3-12d: the set covers reviewer + tester emit `approved=true`
+    /// verdicts. W3-12f: the set also seeds the Coordinator with an
+    /// `execute_plan` decision so the chain runs end to end.
     fn happy_responses() -> HashMap<String, MockResponse> {
         let mut r: HashMap<String, MockResponse> = HashMap::new();
         let sleep = Some(Duration::from_millis(100));
@@ -2901,6 +3201,22 @@ mod tests {
                 },
             );
         }
+        // Coordinator brain (W3-12f) — votes `execute_plan` so the
+        // existing 5-stage chain runs after Classify lands.
+        r.insert(
+            COORDINATOR_ID.to_string(),
+            MockResponse {
+                result: Ok(InvokeResult {
+                    session_id: "sess-coord".into(),
+                    assistant_text:
+                        r#"{"route":"execute_plan","reasoning":"mock"}"#
+                            .into(),
+                    total_cost_usd: 0.0,
+                    turn_count: 1,
+                }),
+                sleep,
+            },
+        );
         r
     }
 
@@ -2945,20 +3261,31 @@ mod tests {
             .clone();
         let kinds: Vec<&str> =
             captured.iter().map(|e| e.kind.as_str()).collect();
-        // Exact ordered stream on the happy path: 5 (started, 5x
-        // (stage_started, stage_completed), finished).
+        // Exact ordered stream on the W3-12f ExecutePlan happy path:
+        // started → 6 × (stage_started, stage_completed) with
+        // DecisionMade interleaved between Classify's
+        // stage_completed and Plan's stage_started → finished.
         assert_eq!(
             kinds,
             vec![
                 KIND_STARTED,
+                // Scout
                 KIND_STAGE_STARTED,
                 KIND_STAGE_COMPLETED,
+                // Classify
                 KIND_STAGE_STARTED,
                 KIND_STAGE_COMPLETED,
+                KIND_DECISION_MADE,
+                // Plan
                 KIND_STAGE_STARTED,
                 KIND_STAGE_COMPLETED,
+                // Build
                 KIND_STAGE_STARTED,
                 KIND_STAGE_COMPLETED,
+                // Review
+                KIND_STAGE_STARTED,
+                KIND_STAGE_COMPLETED,
+                // Test
                 KIND_STAGE_STARTED,
                 KIND_STAGE_COMPLETED,
                 KIND_FINISHED,
@@ -2967,7 +3294,7 @@ mod tests {
         );
 
         // Each StageStarted carries the upcoming state; assert the
-        // canonical `scout → plan → build → review → test` order.
+        // canonical `scout → classify → plan → build → review → test` order.
         let stage_starts: Vec<&str> = captured
             .iter()
             .filter(|e| e.kind == KIND_STAGE_STARTED)
@@ -2980,7 +3307,7 @@ mod tests {
             .collect();
         assert_eq!(
             stage_starts,
-            vec!["scout", "plan", "build", "review", "test"]
+            vec!["scout", "classify", "plan", "build", "review", "test"]
         );
     }
 
@@ -3038,7 +3365,7 @@ mod tests {
             .and_then(|v| v.as_array())
             .expect("stages array");
         assert_eq!(stages.len(), outcome.stages.len());
-        assert_eq!(stages.len(), 5);
+        assert_eq!(stages.len(), 6);
         let total_cost = outcome_json
             .get("totalCostUsd")
             .and_then(|v| v.as_f64())
@@ -3064,6 +3391,7 @@ mod tests {
             }),
             sleep: Some(Duration::from_millis(100)),
         });
+        responses.insert(COORDINATOR_ID.into(), execute_plan_decision_response());
         responses.insert(PLANNER_ID.into(), MockResponse {
             result: Err(AppError::SwarmInvoke("planner boom".into())),
             sleep: Some(Duration::from_millis(100)),
@@ -3217,6 +3545,9 @@ mod tests {
             }),
             sleep: scout_sleep,
         });
+        // Coordinator brain (W3-12f) — fast ExecutePlan decision so
+        // the cancel target downstream of Classify is reached.
+        responses.insert(COORDINATOR_ID.into(), execute_plan_decision_response());
         responses.insert(PLANNER_ID.into(), MockResponse {
             result: Ok(InvokeResult {
                 session_id: "p".into(),
@@ -3463,9 +3794,10 @@ mod tests {
     }
 
     /// Reviewer rejects on attempt 1, approves on attempt 2.
-    /// Tester always approves. Final state Done, retry_count=1,
-    /// stages: scout (1) + 2 × (plan/build/review) (= 6) + test (1) = 8.
-    /// RetryStarted event fires once; Scout runs once.
+    /// Tester always approves. Final state Done, retry_count=1.
+    /// W3-12f: stages: scout (1) + classify (1) + 2 × (plan/build/review)
+    /// (= 6) + test (1) = 9. RetryStarted event fires once; Scout
+    /// and Classify each run once.
     #[tokio::test]
     async fn fsm_review_reject_retries_within_budget() {
         let (app, _pool, _dir) = mock_app_with_pool().await;
@@ -3475,6 +3807,10 @@ mod tests {
         responses.insert(
             SCOUT_ID.into(),
             vec![ok_response("scout findings", 0.0)],
+        );
+        responses.insert(
+            COORDINATOR_ID.into(),
+            vec![execute_plan_decision_response()],
         );
         responses.insert(
             PLANNER_ID.into(),
@@ -3513,9 +3849,10 @@ mod tests {
             .await
             .expect("FSM ok");
         assert_eq!(outcome.final_state, JobState::Done);
-        assert_eq!(outcome.stages.len(), 8, "1 scout + 2x(plan/build/review) + test");
-        // Scout invoked exactly once.
+        assert_eq!(outcome.stages.len(), 9, "1 scout + 1 classify + 2x(plan/build/review) + test");
+        // Scout + Classify each invoked exactly once across retries.
         assert_eq!(mock.call_count(SCOUT_ID), 1);
+        assert_eq!(mock.call_count(COORDINATOR_ID), 1);
         // Job-level retry_count == 1 (one full retry round).
         let job = registry.get(&job_id).expect("job in registry");
         assert_eq!(job.retry_count, 1);
@@ -3543,7 +3880,8 @@ mod tests {
     }
 
     /// Reviewer rejects on every attempt → retry budget exhausts at
-    /// 3 attempts. Final Failed, retry_count=2, stages = 1 + 3×3 = 10.
+    /// 3 attempts. Final Failed, retry_count=2.
+    /// W3-12f: stages = 1 (scout) + 1 (classify) + 3×3 (plan/build/review) = 11.
     /// RetryStarted fires twice.
     #[tokio::test]
     async fn fsm_review_reject_exhausts_retries() {
@@ -3552,6 +3890,10 @@ mod tests {
 
         let mut responses: HashMap<String, Vec<MockResponse>> = HashMap::new();
         responses.insert(SCOUT_ID.into(), vec![ok_response("s", 0.0)]);
+        responses.insert(
+            COORDINATOR_ID.into(),
+            vec![execute_plan_decision_response()],
+        );
         responses.insert(PLANNER_ID.into(), vec![ok_response("p", 0.0)]);
         responses.insert(BUILDER_ID.into(), vec![ok_response("b", 0.0)]);
         responses.insert(
@@ -3579,7 +3921,7 @@ mod tests {
             .await
             .expect("FSM ok");
         assert_eq!(outcome.final_state, JobState::Failed);
-        assert_eq!(outcome.stages.len(), 10);
+        assert_eq!(outcome.stages.len(), 11);
         let job = registry.get(&job_id).expect("job");
         assert_eq!(job.retry_count, MAX_RETRIES);
         assert!(outcome.last_verdict.is_some());
@@ -3613,6 +3955,10 @@ mod tests {
 
         let mut responses: HashMap<String, Vec<MockResponse>> = HashMap::new();
         responses.insert(SCOUT_ID.into(), vec![ok_response("s", 0.0)]);
+        responses.insert(
+            COORDINATOR_ID.into(),
+            vec![execute_plan_decision_response()],
+        );
         responses.insert(
             PLANNER_ID.into(),
             vec![ok_response("p1", 0.0), ok_response("p2", 0.0)],
@@ -3652,8 +3998,8 @@ mod tests {
             .await
             .expect("FSM ok");
         assert_eq!(outcome.final_state, JobState::Done);
-        // 1 scout + 2x(plan/build/review/test) = 9.
-        assert_eq!(outcome.stages.len(), 9);
+        // W3-12f: 1 scout + 1 classify + 2x(plan/build/review/test) = 10.
+        assert_eq!(outcome.stages.len(), 10);
         let job = registry.get(&job_id).expect("job");
         assert_eq!(job.retry_count, 1);
 
@@ -3669,7 +4015,8 @@ mod tests {
     }
 
     /// Tester rejects on every attempt → retry budget exhausts.
-    /// Final Failed, retry_count=2, stages = 1 + 3×4 = 13.
+    /// Final Failed, retry_count=2.
+    /// W3-12f: stages = 1 (scout) + 1 (classify) + 3×4 (plan/build/review/test) = 14.
     #[tokio::test]
     async fn fsm_test_reject_exhausts_retries() {
         let (app, _pool, _dir) = mock_app_with_pool().await;
@@ -3677,6 +4024,10 @@ mod tests {
 
         let mut responses: HashMap<String, Vec<MockResponse>> = HashMap::new();
         responses.insert(SCOUT_ID.into(), vec![ok_response("s", 0.0)]);
+        responses.insert(
+            COORDINATOR_ID.into(),
+            vec![execute_plan_decision_response()],
+        );
         responses.insert(PLANNER_ID.into(), vec![ok_response("p", 0.0)]);
         responses.insert(BUILDER_ID.into(), vec![ok_response("b", 0.0)]);
         responses.insert(REVIEWER_ID.into(), vec![ok_verdict_response(0.0)]);
@@ -3704,7 +4055,7 @@ mod tests {
             .await
             .expect("FSM ok");
         assert_eq!(outcome.final_state, JobState::Failed);
-        assert_eq!(outcome.stages.len(), 13);
+        assert_eq!(outcome.stages.len(), 14);
         let job = registry.get(&job_id).expect("job");
         assert_eq!(job.retry_count, MAX_RETRIES);
 
@@ -3735,6 +4086,10 @@ mod tests {
         // but we assert the call counter directly so the regression
         // is unambiguous.
         responses.insert(SCOUT_ID.into(), vec![ok_response("scout", 0.0)]);
+        responses.insert(
+            COORDINATOR_ID.into(),
+            vec![execute_plan_decision_response()],
+        );
         responses.insert(PLANNER_ID.into(), vec![ok_response("p", 0.0)]);
         responses.insert(BUILDER_ID.into(), vec![ok_response("b", 0.0)]);
         responses.insert(
@@ -3763,6 +4118,14 @@ mod tests {
             1,
             "Scout must run exactly once even across retries"
         );
+        // W3-12f: Coordinator brain also runs exactly once per job
+        // (Classify is a one-shot decision, not part of the retry
+        // loop).
+        assert_eq!(
+            mock.call_count(COORDINATOR_ID),
+            1,
+            "Coordinator must run exactly once even across retries"
+        );
         // Sanity: planner ran 3 times (one per attempt).
         assert_eq!(mock.call_count(PLANNER_ID), 3);
     }
@@ -3777,6 +4140,10 @@ mod tests {
 
         let mut responses: HashMap<String, Vec<MockResponse>> = HashMap::new();
         responses.insert(SCOUT_ID.into(), vec![ok_response("scout-out", 0.0)]);
+        responses.insert(
+            COORDINATOR_ID.into(),
+            vec![execute_plan_decision_response()],
+        );
         responses.insert(
             PLANNER_ID.into(),
             vec![
@@ -3889,6 +4256,10 @@ mod tests {
         let registry = Arc::new(JobRegistry::new());
         let mut responses: HashMap<String, Vec<MockResponse>> = HashMap::new();
         responses.insert(SCOUT_ID.into(), vec![ok_response("s", 0.0)]);
+        responses.insert(
+            COORDINATOR_ID.into(),
+            vec![execute_plan_decision_response()],
+        );
         responses.insert(PLANNER_ID.into(), vec![ok_response("p", 0.0)]);
         responses.insert(BUILDER_ID.into(), vec![ok_response("b", 0.0)]);
         responses.insert(
@@ -3971,6 +4342,10 @@ mod tests {
 
         let mut responses: HashMap<String, Vec<MockResponse>> = HashMap::new();
         responses.insert(SCOUT_ID.into(), vec![ok_response("s", 0.0)]);
+        responses.insert(
+            COORDINATOR_ID.into(),
+            vec![execute_plan_decision_response()],
+        );
         // Plan: fast on both attempts.
         responses.insert(
             PLANNER_ID.into(),
@@ -4088,6 +4463,10 @@ mod tests {
         let mut responses: HashMap<String, Vec<MockResponse>> = HashMap::new();
         responses.insert(SCOUT_ID.into(), vec![ok_response("s", 0.0)]);
         responses.insert(
+            COORDINATOR_ID.into(),
+            vec![execute_plan_decision_response()],
+        );
+        responses.insert(
             PLANNER_ID.into(),
             vec![
                 ok_response("p1", 0.0),
@@ -4139,10 +4518,10 @@ mod tests {
         assert_eq!(outcome.final_state, JobState::Done);
         let job = registry.get(&job_id).expect("job");
         assert_eq!(job.retry_count, 2);
-        // 1 scout + attempt 1 (plan/build/review) + attempt 2
-        // (plan/build/review/test) + attempt 3 (plan/build/review/test)
-        // = 1 + 3 + 4 + 4 = 12.
-        assert_eq!(outcome.stages.len(), 12);
+        // W3-12f: 1 scout + 1 classify + attempt 1 (plan/build/review)
+        // + attempt 2 (plan/build/review/test) + attempt 3
+        // (plan/build/review/test) = 1 + 1 + 3 + 4 + 4 = 13.
+        assert_eq!(outcome.stages.len(), 13);
 
         let captured = events.lock().expect("events poisoned").clone();
         let triggers: Vec<&str> = captured
@@ -4153,6 +4532,385 @@ mod tests {
             })
             .collect();
         assert_eq!(triggers, vec!["review", "test"]);
+    }
+
+    // ----------------------------------------------------------------
+    // WP-W3-12f — Coordinator brain (Classify) tests
+    // ----------------------------------------------------------------
+
+    /// Mock-driven research-only path: Coordinator brain returns
+    /// `route: research_only`; FSM finalizes Done after Classify
+    /// without invoking Plan/Build/Review/Test. Stage count = 2
+    /// (Scout + Classify).
+    #[tokio::test]
+    async fn fsm_classify_research_only_skips_to_done() {
+        let (app, _pool, _dir) = mock_app_with_pool().await;
+        let mut responses: HashMap<String, MockResponse> = HashMap::new();
+        responses.insert(SCOUT_ID.into(), ok_response("scout findings", 0.0));
+        responses.insert(
+            COORDINATOR_ID.into(),
+            research_only_decision_response(),
+        );
+        // The downstream specialists must NOT be invoked on this
+        // path; we still seed entries so a regression that calls
+        // them would surface as unrelated assertion failures rather
+        // than a "no scripted response" mock error.
+        responses.insert(PLANNER_ID.into(), ok_response("unused-plan", 0.0));
+        responses.insert(BUILDER_ID.into(), ok_response("unused-build", 0.0));
+        responses.insert(REVIEWER_ID.into(), ok_verdict_response(0.0));
+        responses.insert(TESTER_ID.into(), ok_verdict_response(0.0));
+
+        let mock = Arc::new(MockTransport::new(responses));
+        let fsm = CoordinatorFsm::new(
+            synthetic_registry(),
+            ArcTransport(Arc::clone(&mock)),
+            Arc::new(JobRegistry::new()),
+            Duration::from_secs(5),
+        );
+        let outcome = fsm
+            .run_job(app.handle(), "ws-research-only".into(), "explain X".into())
+            .await
+            .expect("FSM ok");
+        assert_eq!(outcome.final_state, JobState::Done);
+        assert_eq!(outcome.stages.len(), 2);
+        assert_eq!(outcome.stages[0].state, JobState::Scout);
+        assert_eq!(outcome.stages[1].state, JobState::Classify);
+        assert_eq!(
+            outcome.stages[1]
+                .coordinator_decision
+                .as_ref()
+                .map(|d| d.route),
+            Some(CoordinatorRoute::ResearchOnly)
+        );
+        // No verdict-bearing stage on this path.
+        assert!(outcome.last_verdict.is_none());
+        // Plan/Build/Review/Test never invoked — the mock recorded
+        // exactly two calls (scout + coordinator).
+        let seen = mock.seen();
+        let plan_calls = seen.iter().filter(|(id, _)| id == PLANNER_ID).count();
+        let build_calls = seen.iter().filter(|(id, _)| id == BUILDER_ID).count();
+        let review_calls = seen.iter().filter(|(id, _)| id == REVIEWER_ID).count();
+        let test_calls = seen.iter().filter(|(id, _)| id == TESTER_ID).count();
+        assert_eq!(plan_calls, 0, "ResearchOnly must not invoke Planner");
+        assert_eq!(build_calls, 0, "ResearchOnly must not invoke Builder");
+        assert_eq!(review_calls, 0, "ResearchOnly must not invoke Reviewer");
+        assert_eq!(test_calls, 0, "ResearchOnly must not invoke Tester");
+    }
+
+    /// Mock-driven execute-plan path: Coordinator brain returns
+    /// `route: execute_plan`; FSM walks the canonical 5-stage chain.
+    /// Stage count = 6 (Scout + Classify + Plan + Build + Review + Test).
+    #[tokio::test]
+    async fn fsm_classify_execute_plan_continues_full_chain() {
+        let (app, _pool, _dir) = mock_app_with_pool().await;
+        let responses = happy_5_stage_responses(
+            "scout-out", "plan-out", "build-out", 0.01, 0.02, 0.03,
+        );
+        let fsm = CoordinatorFsm::new(
+            synthetic_registry(),
+            MockTransport::new(responses),
+            Arc::new(JobRegistry::new()),
+            Duration::from_secs(5),
+        );
+        let outcome = fsm
+            .run_job(app.handle(), "ws-execute-plan".into(), "add X".into())
+            .await
+            .expect("FSM ok");
+        assert_eq!(outcome.final_state, JobState::Done);
+        assert_eq!(outcome.stages.len(), 6);
+        assert_eq!(outcome.stages[1].state, JobState::Classify);
+        assert_eq!(
+            outcome.stages[1]
+                .coordinator_decision
+                .as_ref()
+                .map(|d| d.route),
+            Some(CoordinatorRoute::ExecutePlan)
+        );
+    }
+
+    /// Coordinator output is unparseable (not JSON, not fenced, not
+    /// a balanced object). Per WP §"Notes/risks", the FSM must
+    /// default-fail-open to ExecutePlan with a fallback decision
+    /// stamped on the StageResult.
+    #[tokio::test]
+    async fn fsm_classify_unparseable_falls_back_to_execute_plan() {
+        let (app, _pool, _dir) = mock_app_with_pool().await;
+        let mut responses = happy_5_stage_responses(
+            "scout", "plan", "build", 0.0, 0.0, 0.0,
+        );
+        responses.insert(
+            COORDINATOR_ID.into(),
+            ok_response("garbage non-JSON output", 0.0),
+        );
+        let fsm = CoordinatorFsm::new(
+            synthetic_registry(),
+            MockTransport::new(responses),
+            Arc::new(JobRegistry::new()),
+            Duration::from_secs(5),
+        );
+        let outcome = fsm
+            .run_job(app.handle(), "ws-fallback".into(), "g".into())
+            .await
+            .expect("FSM ok");
+        // Fallback fires → ExecutePlan branch → full 6-stage chain.
+        assert_eq!(outcome.final_state, JobState::Done);
+        assert_eq!(outcome.stages.len(), 6);
+        let classify = &outcome.stages[1];
+        assert_eq!(classify.state, JobState::Classify);
+        let decision =
+            classify.coordinator_decision.as_ref().expect("fallback decision");
+        assert_eq!(decision.route, CoordinatorRoute::ExecutePlan);
+        assert!(
+            decision.reasoning.contains("fallback"),
+            "fallback reasoning should mention fallback: {}",
+            decision.reasoning
+        );
+    }
+
+    /// `DecisionMade` event fires after `StageCompleted(Classify)` and
+    /// before the next `StageStarted(Plan)`. On the ExecutePlan
+    /// branch the order is: ... → StageStarted(Classify) →
+    /// StageCompleted(Classify) → DecisionMade → StageStarted(Plan)
+    /// → ...
+    #[tokio::test]
+    async fn decision_made_event_fires_after_classify() {
+        let (app, _pool, _dir) = mock_app_with_pool().await;
+        let registry = Arc::new(JobRegistry::new());
+        let responses = happy_5_stage_responses(
+            "s", "p", "b", 0.0, 0.0, 0.0,
+        );
+        let fsm = CoordinatorFsm::new(
+            synthetic_registry(),
+            MockTransport::new(responses),
+            Arc::clone(&registry),
+            Duration::from_secs(5),
+        );
+        let job_id = "j-decision-event".to_string();
+        let events = capture_events(&app, &job_id);
+        fsm.run_job_with_id(
+            app.handle(),
+            job_id.clone(),
+            "ws-decision-event".into(),
+            "g".into(),
+        )
+        .await
+        .expect("FSM ok");
+
+        wait_for_events(&events, Duration::from_secs(2), |evts| {
+            evts.iter().any(|e| e.kind == KIND_FINISHED)
+        })
+        .await;
+
+        let captured = events.lock().expect("events poisoned").clone();
+        // Locate the indices of the events we care about. The order
+        // must be: StageCompleted(Classify) → DecisionMade →
+        // StageStarted(Plan).
+        let classify_completed_idx = captured
+            .iter()
+            .position(|e| {
+                e.kind == KIND_STAGE_COMPLETED
+                    && e.json
+                        .get("stage")
+                        .and_then(|s| s.get("state"))
+                        .and_then(|v| v.as_str())
+                        == Some("classify")
+            })
+            .expect("StageCompleted(Classify) present");
+        let decision_idx = captured
+            .iter()
+            .position(|e| e.kind == KIND_DECISION_MADE)
+            .expect("DecisionMade present");
+        let plan_started_idx = captured
+            .iter()
+            .position(|e| {
+                e.kind == KIND_STAGE_STARTED
+                    && e.json.get("state").and_then(|v| v.as_str())
+                        == Some("plan")
+            })
+            .expect("StageStarted(Plan) present");
+        assert!(
+            classify_completed_idx < decision_idx,
+            "DecisionMade must fire AFTER StageCompleted(Classify)"
+        );
+        assert!(
+            decision_idx < plan_started_idx,
+            "DecisionMade must fire BEFORE StageStarted(Plan)"
+        );
+        // DecisionMade exactly once per job.
+        let decision_count = captured
+            .iter()
+            .filter(|e| e.kind == KIND_DECISION_MADE)
+            .count();
+        assert_eq!(decision_count, 1);
+        // The event payload carries a parseable `decision.route`.
+        let decision_event = &captured[decision_idx];
+        let route = decision_event
+            .json
+            .get("decision")
+            .and_then(|d| d.get("route"))
+            .and_then(|v| v.as_str());
+        assert_eq!(route, Some("execute_plan"));
+    }
+
+    /// `StageResult.coordinator_decision` round-trips through SQLite.
+    /// Drive a full mock-driven run against a pool-backed registry,
+    /// reload via `get_job_detail`, assert the Classify stage's
+    /// decision survived.
+    #[tokio::test]
+    async fn coordinator_decision_persists_on_stage_result() {
+        let (app, _pool, _dir) = mock_app_with_pool().await;
+        let (registry, _pool, _reg_dir) = pool_backed_registry().await;
+        let responses = happy_5_stage_responses(
+            "s", "p", "b", 0.0, 0.0, 0.0,
+        );
+        let fsm = CoordinatorFsm::new(
+            synthetic_registry(),
+            MockTransport::new(responses),
+            Arc::clone(&registry),
+            Duration::from_secs(5),
+        );
+        let job_id = "j-decision-persist".to_string();
+        fsm.run_job_with_id(
+            app.handle(),
+            job_id.clone(),
+            "ws-decision-persist".into(),
+            "g".into(),
+        )
+        .await
+        .expect("FSM ok");
+
+        let detail = registry
+            .get_job_detail(&job_id)
+            .await
+            .expect("query")
+            .expect("Some");
+        assert_eq!(detail.stages.len(), 6);
+        // Stages[1] must be Classify with the ExecutePlan decision.
+        let classify = &detail.stages[1];
+        assert_eq!(classify.state, JobState::Classify);
+        let decision = classify
+            .coordinator_decision
+            .as_ref()
+            .expect("decision persisted");
+        assert_eq!(decision.route, CoordinatorRoute::ExecutePlan);
+        // Every other stage's decision is None.
+        for (i, stage) in detail.stages.iter().enumerate() {
+            if i == 1 {
+                continue;
+            }
+            assert!(
+                stage.coordinator_decision.is_none(),
+                "stage {i} ({:?}) should have no decision",
+                stage.state
+            );
+        }
+    }
+
+    /// `render_classify_prompt` substitutes the goal and scout
+    /// findings into the Turkish template.
+    #[test]
+    fn classify_prompt_includes_goal_and_scout_findings() {
+        let goal = "EXACT-GOAL-MARKER";
+        let scout_output = "EXACT-SCOUT-MARKER\nfile:line — finding";
+        let rendered = render_classify_prompt(goal, scout_output);
+        assert!(
+            rendered.contains(goal),
+            "rendered prompt missing goal: {rendered}"
+        );
+        assert!(
+            rendered.contains(scout_output),
+            "rendered prompt missing scout output: {rendered}"
+        );
+        // Turkish header lands.
+        assert!(
+            rendered.contains("Hedef:"),
+            "rendered prompt missing Turkish header: {rendered}"
+        );
+        // OUTPUT CONTRACT restated inline so the LLM hits the JSON
+        // path even when the persona body is long.
+        assert!(
+            rendered.contains("research_only"),
+            "rendered prompt missing route option: {rendered}"
+        );
+        assert!(
+            rendered.contains("execute_plan"),
+            "rendered prompt missing route option: {rendered}"
+        );
+        // No leftover placeholders.
+        assert!(
+            !rendered.contains("{goal}"),
+            "rendered prompt has unsubstituted {{goal}}: {rendered}"
+        );
+        assert!(
+            !rendered.contains("{scout_output}"),
+            "rendered prompt has unsubstituted {{scout_output}}: {rendered}"
+        );
+    }
+
+    /// `next_state` handles the new Classify state. Both edges land:
+    /// Ok → Plan (assumes ExecutePlan; the run loop owns the
+    /// ResearchOnly short-circuit), Err → Failed.
+    #[test]
+    fn next_state_classify_transitions() {
+        assert_eq!(next_state(JobState::Scout, true), JobState::Classify);
+        assert_eq!(next_state(JobState::Classify, true), JobState::Plan);
+        assert_eq!(next_state(JobState::Classify, false), JobState::Failed);
+    }
+
+    /// Real-claude integration smoke (`#[ignore]`) — drives a
+    /// research-only goal end-to-end. Owner runs it manually with
+    /// `cargo test -- --ignored` post-commit.
+    ///
+    /// Time budget: 2 × 180s = 360s worst-case (Scout + Classify);
+    /// typical 30-60s. The Coordinator brain should pick
+    /// `research_only` for an "explain how X works" prompt.
+    #[tokio::test]
+    #[ignore = "requires real `claude` binary + Pro/Max subscription"]
+    async fn integration_research_only_real_claude() {
+        use crate::swarm::transport::SubprocessTransport;
+
+        let stage_secs = std::env::var("NEURON_SWARM_STAGE_TIMEOUT_SEC")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(180);
+
+        let (app, _pool, _dir) = mock_app_with_pool().await;
+        let profiles = bundled_registry();
+        let transport = SubprocessTransport::new();
+        let registry = Arc::new(JobRegistry::new());
+        let fsm = CoordinatorFsm::new(
+            profiles,
+            transport,
+            registry,
+            Duration::from_secs(stage_secs),
+        );
+        let goal = "Explain how the FSM transitions work in \
+            src-tauri/src/swarm/coordinator/fsm.rs based on the \
+            next_state function.";
+        let outcome = fsm
+            .run_job(app.handle(), "default".into(), goal.into())
+            .await
+            .expect("FSM returns Ok");
+        assert_eq!(
+            outcome.final_state,
+            JobState::Done,
+            "expected Done, got {:?} (last_error: {:?})",
+            outcome.final_state,
+            outcome.last_error
+        );
+        // ResearchOnly short-circuit → Scout + Classify only.
+        assert_eq!(outcome.stages.len(), 2);
+        let decision = outcome
+            .stages[1]
+            .coordinator_decision
+            .as_ref()
+            .expect("Classify stage carries a decision");
+        assert_eq!(
+            decision.route,
+            CoordinatorRoute::ResearchOnly,
+            "Coordinator brain should classify an 'explain X' goal as ResearchOnly"
+        );
     }
 
     /// `verdict_issues_as_bullets` empty-list sentinel.
