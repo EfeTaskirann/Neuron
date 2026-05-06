@@ -4,6 +4,45 @@ Running journal of agent-driven changes. Newest entry on top. See `AGENTS.md` §
 
 ---
 
+## 2026-05-06T17:40Z WP-W3-12f completed
+
+- dispatch: **single sub-agent**; orchestrator drove both manual integration smokes
+- sub-agent: general-purpose
+- files changed: 13 in commit `1ac7347`
+  - new: `docs/work-packages/WP-W3-12f-coordinator-brain.md`, `src-tauri/migrations/0008_swarm_decision.sql`, `src-tauri/src/swarm/agents/coordinator.md`, `src-tauri/src/swarm/coordinator/decision.rs`
+  - modified: `src-tauri/src/swarm/coordinator/{fsm,job,mod,store}.rs` (Classify state activation + Decision branching + DecisionMade event + decision_json persistence), `src-tauri/src/swarm/profile.rs` (`bundled_five_*` → `bundled_six_*` test rename), `src-tauri/src/commands/swarm.rs` (`profiles_list_returns_five_*` → `..._six_*`), `src-tauri/src/db.rs` (migration count 7 → 8), `app/src/hooks/useSwarmJob.ts` (+`decision_made` exhaustive case), `app/src/lib/bindings.ts` (regen +CoordinatorRoute +CoordinatorDecision +classify on JobState union +coordinatorDecision? on StageResult +DecisionMade variant), `docs/work-packages/WP-W3-overview.md` (W3-12e flipped to done; W3-12f in-flight then done)
+- commit SHA: `1ac7347`
+- acceptance: ✅ pass
+  - `cargo check` → exit 0
+  - `cargo test --lib` → exit 0, **312 passed; 0 failed; 10 ignored** (293 prior + 19 new unit; 9 prior ignored + 1 new ignored integration)
+  - `pnpm gen:bindings/check/typecheck/test/lint` → all 0 (gen:bindings:check exit 1 pre-commit expected)
+  - **orchestrator-driven integration smokes** (Windows + Pro/Max OAuth):
+    - `integration_research_only_real_claude` (NEW) → Done in **59.70s** ✅. Goal "Explain how the FSM transitions work in src-tauri/src/swarm/coordinator/fsm.rs based on the next_state function" → Coordinator brain classified ResearchOnly → FSM finalized after 2 stages (Scout + Classify). **ROI demo**: same goal would have run all 5 W3-12d stages (~3-4x slower).
+    - `integration_full_chain_real_claude_with_verdict` (regression) → Done in **167.47s** ✅. Coordinator classified ExecutePlan for the canonical "add profile_count helper" goal; full 6-stage chain (Scout + Classify + Plan + Build + Review + Test) succeeded with both Verdicts approved.
+- key implementation choices
+  - **Option B per architectural report §11.4** — single-shot Coordinator LLM call AT ONE decision point (Classify, post-Scout, pre-Plan), not a persistent Coordinator subprocess (Option C, deferred). FSM transitions remain deterministic; only the ResearchOnly vs ExecutePlan branch is LLM-decided.
+  - **Default-fail-open on parse error.** Unparseable Coordinator output → ExecutePlan with `reasoning: "fallback: brain output unparseable"`. Rationale per WP §"Notes / risks": cost of misclassifying execute as research-only ("user thinks job succeeded but no code written") far exceeds cost of misclassifying research as execute (one wasted full chain ~$0.10). Err toward more work.
+  - **`unwrap_or_else` is the only place we accept malformed JSON** in the FSM — documented inline; unit tests assert the fallback fires.
+  - **Parser duplicated, not generalized.** `verdict::parse_verdict` and `decision::parse_decision` share the 4-step structure but diverge on error message wording. Sub-agent picked duplication over generic `parse_robust_json<T>` (one-line justification at top of `decision.rs`): error messages "could not parse Verdict" vs "could not parse CoordinatorDecision" thread differently, and future divergence stays single-file.
+  - **`StageResult.coordinator_decision: Option<CoordinatorDecision>`** parallels `verdict: Option<Verdict>` from W3-12d. Populated for Classify stages only.
+  - **`SwarmJobEvent::DecisionMade`** new variant fires after Classify so UI (W3-14 follow-up) can render route pill before next stage starts.
+  - **Migration `0008_swarm_decision.sql`** is one ALTER TABLE ADD COLUMN, nullable. Existing `swarm_stages` rows from W3-12b/d gain NULL `decision_json` and behave correctly post-upgrade.
+  - **6-profile contract** is the new bundled set baseline. `swarm:profiles_list` returns 6 entries (alphabetical: backend-builder / coordinator / integration-tester / planner / reviewer / scout).
+  - **Coordinator persona uses `permission_mode: plan`** (Read/Grep/Glob only) — it never writes. `max_turns: 4` because the decision should land in 1-2 turns; tight budget keeps misbehavior from burning tokens.
+  - **`useSwarmJob.ts` `decision_made` case is no-op for cache shape** — the actual decision data already lands via `stage_completed`'s `coordinator_decision` field on the StageResult. The DecisionMade event is mostly for UI render hooks (a future "show route pill" effect).
+  - **Existing FSM regression tests bulk-updated** mechanically to seed a Coordinator entry returning `{"route":"execute_plan","reasoning":"mock"}` via `execute_plan_decision_response()` helper. Stage-count expectations bumped from 5 to 6 across the suite. ~30 test fixture lines touched.
+- bindings regenerated: yes (+`CoordinatorRoute`, +`CoordinatorDecision`, +classify on JobState union, +coordinatorDecision? on StageResult, +DecisionMade variant)
+- branch: `main` (local; not pushed; **63 commits ahead of `origin/main`** post-`1ac7347`)
+- known caveats / followups
+  - **`bundled_registry_has_five_specialist_ids` test name is now stale** (sub-agent extended its body to cover all 6 ids but didn't rename to keep diff minimal). Cosmetic; orchestrator can rename in a follow-up small commit.
+  - **Profile rename loss-and-restore** AGAIN (W3-12d had the same issue). Pattern: orchestrator `git restore`s `profile.rs` to drop integration-test artifacts, which also reverts sub-agent's legitimate test renames. Caught + re-applied manually before commit. Lesson: when sub-agent reports a profile.rs change, always inspect the diff before restore.
+  - **No UI surfacing of DecisionMade event / route pill** in `SwarmJobDetail.tsx`. Backend ships the data; render is a small W3-14 follow-up.
+  - **No additional Coordinator decisions** beyond Classify. Skip-Reviewer-for-trivial-edits, retry strategy choice, profile-set narrowing — all W3-12g+.
+  - **Cost ticker.** Each job now pays ~$0.01-0.03 for Classify in addition to the existing per-stage costs. Net: research-only jobs save ~$0.07-0.10; execute-plan jobs pay the small Classify tax. ROI positive iff research-only coverage > 10%.
+- next: W3-14 follow-up to render `DecisionMade` route pill (small commit, no WP doc); W3-12g (additional Coordinator decisions); or push 63 commits to origin.
+
+---
+
 ## 2026-05-06T15:25Z WP-W3-12e completed
 
 - dispatch: **single sub-agent**; orchestrator drove the cancel regression smoke; full-chain regression failed on a KNOWN WINDOWS LIMITATION (cargo-in-cargo file lock) that is NOT a W3-12e bug — failure mode itself proves retry-loop semantics work
