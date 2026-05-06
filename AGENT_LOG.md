@@ -4,6 +4,33 @@ Running journal of agent-driven changes. Newest entry on top. See `AGENTS.md` §
 
 ---
 
+## 2026-05-06T23:30Z fix: Fullstack integration smoke unblocked (W3-12i follow-up)
+
+- commit SHA: `059d704`
+- scope: test-side fixes only — FSM behavior unchanged
+- problem: W3-12i's `integration_fullstack_chain_real_claude` hung 1h 43min on Windows; the W3-12i WP shipped with documented caveat. This commit closes the caveat.
+- four root causes diagnosed across 4 iterations (10-25 min each):
+  1. **Cargo-in-cargo recursion + binary lock + hang.** Outer `cargo test` holds `target/debug/deps/neuron_lib-*.exe` locked; inner `cargo test` (run by IntegrationTester) hits LNK1104 → existing fallback to `cargo check` wasn't enough on Fullstack because BOTH Rust + TS toolchains fire. **Fix**: `TestEnvGuard` RAII helper + isolated `CARGO_TARGET_DIR=<tempdir>` set before subprocess env capture. Inner cargo writes to its own dir; outer test binary stays unlocked.
+  2. **IntegrationTester max_turns=12 too low for fresh-compile-from-scratch.** Isolated CARGO_TARGET_DIR means empty target → 5-8 min full crate compile. **Fix**: bump integration-tester.md max_turns 12 → 24. Doesn't affect normal usage (where target is already populated).
+  3. **Stage timeout 180s too low for Test stage's fresh compile.** Per-stage budget couldn't absorb 5-8 min compile. **Fix**: bump default stage_timeout from 180s to 600s **for the Fullstack integration test only**. Other integration tests still default to 180s. Override via `NEURON_SWARM_STAGE_TIMEOUT_SEC` for fast machines.
+  4. **Goal phrasing tripped Coordinator's research-only heuristic.** Original goal ("briefly noting that Job carries the full lifecycle") sounded researchy → Coordinator classified `route=research_only` → FSM short-circuited after Classify (2 stages, no Build). **Fix**: rewrite goal as explicit imperative ("EXECUTE: Edit two source files. ... add the line ...") with a final "this is an execute_plan task" hint. Coordinator now reliably classifies as `scope=Fullstack + route=execute_plan`.
+- result: **integration_fullstack_chain_real_claude → Done in 743.68s** (12m 24s) ✅
+  - All 8 stages ran in correct order: scout / coordinator / planner / backend-builder / backend-reviewer / frontend-builder / frontend-reviewer / integration-tester.
+  - Coordinator decision: `route=ExecutePlan, scope=Fullstack`.
+  - Both Verdicts (BackendReviewer + FrontendReviewer) approved.
+  - IntegrationTester ran `cargo test` in the isolated target dir successfully.
+- diagnostic upgrade: first assertion in the integration test now dumps `last_error`, `last_verdict`, and `stages` summary (not just stages). Future debugging gets the full picture in one panic message.
+- iteration log:
+  - Iteration 1 (1h 43min hung): no isolation → cargo deadlock. Orphan-killed.
+  - Iteration 2 (400s, FAILED): isolated CARGO_TARGET_DIR but `tail -10` truncated output, no diagnosis.
+  - Iteration 3 (1065s = 17m 45s, FAILED): full output captured; revealed 3 retry attempts; diagnosis showed Test stage timeout (180s) wasn't enough for fresh compile; bumped Tester max_turns 12 → 24.
+  - Iteration 4 (52s, FAILED): stage_timeout=600s but Coordinator classified as research_only → 2 stages. Diagnosis: goal phrasing.
+  - Iteration 5 (743s, ✅ PASSED): imperative goal + all prior fixes stacked.
+- branch: `main` (pushed; **0 commits ahead of `origin/main`** post-`059d704`)
+- next: W3-12j (Fullstack parallel via tokio::join!), then W3-12k (Orchestrator chat layer for the 9th agent), or polish backlog.
+
+---
+
 ## 2026-05-06T22:15Z WP-W3-12i completed (with documented integration-smoke hang)
 
 - dispatch: **single sub-agent**; orchestrator attempted integration smoke but it hung 1.5+ hours on Windows (cargo-in-cargo recursion); shipped on the strength of unit tests + W3-12h's still-green Backend/Frontend regressions
