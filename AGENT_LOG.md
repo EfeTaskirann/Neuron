@@ -4,6 +4,43 @@ Running journal of agent-driven changes. Newest entry on top. See `AGENTS.md` §
 
 ---
 
+## 2026-05-06T19:55Z WP-W3-12h completed
+
+- dispatch: **single sub-agent**; orchestrator drove integration smokes (frontend + backend regression)
+- sub-agent: general-purpose
+- files changed: 7 in commit `e0e9f9c`
+  - new: `docs/work-packages/WP-W3-12h-scope-aware-dispatch.md`
+  - modified: `src-tauri/src/swarm/coordinator/fsm.rs` (+498 / -92; consts + helper + run-loop scope-aware ID resolution + 8 new tests + 1 ignored integration; BUILDER_ID → BACKEND_BUILDER_ID rename), `src-tauri/src/swarm/profile.rs` (frontmatter_round_trip max_turns assertion 6→10), `src-tauri/src/swarm/agents/{scout,planner,coordinator}.md` (max_turns bumps), `docs/work-packages/WP-W3-overview.md` (W3-12g flipped done; W3-12h/i/j/k status rows split per scope reduction)
+- commit SHA: `e0e9f9c`
+- acceptance: ✅ pass (with documented include_dir! rebuild lesson)
+  - `cargo check` → exit 0
+  - `cargo test --lib` → exit 0, **328 passed; 0 failed; 11 ignored** (321 prior + 7 new unit; 10 prior ignored + 1 new ignored integration)
+  - `pnpm gen:bindings/check/typecheck/test/lint` → all 0 (bindings.ts unchanged — gen:bindings:check exit 0)
+  - **orchestrator-driven integration smokes**:
+    - `integration_frontend_chain_real_claude` (NEW) → Done in **299.96s** ✅. Coordinator classified scope=Frontend; FSM dispatched frontend-builder + frontend-reviewer (NOT backend variants); goal "Add a JSDoc comment to formatRelativeMs in SwarmJobList.tsx" completed end-to-end. **First TWO runs failed** with `error_max_turns` at Scout (6 turns insufficient for Glob+Read+format on this goal); bumped Scout to 10, force-rebuilt include_dir! via `touch profile.rs`, third run passed.
+    - `integration_full_chain_real_claude_with_verdict` (regression) → Done in **211.46s** ✅. scope=Backend correctly emitted; existing 6-stage backend chain unchanged.
+- key implementation choices
+  - **Single-domain only.** Backend / Frontend dispatch ships in 12h. Fullstack falls back to backend chain with W3-12i-pointer warn. Splitting Fullstack into 12i (sequential) and 12j (parallel) keeps each WP M-sized.
+  - **`select_chain_ids(scope)` helper** centralizes the dispatch decision. Easy to extend in 12i (add a Fullstack branch returning a sequence of pairs).
+  - **Builder + Reviewer profile resolution moved INSIDE the retry loop.** Decision-stable for 12h (scope doesn't change mid-job), but the placement is correct for future per-domain retry semantics where the chain might vary mid-job.
+  - **`BUILDER_ID` → `BACKEND_BUILDER_ID` rename** for symmetry with `BACKEND_REVIEWER_ID`. ~40 internal call sites updated mechanically. Public API surface (specta'd types, IPC) unaffected.
+  - **One W3-12g test removed**: `fsm_scope_frontend_logs_warning_but_uses_backend_chain` asserted the routing-mismatch behavior 12h explicitly inverts. Replaced by `fsm_scope_frontend_dispatches_frontend_chain` + regression coverage. **NOT a skip-to-pass** — the contract changed; the new tests cover the new contract more thoroughly than the old one covered the old contract.
+  - **`max_turns` bumps** on Scout (6→10), Planner (6→10), Coordinator (4→8). Quality-first per owner directive 2026-05-06; cost increment is negligible vs. the test-pass-rate gain. Coordinator's W3-12g persona expansion (scope rules + few-shot) made 4 turns tight; Scout's 6 was sometimes insufficient on path-specific goals (Glob+Read+formatting on a TSX file); Planner bumped for symmetry.
+  - **`include_dir!` cache trap.** Edited `.md` profiles aren't always picked up by cargo's incremental build because include_dir's macro tracks file dependencies but cargo can miss a profile-file change in some edge cases. **Workaround**: `touch src-tauri/src/swarm/profile.rs` (the file that uses the macro) forces cargo to recompile and re-bundle. Documented in this log for future profile-edit work.
+  - **Diagnostic enhancement** on the frontend integration test: first assertion now includes `outcome.stages` summary (state + specialist_id pairs) on failure. Future debugging can identify which stage hit Failed without grepping `tracing` logs.
+  - **`error_max_turns` failure debugging pattern**: when integration test fails fast (~30s), `last_verdict: None`, `stages: []` → first stage exhausted max_turns. Bump that stage's max_turns and force-rebuild. The first two failed runs followed this exact path and converged on the third.
+- bindings regenerated: yes by `pnpm gen:bindings`, but the diff was empty — no wire shape changes from 12h. `gen:bindings:check` exit 0 post-commit.
+- branch: `main` (local; not pushed; **68 commits ahead of `origin/main`** post-`e0e9f9c`)
+- known caveats / followups
+  - **Fullstack falls back to backend chain.** W3-12i activates Fullstack sequential. Until then, scope=Fullstack jobs run BB+BR only with `tracing::warn!` flagging the gap.
+  - **No per-domain retry budget.** Backend rejection re-runs full chain (existing W3-12e behavior); same for Frontend. Per-domain retry would re-run only the failing domain's stages but that's a future polish.
+  - **Frontend integration test wall clock 5 min** at high end. Typical 2-3 min when AV is warm; first-spawn cold-cache adds 30-60s. Document with each cumulative integration smoke.
+  - **No UI scope pill.** SwarmJobDetail still shows specialist_id per stage row (so frontend-builder labels appear naturally) but no top-level scope badge. Small follow-up.
+  - **`stages: []` on integration-test failure** is now shown via the diagnostic in the first assert. Future integration tests should follow this pattern.
+- next: W3-12i (Fullstack sequential dispatch — BB+BR then FB+FR with retry-loop awareness), then W3-12j (parallel via tokio::join!), then W3-12k (Orchestrator chat layer for the 9th agent).
+
+---
+
 ## 2026-05-06T18:30Z WP-W3-12g completed
 
 - dispatch: **single sub-agent**; orchestrator drove regression integration smoke
