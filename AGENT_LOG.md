@@ -4,6 +4,45 @@ Running journal of agent-driven changes. Newest entry on top. See `AGENTS.md` §
 
 ---
 
+## 2026-05-06T07:18Z WP-W3-14 completed
+
+- dispatch: **single sub-agent**; frontend-only WP, no backend changes, no real-claude integration smoke required (verified Rust regression count unchanged at 254 instead)
+- sub-agent: general-purpose
+- files changed: 17 in commit `2ace648`
+  - new — frontend: `app/src/routes/SwarmRoute.tsx`, `app/src/components/{SwarmGoalForm,SwarmJobList,SwarmJobDetail}.tsx`, `app/src/hooks/{useSwarmJob,useSwarmJobs,useRunSwarmJob,useCancelSwarmJob}.ts`, `app/src/styles/swarm.css`
+  - new — tests: `app/src/hooks/{useSwarmJob,useSwarmJobs}.test.tsx`, `app/src/routes/SwarmRoute.test.tsx`, `app/src/components/SwarmJobDetail.test.tsx`
+  - new — planning: `docs/work-packages/WP-W3-14-swarm-ui-route.md`
+  - modified: `app/src/App.tsx` (+'swarm' route, +NAV/TOPBAR_TITLE entries, +RouteHost case), `app/src/App.test.tsx` (nav-item count 6 → 7), `app/src/main.tsx` (+swarm.css import), `docs/work-packages/WP-W3-overview.md` (W3-12b flipped to done; W3-14 row added)
+- commit SHA: `2ace648`
+- acceptance: ✅ pass
+  - `pnpm typecheck` → exit 0
+  - `pnpm test --run` → exit 0, **34 passed** (17 prior + 17 new across 5 files)
+  - `pnpm lint` → exit 0
+  - `cargo check` → exit 0 (regression — no Rust changes)
+  - `cargo test --lib` → exit 0, **254 passed; 0 failed; 8 ignored** (regression — unchanged from W3-12b)
+  - integration smokes NOT re-run for this WP because backend untouched. The 3-test smoke suite from W3-12b is the most recent green baseline (104.56s + 101.05s + 32.69s on 2026-05-06). Post-commit `pnpm tauri dev` manual UI smoke is owner-driven and out of orchestrator's loop.
+- key implementation choices
+  - **2-pane layout** — left = goal form + jobs list, right = selected-job detail. Mirrors `RunsRoute.tsx` convention.
+  - **TanStack Query + Tauri event subscription** for live updates. `useSwarmJob` calls `commands.swarmGetJob` for the initial load AND `listen<SwarmJobEvent>` for incremental updates; the listener mutates the cache via `qc.setQueryData(applySwarmEventToJobDetail)`. On `finished`, also invalidates `['swarm-jobs']` so the list reflects the terminal state.
+  - **`applySwarmEventToJobDetail` is exported as a pure function** so unit tests drive each event-kind branch directly without spinning up the hook. Mirrors the architectural report's §6 reply-matching pattern (events feed a deterministic projection).
+  - **Listener cleanup via cancellation flag + `unlisten?.()`** — handles React StrictMode double-invoke safely. Same pattern `usePaneLines.ts` uses.
+  - **`workspaceId = "default"` constant.** Multi-workspace UI is post-W3 per WP §"Out of scope".
+  - **`useSwarmJobs` polls every 5s** as a backstop in case events miss (window collapsed or initial load); event-driven invalidation is the primary path.
+  - **No new icons.** `bot` reused for sidebar Swarm entry (same as Agents — distinguished by label and active route).
+  - **No new JS dep.** TanStack Query, React 18, `@tauri-apps/api/event` were all already in tree.
+  - **No backend changes.** Bindings shipped by W3-12a/b/c; this WP only consumes them.
+- bindings regenerated: no (no Rust changes)
+- branch: `main` (local; not pushed; **56 commits ahead of `origin/main`** post-`2ace648`)
+- known caveats / followups
+  - **Manual UI smoke pending owner verification** post-commit via `pnpm tauri dev`. The Vitest-side hook + component tests cover unit behavior; full window-rendered UX is a human-eyes pass.
+  - **No specialist-pane streaming** (the architectural report's §8.2 multi-pane). Single-pane chat-style is the W3-14 contract; multi-pane is a candidate post-W3 polish WP.
+  - **No token-level streaming.** Stage-level events only — mid-stage progress shows "running…" with no token-by-token output.
+  - **Cancel race during stage-boundary** is handled by W3-12c's backend (cancel during the gap between StageCompleted and next StageStarted is recorded with the *next* stage's state). UI shows the eventual `finished` event's terminal state — no special UI logic needed.
+  - **Cost ticker accumulates per-stage** via the live event stream's `stage_completed.stage.totalCostUsd`. Cross-job aggregation (cumulative spend) is post-W3.
+- next: WP-W3-12d (REVIEW/TEST states + reviewer/integration-tester profiles + Verdict schema + retry feedback + Coordinator LLM brain Option B). Last leg of the W3-12 swarm series.
+
+---
+
 ## 2026-05-06T00:35Z WP-W3-12b completed
 
 - dispatch: **single sub-agent**; orchestrator drove all 3 manual integration smokes per the 2026-05-05 standing directive
