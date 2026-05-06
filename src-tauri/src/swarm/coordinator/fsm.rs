@@ -58,14 +58,29 @@ pub const MAX_RETRIES: u32 = 2;
 /// without hardcoding strings in two places.
 pub const SCOUT_ID: &str = "scout";
 pub const PLANNER_ID: &str = "planner";
-pub const BUILDER_ID: &str = "backend-builder";
+/// BackendBuilder profile id (W3-12a, renamed in W3-12h for symmetry
+/// with `FRONTEND_BUILDER_ID`). Used when
+/// `CoordinatorDecision.scope` is `Backend` or `Fullstack`
+/// (Fullstack falls back to the backend chain in W3-12h; W3-12i
+/// activates Fullstack sequential dispatch).
+pub const BACKEND_BUILDER_ID: &str = "backend-builder";
 /// BackendReviewer profile id (W3-12d, renamed in W3-12g). Runs
-/// after `BUILDER_ID` and emits a JSON Verdict the FSM gates on.
-/// Always used by the FSM in W3-12g regardless of
-/// `CoordinatorDecision.scope` — scope-aware dispatch lands in
-/// W3-12h. The const value (`"backend-reviewer"`) matches the
-/// renamed bundled profile (`backend-reviewer.md`).
+/// after `BACKEND_BUILDER_ID` and emits a JSON Verdict the FSM
+/// gates on. Used when `CoordinatorDecision.scope` is `Backend`
+/// or `Fullstack`. The const value (`"backend-reviewer"`) matches
+/// the bundled profile (`backend-reviewer.md`).
 pub const BACKEND_REVIEWER_ID: &str = "backend-reviewer";
+/// FrontendBuilder profile id (W3-12g bundle, W3-12h dispatch).
+/// Used when `CoordinatorDecision.scope` is `Frontend`. The const
+/// value (`"frontend-builder"`) matches the bundled profile
+/// (`frontend-builder.md`).
+pub const FRONTEND_BUILDER_ID: &str = "frontend-builder";
+/// FrontendReviewer profile id (W3-12g bundle, W3-12h dispatch).
+/// Runs after `FRONTEND_BUILDER_ID` and emits a JSON Verdict the
+/// FSM gates on. Used when `CoordinatorDecision.scope` is
+/// `Frontend`. The const value (`"frontend-reviewer"`) matches the
+/// bundled profile (`frontend-reviewer.md`).
+pub const FRONTEND_REVIEWER_ID: &str = "frontend-reviewer";
 /// IntegrationTester profile id (W3-12d). Runs after a successful
 /// Reviewer verdict; emits a JSON Verdict the FSM gates on for
 /// the final transition to `Done`.
@@ -75,6 +90,26 @@ pub const TESTER_ID: &str = "integration-tester";
 /// between `ResearchOnly` (short-circuit to Done) and `ExecutePlan`
 /// (continue the canonical chain).
 pub const COORDINATOR_ID: &str = "coordinator";
+
+/// Resolve the (builder_id, reviewer_id) pair for a given
+/// `CoordinatorScope` (W3-12h).
+///
+/// - `Backend` → backend chain (current behavior).
+/// - `Frontend` → frontend chain (NEW activation in 12h).
+/// - `Fullstack` → falls back to the backend chain in 12h. W3-12i
+///   activates Fullstack sequential dispatch (BB+BR then FB+FR);
+///   W3-12j (if needed) activates Fullstack parallel dispatch.
+fn select_chain_ids(scope: CoordinatorScope) -> (&'static str, &'static str) {
+    match scope {
+        CoordinatorScope::Backend => (BACKEND_BUILDER_ID, BACKEND_REVIEWER_ID),
+        CoordinatorScope::Frontend => (FRONTEND_BUILDER_ID, FRONTEND_REVIEWER_ID),
+        CoordinatorScope::Fullstack => {
+            // W3-12h fallback: same as 12g. W3-12i replaces this
+            // with the real sequential dispatch.
+            (BACKEND_BUILDER_ID, BACKEND_REVIEWER_ID)
+        }
+    }
+}
 
 /// SCOUT stage prompt template — wraps the goal as an
 /// investigation request. WP §3 originally specified "goal
@@ -519,24 +554,15 @@ impl<T: Transport> CoordinatorFsm<T> {
                 ))
             })?
             .clone();
-        let builder = self
-            .profiles
-            .get(BUILDER_ID)
-            .ok_or_else(|| {
-                AppError::NotFound(format!(
-                    "swarm profile `{BUILDER_ID}` (required for FSM)"
-                ))
-            })?
-            .clone();
-        let reviewer = self
-            .profiles
-            .get(BACKEND_REVIEWER_ID)
-            .ok_or_else(|| {
-                AppError::NotFound(format!(
-                    "swarm profile `{BACKEND_REVIEWER_ID}` (required for FSM)"
-                ))
-            })?
-            .clone();
+        // W3-12h: Builder + Reviewer are resolved INSIDE the retry
+        // loop based on `decision.scope` (set by the Classify stage
+        // below). The decision is stable across retry iterations for
+        // 12h (a single job's scope doesn't change mid-flight), but
+        // the resolution happens per-iteration so future per-domain
+        // retry logic (W3-12i+) can pivot the chain without
+        // restructuring the run loop. `scout`, `planner`, `tester`,
+        // and `coordinator` stay scope-agnostic and are still
+        // resolved up front.
         let tester = self
             .profiles
             .get(TESTER_ID)
@@ -677,28 +703,30 @@ impl<T: Transport> CoordinatorFsm<T> {
                     }
                 };
                 // W3-12g §6 — record route + scope for audit. The
-                // scope is logged but NOT acted on; the FSM still
-                // dispatches `BACKEND_BUILDER_ID` + `BACKEND_REVIEWER_ID`
-                // unconditionally. A `tracing::warn!` fires when the
-                // brain produces a non-Backend scope so W3-12h's
-                // dispatch correctness is observable from existing
-                // integration smokes before its FSM logic ships.
+                // scope drives Builder + Reviewer selection in the
+                // retry loop below via `select_chain_ids`. The
+                // `tracing::info!` line stays as the canonical audit
+                // marker for every job (route + scope).
+                //
+                // W3-12h: scope=Frontend now correctly dispatches the
+                // frontend chain, so the warning that fired for
+                // Frontend in 12g is dropped. scope=Fullstack still
+                // falls back to the backend chain — the warn below
+                // flags that mismatch until W3-12i activates real
+                // Fullstack sequential dispatch.
                 tracing::info!(
                     job_id = %job_id,
                     route = ?decision.route,
                     scope = ?decision.scope,
                     "swarm: Coordinator decision recorded"
                 );
-                if matches!(
-                    decision.scope,
-                    CoordinatorScope::Frontend | CoordinatorScope::Fullstack
-                ) {
+                if matches!(decision.scope, CoordinatorScope::Fullstack) {
                     tracing::warn!(
                         job_id = %job_id,
                         scope = ?decision.scope,
-                        "swarm: scope=frontend|fullstack detected; \
-                         W3-12g still routes through backend chain — \
-                         W3-12h activates scope-aware dispatch"
+                        "swarm: scope=fullstack detected; W3-12h falls \
+                         back to backend chain — W3-12i activates \
+                         Fullstack sequential dispatch"
                     );
                 }
                 // Stamp the parsed (or fallback) decision onto the
@@ -779,6 +807,36 @@ impl<T: Transport> CoordinatorFsm<T> {
         //     verbatim.
         let mut last_plan_text: Option<String> = None;
         loop {
+            // W3-12h — pick the Builder + Reviewer chain from the
+            // Coordinator's parsed `decision.scope`. Resolution lives
+            // INSIDE the loop so future per-domain retry logic can
+            // pivot the chain across iterations without restructuring
+            // the run loop. For 12h the scope is stable for the life
+            // of a job (one Classify per job), so every iteration
+            // resolves the same pair; the per-iteration cost is one
+            // `HashMap::get` + `Profile::clone()` (cheap — Profile
+            // holds Strings).
+            let (builder_id, reviewer_id) =
+                select_chain_ids(decision.scope);
+            let builder = self
+                .profiles
+                .get(builder_id)
+                .ok_or_else(|| {
+                    AppError::Internal(format!(
+                        "missing profile id `{builder_id}`"
+                    ))
+                })?
+                .clone();
+            let reviewer = self
+                .profiles
+                .get(reviewer_id)
+                .ok_or_else(|| {
+                    AppError::Internal(format!(
+                        "missing profile id `{reviewer_id}`"
+                    ))
+                })?
+                .clone();
+
             // PLAN — branches on `retry_count`. The first attempt
             // uses the canonical template; retries quote the prior
             // plan + verdict issues.
@@ -1648,14 +1706,33 @@ mod tests {
 
     /// Canned MockResponse whose `assistant_text` is a valid
     /// `CoordinatorDecision` JSON with `route=execute_plan` and
-    /// `scope=frontend`. W3-12g uses this to verify the FSM logs
-    /// the scope warning but still uses the backend chain.
+    /// `scope=frontend`. W3-12g introduced this for scope-emit
+    /// tests; W3-12h's scope-aware dispatch tests reuse it to
+    /// drive the frontend chain (FrontendBuilder + FrontendReviewer).
     fn execute_plan_frontend_decision_response() -> MockResponse {
         MockResponse {
             result: Ok(InvokeResult {
                 session_id: "sess-coord-fe".into(),
                 assistant_text:
                     r#"{"route":"execute_plan","scope":"frontend","reasoning":"frontend goal"}"#.into(),
+                total_cost_usd: 0.0,
+                turn_count: 1,
+            }),
+            sleep: None,
+        }
+    }
+
+    /// Canned MockResponse whose `assistant_text` is a valid
+    /// `CoordinatorDecision` JSON with `route=execute_plan` and
+    /// `scope=fullstack`. W3-12h uses this to verify the FSM
+    /// falls back to the backend chain (Fullstack sequential
+    /// dispatch lands in W3-12i).
+    fn execute_plan_fullstack_decision_response() -> MockResponse {
+        MockResponse {
+            result: Ok(InvokeResult {
+                session_id: "sess-coord-fs".into(),
+                assistant_text:
+                    r#"{"route":"execute_plan","scope":"fullstack","reasoning":"fullstack goal"}"#.into(),
                 total_cost_usd: 0.0,
                 turn_count: 1,
             }),
@@ -1703,7 +1780,7 @@ mod tests {
         let mut r: HashMap<String, MockResponse> = HashMap::new();
         r.insert(SCOUT_ID.into(), ok_response(scout_text, scout_cost));
         r.insert(PLANNER_ID.into(), ok_response(plan_text, plan_cost));
-        r.insert(BUILDER_ID.into(), ok_response(build_text, build_cost));
+        r.insert(BACKEND_BUILDER_ID.into(), ok_response(build_text, build_cost));
         r.insert(BACKEND_REVIEWER_ID.into(), ok_verdict_response(0.0));
         r.insert(TESTER_ID.into(), ok_verdict_response(0.0));
         r.insert(COORDINATOR_ID.into(), execute_plan_decision_response());
@@ -1833,7 +1910,7 @@ mod tests {
         responses
             .insert(PLANNER_ID.into(), ok_response("unused", 0.0));
         responses
-            .insert(BUILDER_ID.into(), ok_response("unused", 0.0));
+            .insert(BACKEND_BUILDER_ID.into(), ok_response("unused", 0.0));
         let fsm = CoordinatorFsm::new(
             synthetic_registry(),
             MockTransport::new(responses),
@@ -1866,7 +1943,7 @@ mod tests {
         responses.insert(COORDINATOR_ID.into(), execute_plan_decision_response());
         responses.insert(PLANNER_ID.into(), err_response("planner boom"));
         responses
-            .insert(BUILDER_ID.into(), ok_response("unused", 0.0));
+            .insert(BACKEND_BUILDER_ID.into(), ok_response("unused", 0.0));
         let fsm = CoordinatorFsm::new(
             synthetic_registry(),
             MockTransport::new(responses),
@@ -1901,7 +1978,7 @@ mod tests {
         responses.insert(COORDINATOR_ID.into(), execute_plan_decision_response());
         responses
             .insert(PLANNER_ID.into(), ok_response("plan ok", 0.02));
-        responses.insert(BUILDER_ID.into(), err_response("builder boom"));
+        responses.insert(BACKEND_BUILDER_ID.into(), err_response("builder boom"));
         let fsm = CoordinatorFsm::new(
             synthetic_registry(),
             MockTransport::new(responses),
@@ -1959,7 +2036,7 @@ mod tests {
         // assertions look at; verdicts + coordinator come from the helper.
         responses.insert(SCOUT_ID.into(), ok_response("X", 0.0));
         responses.insert(PLANNER_ID.into(), ok_response("Y", 0.0));
-        responses.insert(BUILDER_ID.into(), ok_response("Z", 0.0));
+        responses.insert(BACKEND_BUILDER_ID.into(), ok_response("Z", 0.0));
         responses.insert(COORDINATOR_ID.into(), execute_plan_decision_response());
         // Build the mock with a holder so we can read `seen()` after
         // run_job — `MockTransport` only exposes `seen()` through
@@ -2011,7 +2088,7 @@ mod tests {
             ok_response("scout-discovered-finding-XYZ", 0.0),
         );
         responses.insert(PLANNER_ID.into(), ok_response("plan", 0.0));
-        responses.insert(BUILDER_ID.into(), ok_response("build", 0.0));
+        responses.insert(BACKEND_BUILDER_ID.into(), ok_response("build", 0.0));
         responses.insert(COORDINATOR_ID.into(), execute_plan_decision_response());
         let mock = Arc::new(MockTransport::new(responses));
         let fsm = CoordinatorFsm::new(
@@ -2049,7 +2126,7 @@ mod tests {
         responses.insert(SCOUT_ID.into(), ok_response("s", 0.0));
         responses
             .insert(PLANNER_ID.into(), ok_response("plan-text", 0.0));
-        responses.insert(BUILDER_ID.into(), ok_response("b", 0.0));
+        responses.insert(BACKEND_BUILDER_ID.into(), ok_response("b", 0.0));
         responses.insert(COORDINATOR_ID.into(), execute_plan_decision_response());
         let mock = Arc::new(MockTransport::new(responses));
         let fsm = CoordinatorFsm::new(
@@ -2064,7 +2141,7 @@ mod tests {
         let seen = mock.seen();
         let build_prompt = seen
             .iter()
-            .find(|(id, _)| id == BUILDER_ID)
+            .find(|(id, _)| id == BACKEND_BUILDER_ID)
             .map(|(_, p)| p.as_str())
             .expect("build prompt recorded");
         assert!(
@@ -2089,7 +2166,7 @@ mod tests {
         for (id, sess, text) in [
             (SCOUT_ID, "s1", "scout"),
             (PLANNER_ID, "s2", "plan"),
-            (BUILDER_ID, "s3", "build"),
+            (BACKEND_BUILDER_ID, "s3", "build"),
         ] {
             responses.insert(
                 id.into(),
@@ -2624,7 +2701,7 @@ mod tests {
         let mut responses: HashMap<String, MockResponse> = HashMap::new();
         responses.insert(SCOUT_ID.into(), err_response("scout boom"));
         responses.insert(PLANNER_ID.into(), ok_response("u", 0.0));
-        responses.insert(BUILDER_ID.into(), ok_response("u", 0.0));
+        responses.insert(BACKEND_BUILDER_ID.into(), ok_response("u", 0.0));
         let fsm = CoordinatorFsm::new(
             synthetic_registry(),
             MockTransport::new(responses),
@@ -2676,7 +2753,7 @@ mod tests {
         responses.insert(SCOUT_ID.into(), ok_response("scout", 0.01));
         responses.insert(COORDINATOR_ID.into(), execute_plan_decision_response());
         responses.insert(PLANNER_ID.into(), err_response("plan boom"));
-        responses.insert(BUILDER_ID.into(), ok_response("u", 0.0));
+        responses.insert(BACKEND_BUILDER_ID.into(), ok_response("u", 0.0));
         let fsm = CoordinatorFsm::new(
             synthetic_registry(),
             MockTransport::new(responses),
@@ -2747,7 +2824,7 @@ mod tests {
             }),
             sleep: Some(Duration::from_millis(10)),
         });
-        responses.insert(BUILDER_ID.into(), MockResponse {
+        responses.insert(BACKEND_BUILDER_ID.into(), MockResponse {
             result: Ok(InvokeResult {
                 session_id: "b".into(),
                 assistant_text: "build".into(),
@@ -2837,7 +2914,7 @@ mod tests {
         responses.insert(SCOUT_ID.into(), ok_response("s", 0.0));
         responses.insert(COORDINATOR_ID.into(), execute_plan_decision_response());
         responses.insert(PLANNER_ID.into(), ok_response("p", 0.0));
-        responses.insert(BUILDER_ID.into(), ok_response("b", 0.0));
+        responses.insert(BACKEND_BUILDER_ID.into(), ok_response("b", 0.0));
         responses.insert(
             BACKEND_REVIEWER_ID.into(),
             rejected_verdict_response("unwrap on None"),
@@ -2896,7 +2973,7 @@ mod tests {
         responses.insert(SCOUT_ID.into(), ok_response("s", 0.0));
         responses.insert(COORDINATOR_ID.into(), execute_plan_decision_response());
         responses.insert(PLANNER_ID.into(), ok_response("p", 0.0));
-        responses.insert(BUILDER_ID.into(), ok_response("b", 0.0));
+        responses.insert(BACKEND_BUILDER_ID.into(), ok_response("b", 0.0));
         responses.insert(BACKEND_REVIEWER_ID.into(), ok_verdict_response(0.0));
         responses.insert(
             TESTER_ID.into(),
@@ -2947,7 +3024,7 @@ mod tests {
         responses.insert(SCOUT_ID.into(), ok_response("s", 0.0));
         responses.insert(COORDINATOR_ID.into(), execute_plan_decision_response());
         responses.insert(PLANNER_ID.into(), ok_response("p", 0.0));
-        responses.insert(BUILDER_ID.into(), ok_response("b", 0.0));
+        responses.insert(BACKEND_BUILDER_ID.into(), ok_response("b", 0.0));
         responses.insert(
             BACKEND_REVIEWER_ID.into(),
             ok_response("lol idk this isn't JSON", 0.0),
@@ -2997,7 +3074,7 @@ mod tests {
         responses.insert(SCOUT_ID.into(), ok_response("s", 0.0));
         responses.insert(COORDINATOR_ID.into(), execute_plan_decision_response());
         responses.insert(PLANNER_ID.into(), ok_response("p", 0.0));
-        responses.insert(BUILDER_ID.into(), err_response("builder boom"));
+        responses.insert(BACKEND_BUILDER_ID.into(), err_response("builder boom"));
         // These are never consumed since Builder errors first.
         responses.insert(BACKEND_REVIEWER_ID.into(), ok_verdict_response(0.0));
         responses.insert(TESTER_ID.into(), ok_verdict_response(0.0));
@@ -3095,7 +3172,7 @@ mod tests {
         for id in [
             SCOUT_ID,
             PLANNER_ID,
-            BUILDER_ID,
+            BACKEND_BUILDER_ID,
             BACKEND_REVIEWER_ID,
             TESTER_ID,
             COORDINATOR_ID,
@@ -3221,7 +3298,7 @@ mod tests {
         let stages: &[(&str, &str, &str, f64)] = &[
             (SCOUT_ID, "sess-scout", "scout findings", 0.01),
             (PLANNER_ID, "sess-plan", "plan steps", 0.02),
-            (BUILDER_ID, "sess-build", "build done", 0.03),
+            (BACKEND_BUILDER_ID, "sess-build", "build done", 0.03),
         ];
         for (id, sess, text, cost) in stages {
             r.insert(
@@ -3451,7 +3528,7 @@ mod tests {
             result: Err(AppError::SwarmInvoke("planner boom".into())),
             sleep: Some(Duration::from_millis(100)),
         });
-        responses.insert(BUILDER_ID.into(), ok_response("unused", 0.0));
+        responses.insert(BACKEND_BUILDER_ID.into(), ok_response("unused", 0.0));
         let fsm = CoordinatorFsm::new(
             synthetic_registry(),
             MockTransport::new(responses),
@@ -3612,7 +3689,7 @@ mod tests {
             }),
             sleep: plan_sleep,
         });
-        responses.insert(BUILDER_ID.into(), MockResponse {
+        responses.insert(BACKEND_BUILDER_ID.into(), MockResponse {
             result: Ok(InvokeResult {
                 session_id: "b".into(),
                 assistant_text: "build".into(),
@@ -3872,7 +3949,7 @@ mod tests {
             vec![ok_response("plan-A", 0.0), ok_response("plan-B", 0.0)],
         );
         responses.insert(
-            BUILDER_ID.into(),
+            BACKEND_BUILDER_ID.into(),
             vec![ok_response("build-A", 0.0), ok_response("build-B", 0.0)],
         );
         responses.insert(
@@ -3950,7 +4027,7 @@ mod tests {
             vec![execute_plan_decision_response()],
         );
         responses.insert(PLANNER_ID.into(), vec![ok_response("p", 0.0)]);
-        responses.insert(BUILDER_ID.into(), vec![ok_response("b", 0.0)]);
+        responses.insert(BACKEND_BUILDER_ID.into(), vec![ok_response("b", 0.0)]);
         responses.insert(
             BACKEND_REVIEWER_ID.into(),
             vec![rejected_verdict_response("rev fail")],
@@ -4019,7 +4096,7 @@ mod tests {
             vec![ok_response("p1", 0.0), ok_response("p2", 0.0)],
         );
         responses.insert(
-            BUILDER_ID.into(),
+            BACKEND_BUILDER_ID.into(),
             vec![ok_response("b1", 0.0), ok_response("b2", 0.0)],
         );
         responses.insert(
@@ -4084,7 +4161,7 @@ mod tests {
             vec![execute_plan_decision_response()],
         );
         responses.insert(PLANNER_ID.into(), vec![ok_response("p", 0.0)]);
-        responses.insert(BUILDER_ID.into(), vec![ok_response("b", 0.0)]);
+        responses.insert(BACKEND_BUILDER_ID.into(), vec![ok_response("b", 0.0)]);
         responses.insert(BACKEND_REVIEWER_ID.into(), vec![ok_verdict_response(0.0)]);
         responses.insert(
             TESTER_ID.into(),
@@ -4146,7 +4223,7 @@ mod tests {
             vec![execute_plan_decision_response()],
         );
         responses.insert(PLANNER_ID.into(), vec![ok_response("p", 0.0)]);
-        responses.insert(BUILDER_ID.into(), vec![ok_response("b", 0.0)]);
+        responses.insert(BACKEND_BUILDER_ID.into(), vec![ok_response("b", 0.0)]);
         responses.insert(
             BACKEND_REVIEWER_ID.into(),
             vec![rejected_verdict_response("force retry")],
@@ -4207,7 +4284,7 @@ mod tests {
             ],
         );
         responses.insert(
-            BUILDER_ID.into(),
+            BACKEND_BUILDER_ID.into(),
             vec![ok_response("b1", 0.0), ok_response("b2", 0.0)],
         );
         // Rejecting verdict carries one high-severity issue with
@@ -4316,7 +4393,7 @@ mod tests {
             vec![execute_plan_decision_response()],
         );
         responses.insert(PLANNER_ID.into(), vec![ok_response("p", 0.0)]);
-        responses.insert(BUILDER_ID.into(), vec![ok_response("b", 0.0)]);
+        responses.insert(BACKEND_BUILDER_ID.into(), vec![ok_response("b", 0.0)]);
         responses.insert(
             BACKEND_REVIEWER_ID.into(),
             vec![rejected_verdict_response("force retries")],
@@ -4409,7 +4486,7 @@ mod tests {
         // Build: fast on attempt 1, slow on attempt 2 so cancel lands
         // mid-Build.
         responses.insert(
-            BUILDER_ID.into(),
+            BACKEND_BUILDER_ID.into(),
             vec![
                 ok_response("b1", 0.0),
                 MockResponse {
@@ -4530,7 +4607,7 @@ mod tests {
             ],
         );
         responses.insert(
-            BUILDER_ID.into(),
+            BACKEND_BUILDER_ID.into(),
             vec![
                 ok_response("b1", 0.0),
                 ok_response("b2", 0.0),
@@ -4611,7 +4688,7 @@ mod tests {
         // them would surface as unrelated assertion failures rather
         // than a "no scripted response" mock error.
         responses.insert(PLANNER_ID.into(), ok_response("unused-plan", 0.0));
-        responses.insert(BUILDER_ID.into(), ok_response("unused-build", 0.0));
+        responses.insert(BACKEND_BUILDER_ID.into(), ok_response("unused-build", 0.0));
         responses.insert(BACKEND_REVIEWER_ID.into(), ok_verdict_response(0.0));
         responses.insert(TESTER_ID.into(), ok_verdict_response(0.0));
 
@@ -4643,7 +4720,7 @@ mod tests {
         // exactly two calls (scout + coordinator).
         let seen = mock.seen();
         let plan_calls = seen.iter().filter(|(id, _)| id == PLANNER_ID).count();
-        let build_calls = seen.iter().filter(|(id, _)| id == BUILDER_ID).count();
+        let build_calls = seen.iter().filter(|(id, _)| id == BACKEND_BUILDER_ID).count();
         let review_calls = seen.iter().filter(|(id, _)| id == BACKEND_REVIEWER_ID).count();
         let test_calls = seen.iter().filter(|(id, _)| id == TESTER_ID).count();
         assert_eq!(plan_calls, 0, "ResearchOnly must not invoke Planner");
@@ -4863,7 +4940,9 @@ mod tests {
 
     /// W3-12g — Classify stage carries the parsed `scope` field.
     /// Mock Coordinator returns `scope=frontend`; the FSM stamps it
-    /// onto `stages[1].coordinator_decision.scope` verbatim.
+    /// onto `stages[1].coordinator_decision.scope` verbatim. W3-12h
+    /// also dispatches the frontend chain for this scope, so the
+    /// frontend specialists are seeded alongside the backend ones.
     #[tokio::test]
     async fn fsm_classify_emits_scope_in_decision() {
         let (app, _pool, _dir) = mock_app_with_pool().await;
@@ -4875,6 +4954,12 @@ mod tests {
             COORDINATOR_ID.into(),
             execute_plan_frontend_decision_response(),
         );
+        // W3-12h: scope=Frontend now dispatches the frontend chain;
+        // seed those specialists so the FSM walks the full chain.
+        responses
+            .insert(FRONTEND_BUILDER_ID.into(), ok_response("fe-build", 0.0));
+        responses
+            .insert(FRONTEND_REVIEWER_ID.into(), ok_verdict_response(0.0));
         let fsm = CoordinatorFsm::new(
             synthetic_registry(),
             MockTransport::new(responses),
@@ -4901,22 +4986,49 @@ mod tests {
         assert_eq!(decision.scope, CoordinatorScope::Frontend);
     }
 
-    /// W3-12g — when scope=Frontend lands, the FSM still uses the
-    /// backend chain (BACKEND_BUILDER_ID + BACKEND_REVIEWER_ID).
-    /// Scope-aware dispatch is W3-12h's territory; the warning log
-    /// in the run loop is the only behavioral difference here.
-    /// We assert dispatch via `stage.specialist_id` rather than
-    /// capturing the warn log (the latter requires a tracing
-    /// subscriber harness that's not justified for one assertion).
+    // ----------------------------------------------------------------
+    // WP-W3-12h — scope-aware single-domain dispatch
+    // ----------------------------------------------------------------
+
+    /// `select_chain_ids(Backend)` → `(BACKEND_BUILDER_ID, BACKEND_REVIEWER_ID)`.
+    #[test]
+    fn select_chain_ids_backend_returns_backend_pair() {
+        let (b, r) = select_chain_ids(CoordinatorScope::Backend);
+        assert_eq!(b, BACKEND_BUILDER_ID);
+        assert_eq!(b, "backend-builder");
+        assert_eq!(r, BACKEND_REVIEWER_ID);
+        assert_eq!(r, "backend-reviewer");
+    }
+
+    /// `select_chain_ids(Frontend)` → `(FRONTEND_BUILDER_ID, FRONTEND_REVIEWER_ID)`.
+    #[test]
+    fn select_chain_ids_frontend_returns_frontend_pair() {
+        let (b, r) = select_chain_ids(CoordinatorScope::Frontend);
+        assert_eq!(b, FRONTEND_BUILDER_ID);
+        assert_eq!(b, "frontend-builder");
+        assert_eq!(r, FRONTEND_REVIEWER_ID);
+        assert_eq!(r, "frontend-reviewer");
+    }
+
+    /// W3-12h contract: `select_chain_ids(Fullstack)` falls back to
+    /// the backend chain. W3-12i replaces this with sequential
+    /// (BB+BR then FB+FR) dispatch and updates this test.
+    #[test]
+    fn select_chain_ids_fullstack_falls_back_to_backend() {
+        let (b, r) = select_chain_ids(CoordinatorScope::Fullstack);
+        assert_eq!(b, BACKEND_BUILDER_ID);
+        assert_eq!(r, BACKEND_REVIEWER_ID);
+    }
+
+    /// scope=Backend (default) keeps the existing dispatch shape:
+    /// stages[3]=backend-builder, stages[4]=backend-reviewer.
+    /// This is regression coverage — backend chain behavior is
+    /// preserved across the W3-12h refactor.
     #[tokio::test]
-    async fn fsm_scope_frontend_logs_warning_but_uses_backend_chain() {
+    async fn fsm_scope_backend_dispatches_backend_chain() {
         let (app, _pool, _dir) = mock_app_with_pool().await;
-        let mut responses = happy_5_stage_responses(
+        let responses = happy_5_stage_responses(
             "s", "p", "b", 0.0, 0.0, 0.0,
-        );
-        responses.insert(
-            COORDINATOR_ID.into(),
-            execute_plan_frontend_decision_response(),
         );
         let fsm = CoordinatorFsm::new(
             synthetic_registry(),
@@ -4927,27 +5039,69 @@ mod tests {
         let outcome = fsm
             .run_job(
                 app.handle(),
-                "ws-scope-fe".into(),
-                "frontend goal".into(),
+                "ws-scope-be-dispatch".into(),
+                "backend goal".into(),
             )
             .await
             .expect("FSM ok");
-        // Full 6-stage flow (Scout + Classify + Plan + Build + Review
-        // + Test) — same shape as the backend happy path.
         assert_eq!(outcome.final_state, JobState::Done);
         assert_eq!(outcome.stages.len(), 6);
-        // W3-12g contract: scope=Frontend must NOT route to
-        // FrontendBuilder / FrontendReviewer. The build stage is
-        // dispatched to backend-builder; the review stage to
-        // backend-reviewer.
         assert_eq!(outcome.stages[3].state, JobState::Build);
-        assert_eq!(outcome.stages[3].specialist_id, BUILDER_ID);
+        assert_eq!(outcome.stages[3].specialist_id, BACKEND_BUILDER_ID);
         assert_eq!(outcome.stages[3].specialist_id, "backend-builder");
         assert_eq!(outcome.stages[4].state, JobState::Review);
         assert_eq!(outcome.stages[4].specialist_id, BACKEND_REVIEWER_ID);
         assert_eq!(outcome.stages[4].specialist_id, "backend-reviewer");
-        // The decision still carries scope=Frontend so W3-12h has
-        // the routing data when its dispatch logic ships.
+    }
+
+    /// W3-12h activation: scope=Frontend dispatches the frontend
+    /// chain. Mock Coordinator returns scope=Frontend; assert
+    /// stages[3].specialist_id == "frontend-builder" and
+    /// stages[4].specialist_id == "frontend-reviewer". (Stage
+    /// indices: 0=Scout, 1=Classify, 2=Plan, 3=Build, 4=Review,
+    /// 5=Test.)
+    #[tokio::test]
+    async fn fsm_scope_frontend_dispatches_frontend_chain() {
+        let (app, _pool, _dir) = mock_app_with_pool().await;
+        let mut responses = happy_5_stage_responses(
+            "s", "p", "b", 0.0, 0.0, 0.0,
+        );
+        responses.insert(
+            COORDINATOR_ID.into(),
+            execute_plan_frontend_decision_response(),
+        );
+        // Seed the frontend specialists; the backend ones from the
+        // happy-path helper stay unused on this run but cause no
+        // harm (MockTransport ignores keys it never sees).
+        responses
+            .insert(FRONTEND_BUILDER_ID.into(), ok_response("fe-build", 0.0));
+        responses
+            .insert(FRONTEND_REVIEWER_ID.into(), ok_verdict_response(0.0));
+        let fsm = CoordinatorFsm::new(
+            synthetic_registry(),
+            MockTransport::new(responses),
+            Arc::new(JobRegistry::new()),
+            Duration::from_secs(5),
+        );
+        let outcome = fsm
+            .run_job(
+                app.handle(),
+                "ws-scope-fe-dispatch".into(),
+                "frontend goal".into(),
+            )
+            .await
+            .expect("FSM ok");
+        assert_eq!(outcome.final_state, JobState::Done);
+        assert_eq!(outcome.stages.len(), 6);
+        // Frontend chain activation — Build + Review specialists
+        // must be the frontend variants.
+        assert_eq!(outcome.stages[3].state, JobState::Build);
+        assert_eq!(outcome.stages[3].specialist_id, FRONTEND_BUILDER_ID);
+        assert_eq!(outcome.stages[3].specialist_id, "frontend-builder");
+        assert_eq!(outcome.stages[4].state, JobState::Review);
+        assert_eq!(outcome.stages[4].specialist_id, FRONTEND_REVIEWER_ID);
+        assert_eq!(outcome.stages[4].specialist_id, "frontend-reviewer");
+        // Decision carries scope=Frontend.
         assert_eq!(
             outcome.stages[1]
                 .coordinator_decision
@@ -4955,6 +5109,264 @@ mod tests {
                 .map(|d| d.scope),
             Some(CoordinatorScope::Frontend)
         );
+    }
+
+    /// W3-12h fullstack contract: scope=Fullstack falls back to the
+    /// backend chain (W3-12i activates Fullstack sequential
+    /// dispatch). Verifies the helper's fallback wires correctly
+    /// through the run loop.
+    #[tokio::test]
+    async fn fsm_scope_fullstack_falls_back_to_backend_chain() {
+        let (app, _pool, _dir) = mock_app_with_pool().await;
+        let mut responses = happy_5_stage_responses(
+            "s", "p", "b", 0.0, 0.0, 0.0,
+        );
+        responses.insert(
+            COORDINATOR_ID.into(),
+            execute_plan_fullstack_decision_response(),
+        );
+        let fsm = CoordinatorFsm::new(
+            synthetic_registry(),
+            MockTransport::new(responses),
+            Arc::new(JobRegistry::new()),
+            Duration::from_secs(5),
+        );
+        let outcome = fsm
+            .run_job(
+                app.handle(),
+                "ws-scope-fs".into(),
+                "fullstack goal".into(),
+            )
+            .await
+            .expect("FSM ok");
+        assert_eq!(outcome.final_state, JobState::Done);
+        assert_eq!(outcome.stages.len(), 6);
+        // Fullstack still routes through the backend chain in 12h.
+        assert_eq!(outcome.stages[3].specialist_id, BACKEND_BUILDER_ID);
+        assert_eq!(outcome.stages[4].specialist_id, BACKEND_REVIEWER_ID);
+        // Decision carries scope=Fullstack so the audit trail is
+        // intact for W3-12i to consume.
+        assert_eq!(
+            outcome.stages[1]
+                .coordinator_decision
+                .as_ref()
+                .map(|d| d.scope),
+            Some(CoordinatorScope::Fullstack)
+        );
+    }
+
+    /// `StageResult.specialist_id` round-trips through SQLite for a
+    /// frontend-scope job. Drive the FSM against a pool-backed
+    /// registry with `scope=frontend`; reload via
+    /// `get_job_detail` and assert the per-stage `specialist_id`s
+    /// match the frontend chain.
+    #[tokio::test]
+    async fn fsm_frontend_chain_persists_correct_specialist_ids() {
+        let (app, _pool, _dir) = mock_app_with_pool().await;
+        let (registry, _pool, _reg_dir) = pool_backed_registry().await;
+        let mut responses = happy_5_stage_responses(
+            "s", "p", "b", 0.0, 0.0, 0.0,
+        );
+        responses.insert(
+            COORDINATOR_ID.into(),
+            execute_plan_frontend_decision_response(),
+        );
+        responses
+            .insert(FRONTEND_BUILDER_ID.into(), ok_response("fe-build", 0.0));
+        responses
+            .insert(FRONTEND_REVIEWER_ID.into(), ok_verdict_response(0.0));
+        let fsm = CoordinatorFsm::new(
+            synthetic_registry(),
+            MockTransport::new(responses),
+            Arc::clone(&registry),
+            Duration::from_secs(5),
+        );
+        let job_id = "j-fe-persist".to_string();
+        fsm.run_job_with_id(
+            app.handle(),
+            job_id.clone(),
+            "ws-fe-persist".into(),
+            "frontend goal".into(),
+        )
+        .await
+        .expect("FSM ok");
+
+        let detail = registry
+            .get_job_detail(&job_id)
+            .await
+            .expect("query")
+            .expect("Some");
+        assert_eq!(detail.stages.len(), 6);
+        // Per-stage specialist_id round-trip.
+        assert_eq!(detail.stages[0].specialist_id, SCOUT_ID);
+        assert_eq!(detail.stages[1].specialist_id, COORDINATOR_ID);
+        assert_eq!(detail.stages[2].specialist_id, PLANNER_ID);
+        assert_eq!(detail.stages[3].specialist_id, FRONTEND_BUILDER_ID);
+        assert_eq!(detail.stages[4].specialist_id, FRONTEND_REVIEWER_ID);
+        assert_eq!(detail.stages[5].specialist_id, TESTER_ID);
+    }
+
+    /// On a frontend Reviewer rejection + retry, BOTH the first and
+    /// the retried attempt dispatch the frontend chain (no accidental
+    /// fall-back to backend on retry). The chain selection lives
+    /// inside the retry loop body, so each iteration re-evaluates
+    /// `decision.scope` — but `decision` is stable per job, so every
+    /// iteration must pick the same frontend pair.
+    #[tokio::test]
+    async fn fsm_frontend_retry_loop_preserves_chain_choice() {
+        let (app, _pool, _dir) = mock_app_with_pool().await;
+        let registry = Arc::new(JobRegistry::new());
+
+        let mut responses: HashMap<String, Vec<MockResponse>> = HashMap::new();
+        responses.insert(SCOUT_ID.into(), vec![ok_response("s", 0.0)]);
+        responses.insert(
+            COORDINATOR_ID.into(),
+            vec![execute_plan_frontend_decision_response()],
+        );
+        responses.insert(
+            PLANNER_ID.into(),
+            vec![ok_response("p1", 0.0), ok_response("p2", 0.0)],
+        );
+        responses.insert(
+            FRONTEND_BUILDER_ID.into(),
+            vec![ok_response("fe-b1", 0.0), ok_response("fe-b2", 0.0)],
+        );
+        responses.insert(
+            FRONTEND_REVIEWER_ID.into(),
+            vec![
+                rejected_verdict_response("missing JSDoc"),
+                ok_verdict_response(0.0),
+            ],
+        );
+        responses.insert(TESTER_ID.into(), vec![ok_verdict_response(0.0)]);
+
+        let mock = Arc::new(SequencedMock::new(responses));
+        let fsm = CoordinatorFsm::new(
+            synthetic_registry(),
+            ArcSequencedMock(Arc::clone(&mock)),
+            Arc::clone(&registry),
+            Duration::from_secs(5),
+        );
+
+        let job_id = "j-fe-retry".to_string();
+        let outcome = fsm
+            .run_job_with_id(
+                app.handle(),
+                job_id.clone(),
+                "ws-fe-retry".into(),
+                "frontend goal".into(),
+            )
+            .await
+            .expect("FSM ok");
+        assert_eq!(outcome.final_state, JobState::Done);
+        // 1 scout + 1 classify + 2 × (plan/build/review) + 1 test = 9.
+        assert_eq!(outcome.stages.len(), 9);
+
+        // FrontendBuilder + FrontendReviewer each invoked exactly
+        // twice (attempt 1 + retry). NO backend dispatches.
+        assert_eq!(mock.call_count(FRONTEND_BUILDER_ID), 2);
+        assert_eq!(mock.call_count(FRONTEND_REVIEWER_ID), 2);
+        assert_eq!(mock.call_count(BACKEND_BUILDER_ID), 0);
+        assert_eq!(mock.call_count(BACKEND_REVIEWER_ID), 0);
+
+        // Both Build stages and both Review stages must report the
+        // frontend specialist ids.
+        let build_stages: Vec<&StageResult> = outcome
+            .stages
+            .iter()
+            .filter(|s| s.state == JobState::Build)
+            .collect();
+        assert_eq!(build_stages.len(), 2);
+        for s in &build_stages {
+            assert_eq!(s.specialist_id, FRONTEND_BUILDER_ID);
+        }
+        let review_stages: Vec<&StageResult> = outcome
+            .stages
+            .iter()
+            .filter(|s| s.state == JobState::Review)
+            .collect();
+        assert_eq!(review_stages.len(), 2);
+        for s in &review_stages {
+            assert_eq!(s.specialist_id, FRONTEND_REVIEWER_ID);
+        }
+    }
+
+    /// Real-claude integration smoke (`#[ignore]`) for the frontend
+    /// chain. Owner runs it manually with `cargo test -- --ignored`
+    /// post-commit. The Coordinator brain should classify a
+    /// frontend-targeted goal as `scope=frontend`; the FSM should
+    /// dispatch FrontendBuilder + FrontendReviewer.
+    ///
+    /// Time budget: 6 stages × 180s = 1080s worst-case; typical 60-180s.
+    #[tokio::test]
+    #[ignore = "requires real `claude` binary + Pro/Max subscription"]
+    async fn integration_frontend_chain_real_claude() {
+        use crate::swarm::transport::SubprocessTransport;
+
+        let stage_secs = std::env::var("NEURON_SWARM_STAGE_TIMEOUT_SEC")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(180);
+
+        let (app, _pool, _dir) = mock_app_with_pool().await;
+        let profiles = bundled_registry();
+        let transport = SubprocessTransport::new();
+        let registry = Arc::new(JobRegistry::new());
+        let fsm = CoordinatorFsm::new(
+            profiles,
+            transport,
+            registry,
+            Duration::from_secs(stage_secs),
+        );
+        // Frontend-targeted goal — minimal, low-risk doc edit on a
+        // TSX file. Doc-only edit avoids provoking IntegrationTester
+        // into a full `pnpm test` build.
+        let goal = "Add a one-line JSDoc comment above the \
+            `formatRelativeMs` helper exported from \
+            app/src/components/SwarmJobList.tsx explaining that the helper \
+            rounds to the nearest minute. Just the doc comment. \
+            Do not add tests, do not change behavior.";
+        let outcome = fsm
+            .run_job(app.handle(), "default".into(), goal.into())
+            .await
+            .expect("FSM returns Ok");
+        let stage_summary: Vec<(String, String)> = outcome
+            .stages
+            .iter()
+            .map(|s| (format!("{:?}", s.state), s.specialist_id.clone()))
+            .collect();
+        assert_eq!(
+            outcome.final_state,
+            JobState::Done,
+            "expected Done, got {:?} (last_error: {:?}, last_verdict: {:?}, stages: {:?})",
+            outcome.final_state,
+            outcome.last_error,
+            outcome.last_verdict,
+            stage_summary,
+        );
+        // Build + Review specialists must be the frontend variants.
+        let build_stage = outcome
+            .stages
+            .iter()
+            .find(|s| s.state == JobState::Build)
+            .expect("Build stage present");
+        assert_eq!(
+            build_stage.specialist_id,
+            FRONTEND_BUILDER_ID,
+            "expected frontend-builder, got {} (scope={:?})",
+            build_stage.specialist_id,
+            outcome.stages[1]
+                .coordinator_decision
+                .as_ref()
+                .map(|d| d.scope)
+        );
+        let review_stage = outcome
+            .stages
+            .iter()
+            .find(|s| s.state == JobState::Review)
+            .expect("Review stage present");
+        assert_eq!(review_stage.specialist_id, FRONTEND_REVIEWER_ID);
     }
 
     /// `render_classify_prompt` substitutes the goal and scout

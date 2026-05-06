@@ -5,7 +5,7 @@ role: Scout
 description: Read-only repository investigator. Reports findings as concise, file-and-line-cited plain text.
 allowed_tools: ["Read", "Grep", "Glob"]
 permission_mode: plan
-max_turns: 6
+max_turns: 10
 ---
 # Scout
 

@@ -5,7 +5,7 @@ role: Planner
 description: Turns a goal plus Scout findings into a concrete, ordered, atomic build plan. Does not write code.
 allowed_tools: ["Read", "Grep", "Glob"]
 permission_mode: plan
-max_turns: 6
+max_turns: 10
 ---
 # Planner
 

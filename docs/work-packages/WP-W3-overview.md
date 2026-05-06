@@ -57,9 +57,11 @@ matching WP file is authored.
 | WP-W3-12d | Coordinator FSM — REVIEW + TEST states + Verdict schema + robust JSON parser (NO retry, NO Coordinator brain) | done (`ed98cf5`) | shipped 2026-05-06 | WP-W3-12a/b/c | M |
 | WP-W3-12e | Coordinator FSM — retry feedback loop (`MAX_RETRIES=2`, Verdict.rejected → Planner with feedback) | done (`d5e4500`) | shipped 2026-05-06 | WP-W3-12d | M |
 | WP-W3-12f | Coordinator FSM — Coordinator LLM brain (Option B: on-demand routing, Classify research/execute) | done (`1ac7347`) | shipped 2026-05-06 | WP-W3-12d/e | M |
-| WP-W3-12g | Swarm specialist roster expansion (6 → 8 profiles; backend/frontend split + scope classification) | TBD | not-started | WP-W3-12f | M |
-| WP-W3-12h | Coordinator FSM — scope-aware dispatch (Backend/Frontend/Fullstack chains; parallel Builder ∥ Reviewer) | future | not-started | WP-W3-12g | L |
-| WP-W3-12i | Orchestrator user-facing chat layer (9th agent: PM dış kapı) | future | not-started | WP-W3-12h | L |
+| WP-W3-12g | Swarm specialist roster expansion (6 → 8 profiles; backend/frontend split + scope classification) | done (`5f4337a`) | shipped 2026-05-06 | WP-W3-12f | M |
+| WP-W3-12h | Coordinator FSM — scope-aware single-domain dispatch (Backend / Frontend) | TBD | not-started | WP-W3-12g | M |
+| WP-W3-12i | Coordinator FSM — Fullstack sequential dispatch (BB+BR then FB+FR) | future | not-started | WP-W3-12h | M |
+| WP-W3-12j | Coordinator FSM — Fullstack parallel dispatch (Builder ∥ Builder, Reviewer ∥ Reviewer) | future | not-started | WP-W3-12i | M |
+| WP-W3-12k | Orchestrator user-facing chat layer (9th agent: PM dış kapı) | future | not-started | WP-W3-12h+ | L |
 | WP-W3-14 | Swarm UI route (chat-shape, recent-jobs panel, cancel/rerun) | done (`2ace648`) | shipped 2026-05-06 | WP-W3-12a/b/c | M |
 
 Sizes (rough, in sub-agent days): S = 0.5–1 day, M = 1–2 days,

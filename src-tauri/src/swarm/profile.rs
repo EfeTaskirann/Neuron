@@ -568,7 +568,12 @@ mod tests {
             vec!["Read".to_string(), "Grep".to_string(), "Glob".to_string()]
         );
         assert_eq!(scout.permission_mode, PermissionMode::Plan);
-        assert_eq!(scout.max_turns, 6);
+        // W3-12h bumped Scout max_turns from 6 to 10 after the
+        // first frontend integration smoke (frontend-only doc-edit
+        // goal) had Scout exhaust its 6-turn budget on Glob+Read+
+        // formatting. 10 gives headroom; cost not a concern per the
+        // owner's quality-first directive (2026-05-06).
+        assert_eq!(scout.max_turns, 10);
         assert!(!scout.body.is_empty());
         // source_path is diagnostics-only — assert it points into the
         // <bundled> virtual prefix, not a host path.

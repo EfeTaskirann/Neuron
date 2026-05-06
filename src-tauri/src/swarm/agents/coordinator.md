@@ -5,7 +5,7 @@ role: Coordinator
 description: Single-shot routing brain. Reads goal + Scout findings, emits a JSON CoordinatorDecision (route + scope).
 allowed_tools: ["Read", "Grep", "Glob"]
 permission_mode: plan
-max_turns: 4
+max_turns: 8
 ---
 # Coordinator
 
