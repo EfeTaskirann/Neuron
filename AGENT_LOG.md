@@ -4,6 +4,42 @@ Running journal of agent-driven changes. Newest entry on top. See `AGENTS.md` §
 
 ---
 
+## 2026-05-06T18:30Z WP-W3-12g completed
+
+- dispatch: **single sub-agent**; orchestrator drove regression integration smoke
+- sub-agent: general-purpose
+- files changed: 12 in commit `5f4337a`
+  - new: `docs/work-packages/WP-W3-12g-specialist-roster-expansion.md`, `src-tauri/src/swarm/agents/frontend-builder.md`, `src-tauri/src/swarm/agents/frontend-reviewer.md`
+  - renamed: `src-tauri/src/swarm/agents/reviewer.md` → `backend-reviewer.md` (id + role updated; persona body lightly tweaked)
+  - modified: `src-tauri/src/swarm/agents/coordinator.md` (body extended with scope rules + 5 few-shot examples), `src-tauri/src/swarm/coordinator/{decision,fsm,store}.rs` (CoordinatorScope enum + scope field with serde default; REVIEWER_ID→BACKEND_REVIEWER_ID; tracing logs for scope), `src-tauri/src/swarm/profile.rs` (test rename + 2 sibling tests), `src-tauri/src/commands/swarm.rs` (profile-count test rename), `app/src/lib/bindings.ts` (regen +CoordinatorScope +scope? field), `docs/work-packages/WP-W3-overview.md` (W3-12f flipped done; W3-12g/h/i rows added)
+- commit SHA: `5f4337a`
+- acceptance: ✅ pass
+  - `cargo check` → exit 0
+  - `cargo test --lib` → exit 0, **321 passed; 0 failed; 10 ignored** (312 prior + 9 new)
+  - `pnpm gen:bindings/check/typecheck/test/lint` → all 0 (gen:bindings:check exit 1 pre-commit expected)
+  - **orchestrator-driven integration smoke** (Windows + Pro/Max OAuth):
+    - `integration_full_chain_real_claude_with_verdict` (regression) → Done in **174.32s** ✅. Coordinator emitted `{"route":"execute_plan","scope":"backend","reasoning":"..."}`; FSM ran existing 6-stage backend chain (Scout + Classify + Plan + Build + Review + Test); Reviewer + IntegrationTester both approved. **No FSM behavior change confirmed.**
+- key implementation choices
+  - **Roster-only WP**, NO FSM dispatch change. Per WP §"Why now" + §"Out of scope": ship the data first, activate scope-aware dispatch in W3-12h. The 5-of-6 (route × scope) coverage in coordinator.md few-shot examples is the contract that W3-12h's dispatch logic will rely on.
+  - **`reviewer.md` renamed, not split-and-deprecated.** Cleaner — one file, one ID, no orphan. Workspace-override-compatibility note added to commit message: users with custom `reviewer.md` need to rename their override to `backend-reviewer` (or pick a new ID).
+  - **`#[serde(default = "CoordinatorScope::default_backend")]`** for backward compat. Pre-W3-12g `decision_json` rows in SQLite (from W3-12f) lack the scope field; deserialize with scope=Backend, matching the existing FSM behavior.
+  - **`tracing::info!` + `tracing::warn!` for scope visibility.** W3-12g produces scope but doesn't act on it. The warn fires on scope=Frontend|Fullstack so during W3-12h development we have visible signal that Coordinator is producing correct scope classifications.
+  - **Bulk fixture update via helper.** ~25 mock-driven FSM tests use `execute_plan_decision_response()` / `research_only_decision_response()` helpers. Updating those two helpers propagates the new 3-field shape automatically. ~5 inline MockResponse blocks needed manual updates.
+  - **`BACKEND_REVIEWER_ID` const rename.** `REVIEWER_ID` was misleading once we added a frontend reviewer. The rename is mechanical (find-and-replace `REVIEWER_ID` → `BACKEND_REVIEWER_ID` and `"reviewer"` → `"backend-reviewer"` in test mock keys).
+  - **`scope?: CoordinatorScope` (optional) on TS side.** Specta correctly reflects the serde default as TS optionality. Frontend code reading `decision.scope` gets `CoordinatorScope | undefined`; treats undefined as backend (or waits for W3-12h's UI work).
+  - **NO new integration test in this WP.** W3-12h adds the scope-driven smoke. The existing 4 integration tests (`integration_full_chain_real_claude_with_verdict`, `integration_research_only_real_claude`, `integration_persistence_survives_real_claude_chain`, `integration_cancel_during_real_claude_chain`) all still compile and (modulo cargo-test cost) still pass — the orchestrator ran the full-chain one as the canonical regression smoke.
+  - **`profile_count` smoke artifact removed pre-commit.** The integration test that ran during regression smoke had Builder add a `profile_count(&self) -> usize` helper to ProfileRegistry (a recurring pattern across W3-11/12d/12f integration smokes since the goal is the same canonical "add helper" scenario). Orchestrator surgically removed just the artifact — KEEPING sub-agent's legitimate test renames + new sibling tests — before commit.
+- bindings regenerated: yes (+`CoordinatorScope`, +optional `scope` field on `CoordinatorDecision`)
+- branch: `main` (local; not pushed; **65 commits ahead of `origin/main`** post-`5f4337a`)
+- known caveats / followups
+  - **W3-12h activates scope-aware dispatch.** Until then, FSM uses backend chain regardless of Coordinator's scope output. The `tracing::warn!` makes mismatch visible during development.
+  - **Workspace overrides for `reviewer` ID are now orphaned.** Users with custom `<app_data_dir>/agents/reviewer.md` will see their file load (registry tolerates orphan IDs) but FSM never references it. Document in CHANGELOG when ready.
+  - **`profile.rs` doc comment top of file** still says "three personas (`scout`, `planner`, `backend-builder`) ship with the binary" — this is stale (we now have 8). Pre-existing minor issue from W3-11; not in 12g scope. Cosmetic.
+  - **5 of 6 (route × scope) few-shot examples covered.** Missing: frontend+research_only and fullstack+research_only (uncommon in practice — research goals rarely classify as cross-cutting).
+- next: W3-12h (scope-aware FSM dispatch — Backend/Frontend/Fullstack chains, parallel Builder ∥ Reviewer for Fullstack), then W3-12i (Orchestrator user-facing chat layer for the 9th agent), then back to user's deferred polish list.
+
+---
+
 ## 2026-05-06T17:40Z WP-W3-12f completed
 
 - dispatch: **single sub-agent**; orchestrator drove both manual integration smokes
