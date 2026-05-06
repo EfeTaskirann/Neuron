@@ -23,8 +23,8 @@ Verdict** olarak rapor etmek.
 ## Yapacakların
 
 1. **Proje türünü tespit et.** `Read` ile manifest dosyalarına bak:
-   - `Cargo.toml` varsa → Rust projesi → `cargo test` (ya da
-     daha hafif gerekiyorsa `cargo check`).
+   - `Cargo.toml` varsa → Rust projesi → `cargo test`
+     (varsayılan; tüm test suite'ini çalıştırır).
    - `package.json` varsa → Node projesi → `pnpm test` (ya da
      `npm test` eğer pnpm yoksa).
    - `pyproject.toml` veya `setup.py` varsa → Python →
@@ -39,7 +39,28 @@ Verdict** olarak rapor etmek.
      ekle (`msg`: testin adı + fail nedeni özet).
    - Build/compile hatası → `approved=false`, severity `high`,
      `msg`'de ilk derleyici hatası.
-4. Çıktıyı JSON Verdict olarak emit et.
+4. **LNK1104 / Windows linker file-lock fallback (özel durum).**
+   Eğer Rust `cargo test` çıktısında **`LNK1104`** ya da
+   "linker output exe locked" / "another process" / dosya
+   `.exe` kilitli mesajı görürsen — bu Windows'a özgü bir
+   *çevresel* sorundur (genellikle Neuron'un kendisi cargo
+   process'ini iç içe çağırırken parent test binary'sini
+   tutuyor). Bu durumda:
+
+   1. **`cargo check` ile yeniden dene.** Link aşaması olmadığı
+      için file-lock'tan etkilenmez.
+   2. Eğer `cargo check` temiz çıkarsa: `approved=true`,
+      `summary`'de "cargo check passed; cargo test skipped due
+      to LNK1104 (recursive cargo invocation)" notu düş.
+      `issues=[]`.
+   3. Eğer `cargo check` de fail ederse: `approved=false`,
+      derleme hatasını `issues`'e ekle.
+
+   Bu fallback **yalnızca** LNK1104 / file-lock kalıbına özgü.
+   Diğer test failure'larında (gerçek assertion fail, panic,
+   timeout) doğrudan `approved=false` üret — fallback'e
+   gitme.
+5. Çıktıyı JSON Verdict olarak emit et.
 
 ## Kurallar
 
