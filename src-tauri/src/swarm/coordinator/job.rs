@@ -728,6 +728,16 @@ impl JobRegistry {
     }
 
     /// Signal cancellation for the given `job_id`.
+    ///
+    /// W3-12j: switched from `notify_one()` to `notify_waiters()` so
+    /// every task currently `await`-ing the per-job `Notify` wakes —
+    /// the Fullstack parallel dispatch races two `tokio::select!`s on
+    /// the same `Notify`, and `notify_one` would only wake the first.
+    /// `notify_waiters` is a no-op when there are no current waiters
+    /// (no permit is stored), but every FSM stage call sequences
+    /// `notified()` on the same handle before any awaitable point, so
+    /// the parallel-track waiters are always registered by the time a
+    /// user-driven cancel arrives.
     pub fn signal_cancel(&self, job_id: &str) -> Result<(), AppError> {
         let notifies = self
             .cancel_notifies
@@ -735,7 +745,7 @@ impl JobRegistry {
             .expect("cancel_notifies mutex poisoned");
         match notifies.get(job_id) {
             Some(notify) => {
-                notify.notify_one();
+                notify.notify_waiters();
                 Ok(())
             }
             None => Err(AppError::NotFound(format!(

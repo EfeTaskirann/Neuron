@@ -995,16 +995,29 @@ impl<T: Transport> CoordinatorFsm<T> {
             };
             last_plan_text = Some(plan_text.clone());
 
-            // BUILD + REVIEW pairs (W3-12i). For Backend/Frontend
-            // this loop runs once; for Fullstack it runs twice
-            // (backend pair, then frontend pair). `last_build_text`
-            // tracks the most recent Builder output so the TEST
-            // gate after the loop has something to feed downstream
-            // (Fullstack = the FrontendBuilder's text; matches the
-            // sequential narrative).
+            // BUILD + REVIEW pairs. Single-domain scopes
+            // (Backend / Frontend) take the `pairs.len() == 1`
+            // sequential branch — identical to W3-12h behavior:
+            // BUILD then REVIEW for the one pair, with the existing
+            // emit + push + retry-or-finalize plumbing inlined here.
+            // Multi-domain (Fullstack today; future N>2 scopes) take
+            // the parallel branch where each pair's BUILD then
+            // REVIEW runs concurrently via `tokio::join!` and the
+            // outcomes are aggregated before the retry-vs-continue
+            // decision.
+            //
+            // `last_build_text` tracks the Builder output fed into
+            // the TEST gate. On the sequential path it's the one
+            // pair's text; on the parallel path it's the LAST pair's
+            // text (in `select_chain_pairs` declaration order, i.e.
+            // FrontendBuilder for Fullstack) — matches the
+            // pre-W3-12j narrative where the integration tester sees
+            // the frontend builder's diff.
             let pairs = select_chain_pairs(decision.scope);
-            let mut last_build_text: Option<String> = None;
-            for (builder_id, reviewer_id) in &pairs {
+            let last_build_text: Option<String>;
+            if pairs.len() == 1 {
+                // ----- Single-domain sequential path (W3-12h). -----
+                let (builder_id, reviewer_id) = pairs[0];
                 let builder = self
                     .profiles
                     .get(builder_id)
@@ -1070,9 +1083,8 @@ impl<T: Transport> CoordinatorFsm<T> {
                         return self.emit_finished_and_build(app, &job_id);
                     }
                 };
-                last_build_text = Some(build_text.clone());
 
-                // REVIEW gate for this pair.
+                // REVIEW gate.
                 let review_prompt =
                     render_review_prompt(&goal, &plan_text, &build_text);
                 match self
@@ -1087,9 +1099,7 @@ impl<T: Transport> CoordinatorFsm<T> {
                     .await?
                 {
                     VerdictStageOutcome::Approved(_) => {
-                        // Continue to the next pair (or fall through
-                        // to the TEST gate when this was the last
-                        // pair).
+                        // Fall through to the TEST gate.
                     }
                     VerdictStageOutcome::Rejected(verdict) => {
                         if self
@@ -1101,11 +1111,6 @@ impl<T: Transport> CoordinatorFsm<T> {
                             )
                             .await?
                         {
-                            // Re-run the WHOLE pairs sequence from
-                            // PLAN. Wasteful for Fullstack on a
-                            // late-pair rejection (re-runs already-
-                            // approved earlier pair) but correct;
-                            // per-domain retry is a future polish.
                             continue 'retry_loop;
                         }
                         self.finalize_failed_with_verdict(
@@ -1139,13 +1144,105 @@ impl<T: Transport> CoordinatorFsm<T> {
                         return self.emit_finished_and_build(app, &job_id);
                     }
                 }
+                last_build_text = Some(build_text);
+            } else {
+                // ----- Multi-domain parallel dispatch (W3-12j). -----
+                // Today this is exclusively the 2-pair Fullstack
+                // scope; future N>2 scopes would require swapping
+                // `tokio::join!` for `futures::future::join_all`
+                // (not currently a direct dep).
+                let pair_outcomes: Vec<PairOutcome> = match pairs.len() {
+                    2 => {
+                        let (a, b) = (pairs[0], pairs[1]);
+                        let (oa, ob) = tokio::join!(
+                            self.run_pair_concurrent(
+                                app,
+                                a.0,
+                                a.1,
+                                &plan_text,
+                                &goal,
+                                &job_id,
+                                &notify,
+                            ),
+                            self.run_pair_concurrent(
+                                app,
+                                b.0,
+                                b.1,
+                                &plan_text,
+                                &goal,
+                                &job_id,
+                                &notify,
+                            ),
+                        );
+                        vec![oa, ob]
+                    }
+                    _ => unreachable!(
+                        "W3-12j only supports the 2-pair Fullstack \
+                         multi-domain scope; future N>2 scopes need \
+                         futures::future::join_all"
+                    ),
+                };
+
+                // The TEST gate downstream wants the LAST pair's
+                // builder text (Fullstack: FrontendBuilder); read it
+                // from the second pair's outcome before consuming the
+                // vec via aggregation. `Approved` is the only variant
+                // that stamps a `build`-stage; on Errored/Rejected/
+                // Cancelled the empty fallback string is fed into
+                // TEST, but the aggregation will short-circuit before
+                // TEST runs anyway.
+                let last_pair_build_text: String = pair_outcomes
+                    .last()
+                    .and_then(|po| match po {
+                        PairOutcome::Approved { build, .. }
+                        | PairOutcome::Rejected { build, .. } => {
+                            Some(build.assistant_text.clone())
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+
+                let total_pairs = pairs.len();
+                match aggregate_pair_outcomes(pair_outcomes, total_pairs) {
+                    AggregateOutcome::AllApproved => {
+                        last_build_text = Some(last_pair_build_text);
+                    }
+                    AggregateOutcome::SomeRejected(verdict) => {
+                        if self
+                            .try_start_retry(
+                                app,
+                                &job_id,
+                                JobState::Review,
+                                verdict.clone(),
+                            )
+                            .await?
+                        {
+                            continue 'retry_loop;
+                        }
+                        self.finalize_failed_with_verdict(
+                            &job_id,
+                            &workspace_id,
+                            verdict,
+                        )
+                        .await?;
+                        return self.emit_finished_and_build(app, &job_id);
+                    }
+                    AggregateOutcome::Errored(e) => {
+                        self.finalize_failed(
+                            &job_id,
+                            &workspace_id,
+                            Some(e.to_string()),
+                        )
+                        .await?;
+                        return self.emit_finished_and_build(app, &job_id);
+                    }
+                    AggregateOutcome::Cancelled => {
+                        self.finalize_cancelled(&job_id, &workspace_id).await?;
+                        return self.emit_finished_and_build(app, &job_id);
+                    }
+                }
             }
 
-            // All pairs approved. Run the TEST gate against the
-            // most recent Builder output. `expect`-free: the for-
-            // loop above always populates `last_build_text` because
-            // `select_chain_pairs` never returns an empty Vec —
-            // every CoordinatorScope variant maps to ≥1 pair.
             let build_text = last_build_text.unwrap_or_default();
 
             // TEST gate.
@@ -1375,6 +1472,142 @@ impl<T: Transport> CoordinatorFsm<T> {
             Ok(VerdictStageOutcome::Rejected(verdict))
         } else {
             Ok(VerdictStageOutcome::Approved(verdict))
+        }
+    }
+
+    /// Run one (Builder, Reviewer) pair concurrently with the other
+    /// parallel pair (W3-12j Fullstack). Sequential within the pair —
+    /// BUILD then REVIEW — but the two pair futures themselves are
+    /// raced via `tokio::join!` at the call site.
+    ///
+    /// Pushes the BUILD stage to `Job.stages` (and emits
+    /// `StageCompleted`) immediately after BUILD completes, then
+    /// delegates to `run_verdict_stage` for REVIEW, which handles
+    /// the REVIEW-stage push + emit itself. Stage ordering across
+    /// the two parallel pairs in `Job.stages` is therefore
+    /// non-deterministic — whichever pair's BUILD finishes first
+    /// pushes first. Tests must use set-based assertions on
+    /// `(state, specialist_id)` tuples.
+    ///
+    /// Returns `PairOutcome` so the run loop can aggregate across
+    /// all parallel pairs before deciding retry vs. finalize.
+    async fn run_pair_concurrent<R: Runtime>(
+        &self,
+        app: &AppHandle<R>,
+        builder_id: &'static str,
+        reviewer_id: &'static str,
+        plan_text: &str,
+        goal: &str,
+        job_id: &str,
+        notify: &Notify,
+    ) -> PairOutcome {
+        // Resolve profiles. A missing-profile error is an Internal
+        // bug (the run loop already vetted scope→profile mapping).
+        let builder = match self.profiles.get(builder_id) {
+            Some(p) => p.clone(),
+            None => {
+                return PairOutcome::Errored {
+                    error: AppError::Internal(format!(
+                        "missing profile id `{builder_id}`"
+                    )),
+                };
+            }
+        };
+        let reviewer = match self.profiles.get(reviewer_id) {
+            Some(p) => p.clone(),
+            None => {
+                return PairOutcome::Errored {
+                    error: AppError::Internal(format!(
+                        "missing profile id `{reviewer_id}`"
+                    )),
+                };
+            }
+        };
+        let domain = builder_domain_for(builder_id);
+
+        // BUILD.
+        let build_prompt = render_build_prompt(plan_text, Some(domain));
+        let build_stage = match self
+            .run_stage_with_cancel(
+                app,
+                JobState::Build,
+                &builder,
+                &build_prompt,
+                job_id,
+                notify,
+            )
+            .await
+        {
+            StageOutcome::Ok(stage) => {
+                emit_swarm_event(
+                    app,
+                    job_id,
+                    &SwarmJobEvent::StageCompleted {
+                        job_id: job_id.to_string(),
+                        stage: stage.clone(),
+                    },
+                );
+                // Push immediately so the audit trail surfaces both
+                // pairs' Build stages even when REVIEW is mid-flight.
+                // `JobRegistry::update` is mutex-guarded so the two
+                // parallel pair pushes serialize cleanly; the order
+                // is non-deterministic but each push is atomic.
+                if let Err(e) = self
+                    .registry
+                    .update(job_id, |j| {
+                        j.stages.push(stage.clone());
+                    })
+                    .await
+                {
+                    return PairOutcome::Errored { error: e };
+                }
+                stage
+            }
+            StageOutcome::Err(e) => {
+                return PairOutcome::Errored { error: e };
+            }
+            StageOutcome::Cancelled => {
+                return PairOutcome::Cancelled;
+            }
+        };
+
+        // REVIEW. `run_verdict_stage` handles the per-stage emit +
+        // push internally (including the parse-failed branch which
+        // still pushes the unverdicted stage). Tag the BUILD stage's
+        // assistant_text into the review prompt so the Reviewer sees
+        // its own Builder's diff (NOT the other pair's).
+        let review_prompt = render_review_prompt(
+            goal,
+            plan_text,
+            &build_stage.assistant_text,
+        );
+        match self
+            .run_verdict_stage(
+                app,
+                JobState::Review,
+                &reviewer,
+                &review_prompt,
+                job_id,
+                notify,
+            )
+            .await
+        {
+            Ok(VerdictStageOutcome::Approved(_)) => PairOutcome::Approved {
+                build: build_stage,
+            },
+            Ok(VerdictStageOutcome::Rejected(verdict)) => PairOutcome::Rejected {
+                build: build_stage,
+                verdict,
+                domain,
+            },
+            Ok(VerdictStageOutcome::ParseFailed(e)) => {
+                PairOutcome::Errored { error: e }
+            }
+            Ok(VerdictStageOutcome::InvokeError(e)) => {
+                PairOutcome::Errored { error: e }
+            }
+            Ok(VerdictStageOutcome::Cancelled) => PairOutcome::Cancelled,
+            Err(e) => PairOutcome::Errored { error: e },
         }
     }
 
@@ -1695,6 +1928,148 @@ enum VerdictStageOutcome {
     /// `Cancelled` event has already been emitted. The run loop
     /// finalizes via `finalize_cancelled`.
     Cancelled,
+}
+
+/// Outcome of one (Builder, Reviewer) pair on the parallel
+/// dispatch path (W3-12j). One per concurrent track. The run loop
+/// aggregates these via `aggregate_pair_outcomes` to make the
+/// retry-vs-finalize call.
+///
+/// BUILD/REVIEW stages are pushed to `Job.stages` inside
+/// `run_pair_concurrent` (under the registry mutex) BEFORE this
+/// outcome is returned, so the variants don't carry `Vec<StageResult>`
+/// for the caller to push — the audit trail is already on disk by
+/// the time the outcomes reach `aggregate_pair_outcomes`. The
+/// `build` field on `Approved`/`Rejected` is kept for the TEST gate
+/// downstream (it needs the LAST pair's builder text) and for
+/// future per-domain retry diagnostics.
+enum PairOutcome {
+    /// Both BUILD + REVIEW completed; Verdict approved. `build`
+    /// kept for the TEST gate's "last builder text" lookup.
+    Approved {
+        #[allow(dead_code)]
+        build: StageResult,
+    },
+    /// Both BUILD + REVIEW completed; Verdict rejected. `domain`
+    /// labels the issues during aggregation; `verdict` is folded
+    /// into the synthesized cross-domain Verdict.
+    Rejected {
+        build: StageResult,
+        verdict: Verdict,
+        domain: BuilderDomain,
+    },
+    /// BUILD or REVIEW failed (transport error / parse failure).
+    /// Whatever stage(s) completed before the failure are already
+    /// pushed to `Job.stages`; the error rides into
+    /// `aggregate_pair_outcomes` and finalizes the job as Failed.
+    Errored { error: AppError },
+    /// Cancellation observed mid-pair. Whatever stage(s) completed
+    /// before the cancel are already pushed to `Job.stages`;
+    /// `Cancelled` event is already emitted.
+    Cancelled,
+}
+
+/// Aggregate verdict across all parallel pairs (W3-12j). The run
+/// loop's `pairs.len() > 1` branch matches on this enum after
+/// `tokio::join!` resolves all pair futures.
+///
+/// Priority order when pairs disagree:
+/// 1. Any `Cancelled` → `Cancelled` (user override beats everything).
+/// 2. Any `Errored` → `Errored` (the FIRST error wins).
+/// 3. Any `Rejected` → `SomeRejected` (synthesize aggregate Verdict
+///    with domain-prefixed issues).
+/// 4. All `Approved` → `AllApproved` (fall through to TEST gate).
+enum AggregateOutcome {
+    AllApproved,
+    /// Synthesized aggregate Verdict (`approved=false`) with
+    /// domain-prefixed issues across all rejecting pairs. The retry
+    /// loop / `finalize_failed_with_verdict` consume this exactly
+    /// like a single-pair Rejected verdict.
+    SomeRejected(Verdict),
+    Errored(AppError),
+    Cancelled,
+}
+
+/// Aggregate `pair_outcomes` (one per parallel pair) into a single
+/// `AggregateOutcome` for the run loop. `total_pairs` is plumbed
+/// in so the synthesized rejection summary can quote "N of M
+/// pairs rejected" — passing the original `pairs.len()` keeps the
+/// number meaningful when `pair_outcomes` has been consumed and
+/// reordered by aggregation.
+fn aggregate_pair_outcomes(
+    outcomes: Vec<PairOutcome>,
+    total_pairs: usize,
+) -> AggregateOutcome {
+    // 1. Cancelled trumps everything.
+    if outcomes.iter().any(|o| matches!(o, PairOutcome::Cancelled)) {
+        return AggregateOutcome::Cancelled;
+    }
+    // 2. Any Errored → finalize Failed with the FIRST error
+    //    encountered. We don't aggregate errors across pairs because
+    //    the underlying `AppError` shape isn't a list and the user
+    //    only ever sees one `last_error` field on `JobOutcome`.
+    if let Some(err) = outcomes.iter().find_map(|o| match o {
+        PairOutcome::Errored { error } => Some(error.clone()),
+        _ => None,
+    }) {
+        return AggregateOutcome::Errored(err);
+    }
+    // 3. Any Rejected → synthesize an aggregate Verdict carrying
+    //    domain-prefixed issues from every rejecting pair.
+    let rejections: Vec<(Verdict, BuilderDomain)> = outcomes
+        .iter()
+        .filter_map(|o| match o {
+            PairOutcome::Rejected { verdict, domain, .. } => {
+                Some((verdict.clone(), *domain))
+            }
+            _ => None,
+        })
+        .collect();
+    if !rejections.is_empty() {
+        return AggregateOutcome::SomeRejected(aggregate_rejections(
+            rejections,
+            total_pairs,
+        ));
+    }
+    // 4. All Approved.
+    AggregateOutcome::AllApproved
+}
+
+/// Synthesize one aggregate `Verdict` from the rejecting pairs'
+/// individual verdicts. Each issue's `message` is prefixed with the
+/// rejecting pair's domain (`[backend] ...` / `[frontend] ...`) so
+/// the user reads "which side of the fullstack rejected this?" at
+/// a glance. `total_pairs` quotes the denominator in the summary.
+fn aggregate_rejections(
+    rejections: Vec<(Verdict, BuilderDomain)>,
+    total_pairs: usize,
+) -> Verdict {
+    let mut all_issues = Vec::new();
+    for (verdict, domain) in &rejections {
+        let domain_label = match domain {
+            BuilderDomain::Backend => "backend",
+            BuilderDomain::Frontend => "frontend",
+        };
+        for issue in &verdict.issues {
+            let mut prefixed = issue.clone();
+            prefixed.message = format!(
+                "[{domain_label}] {}",
+                issue.message
+            );
+            all_issues.push(prefixed);
+        }
+    }
+    let summary = format!(
+        "{n} of {total} parallel pairs rejected; aggregated {issues_count} issues across domains.",
+        n = rejections.len(),
+        total = total_pairs,
+        issues_count = all_issues.len(),
+    );
+    Verdict {
+        approved: false,
+        issues: all_issues,
+        summary,
+    }
 }
 
 /// Stable last-error string the FSM writes when cancelled. Pulled
@@ -5278,8 +5653,48 @@ mod tests {
     }
 
     // ----------------------------------------------------------------
-    // WP-W3-12i — Fullstack sequential dispatch (BB+BR then FB+FR)
+    // WP-W3-12j — Fullstack PARALLEL dispatch (BB ∥ FB, BR ∥ FR via
+    // `tokio::join!`). The 12i sequential contract is superseded;
+    // `Job.stages` ordering for Fullstack is now non-deterministic
+    // across the two parallel pairs and tests use SET-based
+    // assertions on `(state, specialist_id)` tuples.
     // ----------------------------------------------------------------
+
+    /// Collect a SET-based fingerprint of `(state, specialist_id)`
+    /// tuples from a stage list. Pulled out as a helper so the W3-12j
+    /// parallel-aware tests assert on stage SETS without baking in
+    /// the non-deterministic ordering across the two concurrent
+    /// pairs. Both `state` and `specialist_id` are stringified so
+    /// the `HashSet` key is `Hash`-friendly without import churn.
+    fn stage_set(
+        stages: &[StageResult],
+    ) -> std::collections::HashSet<(String, String)> {
+        stages
+            .iter()
+            .map(|s| (format!("{:?}", s.state), s.specialist_id.clone()))
+            .collect()
+    }
+
+    /// The canonical 8-stage `(state, specialist_id)` SET for a
+    /// Fullstack happy-path run. Order-independent so the W3-12j
+    /// parallel dispatch can interleave Backend and Frontend Build /
+    /// Review stages in any order without breaking assertions.
+    fn expected_fullstack_stage_set()
+    -> std::collections::HashSet<(String, String)> {
+        [
+            ("Scout", SCOUT_ID),
+            ("Classify", COORDINATOR_ID),
+            ("Plan", PLANNER_ID),
+            ("Build", BACKEND_BUILDER_ID),
+            ("Review", BACKEND_REVIEWER_ID),
+            ("Build", FRONTEND_BUILDER_ID),
+            ("Review", FRONTEND_REVIEWER_ID),
+            ("Test", TESTER_ID),
+        ]
+        .into_iter()
+        .map(|(s, id)| (s.to_string(), id.to_string()))
+        .collect()
+    }
 
     /// Build the canonical 8-stage Fullstack happy-path response set:
     /// scout/planner/builders return text; reviewers + tester return
@@ -5303,10 +5718,16 @@ mod tests {
     }
 
     /// scope=Fullstack walks all 8 stages on the approved path:
-    /// scout → coordinator (Classify) → planner → backend-builder →
-    /// backend-reviewer → frontend-builder → frontend-reviewer →
-    /// integration-tester → Done. Stage IDs assert the dispatch
-    /// order is exactly the report §2.1 sequential hierarchy.
+    /// scout → coordinator (Classify) → planner → (BackendBuilder ∥
+    /// FrontendBuilder, BackendReviewer ∥ FrontendReviewer via
+    /// `tokio::join!`) → integration-tester → Done.
+    ///
+    /// W3-12j: ordering across the two parallel pairs is non-
+    /// deterministic — the assertion is over the SET of
+    /// `(state, specialist_id)` pairs, not their index in
+    /// `outcome.stages`. The Scout/Classify/Plan prologue and the
+    /// trailing Test stage stay deterministic (they bracket the
+    /// parallel section).
     #[tokio::test]
     async fn fsm_scope_fullstack_walks_eight_stages_on_approved_path() {
         let (app, _pool, _dir) = mock_app_with_pool().await;
@@ -5326,43 +5747,33 @@ mod tests {
             .expect("FSM ok");
         assert_eq!(outcome.final_state, JobState::Done);
         assert_eq!(outcome.stages.len(), 8);
-        // Stage IDs in order — this is the contract.
-        let expected_ids = [
-            SCOUT_ID,
-            COORDINATOR_ID,
-            PLANNER_ID,
-            BACKEND_BUILDER_ID,
-            BACKEND_REVIEWER_ID,
-            FRONTEND_BUILDER_ID,
-            FRONTEND_REVIEWER_ID,
-            TESTER_ID,
-        ];
-        for (idx, expected) in expected_ids.iter().enumerate() {
-            assert_eq!(
-                outcome.stages[idx].specialist_id, *expected,
-                "stage {idx}: expected `{expected}`, got `{}`",
-                outcome.stages[idx].specialist_id,
-            );
-        }
-        // Stage state ordering: scout, classify, plan, build, review,
-        // build, review, test.
-        assert_eq!(outcome.stages[0].state, JobState::Scout);
-        assert_eq!(outcome.stages[1].state, JobState::Classify);
-        assert_eq!(outcome.stages[2].state, JobState::Plan);
-        assert_eq!(outcome.stages[3].state, JobState::Build);
-        assert_eq!(outcome.stages[4].state, JobState::Review);
-        assert_eq!(outcome.stages[5].state, JobState::Build);
-        assert_eq!(outcome.stages[6].state, JobState::Review);
-        assert_eq!(outcome.stages[7].state, JobState::Test);
-        // Both Reviewer stages + the Tester stage carry verdicts.
-        for idx in [4, 6, 7] {
+        // Set-based assertion over (state, specialist_id) tuples —
+        // Fullstack parallel dispatch reorders Build/Review stages
+        // across the two pairs depending on which pair finishes its
+        // BUILD / REVIEW first.
+        assert_eq!(stage_set(&outcome.stages), expected_fullstack_stage_set());
+        // Pre-parallel prologue is deterministic: Scout, Classify,
+        // Plan land in that order before any Build kicks off.
+        assert_eq!(outcome.stages[0].specialist_id, SCOUT_ID);
+        assert_eq!(outcome.stages[1].specialist_id, COORDINATOR_ID);
+        assert_eq!(outcome.stages[2].specialist_id, PLANNER_ID);
+        // Trailing TEST is also deterministic: it runs only after
+        // both parallel pairs aggregate to AllApproved.
+        assert_eq!(
+            outcome.stages.last().expect("non-empty").specialist_id,
+            TESTER_ID
+        );
+        // Both Reviewer stages + the Tester stage carry approved
+        // verdicts. Order-independent: filter rather than index.
+        for stage in outcome
+            .stages
+            .iter()
+            .filter(|s| matches!(s.state, JobState::Review | JobState::Test))
+        {
             assert!(
-                outcome.stages[idx]
-                    .verdict
-                    .as_ref()
-                    .map(|v| v.approved)
-                    .unwrap_or(false),
-                "stage {idx} should carry approved verdict"
+                stage.verdict.as_ref().map(|v| v.approved).unwrap_or(false),
+                "stage `{}` should carry approved verdict",
+                stage.specialist_id
             );
         }
         // Decision still records scope=Fullstack.
@@ -5379,15 +5790,21 @@ mod tests {
     /// FrontendReviewer + Tester always approve. Final Done,
     /// retry_count=1.
     ///
+    /// W3-12j: with parallel dispatch the FrontendBuilder /
+    /// FrontendReviewer DO run on attempt 1 (the two pairs race
+    /// through to completion regardless of one pair's reject —
+    /// `aggregate_pair_outcomes` only fires AFTER both finish). The
+    /// aggregate Verdict carries one `[backend]`-prefixed issue
+    /// from BR; FR's approve doesn't override it.
+    ///
     /// Stage count breakdown:
     /// - attempt 1: scout(1) + classify(1) + plan(1) + BB(1) +
-    ///   BR-rejected(1) = 5 stages.
-    /// - attempt 2: plan(1) + BB(1) + BR-approved(1) + FB(1) +
-    ///   FR-approved(1) + test(1) = 6 stages. (Scout + Classify
-    ///   cached.)
-    /// - total = 11.
+    ///   FB(1) + BR-rejected(1) + FR-approved(1) = 7 stages.
+    /// - attempt 2: plan(1) + BB(1) + FB(1) + BR(1) + FR(1) +
+    ///   test(1) = 6 stages. (Scout + Classify cached.)
+    /// - total = 13.
     #[tokio::test]
-    async fn fsm_scope_fullstack_backend_review_rejection_retries_full_chain() {
+    async fn fsm_fullstack_parallel_backend_rejection_retries() {
         let (app, _pool, _dir) = mock_app_with_pool().await;
         let registry = Arc::new(JobRegistry::new());
         let mut responses: HashMap<String, Vec<MockResponse>> = HashMap::new();
@@ -5411,10 +5828,16 @@ mod tests {
                 ok_verdict_response(0.0),
             ],
         );
-        responses
-            .insert(FRONTEND_BUILDER_ID.into(), vec![ok_response("fe", 0.0)]);
-        responses
-            .insert(FRONTEND_REVIEWER_ID.into(), vec![ok_verdict_response(0.0)]);
+        // Frontend now runs in parallel on attempt 1 too — seed
+        // two responses.
+        responses.insert(
+            FRONTEND_BUILDER_ID.into(),
+            vec![ok_response("fe1", 0.0), ok_response("fe2", 0.0)],
+        );
+        responses.insert(
+            FRONTEND_REVIEWER_ID.into(),
+            vec![ok_verdict_response(0.0), ok_verdict_response(0.0)],
+        );
         responses.insert(TESTER_ID.into(), vec![ok_verdict_response(0.0)]);
 
         let mock = Arc::new(SequencedMock::new(responses));
@@ -5435,16 +5858,15 @@ mod tests {
             .await
             .expect("FSM ok");
         assert_eq!(outcome.final_state, JobState::Done);
-        assert_eq!(outcome.stages.len(), 11);
+        assert_eq!(outcome.stages.len(), 13);
         let job = registry.get(&job_id).expect("job in registry");
         assert_eq!(job.retry_count, 1);
-        // Frontend specialists never invoked on attempt 1 (BR
-        // short-circuits before FB/FR).
-        assert_eq!(mock.call_count(FRONTEND_BUILDER_ID), 1);
-        assert_eq!(mock.call_count(FRONTEND_REVIEWER_ID), 1);
-        // Backend specialists invoked twice (one per attempt).
+        // Both Backend and Frontend specialists invoked twice
+        // (parallel dispatch on attempt 1 + retry on attempt 2).
         assert_eq!(mock.call_count(BACKEND_BUILDER_ID), 2);
         assert_eq!(mock.call_count(BACKEND_REVIEWER_ID), 2);
+        assert_eq!(mock.call_count(FRONTEND_BUILDER_ID), 2);
+        assert_eq!(mock.call_count(FRONTEND_REVIEWER_ID), 2);
         // Scout + Coordinator each once.
         assert_eq!(mock.call_count(SCOUT_ID), 1);
         assert_eq!(mock.call_count(COORDINATOR_ID), 1);
@@ -5453,17 +5875,22 @@ mod tests {
     /// FrontendReviewer rejects on attempt 1, approves on attempt 2.
     /// All other gates approve. Final Done, retry_count=1.
     ///
+    /// W3-12j: parallel dispatch keeps the totals the same as the
+    /// W3-12i sequential expectation — both attempts run all four
+    /// builder/reviewer specialists. Only the in-stages ordering of
+    /// the (Build/Review) pairs is non-deterministic.
+    ///
     /// Stage count breakdown:
-    /// - attempt 1: scout + classify + plan + BB + BR-approved +
-    ///   FB + FR-rejected = 7 stages.
-    /// - attempt 2: plan + BB + BR + FB + FR + test = 6 stages.
+    /// - attempt 1: scout + classify + plan + BB + FB + BR + FR
+    ///   (FR rejected) = 7 stages.
+    /// - attempt 2: plan + BB + FB + BR + FR + test = 6 stages.
     ///   (Scout + Classify cached.)
     /// - total = 13.
     ///
     /// Backend stages re-run on retry — wasteful but correct (per-
     /// domain retry is a future polish).
     #[tokio::test]
-    async fn fsm_scope_fullstack_frontend_review_rejection_retries_full_chain() {
+    async fn fsm_fullstack_parallel_frontend_rejection_retries() {
         let (app, _pool, _dir) = mock_app_with_pool().await;
         let registry = Arc::new(JobRegistry::new());
         let mut responses: HashMap<String, Vec<MockResponse>> = HashMap::new();
@@ -5651,6 +6078,568 @@ mod tests {
         assert_eq!(mock.call_count(TESTER_ID), 0);
     }
 
+    // ----------------------------------------------------------------
+    // WP-W3-12j — Pure-fn tests for the parallel-aggregation helpers.
+    // ----------------------------------------------------------------
+
+    /// `aggregate_rejections` concatenates issues across the
+    /// rejecting pairs and prefixes each issue's message with its
+    /// source domain (`[backend] ...` / `[frontend] ...`).
+    #[test]
+    fn aggregate_rejections_concatenates_issues_with_domain_prefix() {
+        let backend_verdict = Verdict {
+            approved: false,
+            issues: vec![
+                VerdictIssue {
+                    severity: VerdictSeverity::High,
+                    file: Some("be.rs".into()),
+                    line: Some(10),
+                    message: "missing import".into(),
+                },
+                VerdictIssue {
+                    severity: VerdictSeverity::Med,
+                    file: None,
+                    line: None,
+                    message: "missing doc".into(),
+                },
+            ],
+            summary: "be rejected".into(),
+        };
+        let frontend_verdict = Verdict {
+            approved: false,
+            issues: vec![VerdictIssue {
+                severity: VerdictSeverity::Low,
+                file: Some("fe.tsx".into()),
+                line: Some(99),
+                message: "no JSDoc".into(),
+            }],
+            summary: "fe rejected".into(),
+        };
+        let aggregate = aggregate_rejections(
+            vec![
+                (backend_verdict, BuilderDomain::Backend),
+                (frontend_verdict, BuilderDomain::Frontend),
+            ],
+            2,
+        );
+        assert!(!aggregate.approved);
+        assert_eq!(aggregate.issues.len(), 3);
+        let messages: Vec<&str> = aggregate
+            .issues
+            .iter()
+            .map(|i| i.message.as_str())
+            .collect();
+        assert!(
+            messages.iter().any(|m| *m == "[backend] missing import"),
+            "expected `[backend] missing import` in {messages:?}"
+        );
+        assert!(
+            messages.iter().any(|m| *m == "[backend] missing doc"),
+            "expected `[backend] missing doc` in {messages:?}"
+        );
+        assert!(
+            messages.iter().any(|m| *m == "[frontend] no JSDoc"),
+            "expected `[frontend] no JSDoc` in {messages:?}"
+        );
+    }
+
+    /// `aggregate_rejections` summary quotes the count + total.
+    #[test]
+    fn aggregate_rejections_summary_format() {
+        let v = Verdict {
+            approved: false,
+            issues: vec![VerdictIssue {
+                severity: VerdictSeverity::High,
+                file: None,
+                line: None,
+                message: "x".into(),
+            }],
+            summary: "rejected".into(),
+        };
+        let agg = aggregate_rejections(
+            vec![(v, BuilderDomain::Backend)],
+            2,
+        );
+        assert!(
+            agg.summary.contains("1 of 2"),
+            "summary should quote `1 of 2`: {}",
+            agg.summary
+        );
+        assert!(
+            agg.summary.contains("1 issues"),
+            "summary should quote issues count: {}",
+            agg.summary
+        );
+        assert!(
+            agg.summary.contains("aggregated"),
+            "summary should mention aggregation: {}",
+            agg.summary
+        );
+    }
+
+    /// Cancelled wins over every other PairOutcome variant.
+    #[test]
+    fn aggregate_pair_outcomes_cancelled_takes_priority() {
+        let stage = StageResult {
+            state: JobState::Build,
+            specialist_id: BACKEND_BUILDER_ID.into(),
+            assistant_text: "x".into(),
+            session_id: "s".into(),
+            total_cost_usd: 0.0,
+            duration_ms: 0,
+            verdict: None,
+            coordinator_decision: None,
+        };
+        let outcomes = vec![
+            PairOutcome::Approved {
+                build: stage.clone(),
+            },
+            PairOutcome::Cancelled,
+            PairOutcome::Errored {
+                error: AppError::Internal("nope".into()),
+            },
+            PairOutcome::Rejected {
+                build: stage,
+                verdict: Verdict {
+                    approved: false,
+                    issues: vec![],
+                    summary: "x".into(),
+                },
+                domain: BuilderDomain::Frontend,
+            },
+        ];
+        let agg = aggregate_pair_outcomes(outcomes, 2);
+        assert!(matches!(agg, AggregateOutcome::Cancelled));
+    }
+
+    /// Errored wins over Rejected / Approved (but not Cancelled).
+    #[test]
+    fn aggregate_pair_outcomes_errored_takes_priority_over_rejected() {
+        let stage = StageResult {
+            state: JobState::Build,
+            specialist_id: BACKEND_BUILDER_ID.into(),
+            assistant_text: "x".into(),
+            session_id: "s".into(),
+            total_cost_usd: 0.0,
+            duration_ms: 0,
+            verdict: None,
+            coordinator_decision: None,
+        };
+        let outcomes = vec![
+            PairOutcome::Rejected {
+                build: stage,
+                verdict: Verdict {
+                    approved: false,
+                    issues: vec![],
+                    summary: "x".into(),
+                },
+                domain: BuilderDomain::Backend,
+            },
+            PairOutcome::Errored {
+                error: AppError::SwarmInvoke("boom".into()),
+            },
+        ];
+        match aggregate_pair_outcomes(outcomes, 2) {
+            AggregateOutcome::Errored(e) => {
+                assert!(e.to_string().contains("boom"));
+            }
+            other => panic!("expected Errored, got {other:?}"),
+        }
+    }
+
+    /// All-Approved is the AllApproved fall-through.
+    #[test]
+    fn aggregate_pair_outcomes_all_approved_when_no_rejections() {
+        let stage = StageResult {
+            state: JobState::Build,
+            specialist_id: BACKEND_BUILDER_ID.into(),
+            assistant_text: "x".into(),
+            session_id: "s".into(),
+            total_cost_usd: 0.0,
+            duration_ms: 0,
+            verdict: None,
+            coordinator_decision: None,
+        };
+        let outcomes = vec![
+            PairOutcome::Approved {
+                build: stage.clone(),
+            },
+            PairOutcome::Approved { build: stage },
+        ];
+        assert!(matches!(
+            aggregate_pair_outcomes(outcomes, 2),
+            AggregateOutcome::AllApproved
+        ));
+    }
+
+    /// `AggregateOutcome` debug printing for panic messages — the
+    /// `aggregate_pair_outcomes_errored_takes_priority_over_rejected`
+    /// test panics with a Debug-formatted variant.
+    impl std::fmt::Debug for AggregateOutcome {
+        fn fmt(
+            &self,
+            f: &mut std::fmt::Formatter<'_>,
+        ) -> std::fmt::Result {
+            match self {
+                AggregateOutcome::AllApproved => f.write_str("AllApproved"),
+                AggregateOutcome::SomeRejected(_) => f.write_str("SomeRejected"),
+                AggregateOutcome::Errored(_) => f.write_str("Errored"),
+                AggregateOutcome::Cancelled => f.write_str("Cancelled"),
+            }
+        }
+    }
+
+    // ----------------------------------------------------------------
+    // WP-W3-12j — FSM tests for parallel dispatch behaviors.
+    // ----------------------------------------------------------------
+
+    /// Both Reviewers reject → aggregate verdict carries domain-
+    /// prefixed issues from BOTH backend and frontend; final state
+    /// Failed after MAX_RETRIES exhausts.
+    #[tokio::test]
+    async fn fsm_fullstack_parallel_both_rejected_aggregate_verdict_includes_both_domains()
+    {
+        let (app, _pool, _dir) = mock_app_with_pool().await;
+        let registry = Arc::new(JobRegistry::new());
+        let mut responses: HashMap<String, Vec<MockResponse>> = HashMap::new();
+        responses.insert(SCOUT_ID.into(), vec![ok_response("s", 0.0)]);
+        responses.insert(
+            COORDINATOR_ID.into(),
+            vec![execute_plan_fullstack_decision_response()],
+        );
+        responses.insert(PLANNER_ID.into(), vec![ok_response("p", 0.0)]);
+        responses
+            .insert(BACKEND_BUILDER_ID.into(), vec![ok_response("be", 0.0)]);
+        responses.insert(
+            BACKEND_REVIEWER_ID.into(),
+            vec![rejected_verdict_response("backend issue")],
+        );
+        responses
+            .insert(FRONTEND_BUILDER_ID.into(), vec![ok_response("fe", 0.0)]);
+        responses.insert(
+            FRONTEND_REVIEWER_ID.into(),
+            vec![rejected_verdict_response("frontend issue")],
+        );
+        responses.insert(TESTER_ID.into(), vec![ok_verdict_response(0.0)]);
+
+        let mock = Arc::new(SequencedMock::new(responses));
+        let fsm = CoordinatorFsm::new(
+            synthetic_registry(),
+            ArcSequencedMock(Arc::clone(&mock)),
+            Arc::clone(&registry),
+            Duration::from_secs(5),
+        );
+        let job_id = "j-fs-both-rej".to_string();
+        let outcome = fsm
+            .run_job_with_id(
+                app.handle(),
+                job_id.clone(),
+                "ws-fs-both-rej".into(),
+                "fullstack goal".into(),
+            )
+            .await
+            .expect("FSM ok");
+        assert_eq!(outcome.final_state, JobState::Failed);
+        let lv = outcome.last_verdict.as_ref().expect("last_verdict");
+        assert!(!lv.approved);
+        // Aggregate verdict carries one issue per pair × number of
+        // attempts the FSM ran (the LAST aggregate becomes
+        // `last_verdict`). Both `[backend]` and `[frontend]` prefixes
+        // must appear in the surviving aggregate.
+        let messages: Vec<&str> =
+            lv.issues.iter().map(|i| i.message.as_str()).collect();
+        assert!(
+            messages.iter().any(|m| m.starts_with("[backend]")),
+            "aggregate verdict missing [backend] prefix: {messages:?}"
+        );
+        assert!(
+            messages.iter().any(|m| m.starts_with("[frontend]")),
+            "aggregate verdict missing [frontend] prefix: {messages:?}"
+        );
+        assert!(
+            lv.summary.contains("of 2"),
+            "summary should mention `of 2`: {}",
+            lv.summary
+        );
+        // Tester never runs (every attempt's aggregate rejects).
+        assert_eq!(mock.call_count(TESTER_ID), 0);
+    }
+
+    /// Both Reviewers reject on every attempt → MAX_RETRIES exhausts;
+    /// final state Failed with aggregate Verdict.
+    #[tokio::test]
+    async fn fsm_fullstack_parallel_both_rejected_exhausts_retries_finalizes_failed()
+    {
+        let (app, _pool, _dir) = mock_app_with_pool().await;
+        let registry = Arc::new(JobRegistry::new());
+        let mut responses: HashMap<String, Vec<MockResponse>> = HashMap::new();
+        responses.insert(SCOUT_ID.into(), vec![ok_response("s", 0.0)]);
+        responses.insert(
+            COORDINATOR_ID.into(),
+            vec![execute_plan_fullstack_decision_response()],
+        );
+        responses.insert(PLANNER_ID.into(), vec![ok_response("p", 0.0)]);
+        responses
+            .insert(BACKEND_BUILDER_ID.into(), vec![ok_response("be", 0.0)]);
+        responses.insert(
+            BACKEND_REVIEWER_ID.into(),
+            vec![rejected_verdict_response("be never approves")],
+        );
+        responses
+            .insert(FRONTEND_BUILDER_ID.into(), vec![ok_response("fe", 0.0)]);
+        responses.insert(
+            FRONTEND_REVIEWER_ID.into(),
+            vec![rejected_verdict_response("fe never approves")],
+        );
+        responses.insert(TESTER_ID.into(), vec![ok_verdict_response(0.0)]);
+
+        let mock = Arc::new(SequencedMock::new(responses));
+        let fsm = CoordinatorFsm::new(
+            synthetic_registry(),
+            ArcSequencedMock(Arc::clone(&mock)),
+            Arc::clone(&registry),
+            Duration::from_secs(5),
+        );
+        let job_id = "j-fs-both-rej-exhaust".to_string();
+        let outcome = fsm
+            .run_job_with_id(
+                app.handle(),
+                job_id.clone(),
+                "ws-fs-both-rej-exhaust".into(),
+                "fullstack goal".into(),
+            )
+            .await
+            .expect("FSM ok");
+        assert_eq!(outcome.final_state, JobState::Failed);
+        let job = registry.get(&job_id).expect("job");
+        assert_eq!(job.retry_count, MAX_RETRIES);
+        let lv = outcome.last_verdict.as_ref().expect("last_verdict");
+        assert!(!lv.approved);
+        // Each attempt produces aggregate Verdict with 1 BE + 1 FE
+        // issue = 2 issues. Last aggregate persists as last_verdict.
+        assert_eq!(lv.issues.len(), 2);
+    }
+
+    /// BackendBuilder errors mid-flight → FSM aggregates an Errored
+    /// outcome and finalizes Failed. The frontend track may have
+    /// completed (and pushed its stages) before the cancellation
+    /// landed; the test asserts the FSM finalizes correctly without
+    /// hanging on the still-running parallel track.
+    #[tokio::test]
+    async fn fsm_fullstack_parallel_backend_invoke_error_short_circuits() {
+        let (app, _pool, _dir) = mock_app_with_pool().await;
+        let registry = Arc::new(JobRegistry::new());
+        let mut responses: HashMap<String, Vec<MockResponse>> = HashMap::new();
+        responses.insert(SCOUT_ID.into(), vec![ok_response("s", 0.0)]);
+        responses.insert(
+            COORDINATOR_ID.into(),
+            vec![execute_plan_fullstack_decision_response()],
+        );
+        responses.insert(PLANNER_ID.into(), vec![ok_response("p", 0.0)]);
+        responses.insert(
+            BACKEND_BUILDER_ID.into(),
+            vec![err_response("be builder boom")],
+        );
+        // Frontend pair runs in parallel and may complete or be
+        // cancelled before the run loop's aggregator runs; either way
+        // the FSM must finalize Failed.
+        responses
+            .insert(FRONTEND_BUILDER_ID.into(), vec![ok_response("fe", 0.0)]);
+        responses
+            .insert(FRONTEND_REVIEWER_ID.into(), vec![ok_verdict_response(0.0)]);
+        responses
+            .insert(BACKEND_REVIEWER_ID.into(), vec![ok_verdict_response(0.0)]);
+        responses.insert(TESTER_ID.into(), vec![ok_verdict_response(0.0)]);
+
+        let mock = Arc::new(SequencedMock::new(responses));
+        let fsm = CoordinatorFsm::new(
+            synthetic_registry(),
+            ArcSequencedMock(Arc::clone(&mock)),
+            Arc::clone(&registry),
+            Duration::from_secs(5),
+        );
+        let job_id = "j-fs-be-err".to_string();
+        let outcome = fsm
+            .run_job_with_id(
+                app.handle(),
+                job_id.clone(),
+                "ws-fs-be-err".into(),
+                "fullstack goal".into(),
+            )
+            .await
+            .expect("FSM ok");
+        assert_eq!(outcome.final_state, JobState::Failed);
+        assert!(
+            outcome
+                .last_error
+                .as_deref()
+                .unwrap_or("")
+                .contains("be builder boom"),
+            "last_error should carry the BB invoke error: {:?}",
+            outcome.last_error
+        );
+        // Tester never runs (BUILD-stage error short-circuits before
+        // the post-pair TEST gate).
+        assert_eq!(mock.call_count(TESTER_ID), 0);
+    }
+
+    /// Cancel propagates to BOTH parallel tracks: with slow mocks on
+    /// both Builders, signalling cancel mid-flight aborts both
+    /// `tokio::select!`s within 2s and the job finalizes as Failed
+    /// with the canonical `cancelled by user` last_error.
+    ///
+    /// Pre-W3-12j this would hang because `notify_one()` only wakes
+    /// one waiter; the other parallel track stays in `notified()`
+    /// indefinitely. W3-12j switches `signal_cancel` to
+    /// `notify_waiters()` so all in-flight `tokio::select!`s wake.
+    #[tokio::test]
+    async fn fsm_fullstack_parallel_cancel_propagates_to_both_tracks() {
+        let (app, _pool, _dir) = mock_app_with_pool().await;
+        let registry = Arc::new(JobRegistry::new());
+
+        // Slow BB and FB so the FSM enters the parallel section and
+        // both tracks are blocked on `notified()` when the cancel
+        // signal fires. 5s sleep is long enough that without the
+        // cancel both tracks would still be running after the
+        // 2-second deadline — so the assertion fail mode is "cancel
+        // didn't actually wake them".
+        let mut responses: HashMap<String, MockResponse> = HashMap::new();
+        responses.insert(SCOUT_ID.into(), ok_response("s", 0.0));
+        responses
+            .insert(COORDINATOR_ID.into(), execute_plan_fullstack_decision_response());
+        responses.insert(PLANNER_ID.into(), ok_response("p", 0.0));
+        responses.insert(BACKEND_BUILDER_ID.into(), MockResponse {
+            result: Ok(InvokeResult {
+                session_id: "s".into(),
+                assistant_text: "be".into(),
+                total_cost_usd: 0.0,
+                turn_count: 1,
+            }),
+            sleep: Some(Duration::from_secs(5)),
+        });
+        responses.insert(FRONTEND_BUILDER_ID.into(), MockResponse {
+            result: Ok(InvokeResult {
+                session_id: "s".into(),
+                assistant_text: "fe".into(),
+                total_cost_usd: 0.0,
+                turn_count: 1,
+            }),
+            sleep: Some(Duration::from_secs(5)),
+        });
+        responses
+            .insert(BACKEND_REVIEWER_ID.into(), ok_verdict_response(0.0));
+        responses
+            .insert(FRONTEND_REVIEWER_ID.into(), ok_verdict_response(0.0));
+        responses.insert(TESTER_ID.into(), ok_verdict_response(0.0));
+
+        let fsm = Arc::new(CoordinatorFsm::new(
+            synthetic_registry(),
+            MockTransport::new(responses),
+            Arc::clone(&registry),
+            Duration::from_secs(15),
+        ));
+        let job_id = "j-fs-cancel".to_string();
+        let events = capture_events(&app, &job_id);
+        let app_handle = app.handle().clone();
+        let fsm_for_task = Arc::clone(&fsm);
+        let job_id_for_task = job_id.clone();
+        let task = tokio::spawn(async move {
+            fsm_for_task
+                .run_job_with_id(
+                    &app_handle,
+                    job_id_for_task,
+                    "ws-fs-cancel".into(),
+                    "g".into(),
+                )
+                .await
+        });
+
+        // Wait until BOTH parallel tracks have started their BUILD
+        // stages — observe two `StageStarted{state="build"}` events.
+        // This proves both `notified()` waiters are registered before
+        // we signal cancel.
+        wait_for_events(&events, Duration::from_secs(5), |evts| {
+            evts.iter()
+                .filter(|e| {
+                    e.kind == KIND_STAGE_STARTED
+                        && e.json
+                            .get("state")
+                            .and_then(|v| v.as_str())
+                            == Some("build")
+                })
+                .count()
+                >= 2
+        })
+        .await;
+
+        registry.signal_cancel(&job_id).expect("signal");
+
+        // Both tracks must abort within 2s; if they didn't, the
+        // 5s mock sleep would still be in flight and the timeout
+        // here would fire.
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(2),
+            task,
+        )
+        .await
+        .expect("FSM did not finalize within 2s of cancel")
+        .expect("task ok")
+        .expect("FSM ok");
+        assert_eq!(outcome.final_state, JobState::Failed);
+        assert_eq!(
+            outcome.last_error.as_deref(),
+            Some(CANCELLED_LAST_ERROR)
+        );
+    }
+
+    /// Single-domain (Backend) takes the `pairs.len() == 1`
+    /// sequential branch — regression coverage that 12j didn't
+    /// accidentally rewire single-domain dispatch through the
+    /// parallel path. Stage count + IDs identical to W3-12h.
+    #[tokio::test]
+    async fn fsm_single_domain_unchanged_in_parallel_mode() {
+        let (app, _pool, _dir) = mock_app_with_pool().await;
+        let responses = happy_5_stage_responses(
+            "s", "p", "b", 0.0, 0.0, 0.0,
+        );
+        let fsm = CoordinatorFsm::new(
+            synthetic_registry(),
+            MockTransport::new(responses),
+            Arc::new(JobRegistry::new()),
+            Duration::from_secs(5),
+        );
+        let outcome = fsm
+            .run_job(
+                app.handle(),
+                "ws-single-domain".into(),
+                "g".into(),
+            )
+            .await
+            .expect("FSM ok");
+        assert_eq!(outcome.final_state, JobState::Done);
+        // Backend single-domain run = 6 stages
+        // (Scout/Classify/Plan/Build/Review/Test) — identical to
+        // W3-12h's contract.
+        assert_eq!(outcome.stages.len(), 6);
+        // Order IS deterministic on the single-domain path.
+        let ids: Vec<&str> = outcome
+            .stages
+            .iter()
+            .map(|s| s.specialist_id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                SCOUT_ID,
+                COORDINATOR_ID,
+                PLANNER_ID,
+                BACKEND_BUILDER_ID,
+                BACKEND_REVIEWER_ID,
+                TESTER_ID,
+            ]
+        );
+    }
+
     /// Plan prompt for scope=Fullstack carries the fullstack scope
     /// label so the Planner produces a dual-domain plan.
     #[test]
@@ -5769,8 +6758,15 @@ mod tests {
     /// Pool-backed Fullstack happy path. All 8 stages and per-stage
     /// `specialist_id` round-trip through SQLite via the registry's
     /// write-through.
+    ///
+    /// W3-12j: SET-based assertion — parallel dispatch reorders the
+    /// Build/Review stages across the two pairs in `Job.stages`,
+    /// so the persistence round-trip preserves whatever order the
+    /// runtime races picked. The prologue (Scout/Classify/Plan) and
+    /// the trailing Test stage stay deterministic because they
+    /// bracket the parallel section.
     #[tokio::test]
-    async fn fsm_fullstack_persistence_round_trip() {
+    async fn fsm_fullstack_parallel_persistence_round_trip() {
         let (app, _pool, _dir) = mock_app_with_pool().await;
         let (registry, _pool, _reg_dir) = pool_backed_registry().await;
         let fsm = CoordinatorFsm::new(
@@ -5795,15 +6791,15 @@ mod tests {
             .expect("query")
             .expect("Some");
         assert_eq!(detail.stages.len(), 8);
-        // Per-stage specialist_id round-trip in dispatch order.
+        assert_eq!(stage_set(&detail.stages), expected_fullstack_stage_set());
+        // Pre-parallel prologue stays deterministic.
         assert_eq!(detail.stages[0].specialist_id, SCOUT_ID);
         assert_eq!(detail.stages[1].specialist_id, COORDINATOR_ID);
         assert_eq!(detail.stages[2].specialist_id, PLANNER_ID);
-        assert_eq!(detail.stages[3].specialist_id, BACKEND_BUILDER_ID);
-        assert_eq!(detail.stages[4].specialist_id, BACKEND_REVIEWER_ID);
-        assert_eq!(detail.stages[5].specialist_id, FRONTEND_BUILDER_ID);
-        assert_eq!(detail.stages[6].specialist_id, FRONTEND_REVIEWER_ID);
-        assert_eq!(detail.stages[7].specialist_id, TESTER_ID);
+        assert_eq!(
+            detail.stages.last().expect("non-empty").specialist_id,
+            TESTER_ID
+        );
         // Decision still records scope=Fullstack.
         let classify = &detail.stages[1];
         let decision = classify
@@ -5814,16 +6810,21 @@ mod tests {
     }
 
     /// Real-claude integration smoke (`#[ignore]`) for the Fullstack
-    /// chain. Owner runs it manually with `cargo test -- --ignored`
-    /// post-commit. The Coordinator brain should classify a
-    /// dual-domain goal as `scope=fullstack`; the FSM dispatches all
-    /// 8 stages.
+    /// PARALLEL chain (W3-12j). Owner runs it manually with
+    /// `cargo test -- --ignored` post-commit. The Coordinator brain
+    /// should classify a dual-domain goal as `scope=fullstack`;
+    /// the FSM dispatches all 8 stages with the two Build+Review
+    /// pairs racing concurrently via `tokio::join!`.
     ///
-    /// Time budget: 8 stages × 180s = 1440s (24 min) worst-case;
-    /// typical 6-12 min once warm.
+    /// Time budget: parallel dispatch saves ~30-40% of the W3-12i
+    /// sequential ~743s wall clock — target < 600s typical, with a
+    /// 600s/stage timeout still in place for the slowest stage.
+    /// Set-based assertion on `(state, specialist_id)` because the
+    /// two parallel pairs interleave their pushes to `Job.stages`
+    /// non-deterministically.
     #[tokio::test]
     #[ignore = "requires real `claude` binary + Pro/Max subscription"]
-    async fn integration_fullstack_chain_real_claude() {
+    async fn integration_fullstack_parallel_chain_real_claude() {
         use crate::swarm::transport::SubprocessTransport;
 
         // Isolate the child cargo's target dir so IntegrationTester
@@ -5906,23 +6907,19 @@ mod tests {
             stage_summary,
         );
         assert_eq!(outcome.stages.len(), 8);
-        let expected_ids = [
-            "scout",
-            "coordinator",
-            "planner",
-            "backend-builder",
-            "backend-reviewer",
-            "frontend-builder",
-            "frontend-reviewer",
-            "integration-tester",
-        ];
-        for (idx, expected) in expected_ids.iter().enumerate() {
-            assert_eq!(
-                outcome.stages[idx].specialist_id, *expected,
-                "stage {idx}: expected specialist_id `{expected}`, got `{}`",
-                outcome.stages[idx].specialist_id,
-            );
-        }
+        // Set-based assertion — Fullstack parallel dispatch
+        // interleaves the two Build/Review pairs in `Job.stages`.
+        // Pre-parallel prologue (Scout/Classify/Plan) and trailing
+        // Test stage are deterministic; the four middle stages are
+        // not.
+        assert_eq!(stage_set(&outcome.stages), expected_fullstack_stage_set());
+        assert_eq!(outcome.stages[0].specialist_id, "scout");
+        assert_eq!(outcome.stages[1].specialist_id, "coordinator");
+        assert_eq!(outcome.stages[2].specialist_id, "planner");
+        assert_eq!(
+            outcome.stages.last().expect("non-empty").specialist_id,
+            "integration-tester"
+        );
         let classify_stage = &outcome.stages[1];
         let decision = classify_stage
             .coordinator_decision
