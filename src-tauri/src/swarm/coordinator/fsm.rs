@@ -91,23 +91,66 @@ pub const TESTER_ID: &str = "integration-tester";
 /// (continue the canonical chain).
 pub const COORDINATOR_ID: &str = "coordinator";
 
-/// Resolve the (builder_id, reviewer_id) pair for a given
-/// `CoordinatorScope` (W3-12h).
+/// Resolve specialist (builder, reviewer) pairs for a given scope
+/// (W3-12i).
 ///
-/// - `Backend` → backend chain (current behavior).
-/// - `Frontend` → frontend chain (NEW activation in 12h).
-/// - `Fullstack` → falls back to the backend chain in 12h. W3-12i
-///   activates Fullstack sequential dispatch (BB+BR then FB+FR);
-///   W3-12j (if needed) activates Fullstack parallel dispatch.
-fn select_chain_ids(scope: CoordinatorScope) -> (&'static str, &'static str) {
+/// - `Backend` → one pair: backend-builder + backend-reviewer.
+/// - `Frontend` → one pair: frontend-builder + frontend-reviewer.
+/// - `Fullstack` → two pairs in dispatch order: backend pair first,
+///   then frontend pair. The FSM run loop iterates this Vec
+///   sequentially. W3-12j (future) parallelizes Fullstack via
+///   `tokio::join!`; 12i keeps the FSM mental model linear.
+///
+/// Single-domain scopes return a 1-element Vec so the for-loop in
+/// the run loop runs once — identical behavior to W3-12h's
+/// `select_chain_ids`. The W3-12h helper is gone; no callers
+/// remained post-12i.
+fn select_chain_pairs(
+    scope: CoordinatorScope,
+) -> Vec<(&'static str, &'static str)> {
     match scope {
-        CoordinatorScope::Backend => (BACKEND_BUILDER_ID, BACKEND_REVIEWER_ID),
-        CoordinatorScope::Frontend => (FRONTEND_BUILDER_ID, FRONTEND_REVIEWER_ID),
-        CoordinatorScope::Fullstack => {
-            // W3-12h fallback: same as 12g. W3-12i replaces this
-            // with the real sequential dispatch.
-            (BACKEND_BUILDER_ID, BACKEND_REVIEWER_ID)
+        CoordinatorScope::Backend => {
+            vec![(BACKEND_BUILDER_ID, BACKEND_REVIEWER_ID)]
         }
+        CoordinatorScope::Frontend => {
+            vec![(FRONTEND_BUILDER_ID, FRONTEND_REVIEWER_ID)]
+        }
+        CoordinatorScope::Fullstack => vec![
+            (BACKEND_BUILDER_ID, BACKEND_REVIEWER_ID),
+            (FRONTEND_BUILDER_ID, FRONTEND_REVIEWER_ID),
+        ],
+    }
+}
+
+/// Domain hint piped into the BUILD prompt so the Builder knows
+/// which side of a (potentially fullstack) plan to apply (W3-12i).
+///
+/// On Fullstack jobs the Plan covers both backend and frontend
+/// steps; without a domain hint, BackendBuilder reading "Plan'ın
+/// 1. adımı" would see step 1 = backend, but FrontendBuilder
+/// reading the same plan would also pick step 1 — re-implementing
+/// the backend step. The hint adds a single sentence steering the
+/// Builder toward its own domain's steps.
+///
+/// Single-domain scopes still pass `Some(...)` (the hint is a
+/// safe no-op there since the plan is already single-domain).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum BuilderDomain {
+    Backend,
+    Frontend,
+}
+
+/// Map a Builder profile id to its `BuilderDomain`. Defaults to
+/// `Backend` for any unknown id — the run loop only ever feeds
+/// this with the four canonical builder ids
+/// (`BACKEND_BUILDER_ID` / `FRONTEND_BUILDER_ID`), and the
+/// fallback keeps the function total without panicking on a
+/// programmer bug.
+fn builder_domain_for(builder_id: &str) -> BuilderDomain {
+    if builder_id == FRONTEND_BUILDER_ID {
+        BuilderDomain::Frontend
+    } else {
+        BuilderDomain::Backend
     }
 }
 
@@ -128,23 +171,36 @@ const SCOUT_PROMPT_TEMPLATE: &str =
      \n\
      {goal}\n";
 
-/// PLAN stage prompt template — Turkish, exact text from WP §3.
-/// Substitutions: `{goal}`, `{scout_output}`.
+/// PLAN stage prompt template — Turkish. W3-12i adds `{scope}` so
+/// the Planner knows whether to produce a single-domain plan or a
+/// dual-domain (backend + frontend) plan for Fullstack goals.
+/// Substitutions: `{goal}`, `{scope}`, `{scout_output}`.
 const PLAN_PROMPT_TEMPLATE: &str = "Hedef: {goal}\n\
+\n\
+Kapsam: {scope}\n\
 \n\
 Scout bulguları:\n\
 \n\
 {scout_output}\n\
 \n\
-Bu hedef için adım adım bir plan üret.\n";
+Bu hedef için adım adım bir plan üret. Kapsam fullstack ise \
+plan hem backend (Rust/SQL) hem frontend (TS/React/CSS) \
+adımlarını ayrı ayrı listelemeli; sıralama önemli — backend \
+önce, frontend sonra.\n";
 
-/// BUILD stage prompt template — Turkish, exact text from WP §3.
-/// Substitutions: `{plan_output}`. The "step 1 only" instruction is
-/// the contract from the manual mini-flow validation; multi-step
-/// build is a W3-12d concern.
+/// BUILD stage prompt template — Turkish. W3-12i adds a
+/// `{domain_note}` placeholder steering the Builder toward its own
+/// domain's steps when the upstream Plan is dual-domain (Fullstack).
+/// On single-domain scopes the note still fires (Backend → "backend
+/// tarafına bakıyorsun", Frontend → "frontend tarafına bakıyorsun")
+/// — a no-op nudge that costs ~1 line but keeps the prompt shape
+/// uniform across scopes. Substitutions: `{plan_output}`,
+/// `{domain_note}`.
 const BUILD_PROMPT_TEMPLATE: &str = "Aşağıdaki Plan'ın 1. adımını uygula.\n\
 \n\
 {plan_output}\n\
+\n\
+{domain_note}\n\
 \n\
 ŞU ANDA SADECE ADIM 1'İ UYGULA.\n";
 
@@ -208,9 +264,13 @@ Bu hedef için uygun rotayı seç. Çıktı sadece bir JSON objesi olmalı:\n\
 /// Planner can produce a corrected plan rather than starting from
 /// scratch. The `{gate}` substitution is `"Reviewer"` or
 /// `"IntegrationTester"` — the human-readable label of the gate that
-/// triggered the retry. Substitutions: `{goal}`, `{scout_output}`,
+/// triggered the retry. W3-12i adds `{scope}` so the retry plan stays
+/// scope-aware (Fullstack retries must still cover both domains).
+/// Substitutions: `{goal}`, `{scope}`, `{scout_output}`,
 /// `{verdict_issues}`, `{previous_plan}`, `{gate}`.
 const RETRY_PLAN_PROMPT_TEMPLATE: &str = "Hedef: {goal}\n\
+\n\
+Kapsam: {scope}\n\
 \n\
 Scout bulguları:\n\
 \n\
@@ -226,7 +286,9 @@ sorunlar:\n\
 {previous_plan}\n\
 \n\
 Bu sorunları çözecek yeni bir plan üret. Yalnızca reddedilen \
-sorunlara odaklan; mevcut başarılı kısımları yeniden tasarlama.\n";
+sorunlara odaklan; mevcut başarılı kısımları yeniden tasarlama. \
+Kapsam fullstack ise plan hem backend hem frontend adımlarını \
+kapsamalı.\n";
 
 /// Render the SCOUT prompt by substituting `{goal}`. Free fn so
 /// the prompt-template test can call it without a full FSM.
@@ -234,18 +296,60 @@ fn render_scout_prompt(goal: &str) -> String {
     SCOUT_PROMPT_TEMPLATE.replace("{goal}", goal)
 }
 
-/// Render the PLAN prompt by substituting `{goal}` and
+/// Render the PLAN prompt by substituting `{goal}`, `{scope}`, and
 /// `{scout_output}`. Pulled out as a free fn so the prompt-template
-/// test can call it without instantiating a full FSM.
-fn render_plan_prompt(goal: &str, scout_output: &str) -> String {
+/// test can call it without instantiating a full FSM. W3-12i adds
+/// `scope` so the Planner can produce a dual-domain plan for
+/// Fullstack goals (see `PLAN_PROMPT_TEMPLATE`).
+fn render_plan_prompt(
+    goal: &str,
+    scout_output: &str,
+    scope: CoordinatorScope,
+) -> String {
     PLAN_PROMPT_TEMPLATE
         .replace("{goal}", goal)
+        .replace("{scope}", scope_label(scope))
         .replace("{scout_output}", scout_output)
 }
 
-/// Render the BUILD prompt by substituting `{plan_output}`.
-fn render_build_prompt(plan_output: &str) -> String {
-    BUILD_PROMPT_TEMPLATE.replace("{plan_output}", plan_output)
+/// Render the BUILD prompt by substituting `{plan_output}` and
+/// `{domain_note}`. W3-12i adds `builder_domain` so the FSM can
+/// steer a Fullstack run's BackendBuilder vs FrontendBuilder toward
+/// its own half of the dual-domain plan. `None` is a backwards-compat
+/// path for tests that exercise the helper directly; the run loop
+/// always passes `Some(...)`.
+fn render_build_prompt(
+    plan_output: &str,
+    builder_domain: Option<BuilderDomain>,
+) -> String {
+    let domain_note = match builder_domain {
+        Some(BuilderDomain::Backend) => {
+            "Sen backend tarafına bakıyorsun (Rust / SQL / Tauri \
+             komutları). Plan'daki backend adımlarına odaklan; \
+             frontend adımlarını atla."
+        }
+        Some(BuilderDomain::Frontend) => {
+            "Sen frontend tarafına bakıyorsun (React / TS / CSS). \
+             Plan'daki frontend adımlarına odaklan; backend \
+             adımlarını atla."
+        }
+        None => "",
+    };
+    BUILD_PROMPT_TEMPLATE
+        .replace("{plan_output}", plan_output)
+        .replace("{domain_note}", domain_note)
+}
+
+/// Wire-form label for a scope (W3-12i). Matches the snake_case
+/// `#[serde(rename_all = "snake_case")]` enum encoding so the
+/// Planner sees the same string the persisted `decision.scope`
+/// carries.
+fn scope_label(scope: CoordinatorScope) -> &'static str {
+    match scope {
+        CoordinatorScope::Backend => "backend",
+        CoordinatorScope::Frontend => "frontend",
+        CoordinatorScope::Fullstack => "fullstack",
+    }
 }
 
 /// Render the CLASSIFY prompt by substituting `{goal}` and
@@ -295,11 +399,13 @@ fn render_retry_plan_prompt(
     previous_plan: &str,
     verdict: &Verdict,
     gate: JobState,
+    scope: CoordinatorScope,
 ) -> String {
     let gate_label = retry_gate_label(gate);
     let issues = verdict_issues_as_bullets(&verdict.issues);
     RETRY_PLAN_PROMPT_TEMPLATE
         .replace("{goal}", goal)
+        .replace("{scope}", scope_label(scope))
         .replace("{scout_output}", scout_output)
         .replace("{verdict_issues}", &issues)
         .replace("{previous_plan}", previous_plan)
@@ -704,31 +810,19 @@ impl<T: Transport> CoordinatorFsm<T> {
                 };
                 // W3-12g §6 — record route + scope for audit. The
                 // scope drives Builder + Reviewer selection in the
-                // retry loop below via `select_chain_ids`. The
+                // retry loop below via `select_chain_pairs`. The
                 // `tracing::info!` line stays as the canonical audit
                 // marker for every job (route + scope).
                 //
-                // W3-12h: scope=Frontend now correctly dispatches the
-                // frontend chain, so the warning that fired for
-                // Frontend in 12g is dropped. scope=Fullstack still
-                // falls back to the backend chain — the warn below
-                // flags that mismatch until W3-12i activates real
-                // Fullstack sequential dispatch.
+                // W3-12i: scope=Fullstack now dispatches the full
+                // sequential chain (BB+BR then FB+FR); the W3-12h
+                // fallback warn is dropped.
                 tracing::info!(
                     job_id = %job_id,
                     route = ?decision.route,
                     scope = ?decision.scope,
                     "swarm: Coordinator decision recorded"
                 );
-                if matches!(decision.scope, CoordinatorScope::Fullstack) {
-                    tracing::warn!(
-                        job_id = %job_id,
-                        scope = ?decision.scope,
-                        "swarm: scope=fullstack detected; W3-12h falls \
-                         back to backend chain — W3-12i activates \
-                         Fullstack sequential dispatch"
-                    );
-                }
                 // Stamp the parsed (or fallback) decision onto the
                 // StageResult so it lands in `swarm_stages.decision_json`
                 // via the registry's SQL write-through. We emit
@@ -805,41 +899,22 @@ impl<T: Transport> CoordinatorFsm<T> {
         //     `render_retry_plan_prompt`. `last_plan_text` keeps the
         //     prior plan around so the retry prompt can quote it
         //     verbatim.
+        //
+        //     W3-12i: Build/Review now iterates over
+        //     `select_chain_pairs(decision.scope)`. Backend/Frontend
+        //     return one pair → for-loop runs once (identical
+        //     behavior to W3-12h). Fullstack returns two pairs →
+        //     BB+BR runs first, then FB+FR; rejection at any pair's
+        //     Review gate triggers `try_start_retry` and re-runs the
+        //     whole Plan + pairs sequence (per-domain retry is a
+        //     future polish; see WP §"Notes / risks").
         let mut last_plan_text: Option<String> = None;
-        loop {
-            // W3-12h — pick the Builder + Reviewer chain from the
-            // Coordinator's parsed `decision.scope`. Resolution lives
-            // INSIDE the loop so future per-domain retry logic can
-            // pivot the chain across iterations without restructuring
-            // the run loop. For 12h the scope is stable for the life
-            // of a job (one Classify per job), so every iteration
-            // resolves the same pair; the per-iteration cost is one
-            // `HashMap::get` + `Profile::clone()` (cheap — Profile
-            // holds Strings).
-            let (builder_id, reviewer_id) =
-                select_chain_ids(decision.scope);
-            let builder = self
-                .profiles
-                .get(builder_id)
-                .ok_or_else(|| {
-                    AppError::Internal(format!(
-                        "missing profile id `{builder_id}`"
-                    ))
-                })?
-                .clone();
-            let reviewer = self
-                .profiles
-                .get(reviewer_id)
-                .ok_or_else(|| {
-                    AppError::Internal(format!(
-                        "missing profile id `{reviewer_id}`"
-                    ))
-                })?
-                .clone();
-
+        'retry_loop: loop {
             // PLAN — branches on `retry_count`. The first attempt
             // uses the canonical template; retries quote the prior
-            // plan + verdict issues.
+            // plan + verdict issues. The Plan covers all domains
+            // (Fullstack plan = backend section + frontend section);
+            // the per-pair BUILD prompt narrows via `BuilderDomain`.
             let plan_prompt = {
                 let snapshot = self.registry.get(&job_id).ok_or_else(|| {
                     AppError::Internal(format!(
@@ -847,7 +922,7 @@ impl<T: Transport> CoordinatorFsm<T> {
                     ))
                 })?;
                 if snapshot.retry_count == 0 {
-                    render_plan_prompt(&goal, &scout_text)
+                    render_plan_prompt(&goal, &scout_text, decision.scope)
                 } else {
                     let prev_plan = last_plan_text.as_deref().unwrap_or("");
                     // `last_verdict` is set by the rejection branch
@@ -871,6 +946,7 @@ impl<T: Transport> CoordinatorFsm<T> {
                         prev_plan,
                         &prev_verdict,
                         gate,
+                        decision.scope,
                     )
                 }
             };
@@ -919,109 +995,158 @@ impl<T: Transport> CoordinatorFsm<T> {
             };
             last_plan_text = Some(plan_text.clone());
 
-            // BUILD.
-            let build_prompt = render_build_prompt(&plan_text);
-            let build_text = match self
-                .run_stage_with_cancel(
-                    app,
-                    JobState::Build,
-                    &builder,
-                    &build_prompt,
-                    &job_id,
-                    &notify,
-                )
-                .await
-            {
-                StageOutcome::Ok(stage) => {
-                    let text = stage.assistant_text.clone();
-                    emit_swarm_event(
-                        app,
-                        &job_id,
-                        &SwarmJobEvent::StageCompleted {
-                            job_id: job_id.clone(),
-                            stage: stage.clone(),
-                        },
-                    );
-                    self.registry
-                        .update(&job_id, |j| {
-                            j.stages.push(stage);
-                        })
-                        .await?;
-                    text
-                }
-                StageOutcome::Err(e) => {
-                    self.finalize_failed(
-                        &job_id,
-                        &workspace_id,
-                        Some(e.to_string()),
-                    )
-                    .await?;
-                    return self.emit_finished_and_build(app, &job_id);
-                }
-                StageOutcome::Cancelled => {
-                    self.finalize_cancelled(&job_id, &workspace_id).await?;
-                    return self.emit_finished_and_build(app, &job_id);
-                }
-            };
+            // BUILD + REVIEW pairs (W3-12i). For Backend/Frontend
+            // this loop runs once; for Fullstack it runs twice
+            // (backend pair, then frontend pair). `last_build_text`
+            // tracks the most recent Builder output so the TEST
+            // gate after the loop has something to feed downstream
+            // (Fullstack = the FrontendBuilder's text; matches the
+            // sequential narrative).
+            let pairs = select_chain_pairs(decision.scope);
+            let mut last_build_text: Option<String> = None;
+            for (builder_id, reviewer_id) in &pairs {
+                let builder = self
+                    .profiles
+                    .get(builder_id)
+                    .ok_or_else(|| {
+                        AppError::Internal(format!(
+                            "missing profile id `{builder_id}`"
+                        ))
+                    })?
+                    .clone();
+                let reviewer = self
+                    .profiles
+                    .get(reviewer_id)
+                    .ok_or_else(|| {
+                        AppError::Internal(format!(
+                            "missing profile id `{reviewer_id}`"
+                        ))
+                    })?
+                    .clone();
+                let domain = builder_domain_for(builder_id);
 
-            // REVIEW gate.
-            let review_prompt =
-                render_review_prompt(&goal, &plan_text, &build_text);
-            match self
-                .run_verdict_stage(
-                    app,
-                    JobState::Review,
-                    &reviewer,
-                    &review_prompt,
-                    &job_id,
-                    &notify,
-                )
-                .await?
-            {
-                VerdictStageOutcome::Approved(_) => {}
-                VerdictStageOutcome::Rejected(verdict) => {
-                    if self
-                        .try_start_retry(
+                // BUILD.
+                let build_prompt =
+                    render_build_prompt(&plan_text, Some(domain));
+                let build_text = match self
+                    .run_stage_with_cancel(
+                        app,
+                        JobState::Build,
+                        &builder,
+                        &build_prompt,
+                        &job_id,
+                        &notify,
+                    )
+                    .await
+                {
+                    StageOutcome::Ok(stage) => {
+                        let text = stage.assistant_text.clone();
+                        emit_swarm_event(
                             app,
                             &job_id,
-                            JobState::Review,
-                            verdict.clone(),
-                        )
-                        .await?
-                    {
-                        continue;
+                            &SwarmJobEvent::StageCompleted {
+                                job_id: job_id.clone(),
+                                stage: stage.clone(),
+                            },
+                        );
+                        self.registry
+                            .update(&job_id, |j| {
+                                j.stages.push(stage);
+                            })
+                            .await?;
+                        text
                     }
-                    self.finalize_failed_with_verdict(
+                    StageOutcome::Err(e) => {
+                        self.finalize_failed(
+                            &job_id,
+                            &workspace_id,
+                            Some(e.to_string()),
+                        )
+                        .await?;
+                        return self.emit_finished_and_build(app, &job_id);
+                    }
+                    StageOutcome::Cancelled => {
+                        self.finalize_cancelled(&job_id, &workspace_id).await?;
+                        return self.emit_finished_and_build(app, &job_id);
+                    }
+                };
+                last_build_text = Some(build_text.clone());
+
+                // REVIEW gate for this pair.
+                let review_prompt =
+                    render_review_prompt(&goal, &plan_text, &build_text);
+                match self
+                    .run_verdict_stage(
+                        app,
+                        JobState::Review,
+                        &reviewer,
+                        &review_prompt,
                         &job_id,
-                        &workspace_id,
-                        verdict,
+                        &notify,
                     )
-                    .await?;
-                    return self.emit_finished_and_build(app, &job_id);
-                }
-                VerdictStageOutcome::ParseFailed(e) => {
-                    self.finalize_failed(
-                        &job_id,
-                        &workspace_id,
-                        Some(e.to_string()),
-                    )
-                    .await?;
-                    return self.emit_finished_and_build(app, &job_id);
-                }
-                VerdictStageOutcome::InvokeError(e) => {
-                    self.finalize_failed(
-                        &job_id,
-                        &workspace_id,
-                        Some(e.to_string()),
-                    )
-                    .await?;
-                    return self.emit_finished_and_build(app, &job_id);
-                }
-                VerdictStageOutcome::Cancelled => {
-                    self.finalize_cancelled(&job_id, &workspace_id).await?;
-                    return self.emit_finished_and_build(app, &job_id);
+                    .await?
+                {
+                    VerdictStageOutcome::Approved(_) => {
+                        // Continue to the next pair (or fall through
+                        // to the TEST gate when this was the last
+                        // pair).
+                    }
+                    VerdictStageOutcome::Rejected(verdict) => {
+                        if self
+                            .try_start_retry(
+                                app,
+                                &job_id,
+                                JobState::Review,
+                                verdict.clone(),
+                            )
+                            .await?
+                        {
+                            // Re-run the WHOLE pairs sequence from
+                            // PLAN. Wasteful for Fullstack on a
+                            // late-pair rejection (re-runs already-
+                            // approved earlier pair) but correct;
+                            // per-domain retry is a future polish.
+                            continue 'retry_loop;
+                        }
+                        self.finalize_failed_with_verdict(
+                            &job_id,
+                            &workspace_id,
+                            verdict,
+                        )
+                        .await?;
+                        return self.emit_finished_and_build(app, &job_id);
+                    }
+                    VerdictStageOutcome::ParseFailed(e) => {
+                        self.finalize_failed(
+                            &job_id,
+                            &workspace_id,
+                            Some(e.to_string()),
+                        )
+                        .await?;
+                        return self.emit_finished_and_build(app, &job_id);
+                    }
+                    VerdictStageOutcome::InvokeError(e) => {
+                        self.finalize_failed(
+                            &job_id,
+                            &workspace_id,
+                            Some(e.to_string()),
+                        )
+                        .await?;
+                        return self.emit_finished_and_build(app, &job_id);
+                    }
+                    VerdictStageOutcome::Cancelled => {
+                        self.finalize_cancelled(&job_id, &workspace_id).await?;
+                        return self.emit_finished_and_build(app, &job_id);
+                    }
                 }
             }
+
+            // All pairs approved. Run the TEST gate against the
+            // most recent Builder output. `expect`-free: the for-
+            // loop above always populates `last_build_text` because
+            // `select_chain_pairs` never returns an empty Vec —
+            // every CoordinatorScope variant maps to ≥1 pair.
+            let build_text = last_build_text.unwrap_or_default();
 
             // TEST gate.
             let test_prompt = render_test_prompt(&goal, &build_text);
@@ -1047,7 +1172,7 @@ impl<T: Transport> CoordinatorFsm<T> {
                         )
                         .await?
                     {
-                        continue;
+                        continue 'retry_loop;
                     }
                     self.finalize_failed_with_verdict(
                         &job_id,
@@ -1081,7 +1206,7 @@ impl<T: Transport> CoordinatorFsm<T> {
                 }
             }
 
-            // Both gates approved — happy path.
+            // All gates approved — happy path.
             // 8. Mark Done and release the workspace lock. The Drop
             //    guards will also fire on scope exit — both
             //    `release_workspace` and `unregister_cancel` are
@@ -4990,34 +5115,46 @@ mod tests {
     // WP-W3-12h — scope-aware single-domain dispatch
     // ----------------------------------------------------------------
 
-    /// `select_chain_ids(Backend)` → `(BACKEND_BUILDER_ID, BACKEND_REVIEWER_ID)`.
+    /// W3-12i: `select_chain_pairs(Backend)` returns one pair —
+    /// the backend builder + reviewer.
     #[test]
-    fn select_chain_ids_backend_returns_backend_pair() {
-        let (b, r) = select_chain_ids(CoordinatorScope::Backend);
+    fn select_chain_pairs_backend_returns_one_pair() {
+        let pairs = select_chain_pairs(CoordinatorScope::Backend);
+        assert_eq!(pairs.len(), 1);
+        let (b, r) = pairs[0];
         assert_eq!(b, BACKEND_BUILDER_ID);
         assert_eq!(b, "backend-builder");
         assert_eq!(r, BACKEND_REVIEWER_ID);
         assert_eq!(r, "backend-reviewer");
     }
 
-    /// `select_chain_ids(Frontend)` → `(FRONTEND_BUILDER_ID, FRONTEND_REVIEWER_ID)`.
+    /// W3-12i: `select_chain_pairs(Frontend)` returns one pair —
+    /// the frontend builder + reviewer.
     #[test]
-    fn select_chain_ids_frontend_returns_frontend_pair() {
-        let (b, r) = select_chain_ids(CoordinatorScope::Frontend);
+    fn select_chain_pairs_frontend_returns_one_pair() {
+        let pairs = select_chain_pairs(CoordinatorScope::Frontend);
+        assert_eq!(pairs.len(), 1);
+        let (b, r) = pairs[0];
         assert_eq!(b, FRONTEND_BUILDER_ID);
         assert_eq!(b, "frontend-builder");
         assert_eq!(r, FRONTEND_REVIEWER_ID);
         assert_eq!(r, "frontend-reviewer");
     }
 
-    /// W3-12h contract: `select_chain_ids(Fullstack)` falls back to
-    /// the backend chain. W3-12i replaces this with sequential
-    /// (BB+BR then FB+FR) dispatch and updates this test.
+    /// W3-12i: `select_chain_pairs(Fullstack)` returns two pairs in
+    /// dispatch order — backend pair first (idx 0), then frontend
+    /// pair (idx 1). The order is the contract; the FSM run loop
+    /// iterates this Vec sequentially.
     #[test]
-    fn select_chain_ids_fullstack_falls_back_to_backend() {
-        let (b, r) = select_chain_ids(CoordinatorScope::Fullstack);
-        assert_eq!(b, BACKEND_BUILDER_ID);
-        assert_eq!(r, BACKEND_REVIEWER_ID);
+    fn select_chain_pairs_fullstack_returns_two_pairs() {
+        let pairs = select_chain_pairs(CoordinatorScope::Fullstack);
+        assert_eq!(pairs.len(), 2);
+        // Backend pair MUST come first.
+        assert_eq!(pairs[0].0, BACKEND_BUILDER_ID);
+        assert_eq!(pairs[0].1, BACKEND_REVIEWER_ID);
+        // Frontend pair second.
+        assert_eq!(pairs[1].0, FRONTEND_BUILDER_ID);
+        assert_eq!(pairs[1].1, FRONTEND_REVIEWER_ID);
     }
 
     /// scope=Backend (default) keeps the existing dispatch shape:
@@ -5111,41 +5248,95 @@ mod tests {
         );
     }
 
-    /// W3-12h fullstack contract: scope=Fullstack falls back to the
-    /// backend chain (W3-12i activates Fullstack sequential
-    /// dispatch). Verifies the helper's fallback wires correctly
-    /// through the run loop.
-    #[tokio::test]
-    async fn fsm_scope_fullstack_falls_back_to_backend_chain() {
-        let (app, _pool, _dir) = mock_app_with_pool().await;
-        let mut responses = happy_5_stage_responses(
-            "s", "p", "b", 0.0, 0.0, 0.0,
-        );
-        responses.insert(
+    // ----------------------------------------------------------------
+    // WP-W3-12i — Fullstack sequential dispatch (BB+BR then FB+FR)
+    // ----------------------------------------------------------------
+
+    /// Build the canonical 8-stage Fullstack happy-path response set:
+    /// scout/planner/builders return text; reviewers + tester return
+    /// approved verdicts; coordinator votes ExecutePlan + Fullstack.
+    /// Used by Fullstack happy-path tests so each test doesn't have
+    /// to spell out 8 mock entries inline.
+    fn happy_fullstack_responses() -> HashMap<String, MockResponse> {
+        let mut r: HashMap<String, MockResponse> = HashMap::new();
+        r.insert(SCOUT_ID.into(), ok_response("scout findings", 0.0));
+        r.insert(PLANNER_ID.into(), ok_response("dual-domain plan", 0.0));
+        r.insert(BACKEND_BUILDER_ID.into(), ok_response("be-build", 0.0));
+        r.insert(BACKEND_REVIEWER_ID.into(), ok_verdict_response(0.0));
+        r.insert(FRONTEND_BUILDER_ID.into(), ok_response("fe-build", 0.0));
+        r.insert(FRONTEND_REVIEWER_ID.into(), ok_verdict_response(0.0));
+        r.insert(TESTER_ID.into(), ok_verdict_response(0.0));
+        r.insert(
             COORDINATOR_ID.into(),
             execute_plan_fullstack_decision_response(),
         );
+        r
+    }
+
+    /// scope=Fullstack walks all 8 stages on the approved path:
+    /// scout → coordinator (Classify) → planner → backend-builder →
+    /// backend-reviewer → frontend-builder → frontend-reviewer →
+    /// integration-tester → Done. Stage IDs assert the dispatch
+    /// order is exactly the report §2.1 sequential hierarchy.
+    #[tokio::test]
+    async fn fsm_scope_fullstack_walks_eight_stages_on_approved_path() {
+        let (app, _pool, _dir) = mock_app_with_pool().await;
         let fsm = CoordinatorFsm::new(
             synthetic_registry(),
-            MockTransport::new(responses),
+            MockTransport::new(happy_fullstack_responses()),
             Arc::new(JobRegistry::new()),
             Duration::from_secs(5),
         );
         let outcome = fsm
             .run_job(
                 app.handle(),
-                "ws-scope-fs".into(),
-                "fullstack goal".into(),
+                "ws-fs-happy".into(),
+                "add /me IPC + useMe hook".into(),
             )
             .await
             .expect("FSM ok");
         assert_eq!(outcome.final_state, JobState::Done);
-        assert_eq!(outcome.stages.len(), 6);
-        // Fullstack still routes through the backend chain in 12h.
-        assert_eq!(outcome.stages[3].specialist_id, BACKEND_BUILDER_ID);
-        assert_eq!(outcome.stages[4].specialist_id, BACKEND_REVIEWER_ID);
-        // Decision carries scope=Fullstack so the audit trail is
-        // intact for W3-12i to consume.
+        assert_eq!(outcome.stages.len(), 8);
+        // Stage IDs in order — this is the contract.
+        let expected_ids = [
+            SCOUT_ID,
+            COORDINATOR_ID,
+            PLANNER_ID,
+            BACKEND_BUILDER_ID,
+            BACKEND_REVIEWER_ID,
+            FRONTEND_BUILDER_ID,
+            FRONTEND_REVIEWER_ID,
+            TESTER_ID,
+        ];
+        for (idx, expected) in expected_ids.iter().enumerate() {
+            assert_eq!(
+                outcome.stages[idx].specialist_id, *expected,
+                "stage {idx}: expected `{expected}`, got `{}`",
+                outcome.stages[idx].specialist_id,
+            );
+        }
+        // Stage state ordering: scout, classify, plan, build, review,
+        // build, review, test.
+        assert_eq!(outcome.stages[0].state, JobState::Scout);
+        assert_eq!(outcome.stages[1].state, JobState::Classify);
+        assert_eq!(outcome.stages[2].state, JobState::Plan);
+        assert_eq!(outcome.stages[3].state, JobState::Build);
+        assert_eq!(outcome.stages[4].state, JobState::Review);
+        assert_eq!(outcome.stages[5].state, JobState::Build);
+        assert_eq!(outcome.stages[6].state, JobState::Review);
+        assert_eq!(outcome.stages[7].state, JobState::Test);
+        // Both Reviewer stages + the Tester stage carry verdicts.
+        for idx in [4, 6, 7] {
+            assert!(
+                outcome.stages[idx]
+                    .verdict
+                    .as_ref()
+                    .map(|v| v.approved)
+                    .unwrap_or(false),
+                "stage {idx} should carry approved verdict"
+            );
+        }
+        // Decision still records scope=Fullstack.
         assert_eq!(
             outcome.stages[1]
                 .coordinator_decision
@@ -5153,6 +5344,525 @@ mod tests {
                 .map(|d| d.scope),
             Some(CoordinatorScope::Fullstack)
         );
+    }
+
+    /// BackendReviewer rejects on attempt 1, approves on attempt 2.
+    /// FrontendReviewer + Tester always approve. Final Done,
+    /// retry_count=1.
+    ///
+    /// Stage count breakdown:
+    /// - attempt 1: scout(1) + classify(1) + plan(1) + BB(1) +
+    ///   BR-rejected(1) = 5 stages.
+    /// - attempt 2: plan(1) + BB(1) + BR-approved(1) + FB(1) +
+    ///   FR-approved(1) + test(1) = 6 stages. (Scout + Classify
+    ///   cached.)
+    /// - total = 11.
+    #[tokio::test]
+    async fn fsm_scope_fullstack_backend_review_rejection_retries_full_chain() {
+        let (app, _pool, _dir) = mock_app_with_pool().await;
+        let registry = Arc::new(JobRegistry::new());
+        let mut responses: HashMap<String, Vec<MockResponse>> = HashMap::new();
+        responses.insert(SCOUT_ID.into(), vec![ok_response("s", 0.0)]);
+        responses.insert(
+            COORDINATOR_ID.into(),
+            vec![execute_plan_fullstack_decision_response()],
+        );
+        responses.insert(
+            PLANNER_ID.into(),
+            vec![ok_response("p1", 0.0), ok_response("p2", 0.0)],
+        );
+        responses.insert(
+            BACKEND_BUILDER_ID.into(),
+            vec![ok_response("be1", 0.0), ok_response("be2", 0.0)],
+        );
+        responses.insert(
+            BACKEND_REVIEWER_ID.into(),
+            vec![
+                rejected_verdict_response("missing import"),
+                ok_verdict_response(0.0),
+            ],
+        );
+        responses
+            .insert(FRONTEND_BUILDER_ID.into(), vec![ok_response("fe", 0.0)]);
+        responses
+            .insert(FRONTEND_REVIEWER_ID.into(), vec![ok_verdict_response(0.0)]);
+        responses.insert(TESTER_ID.into(), vec![ok_verdict_response(0.0)]);
+
+        let mock = Arc::new(SequencedMock::new(responses));
+        let fsm = CoordinatorFsm::new(
+            synthetic_registry(),
+            ArcSequencedMock(Arc::clone(&mock)),
+            Arc::clone(&registry),
+            Duration::from_secs(5),
+        );
+        let job_id = "j-fs-br-retry".to_string();
+        let outcome = fsm
+            .run_job_with_id(
+                app.handle(),
+                job_id.clone(),
+                "ws-fs-br-retry".into(),
+                "fullstack goal".into(),
+            )
+            .await
+            .expect("FSM ok");
+        assert_eq!(outcome.final_state, JobState::Done);
+        assert_eq!(outcome.stages.len(), 11);
+        let job = registry.get(&job_id).expect("job in registry");
+        assert_eq!(job.retry_count, 1);
+        // Frontend specialists never invoked on attempt 1 (BR
+        // short-circuits before FB/FR).
+        assert_eq!(mock.call_count(FRONTEND_BUILDER_ID), 1);
+        assert_eq!(mock.call_count(FRONTEND_REVIEWER_ID), 1);
+        // Backend specialists invoked twice (one per attempt).
+        assert_eq!(mock.call_count(BACKEND_BUILDER_ID), 2);
+        assert_eq!(mock.call_count(BACKEND_REVIEWER_ID), 2);
+        // Scout + Coordinator each once.
+        assert_eq!(mock.call_count(SCOUT_ID), 1);
+        assert_eq!(mock.call_count(COORDINATOR_ID), 1);
+    }
+
+    /// FrontendReviewer rejects on attempt 1, approves on attempt 2.
+    /// All other gates approve. Final Done, retry_count=1.
+    ///
+    /// Stage count breakdown:
+    /// - attempt 1: scout + classify + plan + BB + BR-approved +
+    ///   FB + FR-rejected = 7 stages.
+    /// - attempt 2: plan + BB + BR + FB + FR + test = 6 stages.
+    ///   (Scout + Classify cached.)
+    /// - total = 13.
+    ///
+    /// Backend stages re-run on retry — wasteful but correct (per-
+    /// domain retry is a future polish).
+    #[tokio::test]
+    async fn fsm_scope_fullstack_frontend_review_rejection_retries_full_chain() {
+        let (app, _pool, _dir) = mock_app_with_pool().await;
+        let registry = Arc::new(JobRegistry::new());
+        let mut responses: HashMap<String, Vec<MockResponse>> = HashMap::new();
+        responses.insert(SCOUT_ID.into(), vec![ok_response("s", 0.0)]);
+        responses.insert(
+            COORDINATOR_ID.into(),
+            vec![execute_plan_fullstack_decision_response()],
+        );
+        responses.insert(
+            PLANNER_ID.into(),
+            vec![ok_response("p1", 0.0), ok_response("p2", 0.0)],
+        );
+        responses.insert(
+            BACKEND_BUILDER_ID.into(),
+            vec![ok_response("be1", 0.0), ok_response("be2", 0.0)],
+        );
+        responses.insert(
+            BACKEND_REVIEWER_ID.into(),
+            vec![ok_verdict_response(0.0), ok_verdict_response(0.0)],
+        );
+        responses.insert(
+            FRONTEND_BUILDER_ID.into(),
+            vec![ok_response("fe1", 0.0), ok_response("fe2", 0.0)],
+        );
+        responses.insert(
+            FRONTEND_REVIEWER_ID.into(),
+            vec![
+                rejected_verdict_response("missing JSDoc"),
+                ok_verdict_response(0.0),
+            ],
+        );
+        responses.insert(TESTER_ID.into(), vec![ok_verdict_response(0.0)]);
+
+        let mock = Arc::new(SequencedMock::new(responses));
+        let fsm = CoordinatorFsm::new(
+            synthetic_registry(),
+            ArcSequencedMock(Arc::clone(&mock)),
+            Arc::clone(&registry),
+            Duration::from_secs(5),
+        );
+        let job_id = "j-fs-fr-retry".to_string();
+        let outcome = fsm
+            .run_job_with_id(
+                app.handle(),
+                job_id.clone(),
+                "ws-fs-fr-retry".into(),
+                "fullstack goal".into(),
+            )
+            .await
+            .expect("FSM ok");
+        assert_eq!(outcome.final_state, JobState::Done);
+        assert_eq!(outcome.stages.len(), 13);
+        let job = registry.get(&job_id).expect("job in registry");
+        assert_eq!(job.retry_count, 1);
+        // Backend stages re-run on retry — cost of full-chain retry.
+        assert_eq!(mock.call_count(BACKEND_BUILDER_ID), 2);
+        assert_eq!(mock.call_count(BACKEND_REVIEWER_ID), 2);
+        // Frontend stages also run twice (one per attempt).
+        assert_eq!(mock.call_count(FRONTEND_BUILDER_ID), 2);
+        assert_eq!(mock.call_count(FRONTEND_REVIEWER_ID), 2);
+    }
+
+    /// Test gate rejects on attempt 1, approves on attempt 2. Both
+    /// Reviewer gates always approve. Final Done, retry_count=1.
+    /// Re-runs the full chain (scout cached) on retry.
+    #[tokio::test]
+    async fn fsm_scope_fullstack_test_rejection_retries_full_chain() {
+        let (app, _pool, _dir) = mock_app_with_pool().await;
+        let registry = Arc::new(JobRegistry::new());
+        let mut responses: HashMap<String, Vec<MockResponse>> = HashMap::new();
+        responses.insert(SCOUT_ID.into(), vec![ok_response("s", 0.0)]);
+        responses.insert(
+            COORDINATOR_ID.into(),
+            vec![execute_plan_fullstack_decision_response()],
+        );
+        responses.insert(
+            PLANNER_ID.into(),
+            vec![ok_response("p1", 0.0), ok_response("p2", 0.0)],
+        );
+        responses.insert(
+            BACKEND_BUILDER_ID.into(),
+            vec![ok_response("be1", 0.0), ok_response("be2", 0.0)],
+        );
+        responses.insert(
+            BACKEND_REVIEWER_ID.into(),
+            vec![ok_verdict_response(0.0), ok_verdict_response(0.0)],
+        );
+        responses.insert(
+            FRONTEND_BUILDER_ID.into(),
+            vec![ok_response("fe1", 0.0), ok_response("fe2", 0.0)],
+        );
+        responses.insert(
+            FRONTEND_REVIEWER_ID.into(),
+            vec![ok_verdict_response(0.0), ok_verdict_response(0.0)],
+        );
+        responses.insert(
+            TESTER_ID.into(),
+            vec![
+                rejected_verdict_response("test_foo failed"),
+                ok_verdict_response(0.0),
+            ],
+        );
+
+        let mock = Arc::new(SequencedMock::new(responses));
+        let fsm = CoordinatorFsm::new(
+            synthetic_registry(),
+            ArcSequencedMock(Arc::clone(&mock)),
+            Arc::clone(&registry),
+            Duration::from_secs(5),
+        );
+        let job_id = "j-fs-test-retry".to_string();
+        let outcome = fsm
+            .run_job_with_id(
+                app.handle(),
+                job_id.clone(),
+                "ws-fs-test-retry".into(),
+                "fullstack goal".into(),
+            )
+            .await
+            .expect("FSM ok");
+        assert_eq!(outcome.final_state, JobState::Done);
+        let job = registry.get(&job_id).expect("job");
+        assert_eq!(job.retry_count, 1);
+        // attempt 1: scout + classify + plan + BB + BR + FB + FR +
+        // test-rejected = 8. attempt 2: plan + BB + BR + FB + FR +
+        // test = 6. Total 14.
+        assert_eq!(outcome.stages.len(), 14);
+        // Tester invoked twice; both Reviewer gates twice; Builders
+        // twice each.
+        assert_eq!(mock.call_count(TESTER_ID), 2);
+        assert_eq!(mock.call_count(BACKEND_BUILDER_ID), 2);
+        assert_eq!(mock.call_count(FRONTEND_BUILDER_ID), 2);
+    }
+
+    /// FrontendReviewer rejects on every attempt → retry budget
+    /// exhausts at MAX_RETRIES. Final Failed, retry_count=2,
+    /// last_verdict.approved=false.
+    #[tokio::test]
+    async fn fsm_scope_fullstack_exhausts_retries_finalizes_failed() {
+        let (app, _pool, _dir) = mock_app_with_pool().await;
+        let registry = Arc::new(JobRegistry::new());
+        let mut responses: HashMap<String, Vec<MockResponse>> = HashMap::new();
+        responses.insert(SCOUT_ID.into(), vec![ok_response("s", 0.0)]);
+        responses.insert(
+            COORDINATOR_ID.into(),
+            vec![execute_plan_fullstack_decision_response()],
+        );
+        responses.insert(PLANNER_ID.into(), vec![ok_response("p", 0.0)]);
+        responses.insert(BACKEND_BUILDER_ID.into(), vec![ok_response("be", 0.0)]);
+        responses.insert(
+            BACKEND_REVIEWER_ID.into(),
+            vec![ok_verdict_response(0.0)],
+        );
+        responses.insert(FRONTEND_BUILDER_ID.into(), vec![ok_response("fe", 0.0)]);
+        responses.insert(
+            FRONTEND_REVIEWER_ID.into(),
+            vec![rejected_verdict_response("never approving")],
+        );
+        responses.insert(TESTER_ID.into(), vec![ok_verdict_response(0.0)]);
+
+        let mock = Arc::new(SequencedMock::new(responses));
+        let fsm = CoordinatorFsm::new(
+            synthetic_registry(),
+            ArcSequencedMock(Arc::clone(&mock)),
+            Arc::clone(&registry),
+            Duration::from_secs(5),
+        );
+        let job_id = "j-fs-exhaust".to_string();
+        let outcome = fsm
+            .run_job_with_id(
+                app.handle(),
+                job_id.clone(),
+                "ws-fs-exhaust".into(),
+                "fullstack goal".into(),
+            )
+            .await
+            .expect("FSM ok");
+        assert_eq!(outcome.final_state, JobState::Failed);
+        let job = registry.get(&job_id).expect("job");
+        assert_eq!(job.retry_count, MAX_RETRIES);
+        // last_verdict reflects the rejecting FrontendReviewer.
+        let lv = outcome.last_verdict.as_ref().expect("last_verdict set");
+        assert!(!lv.approved);
+        // Tester never runs across all attempts (FR rejects first).
+        assert_eq!(mock.call_count(TESTER_ID), 0);
+    }
+
+    /// Plan prompt for scope=Fullstack carries the fullstack scope
+    /// label so the Planner produces a dual-domain plan.
+    #[test]
+    fn plan_prompt_includes_fullstack_scope_when_scope_is_fullstack() {
+        let p = render_plan_prompt(
+            "G",
+            "S",
+            CoordinatorScope::Fullstack,
+        );
+        assert!(
+            p.contains("Kapsam: fullstack"),
+            "fullstack scope not in plan prompt: {p}"
+        );
+    }
+
+    /// Plan prompt for scope=Backend carries the backend scope label.
+    #[test]
+    fn plan_prompt_includes_backend_scope_when_scope_is_backend() {
+        let p = render_plan_prompt("G", "S", CoordinatorScope::Backend);
+        assert!(
+            p.contains("Kapsam: backend"),
+            "backend scope not in plan prompt: {p}"
+        );
+    }
+
+    /// Plan prompt for scope=Frontend carries the frontend scope label.
+    #[test]
+    fn plan_prompt_includes_frontend_scope_when_scope_is_frontend() {
+        let p = render_plan_prompt("G", "S", CoordinatorScope::Frontend);
+        assert!(
+            p.contains("Kapsam: frontend"),
+            "frontend scope not in plan prompt: {p}"
+        );
+    }
+
+    /// Retry plan prompt also carries the scope so retries stay
+    /// scope-aware (Fullstack retries must still cover both domains).
+    #[test]
+    fn retry_plan_prompt_carries_scope() {
+        let verdict = Verdict {
+            approved: false,
+            issues: vec![],
+            summary: "no good".into(),
+        };
+        let p = render_retry_plan_prompt(
+            "G",
+            "S",
+            "PREV",
+            &verdict,
+            JobState::Review,
+            CoordinatorScope::Fullstack,
+        );
+        assert!(
+            p.contains("Kapsam: fullstack"),
+            "retry plan prompt missing fullstack scope: {p}"
+        );
+        // Sanity: scope substitution leaves no placeholders.
+        assert!(!p.contains("{scope}"));
+    }
+
+    /// On a Fullstack run, the BackendBuilder's BUILD prompt carries
+    /// the backend domain note (steers Builder toward backend steps
+    /// of the dual-domain plan).
+    #[tokio::test]
+    async fn build_prompt_includes_backend_domain_note_for_backend_builder() {
+        let (app, _pool, _dir) = mock_app_with_pool().await;
+        let mock = Arc::new(MockTransport::new(happy_fullstack_responses()));
+        let fsm = CoordinatorFsm::new(
+            synthetic_registry(),
+            ArcTransport(Arc::clone(&mock)),
+            Arc::new(JobRegistry::new()),
+            Duration::from_secs(5),
+        );
+        fsm.run_job(app.handle(), "ws-fs-be-note".into(), "g".into())
+            .await
+            .expect("FSM ok");
+        let seen = mock.seen();
+        let be_build_prompt = seen
+            .iter()
+            .find(|(id, _)| id == BACKEND_BUILDER_ID)
+            .map(|(_, p)| p.as_str())
+            .expect("backend-builder prompt recorded");
+        assert!(
+            be_build_prompt.contains("backend tarafına bakıyorsun"),
+            "backend-builder prompt missing backend domain note: {be_build_prompt}"
+        );
+    }
+
+    /// On a Fullstack run, the FrontendBuilder's BUILD prompt carries
+    /// the frontend domain note.
+    #[tokio::test]
+    async fn build_prompt_includes_frontend_domain_note_for_frontend_builder() {
+        let (app, _pool, _dir) = mock_app_with_pool().await;
+        let mock = Arc::new(MockTransport::new(happy_fullstack_responses()));
+        let fsm = CoordinatorFsm::new(
+            synthetic_registry(),
+            ArcTransport(Arc::clone(&mock)),
+            Arc::new(JobRegistry::new()),
+            Duration::from_secs(5),
+        );
+        fsm.run_job(app.handle(), "ws-fs-fe-note".into(), "g".into())
+            .await
+            .expect("FSM ok");
+        let seen = mock.seen();
+        let fe_build_prompt = seen
+            .iter()
+            .find(|(id, _)| id == FRONTEND_BUILDER_ID)
+            .map(|(_, p)| p.as_str())
+            .expect("frontend-builder prompt recorded");
+        assert!(
+            fe_build_prompt.contains("frontend tarafına bakıyorsun"),
+            "frontend-builder prompt missing frontend domain note: {fe_build_prompt}"
+        );
+    }
+
+    /// Pool-backed Fullstack happy path. All 8 stages and per-stage
+    /// `specialist_id` round-trip through SQLite via the registry's
+    /// write-through.
+    #[tokio::test]
+    async fn fsm_fullstack_persistence_round_trip() {
+        let (app, _pool, _dir) = mock_app_with_pool().await;
+        let (registry, _pool, _reg_dir) = pool_backed_registry().await;
+        let fsm = CoordinatorFsm::new(
+            synthetic_registry(),
+            MockTransport::new(happy_fullstack_responses()),
+            Arc::clone(&registry),
+            Duration::from_secs(5),
+        );
+        let job_id = "j-fs-persist".to_string();
+        fsm.run_job_with_id(
+            app.handle(),
+            job_id.clone(),
+            "ws-fs-persist".into(),
+            "fullstack goal".into(),
+        )
+        .await
+        .expect("FSM ok");
+
+        let detail = registry
+            .get_job_detail(&job_id)
+            .await
+            .expect("query")
+            .expect("Some");
+        assert_eq!(detail.stages.len(), 8);
+        // Per-stage specialist_id round-trip in dispatch order.
+        assert_eq!(detail.stages[0].specialist_id, SCOUT_ID);
+        assert_eq!(detail.stages[1].specialist_id, COORDINATOR_ID);
+        assert_eq!(detail.stages[2].specialist_id, PLANNER_ID);
+        assert_eq!(detail.stages[3].specialist_id, BACKEND_BUILDER_ID);
+        assert_eq!(detail.stages[4].specialist_id, BACKEND_REVIEWER_ID);
+        assert_eq!(detail.stages[5].specialist_id, FRONTEND_BUILDER_ID);
+        assert_eq!(detail.stages[6].specialist_id, FRONTEND_REVIEWER_ID);
+        assert_eq!(detail.stages[7].specialist_id, TESTER_ID);
+        // Decision still records scope=Fullstack.
+        let classify = &detail.stages[1];
+        let decision = classify
+            .coordinator_decision
+            .as_ref()
+            .expect("decision persisted");
+        assert_eq!(decision.scope, CoordinatorScope::Fullstack);
+    }
+
+    /// Real-claude integration smoke (`#[ignore]`) for the Fullstack
+    /// chain. Owner runs it manually with `cargo test -- --ignored`
+    /// post-commit. The Coordinator brain should classify a
+    /// dual-domain goal as `scope=fullstack`; the FSM dispatches all
+    /// 8 stages.
+    ///
+    /// Time budget: 8 stages × 180s = 1440s (24 min) worst-case;
+    /// typical 6-12 min once warm.
+    #[tokio::test]
+    #[ignore = "requires real `claude` binary + Pro/Max subscription"]
+    async fn integration_fullstack_chain_real_claude() {
+        use crate::swarm::transport::SubprocessTransport;
+
+        let stage_secs = std::env::var("NEURON_SWARM_STAGE_TIMEOUT_SEC")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(180);
+
+        let (app, _pool, _dir) = mock_app_with_pool().await;
+        let profiles = bundled_registry();
+        let transport = SubprocessTransport::new();
+        let registry = Arc::new(JobRegistry::new());
+        let fsm = CoordinatorFsm::new(
+            profiles,
+            transport,
+            registry,
+            Duration::from_secs(stage_secs),
+        );
+        // Textbook fullstack edit: one Rust file, one TSX file,
+        // both doc-only.
+        let goal = "Add a one-line doc comment to TWO files: \
+            (1) above the `Job` struct definition in \
+            src-tauri/src/swarm/coordinator/job.rs, briefly noting that \
+            Job carries the full lifecycle of a swarm run; \
+            (2) above the `formatRelativeMs` function exported from \
+            app/src/components/SwarmJobList.tsx, briefly noting that \
+            the helper rounds to the nearest minute. \
+            Just the two doc comments. Do not change behavior.";
+        let outcome = fsm
+            .run_job(app.handle(), "default".into(), goal.into())
+            .await
+            .expect("FSM returns Ok");
+        let stage_summary: Vec<(String, String)> = outcome
+            .stages
+            .iter()
+            .map(|s| (format!("{:?}", s.state), s.specialist_id.clone()))
+            .collect();
+        assert_eq!(
+            outcome.final_state,
+            JobState::Done,
+            "expected Done, got {:?} (stages: {:?})",
+            outcome.final_state,
+            stage_summary,
+        );
+        assert_eq!(outcome.stages.len(), 8);
+        let expected_ids = [
+            "scout",
+            "coordinator",
+            "planner",
+            "backend-builder",
+            "backend-reviewer",
+            "frontend-builder",
+            "frontend-reviewer",
+            "integration-tester",
+        ];
+        for (idx, expected) in expected_ids.iter().enumerate() {
+            assert_eq!(
+                outcome.stages[idx].specialist_id, *expected,
+                "stage {idx}: expected specialist_id `{expected}`, got `{}`",
+                outcome.stages[idx].specialist_id,
+            );
+        }
+        let classify_stage = &outcome.stages[1];
+        let decision = classify_stage
+            .coordinator_decision
+            .as_ref()
+            .expect("Classify stage must carry a CoordinatorDecision");
+        assert_eq!(decision.scope, CoordinatorScope::Fullstack);
     }
 
     /// `StageResult.specialist_id` round-trips through SQLite for a
@@ -5535,6 +6245,7 @@ mod tests {
             "PREV-Z",
             &verdict,
             JobState::Test,
+            CoordinatorScope::Backend,
         );
         assert!(p.contains("GOAL-X"));
         assert!(p.contains("SCOUT-Y"));
