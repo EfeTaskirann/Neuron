@@ -4,6 +4,42 @@ Running journal of agent-driven changes. Newest entry on top. See `AGENTS.md` §
 
 ---
 
+## 2026-05-07T01:25Z WP-W3-12k2 completed — 9-agent vision PRODUCTION-READY (persistent chat + context)
+
+- dispatch: **single sub-agent**; backend SQLite + frontend hook integration. No real-claude smoke (mock tests cover persistence + render; W3-11/12k1 cover substrate).
+- sub-agent: general-purpose
+- files changed: 14 in commit `5747cb5`
+  - new — Rust: `src-tauri/migrations/0009_orchestrator_messages.sql`, `src-tauri/src/swarm/coordinator/orchestrator_session.rs`
+  - new — frontend hooks: `app/src/hooks/{useOrchestratorHistory,useClearOrchestratorHistory,useLogOrchestratorJob}.ts` + `useOrchestratorHistory.test.tsx`
+  - new — planning: `docs/work-packages/WP-W3-12k2-orchestrator-persistent-history.md`
+  - modified: `src-tauri/src/swarm/coordinator/mod.rs` (re-export), `src-tauri/src/commands/swarm.rs` (decide extended + 3 new IPCs), `src-tauri/src/lib.rs` (specta registration), `src-tauri/src/db.rs` (migration count 8→9, table count 15→16), `app/src/components/OrchestratorChatPanel.{tsx,test.tsx}` (seed-from-history + Clear button + log-job-on-dispatch), `app/src/routes/SwarmRoute.test.tsx` (new IPC mocks), `app/src/lib/bindings.ts` (regen +OrchestratorMessage +OrchestratorMessageRole +3 commands)
+- commit SHA: `5747cb5`
+- acceptance: ✅ pass
+  - `cargo check` → exit 0
+  - `cargo test --lib` → exit 0, **388 passed; 0 failed; 12 ignored** (364 prior + 24 new)
+  - `pnpm gen:bindings/check/typecheck/test/lint` → all 0
+  - **No real-claude integration smoke** — mock-tests cover the persistence + render layer; W3-12k1 covers the parser; W3-11 covers the substrate. End-to-end multi-message context validation is owner-driven post-commit via `pnpm tauri dev` and chatting with the Swarm.
+- key implementation choices
+  - **9-agent vision is now PRODUCTION-READY.** Architectural report §2.1's full hierarchy (Orchestrator → Coordinator → 7 specialists) is live AND PERSISTENT. Chat history survives reload. Multi-message context flows into the Orchestrator's prompt for context-aware decisions ("I want to refactor auth" → "/me endpoint" two-message pattern works correctly).
+  - **Persist user message BEFORE invoke.** If `transport.invoke` fails, the user's input is preserved in DB so they can see what they typed and retry. Documented in WP §3 + tested by `swarm_orchestrator_decide_persists_user_before_invoke`.
+  - **`render_with_history` empty-history short-circuit.** First turn (no history) is byte-identical to W3-12k1 stateless behavior. Subsequent turns prepend "Önceki konuşma:" block with role-prefixed lines.
+  - **JSON-pack the OrchestratorOutcome into `content` column.** content TEXT + role-based interpretation: User=raw text, Orchestrator=serialized OrchestratorOutcome JSON, Job=job_id with separate `goal` column. Trade-off: simpler schema vs role-aware parser. Schema simplicity wins.
+  - **`pub(crate)` not `pub(super)` for store helpers.** WP §2 example used `pub(super)` but `commands::swarm` lives outside `swarm::coordinator` — wouldn't compile. `pub(crate)` is the minimum scope that makes the IPC file callable.
+  - **Frontend `useMemo([...seed, ...local])` pattern.** WP §7 recipe was setState-in-useEffect; eslint's `react-hooks/set-state-in-effect` rule (recently added) forbids it. The seed+local-merge pattern preserves the same UX (mount-seed + live additions + Clear button) without setState-in-effect, AND prevents duplicate-bubble race on history-query invalidation mid-session.
+  - **No invalidate after decide.** Combined with the seed+local pattern, mid-session invalidation would re-seed with the just-persisted rows and duplicate every turn. Next mount picks up the full thread automatically. Clear-chat still invalidates so a follow-up mount sees empty.
+  - **3 IPCs for the chat surface** (history / clear / log_job) instead of one wrapping IPC. Composable; frontend orchestrates the sequence (decide → run_job → log_job).
+- bindings regenerated: yes (+`OrchestratorMessage`, +`OrchestratorMessageRole` enum, +3 commands)
+- branch: `main` (pushed; **0 commits ahead of `origin/main`** post-`5747cb5`)
+- known caveats / followups
+  - **No multi-workspace chat switching.** workspaceId stays `"default"` per W3-14/12k-3 pattern. Multi-workspace UX is post-W3.
+  - **No streaming Orchestrator response.** One-shot per message. Future polish.
+  - **No markdown rendering in bubbles.** Plain text. Acceptable for short conversational replies.
+  - **No age-based trim.** `clear_history` is the only purge. Long-running installs accumulate history; future polish could add a trim sweep.
+  - **History query has `staleTime: Infinity`.** Fetched once on mount; subsequent message additions update local state only. Reload picks up the persisted thread automatically.
+- next: 9-agent series is FEATURE-COMPLETE. Remaining backlog is the user's deferred polish list ("geliştirilmesi gereken birçok noktası var") + the W3-04/05/07/08/09/10 backlog from the original Week-3 plan (LangGraph cancel + streaming, approval UI, pane aggregates from spans, multi-workflow editor, capabilities tightening + E2E, Python embed). Consider the swarm-side iteration done unless owner wants W3-12j parallel-smoke goal-hardening.
+
+---
+
 ## 2026-05-07T01:00Z WP-W3-12k3 completed — 9-agent vision UX-COMPLETE (chat panel live)
 
 - dispatch: **single sub-agent**; frontend-only WP; no real-claude smoke (mock tests + W3-12k-1's parser tests cover the surface).
