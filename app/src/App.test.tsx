@@ -230,11 +230,19 @@ beforeEach(async () => {
 });
 
 describe('App shell', () => {
-  it('renders the sidebar with all 6 nav items', () => {
+  it('renders the sidebar with all 7 nav items', () => {
     renderApp();
     const nav = screen.getByRole('navigation');
     expect(nav).toBeInTheDocument();
-    for (const label of ['Workflow', 'Terminal', 'Agents', 'Runs', 'MCP', 'Settings']) {
+    for (const label of [
+      'Workflow',
+      'Terminal',
+      'Swarm',
+      'Agents',
+      'Runs',
+      'MCP',
+      'Settings',
+    ]) {
       expect(screen.getByText(label)).toBeInTheDocument();
     }
   });

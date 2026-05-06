@@ -7,6 +7,7 @@ import './styles/colors_and_type.css';
 import './styles/app.css';
 import './styles/canvas.css';
 import './styles/terminal.css';
+import './styles/swarm.css';
 
 const rootEl = document.getElementById('root');
 if (!rootEl) {

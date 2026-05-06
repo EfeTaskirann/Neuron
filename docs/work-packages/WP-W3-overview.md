@@ -51,7 +51,8 @@ matching WP file is authored.
 | WP-W3-10 | PyOxidizer Python embed | TBD | not-started | (W3-04 deferred — see Owner decision #4) | L |
 | WP-W3-11 | Swarm runtime foundation (claude subprocess substrate) | done (`f1596f8`) | shipped 2026-05-05 | WP-W3-01 | M |
 | WP-W3-12a | Coordinator FSM skeleton (in-memory, blocking, 3-state happy path) | done (`5890841`) | shipped 2026-05-05 | WP-W3-11 | M |
-| WP-W3-12b | Coordinator FSM — SQLite persistence + restart recovery | TBD | not-started | WP-W3-12a | M |
+| WP-W3-12b | Coordinator FSM — SQLite persistence + restart recovery | done (`9f8b4de`) | shipped 2026-05-06 | WP-W3-12a | M |
+| WP-W3-14 | Swarm UI route (chat-shape, recent-jobs panel, cancel/rerun) | TBD | not-started | WP-W3-12a/b/c | M |
 | WP-W3-12c | Coordinator FSM — streaming Tauri events + cancel mid-job (backend only; React hook → W3-14) | done (`3cb6be1`) | shipped 2026-05-05 | WP-W3-12a | M |
 | WP-W3-12d | Coordinator FSM — REVIEW/TEST states + Verdict schema + retry feedback + Coordinator LLM brain (Option B) | TBD | not-started | WP-W3-12a (ideally also 12b) | L |
 
