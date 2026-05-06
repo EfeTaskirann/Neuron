@@ -341,6 +341,12 @@ export type JobDetail = {
 	lastError: string | null,
 	totalCostUsd: number,
 	totalDurationMs: number,
+	/**
+	 *  Parsed Verdict (W3-12d). Mirrors `Job.last_verdict` —
+	 *  populated only when the FSM finalized the job as Failed
+	 *  because a Reviewer or Tester verdict came back rejected.
+	 */
+	lastVerdict?: Verdict | null,
 };
 
 /**
@@ -360,6 +366,13 @@ export type JobOutcome = {
 	totalCostUsd: number,
 	// Sum of `StageResult.duration_ms` across `stages`.
 	totalDurationMs: number,
+	/**
+	 *  Parsed Verdict (W3-12d). Populated when the FSM finalized
+	 *  the job as Failed because a Reviewer or Tester verdict came
+	 *  back rejected. `None` on the happy path and on stage-error
+	 *  failures.
+	 */
+	lastVerdict?: Verdict | null,
 };
 
 /**
@@ -753,6 +766,13 @@ export type StageResult = {
 	 *  `JobOutcome.total_duration_ms`.
 	 */
 	durationMs: number,
+	/**
+	 *  Parsed Verdict (W3-12d). Populated only for the `Review`
+	 *  and `Test` stages — Scout / Plan / Build leave this `None`.
+	 *  `serde(default)` lets older persisted JSON (no `verdict`
+	 *  key) deserialize unchanged.
+	 */
+	verdict?: Verdict | null,
 };
 
 /**
@@ -842,6 +862,46 @@ export type User = {
 	initials: string,
 	name: string,
 };
+
+/**
+ *  The Reviewer / Tester output. `approved=true` means "advance to
+ *  the next stage"; `approved=false` finalizes the job as Failed
+ *  and the issue list lands in the persisted `last_verdict_json`.
+ * 
+ *  Per WP §"Out of scope" there is NO retry loop in W3-12d — a
+ *  rejected verdict is terminal. W3-12e adds the feedback loop.
+ */
+export type Verdict = {
+	approved: boolean,
+	issues: VerdictIssue[],
+	summary: string,
+};
+
+/**
+ *  One Reviewer / Tester finding. `file` + `line` are optional so a
+ *  summary-only verdict (e.g. "tests passed, nothing to nit") can
+ *  emit an empty issues list and still be valid.
+ * 
+ *  `message` is renamed `msg` on the wire to match the persona
+ *  OUTPUT CONTRACT — keeping the JSON shape concise reduces the
+ *  odds of LLMs wandering off-shape mid-stream.
+ */
+export type VerdictIssue = {
+	severity: VerdictSeverity,
+	file: string | null,
+	line: number | null,
+	msg: string,
+};
+
+/**
+ *  Severity of a single Verdict issue. Reviewers grade findings on
+ *  this three-rung ladder; Tester surfaces failing-test names with
+ *  `High` for hard failures and `Med` for flakes-suspected.
+ * 
+ *  Wire form is snake_case (`"high"` / `"med"` / `"low"`) so the
+ *  frontend bindings match the persona contract verbatim.
+ */
+export type VerdictSeverity = "high" | "med" | "low";
 
 export type Workflow = {
 	id: string,

@@ -23,9 +23,11 @@
 pub mod fsm;
 pub mod job;
 pub(crate) mod store;
+pub mod verdict;
 
 pub use fsm::{CoordinatorFsm, MAX_RETRIES};
 pub use job::{
     Job, JobDetail, JobOutcome, JobRegistry, JobState, JobSummary,
     StageResult, SwarmJobEvent,
 };
+pub use verdict::{parse_verdict, Verdict, VerdictIssue, VerdictSeverity};

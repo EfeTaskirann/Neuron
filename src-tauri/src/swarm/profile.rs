@@ -582,10 +582,11 @@ mod tests {
         );
     }
 
-    /// All three bundled profiles load — the same gate the registry
-    /// passes on a clean install.
+    /// All five bundled profiles load — the same gate the registry
+    /// passes on a clean install. Reviewer + IntegrationTester
+    /// joined the bundle in W3-12d.
     #[test]
-    fn bundled_three_profiles_present() {
+    fn bundled_five_profiles_present() {
         let registry = ProfileRegistry::load_from(None).expect("load");
         let mut ids: Vec<&str> = registry
             .list()
@@ -593,7 +594,16 @@ mod tests {
             .map(|p| p.id.as_str())
             .collect();
         ids.sort();
-        assert_eq!(ids, vec!["backend-builder", "planner", "scout"]);
+        assert_eq!(
+            ids,
+            vec![
+                "backend-builder",
+                "integration-tester",
+                "planner",
+                "reviewer",
+                "scout",
+            ]
+        );
     }
 
     #[test]

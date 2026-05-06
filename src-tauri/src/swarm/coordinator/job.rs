@@ -35,6 +35,7 @@ use crate::db::DbPool;
 use crate::error::AppError;
 
 use super::store;
+use super::verdict::Verdict;
 
 /// Lifecycle states of a swarm job. Per WP §2:
 ///
@@ -138,6 +139,12 @@ pub struct StageResult {
     /// the `transport.invoke` await. Sums into
     /// `JobOutcome.total_duration_ms`.
     pub duration_ms: u64,
+    /// Parsed Verdict (W3-12d). Populated only for the `Review`
+    /// and `Test` stages — Scout / Plan / Build leave this `None`.
+    /// `serde(default)` lets older persisted JSON (no `verdict`
+    /// key) deserialize unchanged.
+    #[serde(default)]
+    pub verdict: Option<Verdict>,
 }
 
 /// One in-flight (or completed) swarm job. The registry indexes by
@@ -164,6 +171,12 @@ pub struct Job {
     pub stages: Vec<StageResult>,
     /// Populated when `state == Failed`. None on the happy path.
     pub last_error: Option<String>,
+    /// Parsed Verdict (W3-12d). Populated only when the FSM
+    /// finalized the job as Failed because a Reviewer or Tester
+    /// returned `approved=false`. The Verdict IS the structured
+    /// error, so on this branch `last_error` stays `None`.
+    #[serde(default)]
+    pub last_verdict: Option<Verdict>,
 }
 
 /// Final outcome returned by `swarm:run_job`. Mirrors `Job` minus
@@ -183,6 +196,12 @@ pub struct JobOutcome {
     pub total_cost_usd: f64,
     /// Sum of `StageResult.duration_ms` across `stages`.
     pub total_duration_ms: u64,
+    /// Parsed Verdict (W3-12d). Populated when the FSM finalized
+    /// the job as Failed because a Reviewer or Tester verdict came
+    /// back rejected. `None` on the happy path and on stage-error
+    /// failures.
+    #[serde(default)]
+    pub last_verdict: Option<Verdict>,
 }
 
 /// Slim wire-shape returned by `swarm:list_jobs` (WP-W3-12b §4).
@@ -228,6 +247,11 @@ pub struct JobDetail {
     pub last_error: Option<String>,
     pub total_cost_usd: f64,
     pub total_duration_ms: u64,
+    /// Parsed Verdict (W3-12d). Mirrors `Job.last_verdict` —
+    /// populated only when the FSM finalized the job as Failed
+    /// because a Reviewer or Tester verdict came back rejected.
+    #[serde(default)]
+    pub last_verdict: Option<Verdict>,
 }
 
 impl JobDetail {
@@ -258,6 +282,7 @@ impl JobDetail {
             last_error: job.last_error,
             total_cost_usd,
             total_duration_ms,
+            last_verdict: job.last_verdict,
         }
     }
 }
@@ -804,6 +829,7 @@ mod tests {
             retry_count: 0,
             stages: Vec::new(),
             last_error: None,
+            last_verdict: None,
         }
     }
 

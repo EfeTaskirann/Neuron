@@ -41,6 +41,7 @@ use crate::swarm::transport::Transport;
 use super::job::{
     Job, JobOutcome, JobRegistry, JobState, StageResult, SwarmJobEvent,
 };
+use super::verdict::{parse_verdict, Verdict};
 
 /// Maximum number of retries the FSM allows before falling through
 /// to `Failed`. Exported as a `pub const` so W3-12d's Verdict-gated
@@ -55,6 +56,13 @@ pub const MAX_RETRIES: u32 = 2;
 pub const SCOUT_ID: &str = "scout";
 pub const PLANNER_ID: &str = "planner";
 pub const BUILDER_ID: &str = "backend-builder";
+/// Reviewer profile id (W3-12d). Runs after `BUILDER_ID` and emits
+/// a JSON Verdict the FSM gates on.
+pub const REVIEWER_ID: &str = "reviewer";
+/// IntegrationTester profile id (W3-12d). Runs after a successful
+/// Reviewer verdict; emits a JSON Verdict the FSM gates on for
+/// the final transition to `Done`.
+pub const TESTER_ID: &str = "integration-tester";
 
 /// SCOUT stage prompt template — wraps the goal as an
 /// investigation request. WP §3 originally specified "goal
@@ -93,6 +101,40 @@ const BUILD_PROMPT_TEMPLATE: &str = "Aşağıdaki Plan'ın 1. adımını uygula.
 \n\
 ŞU ANDA SADECE ADIM 1'İ UYGULA.\n";
 
+/// REVIEW stage prompt template (W3-12d §7). Reviewer reads
+/// Builder's changes against the original goal + plan and emits a
+/// JSON Verdict. Substitutions: `{goal}`, `{plan}`, `{build}`.
+///
+/// The OUTPUT CONTRACT in the persona body is the authoritative
+/// shape spec; this prompt restates it briefly so the LLM hits the
+/// JSON-only response path even when the persona body is long.
+const REVIEW_PROMPT_TEMPLATE: &str = "Görev: {goal}\n\
+\n\
+Plan:\n\
+{plan}\n\
+\n\
+Builder'ın çıktısı:\n\
+{build}\n\
+\n\
+Bu kodu ve değişiklikleri review et. Verdict'i tam olarak şu JSON \
+şemasında ver, başka hiçbir şey yazma:\n\
+\n\
+{{ \"approved\": <bool>, \"issues\": [...], \"summary\": \"...\" }}\n";
+
+/// TEST stage prompt template (W3-12d §7). IntegrationTester picks
+/// the right test command for the project type and emits a JSON
+/// Verdict over the result. Substitutions: `{goal}`, `{build}`.
+const TEST_PROMPT_TEMPLATE: &str = "Görev: {goal}\n\
+\n\
+Builder'ın çıktısı:\n\
+{build}\n\
+\n\
+İlgili test suite'ini çalıştır (cargo test / pnpm test / pytest, \
+proje türüne göre). Verdict'i şu JSON şemasında ver, başka hiçbir \
+şey yazma:\n\
+\n\
+{{ \"approved\": <bool>, \"issues\": [...], \"summary\": \"...\" }}\n";
+
 /// Render the SCOUT prompt by substituting `{goal}`. Free fn so
 /// the prompt-template test can call it without a full FSM.
 fn render_scout_prompt(goal: &str) -> String {
@@ -113,16 +155,37 @@ fn render_build_prompt(plan_output: &str) -> String {
     BUILD_PROMPT_TEMPLATE.replace("{plan_output}", plan_output)
 }
 
-/// Pure-Rust transition table for the happy path. Used by tests
-/// that assert the unreachable-state guard fires; the FSM run loop
-/// does not actually consult this fn (it walks a fixed sequence).
-///
-/// `Review` and `Test` trip a `debug_assert!` so the developer
-/// catches the contract violation in test builds. In release builds
-/// (e.g. unforeseen production race) the function falls through to
-/// `Failed` rather than panicking, matching the "FSM never crashes
-/// the host" contract.
-#[allow(dead_code)] // Test-only helper; the run loop is fixed.
+/// Render the REVIEW prompt by substituting `{goal}`, `{plan}`, and
+/// `{build}`. Free fn so tests can call it without a full FSM.
+fn render_review_prompt(
+    goal: &str,
+    plan: &str,
+    build: &str,
+) -> String {
+    REVIEW_PROMPT_TEMPLATE
+        .replace("{goal}", goal)
+        .replace("{plan}", plan)
+        .replace("{build}", build)
+}
+
+/// Render the TEST prompt by substituting `{goal}` and `{build}`.
+/// Free fn so tests can call it without a full FSM.
+fn render_test_prompt(goal: &str, build: &str) -> String {
+    TEST_PROMPT_TEMPLATE
+        .replace("{goal}", goal)
+        .replace("{build}", build)
+}
+
+/// Pure-Rust transition table for the happy path. The FSM run loop
+/// walks a fixed sequence (Scout → Plan → Build → Review → Test →
+/// Done) and additionally branches on the parsed `Verdict.approved`
+/// at the Review and Test gates — the `bool` here represents the
+/// stage's *invocation* outcome (Ok / Err from `transport.invoke`),
+/// NOT the verdict. Verdict-driven branching lives at the call
+/// sites in `run_job_inner` because it requires unwrapping the
+/// parsed Verdict value, which is a structural mismatch with this
+/// boolean transition table.
+#[allow(dead_code)] // Test helper; run loop is fixed.
 pub(crate) fn next_state(current: JobState, ok: bool) -> JobState {
     match (current, ok) {
         (JobState::Init, _) => JobState::Scout,
@@ -130,24 +193,16 @@ pub(crate) fn next_state(current: JobState, ok: bool) -> JobState {
         (JobState::Scout, false) => JobState::Failed,
         (JobState::Plan, true) => JobState::Build,
         (JobState::Plan, false) => JobState::Failed,
-        (JobState::Build, true) => JobState::Done,
+        (JobState::Build, true) => JobState::Review,
         (JobState::Build, false) => JobState::Failed,
-        (JobState::Review, _) => {
-            debug_assert!(
-                false,
-                "JobState::Review is reserved for W3-12d; \
-                 the W3-12a FSM must never compute next-state from it"
-            );
-            JobState::Failed
-        }
-        (JobState::Test, _) => {
-            debug_assert!(
-                false,
-                "JobState::Test is reserved for W3-12d; \
-                 the W3-12a FSM must never compute next-state from it"
-            );
-            JobState::Failed
-        }
+        // (Review, true) is the success edge of the invoke; the FSM
+        // additionally requires `Verdict.approved=true` to actually
+        // advance past Review. See `run_job_inner` for the verdict
+        // branching.
+        (JobState::Review, true) => JobState::Test,
+        (JobState::Review, false) => JobState::Failed,
+        (JobState::Test, true) => JobState::Done,
+        (JobState::Test, false) => JobState::Failed,
         (JobState::Done | JobState::Failed, _) => current,
     }
 }
@@ -264,6 +319,7 @@ impl<T: Transport> CoordinatorFsm<T> {
             retry_count: 0,
             stages: Vec::new(),
             last_error: None,
+            last_verdict: None,
         };
         self.registry
             .try_acquire_workspace(&workspace_id, job)
@@ -316,6 +372,24 @@ impl<T: Transport> CoordinatorFsm<T> {
             .ok_or_else(|| {
                 AppError::NotFound(format!(
                     "swarm profile `{BUILDER_ID}` (required for FSM)"
+                ))
+            })?
+            .clone();
+        let reviewer = self
+            .profiles
+            .get(REVIEWER_ID)
+            .ok_or_else(|| {
+                AppError::NotFound(format!(
+                    "swarm profile `{REVIEWER_ID}` (required for FSM)"
+                ))
+            })?
+            .clone();
+        let tester = self
+            .profiles
+            .get(TESTER_ID)
+            .ok_or_else(|| {
+                AppError::NotFound(format!(
+                    "swarm profile `{TESTER_ID}` (required for FSM)"
                 ))
             })?
             .clone();
@@ -429,7 +503,7 @@ impl<T: Transport> CoordinatorFsm<T> {
 
         // BUILD stage.
         let build_prompt = render_build_prompt(&plan_text);
-        match self
+        let build_text = match self
             .run_stage_with_cancel(
                 app,
                 JobState::Build,
@@ -441,6 +515,7 @@ impl<T: Transport> CoordinatorFsm<T> {
             .await
         {
             StageOutcome::Ok(stage) => {
+                let text = stage.assistant_text.clone();
                 emit_swarm_event(
                     app,
                     &job_id,
@@ -454,6 +529,7 @@ impl<T: Transport> CoordinatorFsm<T> {
                         j.stages.push(stage);
                     })
                     .await?;
+                text
             }
             StageOutcome::Err(e) => {
                 self.finalize_failed(
@@ -466,6 +542,48 @@ impl<T: Transport> CoordinatorFsm<T> {
             }
             StageOutcome::Cancelled => {
                 self.finalize_cancelled(&job_id, &workspace_id).await?;
+                return self.emit_finished_and_build(app, &job_id);
+            }
+        };
+
+        // REVIEW stage (W3-12d). Run reviewer, parse Verdict, and
+        // gate on `approved`.
+        let review_prompt =
+            render_review_prompt(&goal, &plan_text, &build_text);
+        match self
+            .run_verdict_stage(
+                app,
+                JobState::Review,
+                &reviewer,
+                &review_prompt,
+                &job_id,
+                &workspace_id,
+                &notify,
+            )
+            .await?
+        {
+            VerdictStageOutcome::Approved(_) => {}
+            VerdictStageOutcome::Rejected | VerdictStageOutcome::Terminated => {
+                return self.emit_finished_and_build(app, &job_id);
+            }
+        }
+
+        // TEST stage (W3-12d). Same shape as Review.
+        let test_prompt = render_test_prompt(&goal, &build_text);
+        match self
+            .run_verdict_stage(
+                app,
+                JobState::Test,
+                &tester,
+                &test_prompt,
+                &job_id,
+                &workspace_id,
+                &notify,
+            )
+            .await?
+        {
+            VerdictStageOutcome::Approved(_) => {}
+            VerdictStageOutcome::Rejected | VerdictStageOutcome::Terminated => {
                 return self.emit_finished_and_build(app, &job_id);
             }
         }
@@ -483,6 +601,123 @@ impl<T: Transport> CoordinatorFsm<T> {
             .release_workspace(&workspace_id, &job_id)
             .await;
         self.emit_finished_and_build(app, &job_id)
+    }
+
+    /// Run a Review or Test stage end-to-end: invoke the specialist,
+    /// parse the Verdict from `assistant_text`, branch on
+    /// `approved`. Pulled into a helper because both gates have the
+    /// exact same shape (only the prompt + state differ).
+    ///
+    /// Returns:
+    ///
+    /// - `Approved(verdict)` — invoke succeeded, parse succeeded,
+    ///   `approved=true`. The stage is appended to `Job.stages`
+    ///   with `verdict` populated; the FSM should advance.
+    /// - `Rejected` — invoke succeeded, parse succeeded,
+    ///   `approved=false`. The stage is appended with the verdict;
+    ///   the job is finalized as Failed with `last_verdict` set.
+    ///   FSM tail should emit `Finished` and return.
+    /// - `Terminated` — invoke errored, was cancelled, or the
+    ///   verdict was unparseable. Job is already finalized; FSM
+    ///   tail should emit `Finished` and return.
+    ///
+    /// `Result<...>` wraps so SQL failures during finalization
+    /// surface as `AppError::Internal` to the IPC caller (the FSM
+    /// loop already propagates this via `?`).
+    async fn run_verdict_stage<R: Runtime>(
+        &self,
+        app: &AppHandle<R>,
+        state: JobState,
+        profile: &Profile,
+        prompt: &str,
+        job_id: &str,
+        workspace_id: &str,
+        notify: &Notify,
+    ) -> Result<VerdictStageOutcome, AppError> {
+        let mut stage = match self
+            .run_stage_with_cancel(app, state, profile, prompt, job_id, notify)
+            .await
+        {
+            StageOutcome::Ok(s) => s,
+            StageOutcome::Err(e) => {
+                self.finalize_failed(
+                    job_id,
+                    workspace_id,
+                    Some(e.to_string()),
+                )
+                .await?;
+                return Ok(VerdictStageOutcome::Terminated);
+            }
+            StageOutcome::Cancelled => {
+                self.finalize_cancelled(job_id, workspace_id).await?;
+                return Ok(VerdictStageOutcome::Terminated);
+            }
+        };
+
+        // Parse the verdict from the assistant text. If parse fails
+        // the FSM treats it as a stage failure — `last_error`
+        // carries the parse error message; `last_verdict` stays
+        // None because we never resolved a structured verdict.
+        let verdict = match parse_verdict(&stage.assistant_text) {
+            Ok(v) => v,
+            Err(e) => {
+                self.finalize_failed(
+                    job_id,
+                    workspace_id,
+                    Some(e.to_string()),
+                )
+                .await?;
+                // Even on parse failure we still emit the
+                // StageCompleted event so the W3-14 UI sees the raw
+                // assistant text; this matches the streaming
+                // contract ("the listener observes everything that
+                // round-tripped through transport").
+                emit_swarm_event(
+                    app,
+                    job_id,
+                    &SwarmJobEvent::StageCompleted {
+                        job_id: job_id.to_string(),
+                        stage: stage.clone(),
+                    },
+                );
+                self.registry
+                    .update(job_id, |j| {
+                        j.stages.push(stage);
+                    })
+                    .await?;
+                return Ok(VerdictStageOutcome::Terminated);
+            }
+        };
+
+        // Stamp the parsed verdict onto the StageResult so it lands
+        // in `swarm_stages.verdict_json` via the registry's SQL
+        // write-through.
+        stage.verdict = Some(verdict.clone());
+
+        emit_swarm_event(
+            app,
+            job_id,
+            &SwarmJobEvent::StageCompleted {
+                job_id: job_id.to_string(),
+                stage: stage.clone(),
+            },
+        );
+        self.registry
+            .update(job_id, |j| {
+                j.stages.push(stage);
+            })
+            .await?;
+
+        if verdict.rejected() {
+            self.finalize_failed_with_verdict(
+                job_id,
+                workspace_id,
+                verdict,
+            )
+            .await?;
+            return Ok(VerdictStageOutcome::Rejected);
+        }
+        Ok(VerdictStageOutcome::Approved(verdict))
     }
 
     /// Run one FSM stage end-to-end with cancellation support.
@@ -566,6 +801,13 @@ impl<T: Transport> CoordinatorFsm<T> {
                             session_id: invoke.session_id,
                             total_cost_usd: invoke.total_cost_usd,
                             duration_ms,
+                            // Populated downstream by
+                            // `run_verdict_stage` for Review / Test
+                            // stages; stays `None` for Scout / Plan /
+                            // Build (the run loop calls this helper
+                            // directly so the verdict field never
+                            // gets touched on those paths).
+                            verdict: None,
                         })
                     }
                     Err(e) => StageOutcome::Err(e),
@@ -587,6 +829,29 @@ impl<T: Transport> CoordinatorFsm<T> {
             .update(job_id, |j| {
                 j.state = JobState::Failed;
                 j.last_error = last_error;
+            })
+            .await?;
+        self.registry
+            .release_workspace(workspace_id, job_id)
+            .await;
+        Ok(())
+    }
+
+    /// Mirror of `finalize_failed` for verdict-rejected paths
+    /// (W3-12d). Sets `state=Failed`, populates `last_verdict`
+    /// with the structured Verdict, and clears `last_error` —
+    /// the verdict IS the structured error.
+    async fn finalize_failed_with_verdict(
+        &self,
+        job_id: &str,
+        workspace_id: &str,
+        verdict: Verdict,
+    ) -> Result<(), AppError> {
+        self.registry
+            .update(job_id, |j| {
+                j.state = JobState::Failed;
+                j.last_error = None;
+                j.last_verdict = Some(verdict);
             })
             .await?;
         self.registry
@@ -668,6 +933,7 @@ impl<T: Transport> CoordinatorFsm<T> {
             last_error: job.last_error,
             total_cost_usd,
             total_duration_ms,
+            last_verdict: job.last_verdict,
         })
     }
 }
@@ -727,6 +993,24 @@ enum StageOutcome {
     Ok(StageResult),
     Err(AppError),
     Cancelled,
+}
+
+/// Three-way outcome of a verdict-gated stage (Review / Test). Used
+/// internally by `run_verdict_stage` so the call site can pattern-
+/// match on three exhaustive cases without unwrapping nested Result
+/// types.
+enum VerdictStageOutcome {
+    /// Verdict.approved=true. FSM advances to the next stage. The
+    /// payload is the parsed Verdict so a future caller could
+    /// surface "approved with low-severity issues" even on the
+    /// success path; W3-12d itself doesn't read the value.
+    Approved(#[allow(dead_code)] Verdict),
+    /// Verdict.approved=false. Job is already finalized as Failed
+    /// with `last_verdict` populated; FSM tail emits Finished.
+    Rejected,
+    /// Stage error / cancellation / unparseable verdict. Job is
+    /// already finalized; FSM tail emits Finished.
+    Terminated,
 }
 
 /// Stable last-error string the FSM writes when cancelled. Pulled
@@ -809,6 +1093,62 @@ mod tests {
         }
     }
 
+    /// Canned MockResponse whose `assistant_text` is a valid
+    /// Verdict JSON with `approved=true`. Reviewers + Testers in
+    /// the happy-path tests use this to skip past the verdict gate
+    /// without forcing every test to spell out the JSON inline.
+    fn ok_verdict_response(cost: f64) -> MockResponse {
+        MockResponse {
+            result: Ok(InvokeResult {
+                session_id: "sess-verdict".into(),
+                assistant_text: r#"{"approved":true,"issues":[],"summary":"OK"}"#.into(),
+                total_cost_usd: cost,
+                turn_count: 1,
+            }),
+            sleep: None,
+        }
+    }
+
+    /// Canned MockResponse whose `assistant_text` is a valid
+    /// Verdict JSON with `approved=false` and one high-severity
+    /// issue. Used by the verdict-rejection FSM tests.
+    fn rejected_verdict_response(issue_msg: &str) -> MockResponse {
+        let payload = format!(
+            r#"{{"approved":false,"issues":[{{"severity":"high","msg":"{}"}}],"summary":"rejected"}}"#,
+            issue_msg.replace('\\', "\\\\").replace('"', "\\\"")
+        );
+        MockResponse {
+            result: Ok(InvokeResult {
+                session_id: "sess-rej".into(),
+                assistant_text: payload,
+                total_cost_usd: 0.0,
+                turn_count: 1,
+            }),
+            sleep: None,
+        }
+    }
+
+    /// Build the canonical 5-stage happy-path response set:
+    /// scout / planner / builder return `ok_response(text, cost)`;
+    /// reviewer + tester return approved verdicts. Used by tests
+    /// that assert on the full chain reaching Done.
+    fn happy_5_stage_responses(
+        scout_text: &str,
+        plan_text: &str,
+        build_text: &str,
+        scout_cost: f64,
+        plan_cost: f64,
+        build_cost: f64,
+    ) -> HashMap<String, MockResponse> {
+        let mut r: HashMap<String, MockResponse> = HashMap::new();
+        r.insert(SCOUT_ID.into(), ok_response(scout_text, scout_cost));
+        r.insert(PLANNER_ID.into(), ok_response(plan_text, plan_cost));
+        r.insert(BUILDER_ID.into(), ok_response(build_text, build_cost));
+        r.insert(REVIEWER_ID.into(), ok_verdict_response(0.0));
+        r.insert(TESTER_ID.into(), ok_verdict_response(0.0));
+        r
+    }
+
     /// Build a registry holding the bundled profiles. `load_from(None)`
     /// reads the embedded scout/planner/backend-builder set so we
     /// don't have to hand-roll fixture files.
@@ -828,17 +1168,19 @@ mod tests {
         bundled_registry()
     }
 
-    /// Mock-driven happy path: scout / planner / builder all OK.
+    /// Mock-driven happy path: all five stages OK; reviewer +
+    /// tester emit `approved=true` verdicts.
     #[tokio::test]
-    async fn fsm_happy_path_walks_three_stages() {
+    async fn fsm_walks_five_stages_on_approved_path() {
         let (app, _pool, _dir) = mock_app_with_pool().await;
-        let mut responses: HashMap<String, MockResponse> = HashMap::new();
-        responses
-            .insert(SCOUT_ID.into(), ok_response("scout findings", 0.01));
-        responses
-            .insert(PLANNER_ID.into(), ok_response("plan steps", 0.02));
-        responses
-            .insert(BUILDER_ID.into(), ok_response("build done", 0.03));
+        let responses = happy_5_stage_responses(
+            "scout findings",
+            "plan steps",
+            "build done",
+            0.01,
+            0.02,
+            0.03,
+        );
         let mock = MockTransport::new(responses);
 
         let registry = Arc::new(JobRegistry::new());
@@ -854,28 +1196,47 @@ mod tests {
             .await
             .expect("happy path returns Ok");
         assert_eq!(outcome.final_state, JobState::Done);
-        assert_eq!(outcome.stages.len(), 3);
+        assert_eq!(outcome.stages.len(), 5);
         assert!(outcome.last_error.is_none());
+        assert!(outcome.last_verdict.is_none());
         assert!(outcome.total_cost_usd > 0.0);
         assert!(
             (outcome.total_cost_usd - 0.06).abs() < 1e-9,
-            "cost sum off: {}",
+            "cost sum off (scout+plan+build only since verdicts free): {}",
             outcome.total_cost_usd
         );
         // Stage state ordering matches the FSM's fixed sequence.
         assert_eq!(outcome.stages[0].state, JobState::Scout);
         assert_eq!(outcome.stages[1].state, JobState::Plan);
         assert_eq!(outcome.stages[2].state, JobState::Build);
+        assert_eq!(outcome.stages[3].state, JobState::Review);
+        assert_eq!(outcome.stages[4].state, JobState::Test);
+        // Verdict populated on Review/Test, None on the others.
+        assert!(outcome.stages[0].verdict.is_none());
+        assert!(outcome.stages[1].verdict.is_none());
+        assert!(outcome.stages[2].verdict.is_none());
+        assert!(
+            outcome.stages[3]
+                .verdict
+                .as_ref()
+                .map(|v| v.approved)
+                .unwrap_or(false),
+            "review verdict should be approved"
+        );
+        assert!(
+            outcome.stages[4]
+                .verdict
+                .as_ref()
+                .map(|v| v.approved)
+                .unwrap_or(false),
+            "test verdict should be approved"
+        );
 
         // Workspace lock released — second job on same workspace
         // succeeds.
-        let mut responses2: HashMap<String, MockResponse> = HashMap::new();
-        responses2
-            .insert(SCOUT_ID.into(), ok_response("s2", 0.01));
-        responses2
-            .insert(PLANNER_ID.into(), ok_response("p2", 0.01));
-        responses2
-            .insert(BUILDER_ID.into(), ok_response("b2", 0.01));
+        let responses2 = happy_5_stage_responses(
+            "s2", "p2", "b2", 0.01, 0.01, 0.01,
+        );
         let fsm2 = CoordinatorFsm::new(
             synthetic_registry(),
             MockTransport::new(responses2),
@@ -979,16 +1340,14 @@ mod tests {
     }
 
     /// Total cost aggregates across stages on the happy path.
+    /// Reviewer + tester verdicts are zero-cost so the assertion
+    /// stays at 0.06.
     #[tokio::test]
     async fn fsm_aggregates_total_cost() {
         let (app, _pool, _dir) = mock_app_with_pool().await;
-        let mut responses: HashMap<String, MockResponse> = HashMap::new();
-        responses
-            .insert(SCOUT_ID.into(), ok_response("a", 0.01));
-        responses
-            .insert(PLANNER_ID.into(), ok_response("b", 0.02));
-        responses
-            .insert(BUILDER_ID.into(), ok_response("c", 0.03));
+        let responses = happy_5_stage_responses(
+            "a", "b", "c", 0.01, 0.02, 0.03,
+        );
         let fsm = CoordinatorFsm::new(
             synthetic_registry(),
             MockTransport::new(responses),
@@ -1008,7 +1367,11 @@ mod tests {
     #[tokio::test]
     async fn prompt_template_scout_wraps_goal_as_investigation() {
         let (app, _pool, _dir) = mock_app_with_pool().await;
-        let mut responses: HashMap<String, MockResponse> = HashMap::new();
+        let mut responses = happy_5_stage_responses(
+            "X", "Y", "Z", 0.0, 0.0, 0.0,
+        );
+        // Override scout/plan/build to the canonical strings the
+        // assertions look at; verdicts come from the helper.
         responses.insert(SCOUT_ID.into(), ok_response("X", 0.0));
         responses.insert(PLANNER_ID.into(), ok_response("Y", 0.0));
         responses.insert(BUILDER_ID.into(), ok_response("Z", 0.0));
@@ -1049,7 +1412,14 @@ mod tests {
     #[tokio::test]
     async fn prompt_template_plan_includes_scout_findings() {
         let (app, _pool, _dir) = mock_app_with_pool().await;
-        let mut responses: HashMap<String, MockResponse> = HashMap::new();
+        let mut responses = happy_5_stage_responses(
+            "scout-discovered-finding-XYZ",
+            "plan",
+            "build",
+            0.0,
+            0.0,
+            0.0,
+        );
         responses.insert(
             SCOUT_ID.into(),
             ok_response("scout-discovered-finding-XYZ", 0.0),
@@ -1086,7 +1456,9 @@ mod tests {
     #[tokio::test]
     async fn prompt_template_build_includes_plan_step1_directive() {
         let (app, _pool, _dir) = mock_app_with_pool().await;
-        let mut responses: HashMap<String, MockResponse> = HashMap::new();
+        let mut responses = happy_5_stage_responses(
+            "s", "plan-text", "b", 0.0, 0.0, 0.0,
+        );
         responses.insert(SCOUT_ID.into(), ok_response("s", 0.0));
         responses
             .insert(PLANNER_ID.into(), ok_response("plan-text", 0.0));
@@ -1125,42 +1497,45 @@ mod tests {
         let (app, _pool, _dir) = mock_app_with_pool().await;
         let mut responses: HashMap<String, MockResponse> = HashMap::new();
         let sleep = Some(Duration::from_millis(50));
-        responses.insert(
-            SCOUT_ID.into(),
-            MockResponse {
-                result: Ok(InvokeResult {
-                    session_id: "s1".into(),
-                    assistant_text: "scout".into(),
-                    total_cost_usd: 0.01,
-                    turn_count: 1,
-                }),
-                sleep,
-            },
-        );
-        responses.insert(
-            PLANNER_ID.into(),
-            MockResponse {
-                result: Ok(InvokeResult {
-                    session_id: "s2".into(),
-                    assistant_text: "plan".into(),
-                    total_cost_usd: 0.01,
-                    turn_count: 1,
-                }),
-                sleep,
-            },
-        );
-        responses.insert(
-            BUILDER_ID.into(),
-            MockResponse {
-                result: Ok(InvokeResult {
-                    session_id: "s3".into(),
-                    assistant_text: "build".into(),
-                    total_cost_usd: 0.01,
-                    turn_count: 1,
-                }),
-                sleep,
-            },
-        );
+        for (id, sess, text) in [
+            (SCOUT_ID, "s1", "scout"),
+            (PLANNER_ID, "s2", "plan"),
+            (BUILDER_ID, "s3", "build"),
+        ] {
+            responses.insert(
+                id.into(),
+                MockResponse {
+                    result: Ok(InvokeResult {
+                        session_id: sess.into(),
+                        assistant_text: text.into(),
+                        total_cost_usd: 0.01,
+                        turn_count: 1,
+                    }),
+                    sleep,
+                },
+            );
+        }
+        // Reviewer + tester also sleep 50ms each so their
+        // duration_ms entries clear the per-stage threshold.
+        let verdict_text =
+            r#"{"approved":true,"issues":[],"summary":"OK"}"#;
+        for (id, sess) in [
+            (REVIEWER_ID, "s4"),
+            (TESTER_ID, "s5"),
+        ] {
+            responses.insert(
+                id.into(),
+                MockResponse {
+                    result: Ok(InvokeResult {
+                        session_id: sess.into(),
+                        assistant_text: verdict_text.into(),
+                        total_cost_usd: 0.0,
+                        turn_count: 1,
+                    }),
+                    sleep,
+                },
+            );
+        }
         let fsm = CoordinatorFsm::new(
             synthetic_registry(),
             MockTransport::new(responses),
@@ -1171,6 +1546,7 @@ mod tests {
             .run_job(app.handle(), "ws-dur".into(), "g".into())
             .await
             .expect("ok");
+        assert_eq!(outcome.stages.len(), 5);
         for stage in &outcome.stages {
             assert!(
                 stage.duration_ms >= 50,
@@ -1179,26 +1555,21 @@ mod tests {
                 stage.duration_ms
             );
         }
-        // Total duration is at least 3*50=150ms.
-        assert!(outcome.total_duration_ms >= 150);
+        // Total duration is at least 5*50=250ms.
+        assert!(outcome.total_duration_ms >= 250);
     }
 
-    /// `next_state(Review, _)` trips `debug_assert!`. Only meaningful
-    /// in debug builds — release builds compile out the assert and
-    /// the function falls through to `Failed`. We `#[should_panic]`
-    /// gate on `debug_assertions` so release-build CI still passes.
-    #[cfg(debug_assertions)]
+    /// W3-12d activated Review/Test in `next_state`. Both the OK
+    /// and Err transitions are now defined; the verdict-driven
+    /// gate is layered on top by the run loop.
     #[test]
-    #[should_panic(expected = "Review is reserved for W3-12d")]
-    fn fsm_unreachable_states_panic_in_debug_review() {
-        let _ = next_state(JobState::Review, true);
-    }
-
-    #[cfg(debug_assertions)]
-    #[test]
-    #[should_panic(expected = "Test is reserved for W3-12d")]
-    fn fsm_unreachable_states_panic_in_debug_test_state() {
-        let _ = next_state(JobState::Test, true);
+    fn next_state_full_table_review_and_test() {
+        assert_eq!(next_state(JobState::Build, true), JobState::Review);
+        assert_eq!(next_state(JobState::Build, false), JobState::Failed);
+        assert_eq!(next_state(JobState::Review, true), JobState::Test);
+        assert_eq!(next_state(JobState::Review, false), JobState::Failed);
+        assert_eq!(next_state(JobState::Test, true), JobState::Done);
+        assert_eq!(next_state(JobState::Test, false), JobState::Failed);
     }
 
     /// Empty workspace_id is rejected before any registry mutation.
@@ -1296,7 +1667,8 @@ mod tests {
             outcome.final_state,
             outcome.last_error
         );
-        assert_eq!(outcome.stages.len(), 3);
+        // W3-12d: 5 stages (scout / plan / build / review / test).
+        assert_eq!(outcome.stages.len(), 5);
     }
 
     // ----------------------------------------------------------------
@@ -1381,7 +1753,8 @@ mod tests {
                 .fetch_one(&test_pool)
                 .await
                 .expect("count stages");
-        assert_eq!(stage_count, 3, "three stage rows persisted");
+        // W3-12d: 5 stage rows on the happy path.
+        assert_eq!(stage_count, 5, "five stage rows persisted");
         let lock_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM swarm_workspace_locks",
         )
@@ -1568,18 +1941,22 @@ mod tests {
         )
     }
 
-    /// Pool-backed happy path: the FSM walks SCOUT/PLAN/BUILD
+    /// Pool-backed happy path: the FSM walks all five stages
     /// against a SQLite-backed registry; on completion the
-    /// `swarm_jobs` row is `done`, three `swarm_stages` rows, no
+    /// `swarm_jobs` row is `done`, five `swarm_stages` rows, no
     /// `swarm_workspace_locks`.
     #[tokio::test]
-    async fn fsm_happy_path_walks_three_stages_with_pool() {
+    async fn fsm_happy_path_walks_five_stages_with_pool() {
         let (app, _pool, _dir) = mock_app_with_pool().await;
         let (registry, pool, _reg_dir) = pool_backed_registry().await;
-        let mut responses: HashMap<String, MockResponse> = HashMap::new();
-        responses.insert(SCOUT_ID.into(), ok_response("scout findings", 0.01));
-        responses.insert(PLANNER_ID.into(), ok_response("plan steps", 0.02));
-        responses.insert(BUILDER_ID.into(), ok_response("build done", 0.03));
+        let responses = happy_5_stage_responses(
+            "scout findings",
+            "plan steps",
+            "build done",
+            0.01,
+            0.02,
+            0.03,
+        );
         let fsm = CoordinatorFsm::new(
             synthetic_registry(),
             MockTransport::new(responses),
@@ -1591,7 +1968,7 @@ mod tests {
             .await
             .expect("ok");
         assert_eq!(outcome.final_state, JobState::Done);
-        assert_eq!(outcome.stages.len(), 3);
+        assert_eq!(outcome.stages.len(), 5);
 
         let job_count: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM swarm_jobs WHERE state = 'done'")
@@ -1604,7 +1981,16 @@ mod tests {
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        assert_eq!(stage_count, 3);
+        assert_eq!(stage_count, 5);
+        // The Review and Test stage rows carry verdict_json; the
+        // others are NULL (Scout/Plan/Build never run a verdict).
+        let verdict_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM swarm_stages WHERE verdict_json IS NOT NULL",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(verdict_rows, 2, "review + test stages carry verdict_json");
         let lock_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM swarm_workspace_locks",
         )
@@ -1811,13 +2197,246 @@ mod tests {
         assert_eq!(lock_count, 0);
     }
 
-    /// Sanity: the registry indeed has `scout`/`planner`/
-    /// `backend-builder` ids — guards against future renames in the
-    /// bundled `.md` files breaking the FSM contract silently.
+    // ----------------------------------------------------------------
+    // WP-W3-12d — Verdict-driven Review/Test gates
+    // ----------------------------------------------------------------
+
+    /// Reviewer returns `approved=false` → job finalizes Failed
+    /// with `last_verdict` populated and `last_error == None`. The
+    /// Test stage never runs.
+    #[tokio::test]
+    async fn fsm_review_rejection_finalizes_failed_with_verdict() {
+        let (app, _pool, _dir) = mock_app_with_pool().await;
+        let mut responses: HashMap<String, MockResponse> = HashMap::new();
+        responses.insert(SCOUT_ID.into(), ok_response("s", 0.0));
+        responses.insert(PLANNER_ID.into(), ok_response("p", 0.0));
+        responses.insert(BUILDER_ID.into(), ok_response("b", 0.0));
+        responses.insert(
+            REVIEWER_ID.into(),
+            rejected_verdict_response("unwrap on None"),
+        );
+        // Tester response is never consumed (Review rejection
+        // short-circuits the chain) but the mock requires entries
+        // to exist for any id the FSM might ask about; the FSM is
+        // careful to NOT call tester on the rejected path.
+        responses.insert(TESTER_ID.into(), ok_verdict_response(0.0));
+
+        let registry = Arc::new(JobRegistry::new());
+        let fsm = CoordinatorFsm::new(
+            synthetic_registry(),
+            MockTransport::new(responses),
+            Arc::clone(&registry),
+            Duration::from_secs(5),
+        );
+        let outcome = fsm
+            .run_job(app.handle(), "ws-rev-rej".into(), "g".into())
+            .await
+            .expect("FSM returns Ok with Failed outcome");
+        assert_eq!(outcome.final_state, JobState::Failed);
+        // Stages: scout/plan/build (3) + review (1) — tester didn't run.
+        assert_eq!(outcome.stages.len(), 4);
+        assert_eq!(outcome.stages[3].state, JobState::Review);
+        assert!(outcome.stages[3].verdict.is_some());
+        assert_eq!(
+            outcome.stages[3].verdict.as_ref().map(|v| v.approved),
+            Some(false)
+        );
+        // Job-level last_verdict is the rejected one; last_error
+        // stays None (the verdict IS the structured error).
+        assert!(outcome.last_error.is_none());
+        let lv = outcome.last_verdict.as_ref().expect("last_verdict set");
+        assert!(!lv.approved);
+        assert_eq!(lv.issues.len(), 1);
+        assert_eq!(lv.issues[0].message, "unwrap on None");
+    }
+
+    /// Tester returns `approved=false` → job finalizes Failed at
+    /// the Test gate with `last_verdict` populated.
+    #[tokio::test]
+    async fn fsm_test_rejection_finalizes_failed_with_verdict() {
+        let (app, _pool, _dir) = mock_app_with_pool().await;
+        let mut responses: HashMap<String, MockResponse> = HashMap::new();
+        responses.insert(SCOUT_ID.into(), ok_response("s", 0.0));
+        responses.insert(PLANNER_ID.into(), ok_response("p", 0.0));
+        responses.insert(BUILDER_ID.into(), ok_response("b", 0.0));
+        responses.insert(REVIEWER_ID.into(), ok_verdict_response(0.0));
+        responses.insert(
+            TESTER_ID.into(),
+            rejected_verdict_response("test_foo failed"),
+        );
+
+        let registry = Arc::new(JobRegistry::new());
+        let fsm = CoordinatorFsm::new(
+            synthetic_registry(),
+            MockTransport::new(responses),
+            Arc::clone(&registry),
+            Duration::from_secs(5),
+        );
+        let outcome = fsm
+            .run_job(app.handle(), "ws-test-rej".into(), "g".into())
+            .await
+            .expect("FSM returns Ok with Failed outcome");
+        assert_eq!(outcome.final_state, JobState::Failed);
+        // Stages: scout/plan/build (3) + review (approved) + test (rejected) = 5.
+        assert_eq!(outcome.stages.len(), 5);
+        assert_eq!(outcome.stages[4].state, JobState::Test);
+        let test_verdict =
+            outcome.stages[4].verdict.as_ref().expect("test verdict");
+        assert!(!test_verdict.approved);
+        assert!(outcome.last_error.is_none());
+        let lv = outcome.last_verdict.as_ref().expect("last_verdict set");
+        assert_eq!(lv.issues[0].message, "test_foo failed");
+    }
+
+    /// Reviewer's assistant_text is unparseable (not JSON, not
+    /// fenced, not a balanced object). FSM finalizes Failed with
+    /// `last_error` mentioning "could not parse Verdict".
+    /// `last_verdict` stays None — there's no structured verdict.
+    #[tokio::test]
+    async fn fsm_review_unparseable_finalizes_failed() {
+        let (app, _pool, _dir) = mock_app_with_pool().await;
+        let mut responses: HashMap<String, MockResponse> = HashMap::new();
+        responses.insert(SCOUT_ID.into(), ok_response("s", 0.0));
+        responses.insert(PLANNER_ID.into(), ok_response("p", 0.0));
+        responses.insert(BUILDER_ID.into(), ok_response("b", 0.0));
+        responses.insert(
+            REVIEWER_ID.into(),
+            ok_response("lol idk this isn't JSON", 0.0),
+        );
+        responses.insert(TESTER_ID.into(), ok_verdict_response(0.0));
+
+        let registry = Arc::new(JobRegistry::new());
+        let fsm = CoordinatorFsm::new(
+            synthetic_registry(),
+            MockTransport::new(responses),
+            Arc::clone(&registry),
+            Duration::from_secs(5),
+        );
+        let outcome = fsm
+            .run_job(app.handle(), "ws-rev-bad".into(), "g".into())
+            .await
+            .expect("FSM returns Ok with Failed outcome");
+        assert_eq!(outcome.final_state, JobState::Failed);
+        // Review stage IS appended (the run_verdict_stage helper
+        // emits StageCompleted on the parse-error path so the W3-14
+        // UI sees the raw assistant_text). Stage count = 4.
+        assert_eq!(outcome.stages.len(), 4);
+        assert_eq!(outcome.stages[3].state, JobState::Review);
+        // No structured verdict — parse failed.
+        assert!(outcome.stages[3].verdict.is_none());
+        assert!(outcome.last_verdict.is_none());
+        assert!(
+            outcome
+                .last_error
+                .as_deref()
+                .unwrap_or("")
+                .contains("could not parse Verdict"),
+            "last_error should mention parse failure: {:?}",
+            outcome.last_error
+        );
+    }
+
+    /// Builder errors → no review/test stages run, regression
+    /// against the W3-12a failure shape but extended for 5-stage
+    /// flow.
+    #[tokio::test]
+    async fn fsm_review_skipped_when_build_fails() {
+        let (app, _pool, _dir) = mock_app_with_pool().await;
+        let mut responses: HashMap<String, MockResponse> = HashMap::new();
+        responses.insert(SCOUT_ID.into(), ok_response("s", 0.0));
+        responses.insert(PLANNER_ID.into(), ok_response("p", 0.0));
+        responses.insert(BUILDER_ID.into(), err_response("builder boom"));
+        // These are never consumed since Builder errors first.
+        responses.insert(REVIEWER_ID.into(), ok_verdict_response(0.0));
+        responses.insert(TESTER_ID.into(), ok_verdict_response(0.0));
+
+        let registry = Arc::new(JobRegistry::new());
+        let fsm = CoordinatorFsm::new(
+            synthetic_registry(),
+            MockTransport::new(responses),
+            Arc::clone(&registry),
+            Duration::from_secs(5),
+        );
+        let outcome = fsm
+            .run_job(app.handle(), "ws-skip".into(), "g".into())
+            .await
+            .expect("FSM returns Ok with Failed outcome");
+        assert_eq!(outcome.final_state, JobState::Failed);
+        // Scout + Plan succeeded; Build erred; Review/Test never run.
+        assert_eq!(outcome.stages.len(), 2);
+        for stage in &outcome.stages {
+            assert!(matches!(
+                stage.state,
+                JobState::Scout | JobState::Plan
+            ));
+            assert!(stage.verdict.is_none());
+        }
+        assert!(outcome.last_verdict.is_none());
+        assert!(outcome
+            .last_error
+            .as_deref()
+            .unwrap_or("")
+            .contains("builder boom"));
+    }
+
+    /// Real-claude integration test (`#[ignore]`) — drives the
+    /// full 5-stage chain end-to-end. CI lacks `claude` + an OAuth
+    /// session so this stays opt-in. Owner runs it manually with
+    /// `cargo test -- --ignored` post-commit.
+    ///
+    /// Time budget: 5 × 180s = 900s worst-case; typical 2-4 min.
+    /// Reviewer should approve a one-line method add;
+    /// IntegrationTester runs `cargo check` / `cargo test` to
+    /// validate.
+    #[tokio::test]
+    #[ignore = "requires real `claude` binary + Pro/Max subscription"]
+    async fn integration_full_chain_real_claude_with_verdict() {
+        use crate::swarm::transport::SubprocessTransport;
+
+        let stage_secs = std::env::var("NEURON_SWARM_STAGE_TIMEOUT_SEC")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(180);
+
+        let (app, _pool, _dir) = mock_app_with_pool().await;
+        let profiles = bundled_registry();
+        let transport = SubprocessTransport::new();
+        let registry = Arc::new(JobRegistry::new());
+        let fsm = CoordinatorFsm::new(
+            profiles,
+            transport,
+            registry,
+            Duration::from_secs(stage_secs),
+        );
+        let goal = "Find the `impl ProfileRegistry` block in \
+            profile.rs and add a one-line public method \
+            `pub fn profile_count(&self) -> usize { self.profiles.len() }` \
+            right after the existing `list` method. Just the method. \
+            Do NOT add a unit test, do NOT add doc comments, do NOT \
+            run cargo check.";
+        let outcome = fsm
+            .run_job(app.handle(), "default".into(), goal.into())
+            .await
+            .expect("FSM returns Ok");
+        assert_eq!(
+            outcome.final_state,
+            JobState::Done,
+            "expected Done, got {:?} (last_error: {:?}, last_verdict: {:?})",
+            outcome.final_state,
+            outcome.last_error,
+            outcome.last_verdict,
+        );
+        assert_eq!(outcome.stages.len(), 5);
+    }
+
+    /// Sanity: the registry indeed has the five FSM specialist
+    /// ids — guards against future renames in the bundled `.md`
+    /// files breaking the FSM contract silently.
     #[test]
-    fn bundled_registry_has_three_specialist_ids() {
+    fn bundled_registry_has_five_specialist_ids() {
         let reg = bundled_registry();
-        for id in [SCOUT_ID, PLANNER_ID, BUILDER_ID] {
+        for id in [SCOUT_ID, PLANNER_ID, BUILDER_ID, REVIEWER_ID, TESTER_ID] {
             assert!(
                 reg.get(id).is_some(),
                 "bundled profile `{id}` missing"
@@ -1928,38 +2547,51 @@ mod tests {
     /// for tests that assert on `duration_ms`, but it's incidental
     /// to the streaming-event tests — those rely on
     /// `run_job_with_id` so the listener attaches before any emit.
+    ///
+    /// W3-12d: the set now covers all five stages — reviewer +
+    /// tester emit `approved=true` verdicts so the FSM reaches
+    /// Done.
     fn happy_responses() -> HashMap<String, MockResponse> {
         let mut r: HashMap<String, MockResponse> = HashMap::new();
-        let scout = MockResponse {
-            result: Ok(InvokeResult {
-                session_id: "sess-scout".into(),
-                assistant_text: "scout findings".into(),
-                total_cost_usd: 0.01,
-                turn_count: 1,
-            }),
-            sleep: Some(Duration::from_millis(100)),
-        };
-        let plan = MockResponse {
-            result: Ok(InvokeResult {
-                session_id: "sess-plan".into(),
-                assistant_text: "plan steps".into(),
-                total_cost_usd: 0.02,
-                turn_count: 1,
-            }),
-            sleep: Some(Duration::from_millis(100)),
-        };
-        let build = MockResponse {
-            result: Ok(InvokeResult {
-                session_id: "sess-build".into(),
-                assistant_text: "build done".into(),
-                total_cost_usd: 0.03,
-                turn_count: 1,
-            }),
-            sleep: Some(Duration::from_millis(100)),
-        };
-        r.insert(SCOUT_ID.into(), scout);
-        r.insert(PLANNER_ID.into(), plan);
-        r.insert(BUILDER_ID.into(), build);
+        let sleep = Some(Duration::from_millis(100));
+        let stages: &[(&str, &str, &str, f64)] = &[
+            (SCOUT_ID, "sess-scout", "scout findings", 0.01),
+            (PLANNER_ID, "sess-plan", "plan steps", 0.02),
+            (BUILDER_ID, "sess-build", "build done", 0.03),
+        ];
+        for (id, sess, text, cost) in stages {
+            r.insert(
+                (*id).to_string(),
+                MockResponse {
+                    result: Ok(InvokeResult {
+                        session_id: (*sess).into(),
+                        assistant_text: (*text).into(),
+                        total_cost_usd: *cost,
+                        turn_count: 1,
+                    }),
+                    sleep,
+                },
+            );
+        }
+        let verdict_text =
+            r#"{"approved":true,"issues":[],"summary":"OK"}"#;
+        for (id, sess) in [
+            (REVIEWER_ID, "sess-review"),
+            (TESTER_ID, "sess-test"),
+        ] {
+            r.insert(
+                id.to_string(),
+                MockResponse {
+                    result: Ok(InvokeResult {
+                        session_id: sess.into(),
+                        assistant_text: verdict_text.into(),
+                        total_cost_usd: 0.0,
+                        turn_count: 1,
+                    }),
+                    sleep,
+                },
+            );
+        }
         r
     }
 
@@ -2004,11 +2636,16 @@ mod tests {
             .clone();
         let kinds: Vec<&str> =
             captured.iter().map(|e| e.kind.as_str()).collect();
-        // Exact ordered stream on the happy path.
+        // Exact ordered stream on the happy path: 5 (started, 5x
+        // (stage_started, stage_completed), finished).
         assert_eq!(
             kinds,
             vec![
                 KIND_STARTED,
+                KIND_STAGE_STARTED,
+                KIND_STAGE_COMPLETED,
+                KIND_STAGE_STARTED,
+                KIND_STAGE_COMPLETED,
                 KIND_STAGE_STARTED,
                 KIND_STAGE_COMPLETED,
                 KIND_STAGE_STARTED,
@@ -2021,7 +2658,7 @@ mod tests {
         );
 
         // Each StageStarted carries the upcoming state; assert the
-        // canonical `scout → plan → build` order.
+        // canonical `scout → plan → build → review → test` order.
         let stage_starts: Vec<&str> = captured
             .iter()
             .filter(|e| e.kind == KIND_STAGE_STARTED)
@@ -2032,7 +2669,10 @@ mod tests {
                     .unwrap_or("")
             })
             .collect();
-        assert_eq!(stage_starts, vec!["scout", "plan", "build"]);
+        assert_eq!(
+            stage_starts,
+            vec!["scout", "plan", "build", "review", "test"]
+        );
     }
 
     /// `Finished.outcome` deeply equals the IPC return value's key
@@ -2089,7 +2729,7 @@ mod tests {
             .and_then(|v| v.as_array())
             .expect("stages array");
         assert_eq!(stages.len(), outcome.stages.len());
-        assert_eq!(stages.len(), 3);
+        assert_eq!(stages.len(), 5);
         let total_cost = outcome_json
             .get("totalCostUsd")
             .and_then(|v| v.as_f64())

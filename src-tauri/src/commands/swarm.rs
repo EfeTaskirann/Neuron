@@ -357,17 +357,27 @@ mod tests {
     use crate::test_support::mock_app_with_pool;
 
     /// Acceptance: on a fresh install (no `<app_data_dir>/agents/`),
-    /// `swarm:profiles_list` returns exactly the three bundled
-    /// profiles in deterministic order.
+    /// `swarm:profiles_list` returns exactly the five bundled
+    /// profiles (W3-12d added reviewer + integration-tester) in
+    /// deterministic order.
     #[tokio::test]
-    async fn profiles_list_returns_three_bundled() {
+    async fn profiles_list_returns_five_bundled() {
         let (app, _pool, _dir) = mock_app_with_pool().await;
         let summaries = swarm_profiles_list(app.handle().clone())
             .await
             .expect("ok");
         let ids: Vec<&str> =
             summaries.iter().map(|s| s.id.as_str()).collect();
-        assert_eq!(ids, vec!["backend-builder", "planner", "scout"]);
+        assert_eq!(
+            ids,
+            vec![
+                "backend-builder",
+                "integration-tester",
+                "planner",
+                "reviewer",
+                "scout",
+            ]
+        );
         for s in &summaries {
             assert_eq!(
                 s.source, "bundled",
@@ -465,6 +475,7 @@ mod tests {
             retry_count: 0,
             stages: Vec::new(),
             last_error: None,
+        last_verdict: None,
         };
         registry
             .try_acquire_workspace("ws-done", job)
@@ -493,6 +504,7 @@ mod tests {
             retry_count: 0,
             stages: Vec::new(),
             last_error: Some("boom".into()),
+        last_verdict: None,
         };
         registry
             .try_acquire_workspace("ws-failed", job)
@@ -524,6 +536,7 @@ mod tests {
             retry_count: 0,
             stages: Vec::new(),
             last_error: None,
+        last_verdict: None,
         };
         registry
             .try_acquire_workspace("ws-mid", job)
@@ -554,6 +567,7 @@ mod tests {
             retry_count: 0,
             stages: Vec::new(),
             last_error: None,
+        last_verdict: None,
         };
         registry
             .try_acquire_workspace("ws-live", job)
@@ -601,6 +615,7 @@ mod tests {
             retry_count: 0,
             stages: Vec::new(),
             last_error: None,
+        last_verdict: None,
         };
         registry
             .try_acquire_workspace("ws-double", job)
@@ -677,6 +692,7 @@ mod tests {
                 retry_count: 0,
                 stages: Vec::new(),
                 last_error: None,
+            last_verdict: None,
             };
             registry
                 .try_acquire_workspace("ws-list", job)
@@ -743,6 +759,7 @@ mod tests {
             retry_count: 0,
             stages: Vec::new(),
             last_error: None,
+        last_verdict: None,
         };
         registry
             .try_acquire_workspace("ws-detail", job)

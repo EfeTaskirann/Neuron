@@ -32,6 +32,7 @@ use crate::error::AppError;
 use super::job::{
     Job, JobDetail, JobState, JobSummary, StageResult,
 };
+use super::verdict::Verdict;
 
 /// Result of a `recover_orphans` sweep. `count` is the number of
 /// non-terminal rows the sweep flipped to `Failed`; `recovered`
@@ -55,10 +56,11 @@ pub(super) async fn insert_job_and_lock(
     acquired_at_ms: i64,
 ) -> Result<(), AppError> {
     let mut tx = pool.begin().await?;
+    let last_verdict_json = serialize_verdict(job.last_verdict.as_ref())?;
     sqlx::query(
         "INSERT INTO swarm_jobs \
-         (id, workspace_id, goal, created_at_ms, state, retry_count, last_error, finished_at_ms) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+         (id, workspace_id, goal, created_at_ms, state, retry_count, last_error, finished_at_ms, last_verdict_json) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&job.id)
     .bind(workspace_id)
@@ -68,6 +70,7 @@ pub(super) async fn insert_job_and_lock(
     .bind(job.retry_count as i64)
     .bind(job.last_error.as_deref())
     .bind(Option::<i64>::None)
+    .bind(last_verdict_json)
     .execute(&mut *tx)
     .await?;
     sqlx::query(
@@ -97,15 +100,17 @@ pub(super) async fn update_job(
     job: &Job,
     finished_at_ms: Option<i64>,
 ) -> Result<(), AppError> {
+    let last_verdict_json = serialize_verdict(job.last_verdict.as_ref())?;
     sqlx::query(
         "UPDATE swarm_jobs \
-         SET state = ?, retry_count = ?, last_error = ?, finished_at_ms = ? \
+         SET state = ?, retry_count = ?, last_error = ?, finished_at_ms = ?, last_verdict_json = ? \
          WHERE id = ?",
     )
     .bind(job.state.as_db_str())
     .bind(job.retry_count as i64)
     .bind(job.last_error.as_deref())
     .bind(finished_at_ms)
+    .bind(last_verdict_json)
     .bind(&job.id)
     .execute(pool)
     .await?;
@@ -122,10 +127,11 @@ pub(super) async fn insert_stage(
     stage: &StageResult,
     created_at_ms: i64,
 ) -> Result<(), AppError> {
+    let verdict_json = serialize_verdict(stage.verdict.as_ref())?;
     sqlx::query(
         "INSERT INTO swarm_stages \
-         (job_id, idx, state, specialist_id, assistant_text, session_id, total_cost_usd, duration_ms, created_at_ms) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         (job_id, idx, state, specialist_id, assistant_text, session_id, total_cost_usd, duration_ms, created_at_ms, verdict_json) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(job_id)
     .bind(idx as i64)
@@ -136,6 +142,7 @@ pub(super) async fn insert_stage(
     .bind(stage.total_cost_usd)
     .bind(stage.duration_ms as i64)
     .bind(created_at_ms)
+    .bind(verdict_json)
     .execute(pool)
     .await?;
     Ok(())
@@ -235,7 +242,7 @@ pub(super) async fn get_job_detail(
 ) -> Result<Option<JobDetail>, AppError> {
     let job_row_opt = sqlx::query(
         "SELECT id, workspace_id, goal, created_at_ms, finished_at_ms, \
-                state, retry_count, last_error \
+                state, retry_count, last_error, last_verdict_json \
          FROM swarm_jobs \
          WHERE id = ?",
     )
@@ -255,7 +262,10 @@ pub(super) async fn get_job_detail(
     let state_str: String = row.try_get("state")?;
     let retry_count_i: i64 = row.try_get("retry_count")?;
     let last_error: Option<String> = row.try_get("last_error")?;
+    let last_verdict_json: Option<String> =
+        row.try_get("last_verdict_json")?;
     let state = JobState::from_db_str(&state_str)?;
+    let last_verdict = deserialize_verdict(last_verdict_json.as_deref())?;
 
     let stages = fetch_stages(pool, &id).await?;
     let total_cost_usd: f64 =
@@ -274,6 +284,7 @@ pub(super) async fn get_job_detail(
         last_error,
         total_cost_usd,
         total_duration_ms,
+        last_verdict,
     }))
 }
 
@@ -285,7 +296,7 @@ async fn fetch_stages(
 ) -> Result<Vec<StageResult>, AppError> {
     let rows = sqlx::query(
         "SELECT idx, state, specialist_id, assistant_text, session_id, \
-                total_cost_usd, duration_ms \
+                total_cost_usd, duration_ms, verdict_json \
          FROM swarm_stages \
          WHERE job_id = ? \
          ORDER BY idx ASC",
@@ -301,7 +312,9 @@ async fn fetch_stages(
         let session_id: String = row.try_get("session_id")?;
         let total_cost_usd: f64 = row.try_get("total_cost_usd")?;
         let duration_ms_i: i64 = row.try_get("duration_ms")?;
+        let verdict_json: Option<String> = row.try_get("verdict_json")?;
         let state = JobState::from_db_str(&state_str)?;
+        let verdict = deserialize_verdict(verdict_json.as_deref())?;
         out.push(StageResult {
             state,
             specialist_id,
@@ -309,6 +322,7 @@ async fn fetch_stages(
             session_id,
             total_cost_usd,
             duration_ms: duration_ms_i.max(0) as u64,
+            verdict,
         });
     }
     Ok(out)
@@ -417,6 +431,43 @@ fn detail_to_job(detail: JobDetail) -> Job {
         retry_count: detail.retry_count,
         stages: detail.stages,
         last_error: detail.last_error,
+        last_verdict: detail.last_verdict,
+    }
+}
+
+/// Serialize an optional `Verdict` to JSON for column storage.
+/// `None` round-trips to `Ok(None)` (the column stays NULL).
+/// Serialization failure surfaces as `AppError::Internal` —
+/// `Verdict` is a closed serde shape so the only realistic failure
+/// path is OOM, but we surface a typed error rather than panicking.
+fn serialize_verdict(
+    verdict: Option<&Verdict>,
+) -> Result<Option<String>, AppError> {
+    match verdict {
+        None => Ok(None),
+        Some(v) => serde_json::to_string(v)
+            .map(Some)
+            .map_err(|e| AppError::Internal(format!(
+                "swarm: failed to serialize Verdict: {e}"
+            ))),
+    }
+}
+
+/// Deserialize an optional JSON column back to a `Verdict`.
+/// `None` (NULL column) round-trips to `Ok(None)`; a non-null
+/// column that fails to parse surfaces as `AppError::Internal`
+/// with the parse error attached so a corrupted DB never silently
+/// drops a Verdict.
+fn deserialize_verdict(
+    raw: Option<&str>,
+) -> Result<Option<Verdict>, AppError> {
+    match raw {
+        None => Ok(None),
+        Some(s) => serde_json::from_str::<Verdict>(s)
+            .map(Some)
+            .map_err(|e| AppError::Internal(format!(
+                "swarm: failed to deserialize Verdict from DB: {e}"
+            ))),
     }
 }
 
@@ -451,6 +502,7 @@ mod tests {
             retry_count: 0,
             stages: Vec::new(),
             last_error: None,
+            last_verdict: None,
         }
     }
 
@@ -462,6 +514,7 @@ mod tests {
             session_id: format!("sess-{state:?}"),
             total_cost_usd: cost,
             duration_ms: dur,
+            verdict: None,
         }
     }
 
@@ -932,5 +985,104 @@ mod tests {
         let t = truncate_chars(s, 3);
         assert_eq!(t.chars().count(), 3);
         assert_eq!(t, "abç");
+    }
+
+    /// WP-W3-12d — a Failed job with a populated `last_verdict`
+    /// round-trips through the registry → SQLite → store reload.
+    /// The Verdict must reappear with bit-for-bit fidelity (issue
+    /// list, severities, summary). Per-stage verdicts on Review /
+    /// Test stages also survive.
+    #[tokio::test]
+    async fn verdict_persists_across_app_restart() {
+        use crate::swarm::coordinator::verdict::{
+            Verdict, VerdictIssue, VerdictSeverity,
+        };
+        let (pool, _dir) = fresh_pool().await;
+        let reg = JobRegistry::with_pool(pool.clone());
+        reg.try_acquire_workspace(
+            "ws-verdict",
+            fixture_job("j-verdict", "g", 0),
+        )
+        .await
+        .expect("acquire");
+
+        // Push a Review stage with a populated Verdict, then mark
+        // the job Failed with `last_verdict` set — mirrors the
+        // FSM's `finalize_failed_with_verdict` shape.
+        let approved_review = Verdict {
+            approved: true,
+            issues: Vec::new(),
+            summary: "looks fine".to_string(),
+        };
+        let rejected_test = Verdict {
+            approved: false,
+            issues: vec![VerdictIssue {
+                severity: VerdictSeverity::High,
+                file: Some("tests/foo.rs".to_string()),
+                line: Some(7),
+                message: "test_bar fails".to_string(),
+            }],
+            summary: "1 failure".to_string(),
+        };
+        let approved_review_clone = approved_review.clone();
+        let rejected_test_clone = rejected_test.clone();
+        reg.update("j-verdict", |j| {
+            j.stages.push(StageResult {
+                state: JobState::Review,
+                specialist_id: "reviewer".into(),
+                assistant_text: "ok".into(),
+                session_id: "s-r".into(),
+                total_cost_usd: 0.001,
+                duration_ms: 12,
+                verdict: Some(approved_review_clone),
+            });
+            j.state = JobState::Failed;
+            j.last_verdict = Some(rejected_test_clone);
+        })
+        .await
+        .expect("update");
+
+        // Reload through the read path — get_job_detail must surface
+        // both the per-stage verdict and the job-level last_verdict.
+        let detail = get_job_detail(&pool, "j-verdict")
+            .await
+            .expect("query")
+            .expect("Some");
+        assert_eq!(detail.state, JobState::Failed);
+        assert_eq!(detail.last_verdict.as_ref(), Some(&rejected_test));
+        assert_eq!(detail.stages.len(), 1);
+        assert_eq!(
+            detail.stages[0].verdict.as_ref(),
+            Some(&approved_review)
+        );
+        assert_eq!(detail.last_error, None);
+    }
+
+    /// Migration 0007 actually adds the two new columns. Cheap
+    /// schema-pragma probe so future migration drift surfaces here
+    /// rather than mid-write.
+    #[tokio::test]
+    async fn migration_0007_adds_verdict_columns() {
+        let (pool, _dir) = fresh_pool().await;
+        let stage_cols: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM pragma_table_info('swarm_stages')",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("pragma swarm_stages");
+        assert!(
+            stage_cols.iter().any(|c| c == "verdict_json"),
+            "swarm_stages.verdict_json missing; cols={stage_cols:?}"
+        );
+        let job_cols: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM pragma_table_info('swarm_jobs')",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("pragma swarm_jobs");
+        assert!(
+            job_cols.iter().any(|c| c == "last_verdict_json"),
+            "swarm_jobs.last_verdict_json missing; cols={job_cols:?}"
+        );
     }
 }
