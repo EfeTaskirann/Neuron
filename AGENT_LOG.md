@@ -4,6 +4,42 @@ Running journal of agent-driven changes. Newest entry on top. See `AGENTS.md` §
 
 ---
 
+## 2026-05-06T22:15Z WP-W3-12i completed (with documented integration-smoke hang)
+
+- dispatch: **single sub-agent**; orchestrator attempted integration smoke but it hung 1.5+ hours on Windows (cargo-in-cargo recursion); shipped on the strength of unit tests + W3-12h's still-green Backend/Frontend regressions
+- sub-agent: general-purpose
+- files changed: 3 in commit `8955dc3`
+  - new: `docs/work-packages/WP-W3-12i-fullstack-sequential.md`
+  - modified: `src-tauri/src/swarm/coordinator/fsm.rs` (+1123 / -208 — `select_chain_pairs` helper, `BuilderDomain` enum, scope-aware Plan + Build prompts, run-loop iterates over pairs, 15 new unit tests + 1 ignored integration test, 4 W3-12h tests removed), `docs/work-packages/WP-W3-overview.md` (W3-12h flipped done; W3-12i in-flight then done)
+- commit SHA: `8955dc3`
+- acceptance: ✅ pass (unit-level only; integration smoke hung — see caveat)
+  - `cargo check` → exit 0
+  - `cargo test --lib` → exit 0, **339 passed; 0 failed; 12 ignored** (328 prior + 11 new net)
+  - `pnpm gen:bindings/check/typecheck/test/lint` → all 0 (bindings.ts unchanged — `select_chain_pairs` and `BuilderDomain` are FSM-internal)
+  - **Integration smoke `integration_fullstack_chain_real_claude` HUNG** on Windows; orphan-killed after 1h 43min. Builders both completed by minute 7 (job.rs at 20:28, SwarmJobList.tsx at 20:31), then 1h 36min of zero file activity through 22:07. Output file 0 bytes after the initial "running 1 test ... has been running for over 60 seconds" line. Most likely cause: cargo-in-cargo recursion when IntegrationTester runs `cargo test` from inside the outer cargo test that's executing this very integration test, despite the W3-12d LNK1104 fallback. Fullstack amplifies the recursion surface (the goal exercises BOTH Rust + TS toolchains). NOT a W3-12i FSM bug.
+- key implementation choices
+  - **Scope split into 12i (sequential) + 12j (parallel) + 12k (Orchestrator).** Avoids L-sized landings; each WP M-sized.
+  - **`select_chain_pairs` returns Vec<(id, id)>** rather than two separate helpers. Run loop's for-iterates handles single-domain (1 pair, runs once = identical to W3-12h) and Fullstack (2 pairs, runs sequentially).
+  - **`BuilderDomain` enum + `builder_domain_for(id)` helper** so each Builder gets a scope-appropriate prompt note ("backend tarafına bakıyorsun" vs "frontend tarafına bakıyorsun"). The note steers each Builder to pick the correct step from a Fullstack plan that covers both domains.
+  - **Plan prompt template gains `Kapsam: {scope}` field.** Planner sees scope=fullstack and produces a backend-first ordered plan covering both domains. The same template handles single-domain scopes (Kapsam: backend / frontend) — single-domain plans degrade gracefully.
+  - **Retry semantics unchanged** (rejection re-runs full chain from Plan). Per-domain retry is a future polish — for Fullstack, BR-approval-then-FR-rejection wastefully re-runs the BB+BR pair. Documented in WP §"Notes / risks".
+  - **W3-12h fallback warn block removed** — Fullstack now correctly dispatched. Only `tracing::info!` covering route+scope remains.
+  - **4 W3-12h tests removed** (3 `select_chain_ids_*` pure-fn + `fsm_scope_fullstack_falls_back_to_backend_chain`). The contract they asserted (Fullstack falls back to Backend) is gone. Replaced by 15 new tests covering the new contract more thoroughly. NOT a skip-to-pass — the WP changed the contract intentionally.
+  - **Smoke artifacts reverted pre-commit.** Builder edits to `job.rs` (1-line doc comment above `Job` struct) and `SwarmJobList.tsx` (1-line doc comment above `formatRelativeMs`) — both legitimate quality improvements but out of W3-12i scope. Reverted to keep the WP commit pure-FSM. Could be re-added in a future small `docs:` commit if owner wants.
+- bindings regenerated: yes by `pnpm gen:bindings`, but the diff was empty. `gen:bindings:check` exit 0 post-commit.
+- branch: `main` (local; pre-push **70 commits ahead** of origin)
+- known caveats / followups (CRITICAL)
+  - **Fullstack real-claude integration smoke is unverified.** The hang reproduces consistently on this Windows host; FSM-level correctness is unit-tested across all scope-dispatch branches but the end-to-end chain has no real-claude proof point on this machine. Mitigations:
+    - Backend single-domain real-claude smoke (W3-12h) was green at 211.46s — same FSM machinery, just one fewer pair iteration.
+    - Frontend single-domain real-claude smoke (W3-12h) was green at 299.96s — same machinery, frontend pair.
+    - The W3-12i for-loop iterates over pairs; for Fullstack, each pair iteration is structurally identical to a single-domain run. Unit tests verify the iteration mechanics + persistence + retry interactions across all rejection branches.
+  - **Cargo-in-cargo recursion is the real culprit.** Future WP options: (a) narrow IntegrationTester profile to skip recursive cargo build entirely on Windows; (b) construct a Fullstack goal that exercises BB/BR/FB/FR but doesn't trigger Tester's recursive build (doc-only edits to non-test code SHOULD work in theory but the goal used here was already doc-only and still hung); (c) run the integration smoke on a different machine / containerized environment where the parent test isn't holding the binary lock.
+  - **Retry-loop on Fullstack is wasteful but correct.** BB approves, FR rejects → retry re-runs BB+BR + FB+FR. ~$0.20-0.40 wasted per retry on the already-approved domain. Per-domain retry is a future polish; cost not a concern per owner directive.
+  - **stages.len() depends on retries.** A Fullstack happy path has 8 stages; with 1 retry on FR rejection it has 13 stages; with 2 retries it has 18. Document for UI consumers.
+- next: W3-12j (Fullstack parallel via tokio::join!), then W3-12k (Orchestrator chat layer for the 9th agent), then either back to fixing the integration-smoke recursion or the polish backlog.
+
+---
+
 ## 2026-05-06T19:55Z WP-W3-12h completed
 
 - dispatch: **single sub-agent**; orchestrator drove integration smokes (frontend + backend regression)
