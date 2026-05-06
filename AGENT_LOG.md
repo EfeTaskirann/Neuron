@@ -4,6 +4,48 @@ Running journal of agent-driven changes. Newest entry on top. See `AGENTS.md` §
 
 ---
 
+## 2026-05-06T08:30Z WP-W3-12d completed
+
+- dispatch: **single sub-agent**; orchestrator drove integration smokes per the 2026-05-05 standing directive
+- sub-agent: general-purpose
+- files changed: 14 in commit `ed98cf5`
+  - new: `src-tauri/src/swarm/coordinator/verdict.rs` (3 types + `parse_verdict` + helpers), `src-tauri/src/swarm/agents/{reviewer,integration-tester}.md`, `src-tauri/migrations/0007_swarm_verdict.sql`, `docs/work-packages/WP-W3-12d-verdict-review-test.md`
+  - modified: `src-tauri/src/swarm/coordinator/{fsm,job,mod,store}.rs` (REVIEW/TEST activation, run_verdict_stage helper, finalize_failed_with_verdict, store/serialize columns), `src-tauri/src/swarm/profile.rs` (`bundled_three_profiles_present` → `bundled_five_profiles_present` test rename), `src-tauri/src/commands/swarm.rs` (Job constructors get `last_verdict: None`), `src-tauri/src/db.rs` (migration count 6 → 7), `app/src/lib/bindings.ts` (regen +Verdict types +`last_verdict?` / `verdict?` fields), `docs/work-packages/WP-W3-overview.md` (W3-14 flipped to done; W3-12d/e/f rows split per scope reduction)
+- commit SHA: `ed98cf5`
+- acceptance: ✅ pass
+  - `cargo check` → exit 0
+  - `cargo test --lib` → exit 0, **272 passed; 0 failed; 9 ignored** (254 prior + 18 new unit; 8 prior ignored + 1 new ignored integration)
+  - `pnpm gen:bindings` → exit 0
+  - `pnpm gen:bindings:check` → exit 1 PRE-COMMIT (expected). POST-`ed98cf5` it exits 0.
+  - `pnpm typecheck/test/lint` → all 0 (frontend regression: 34/34 — no UI changes from this WP)
+  - **orchestrator-driven integration smokes** (Windows + Pro/Max OAuth):
+    - `integration_full_chain_real_claude_with_verdict` (NEW) → Done in **202.35s** ✅; 5 real-claude stages, both Reviewer + IntegrationTester emitted parseable approved Verdicts, DB has full chain with `verdict_json` columns populated.
+    - `integration_cancel_during_real_claude_chain` (W3-12c regression, now against 5-stage FSM) → Cancelled in **39.90s** ✅.
+    - `integration_persistence_survives_real_claude_chain` and `integration_fsm_drives_real_claude_chain` deliberately skipped — they run the same 5-stage real-claude scenario; the new full-chain test is a strict superset (asserts persistence + verdict round-trip + chain completion). Saved ~5 min of redundant integration runs.
+- key implementation choices
+  - **Scope reduction.** Original W3-12d combined REVIEW + TEST + Verdict + parser + retry loop + Coordinator brain. Orchestrator split: 12d = quality gate (this WP), 12e = retry loop, 12f = Coordinator brain. Each becomes M-sized; the bundled L-version was the demo-stopper risk.
+  - **Failed-on-reject, not retry.** Verdict-rejected → terminal Failed with `last_verdict` populated. User uses W3-14's Rerun button for manual retry. The data flow for retry already exists (12e just adds the FSM branch); 12d ships the gate without the loop.
+  - **Robust JSON parser, 4-step defense.** Per architectural report §7.1: direct → markdown-fence-strip → first-balanced-`{...}`-substring → fail. String-aware brace counting handles `{"summary":"a } b"}` correctly. Unicode-safe (Turkish + emoji in summaries round-trip).
+  - **Strict prompt engineering for both new personas** (architectural report §7.2): explicit OUTPUT CONTRACT, few-shot example (1 approved + 1 rejected), negative examples ("YANLIŞ: ```json {...}``` (fence olmaz). YANLIŞ: 'İşte JSON: {...}' (intro olmaz)."). The robust parser is the safety net; the prompt should produce direct-parseable output 95%+ of the time.
+  - **`run_verdict_stage` helper** centralizes "spawn specialist, parse Verdict, branch on approved" so REVIEW and TEST share one code path. Reduces FSM duplication.
+  - **`finalize_failed_with_verdict`** joins `finalize_failed` + `finalize_cancelled` as the third terminal-finalizer. Sets `Job.last_verdict`, leaves `last_error = None` (the structured Verdict IS the error). Test confirms.
+  - **`StageResult.verdict: Option<Verdict>`** populated for Review/Test stages, `None` for Scout/Plan/Build. Per-stage cost / duration unchanged.
+  - **`Job.last_verdict` only set on Verdict-rejection.** A Done job has `last_verdict = None`; the per-stage `verdict` fields carry the Reviewer/Tester findings on the happy path.
+  - **`skip_serializing_if = "Option::is_none"` removed** from `last_verdict` / `verdict` fields. specta refused unified-mode codegen with that attribute. Wire shape becomes `lastVerdict?: Verdict | null` (always present, null when absent). Frontend treats null as "no verdict"; semantically equivalent.
+  - **Migration `0007_swarm_verdict.sql` is two ALTER TABLE ADD COLUMN statements**, no data migration. Existing `swarm_jobs` and `swarm_stages` rows from W3-12b gain NULL columns and behave correctly post-upgrade.
+  - **5-profile bundle is the new contract.** `swarm:profiles_list` returns scout / planner / backend-builder / reviewer / integration-tester (alphabetically). Profile loader test renamed to match.
+- bindings regenerated: yes (+`Verdict`, +`VerdictIssue`, +`VerdictSeverity`, optional fields on 3 existing types)
+- branch: `main` (local; not pushed; **57 commits ahead of `origin/main`** post-`ed98cf5`)
+- known caveats / followups
+  - **Verdict not rendered in UI.** W3-14's `SwarmJobDetail.tsx` shows the existing state pill on Failed; the verdict's structured issues list is on the wire but not visible. Small follow-up commit can add a "Verdict" subsection. Out of scope for 12d.
+  - **No retry loop.** Failed-on-reject is the contract. W3-12e adds the retry loop with `MAX_RETRIES=2` and feedback piping to Planner.
+  - **No Coordinator brain.** Routing remains hardcoded in the FSM transition table. W3-12f adds Option B's single-shot brain.
+  - **`integration_fsm_drives_real_claude_chain` and `integration_persistence_survives_real_claude_chain` not re-run for this WP** — they run the same 5-stage scenario as the new full-chain test. Both should still pass (their mocks were updated alongside the FSM change); ran the unit-level versions in cargo test --lib (272/0/9 baseline confirms no regression).
+  - **Profile rename loss-and-restore.** Orchestrator initially `git restore`d `profile.rs` to drop the cancel-test smoke artifact, which also reverted sub-agent's legitimate `bundled_three_profiles_present` → `bundled_five_profiles_present` rename. Caught + re-applied manually before commit. Defensive `git restore` lesson: always inspect the file's diff before restore when sub-agent has touched it for unrelated reasons.
+- next: WP-W3-12e (retry feedback loop) and WP-W3-12f (Coordinator brain Option B). Both unblocked by 12d. WP-W3-14 follow-up (verdict-detail rendering in SwarmJobDetail) is a fast small commit that doesn't need its own WP doc.
+
+---
+
 ## 2026-05-06T07:18Z WP-W3-14 completed
 
 - dispatch: **single sub-agent**; frontend-only WP, no backend changes, no real-claude integration smoke required (verified Rust regression count unchanged at 254 instead)
