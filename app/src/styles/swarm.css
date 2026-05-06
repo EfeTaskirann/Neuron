@@ -29,6 +29,220 @@
   overflow: auto;
 }
 
+/* ---------- Orchestrator chat panel (W3-12k3) ----------
+   Replaces the W3-14 .swarm-goal-form. Sits in the same slot
+   (top of left pane), above .swarm-list-title. The history
+   area scrolls; the input row is pinned to the bottom of the
+   chat block via flex layout. Tokens only (Charter §"Hard
+   constraints" #4 — OKLCH only, no hex/HSL). */
+
+.swarm-chat {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  padding: 12px;
+  border-bottom: 1px solid var(--border);
+  min-height: 0;
+  /* History area should stretch when there's vertical room but
+     never push the input row below the fold; cap at ~half the
+     left pane on tall windows. */
+  max-height: 52vh;
+}
+
+.swarm-chat-history {
+  flex: 1;
+  min-height: 120px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 4px 2px 8px;
+}
+
+.swarm-chat-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  padding: 24px 12px;
+  text-align: center;
+  color: var(--muted-foreground);
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+
+.swarm-chat-empty p {
+  margin: 0;
+}
+
+.swarm-chat-msg {
+  max-width: 88%;
+  padding: 8px 10px;
+  border-radius: var(--radius-md);
+  font-size: 12.5px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.swarm-chat-msg.user {
+  align-self: flex-end;
+  background: color-mix(in oklch, var(--neuron-violet-500) 18%, transparent);
+  color: var(--foreground);
+  border: 1px solid color-mix(in oklch, var(--neuron-violet-500) 30%, transparent);
+}
+
+.swarm-chat-msg.orchestrator {
+  align-self: flex-start;
+  background: var(--surface-2);
+  color: var(--foreground);
+  border: 1px solid var(--border);
+}
+
+.swarm-chat-msg.orchestrator.action-clarify {
+  border-color: color-mix(in oklch, var(--neuron-amber-500, var(--syn-warn)) 30%, var(--border));
+  background: color-mix(in oklch, var(--neuron-amber-500, var(--syn-warn)) 6%, var(--surface-2));
+}
+
+.swarm-chat-msg.orchestrator.action-dispatch {
+  border-color: color-mix(in oklch, var(--syn-ok) 30%, var(--border));
+  background: color-mix(in oklch, var(--syn-ok) 6%, var(--surface-2));
+}
+
+.swarm-chat-msg.orchestrator.pending {
+  opacity: 0.65;
+  font-style: italic;
+}
+
+.swarm-chat-msg.job {
+  align-self: flex-start;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  border-radius: 999px;
+  background: color-mix(in oklch, var(--syn-ok) 10%, var(--surface-2));
+  border: 1px solid color-mix(in oklch, var(--syn-ok) 30%, var(--border));
+  font-size: 12px;
+  max-width: 100%;
+}
+
+.swarm-chat-job-prefix {
+  color: var(--muted-foreground);
+}
+
+.swarm-chat-job-link {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--neuron-violet-500);
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.swarm-chat-job-link:hover {
+  color: color-mix(in oklch, var(--neuron-violet-500) 80%, var(--foreground));
+}
+
+.swarm-chat-job-link:focus-visible {
+  outline: 2px solid var(--neuron-violet-500);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm, 4px);
+}
+
+.swarm-chat-job-goal {
+  font-size: 11.5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 220px;
+}
+
+.swarm-chat-error {
+  margin-top: 8px;
+  padding: 6px 10px;
+  font-size: 12px;
+  color: var(--syn-error);
+  background: color-mix(in oklch, var(--syn-error) 10%, transparent);
+  border: 1px solid color-mix(in oklch, var(--syn-error) 30%, transparent);
+  border-radius: var(--radius-md);
+  font-family: var(--font-mono);
+  white-space: pre-wrap;
+}
+
+.swarm-chat-input-row {
+  display: flex;
+  gap: 8px;
+  align-items: flex-end;
+  margin-top: 8px;
+}
+
+.swarm-chat-input {
+  flex: 1;
+  resize: vertical;
+  min-height: 44px;
+  max-height: 160px;
+  padding: 8px 10px;
+  font-family: var(--font-sans);
+  font-size: 13px;
+  line-height: 1.4;
+  color: var(--foreground);
+  background: var(--background);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  outline: none;
+}
+
+.swarm-chat-input:focus {
+  border-color: color-mix(in oklch, var(--neuron-violet-500) 45%, var(--border));
+}
+
+.swarm-chat-input:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+/* Animated thinking dots — pure CSS, no extra deps. Three
+   spans inside `.thinking-dots` pulse in a 0/200/400ms
+   cascade so the bubble reads as "agent is composing". */
+.thinking-dots {
+  display: inline-flex;
+  gap: 4px;
+  align-items: center;
+}
+
+.thinking-dots span {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--muted-foreground);
+  animation: swarm-chat-thinking 1.2s infinite ease-in-out;
+}
+
+.thinking-dots span:nth-child(2) {
+  animation-delay: 0.2s;
+}
+
+.thinking-dots span:nth-child(3) {
+  animation-delay: 0.4s;
+}
+
+@keyframes swarm-chat-thinking {
+  0%, 80%, 100% {
+    opacity: 0.3;
+    transform: scale(0.8);
+  }
+  40% {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
 /* ---------- Goal-input form ---------- */
 
 .swarm-goal-form {

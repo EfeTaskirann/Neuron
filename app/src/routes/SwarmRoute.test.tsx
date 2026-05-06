@@ -9,6 +9,7 @@ vi.mock('../lib/bindings', () => ({
     swarmGetJob: vi.fn(),
     swarmRunJob: vi.fn(),
     swarmCancelJob: vi.fn(),
+    swarmOrchestratorDecide: vi.fn(),
   },
 }));
 
@@ -106,6 +107,14 @@ beforeEach(async () => {
     status: 'ok',
     data: null,
   });
+  vi.mocked(commands.swarmOrchestratorDecide).mockResolvedValue({
+    status: 'ok',
+    data: {
+      action: 'dispatch',
+      text: 'ship a feature',
+      reasoning: 'concrete',
+    },
+  });
 });
 
 describe('SwarmRoute', () => {
@@ -117,16 +126,33 @@ describe('SwarmRoute', () => {
     );
   });
 
-  it('submitting the goal form fires swarmRunJob with the default workspace', async () => {
+  it('renders the OrchestratorChatPanel as the left-pane top section', async () => {
+    renderRoute();
+    expect(
+      screen.getByPlaceholderText(/type a message/i),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/chat with the swarm orchestrator/i),
+    ).toBeInTheDocument();
+  });
+
+  it('chat dispatch outcome fires swarmRunJob with the refined goal', async () => {
     renderRoute();
     const { commands } = await import('../lib/bindings');
-    const textarea = screen.getByPlaceholderText(/describe a goal/i) as HTMLTextAreaElement;
-    fireEvent.change(textarea, { target: { value: 'ship a feature' } });
-    fireEvent.submit(textarea.closest('form')!);
+    const textarea = screen.getByPlaceholderText(/type a message/i) as HTMLTextAreaElement;
+    fireEvent.change(textarea, { target: { value: 'EXECUTE: ship a feature' } });
+    fireEvent.click(screen.getByRole('button', { name: /send/i }));
+    await waitFor(() =>
+      expect(commands.swarmOrchestratorDecide).toHaveBeenCalled(),
+    );
+    const decideCall = vi.mocked(commands.swarmOrchestratorDecide).mock.calls[0]!;
+    expect(decideCall[0]).toBe('default');
+    expect(decideCall[1]).toBe('EXECUTE: ship a feature');
     await waitFor(() => expect(commands.swarmRunJob).toHaveBeenCalled());
-    const call = vi.mocked(commands.swarmRunJob).mock.calls[0]!;
-    expect(call[0]).toBe('default');
-    expect(call[1]).toBe('ship a feature');
+    const runCall = vi.mocked(commands.swarmRunJob).mock.calls[0]!;
+    expect(runCall[0]).toBe('default');
+    // Refined goal returned from the mocked orchestrator decision.
+    expect(runCall[1]).toBe('ship a feature');
   });
 
   it('clicking a job row populates the detail pane and shows Cancel for non-terminal jobs', async () => {
