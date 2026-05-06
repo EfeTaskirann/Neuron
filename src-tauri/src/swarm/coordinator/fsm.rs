@@ -38,7 +38,9 @@ use crate::events;
 use crate::swarm::profile::{Profile, ProfileRegistry};
 use crate::swarm::transport::Transport;
 
-use super::decision::{parse_decision, CoordinatorDecision, CoordinatorRoute};
+use super::decision::{
+    parse_decision, CoordinatorDecision, CoordinatorRoute, CoordinatorScope,
+};
 use super::job::{
     Job, JobOutcome, JobRegistry, JobState, StageResult, SwarmJobEvent,
 };
@@ -57,9 +59,13 @@ pub const MAX_RETRIES: u32 = 2;
 pub const SCOUT_ID: &str = "scout";
 pub const PLANNER_ID: &str = "planner";
 pub const BUILDER_ID: &str = "backend-builder";
-/// Reviewer profile id (W3-12d). Runs after `BUILDER_ID` and emits
-/// a JSON Verdict the FSM gates on.
-pub const REVIEWER_ID: &str = "reviewer";
+/// BackendReviewer profile id (W3-12d, renamed in W3-12g). Runs
+/// after `BUILDER_ID` and emits a JSON Verdict the FSM gates on.
+/// Always used by the FSM in W3-12g regardless of
+/// `CoordinatorDecision.scope` — scope-aware dispatch lands in
+/// W3-12h. The const value (`"backend-reviewer"`) matches the
+/// renamed bundled profile (`backend-reviewer.md`).
+pub const BACKEND_REVIEWER_ID: &str = "backend-reviewer";
 /// IntegrationTester profile id (W3-12d). Runs after a successful
 /// Reviewer verdict; emits a JSON Verdict the FSM gates on for
 /// the final transition to `Done`.
@@ -524,10 +530,10 @@ impl<T: Transport> CoordinatorFsm<T> {
             .clone();
         let reviewer = self
             .profiles
-            .get(REVIEWER_ID)
+            .get(BACKEND_REVIEWER_ID)
             .ok_or_else(|| {
                 AppError::NotFound(format!(
-                    "swarm profile `{REVIEWER_ID}` (required for FSM)"
+                    "swarm profile `{BACKEND_REVIEWER_ID}` (required for FSM)"
                 ))
             })?
             .clone();
@@ -659,12 +665,42 @@ impl<T: Transport> CoordinatorFsm<T> {
                         );
                         CoordinatorDecision {
                             route: CoordinatorRoute::ExecutePlan,
+                            // W3-12g: fallback path picks the safest
+                            // scope (Backend) — matches the FSM's
+                            // existing single-chain dispatch and the
+                            // legacy-shape default in the parser.
+                            scope: CoordinatorScope::Backend,
                             reasoning: format!(
                                 "fallback: brain output unparseable ({e})"
                             ),
                         }
                     }
                 };
+                // W3-12g §6 — record route + scope for audit. The
+                // scope is logged but NOT acted on; the FSM still
+                // dispatches `BACKEND_BUILDER_ID` + `BACKEND_REVIEWER_ID`
+                // unconditionally. A `tracing::warn!` fires when the
+                // brain produces a non-Backend scope so W3-12h's
+                // dispatch correctness is observable from existing
+                // integration smokes before its FSM logic ships.
+                tracing::info!(
+                    job_id = %job_id,
+                    route = ?decision.route,
+                    scope = ?decision.scope,
+                    "swarm: Coordinator decision recorded"
+                );
+                if matches!(
+                    decision.scope,
+                    CoordinatorScope::Frontend | CoordinatorScope::Fullstack
+                ) {
+                    tracing::warn!(
+                        job_id = %job_id,
+                        scope = ?decision.scope,
+                        "swarm: scope=frontend|fullstack detected; \
+                         W3-12g still routes through backend chain — \
+                         W3-12h activates scope-aware dispatch"
+                    );
+                }
                 // Stamp the parsed (or fallback) decision onto the
                 // StageResult so it lands in `swarm_stages.decision_json`
                 // via the registry's SQL write-through. We emit
@@ -1575,16 +1611,17 @@ mod tests {
     }
 
     /// Canned MockResponse whose `assistant_text` is a valid
-    /// `CoordinatorDecision` JSON with `route=execute_plan`. The
-    /// W3-12f Coordinator brain runs once per job between Scout and
-    /// Plan; the default mock keeps the existing 5-stage chain
-    /// intact by always voting ExecutePlan.
+    /// `CoordinatorDecision` JSON with `route=execute_plan` and
+    /// `scope=backend`. The W3-12f Coordinator brain runs once per
+    /// job between Scout and Plan; the default mock keeps the
+    /// existing 5-stage chain intact by always voting ExecutePlan.
+    /// W3-12g added the required `scope` field.
     fn execute_plan_decision_response() -> MockResponse {
         MockResponse {
             result: Ok(InvokeResult {
                 session_id: "sess-coord".into(),
                 assistant_text:
-                    r#"{"route":"execute_plan","reasoning":"mock"}"#.into(),
+                    r#"{"route":"execute_plan","scope":"backend","reasoning":"mock"}"#.into(),
                 total_cost_usd: 0.0,
                 turn_count: 1,
             }),
@@ -1593,14 +1630,32 @@ mod tests {
     }
 
     /// Canned MockResponse whose `assistant_text` is a valid
-    /// `CoordinatorDecision` JSON with `route=research_only`. Used
-    /// by W3-12f tests that exercise the short-circuit branch.
+    /// `CoordinatorDecision` JSON with `route=research_only` and
+    /// `scope=backend`. Used by W3-12f tests that exercise the
+    /// short-circuit branch. W3-12g added the required `scope` field.
     fn research_only_decision_response() -> MockResponse {
         MockResponse {
             result: Ok(InvokeResult {
                 session_id: "sess-coord-r".into(),
                 assistant_text:
-                    r#"{"route":"research_only","reasoning":"mock"}"#.into(),
+                    r#"{"route":"research_only","scope":"backend","reasoning":"mock"}"#.into(),
+                total_cost_usd: 0.0,
+                turn_count: 1,
+            }),
+            sleep: None,
+        }
+    }
+
+    /// Canned MockResponse whose `assistant_text` is a valid
+    /// `CoordinatorDecision` JSON with `route=execute_plan` and
+    /// `scope=frontend`. W3-12g uses this to verify the FSM logs
+    /// the scope warning but still uses the backend chain.
+    fn execute_plan_frontend_decision_response() -> MockResponse {
+        MockResponse {
+            result: Ok(InvokeResult {
+                session_id: "sess-coord-fe".into(),
+                assistant_text:
+                    r#"{"route":"execute_plan","scope":"frontend","reasoning":"frontend goal"}"#.into(),
                 total_cost_usd: 0.0,
                 turn_count: 1,
             }),
@@ -1649,7 +1704,7 @@ mod tests {
         r.insert(SCOUT_ID.into(), ok_response(scout_text, scout_cost));
         r.insert(PLANNER_ID.into(), ok_response(plan_text, plan_cost));
         r.insert(BUILDER_ID.into(), ok_response(build_text, build_cost));
-        r.insert(REVIEWER_ID.into(), ok_verdict_response(0.0));
+        r.insert(BACKEND_REVIEWER_ID.into(), ok_verdict_response(0.0));
         r.insert(TESTER_ID.into(), ok_verdict_response(0.0));
         r.insert(COORDINATOR_ID.into(), execute_plan_decision_response());
         r
@@ -2054,7 +2109,7 @@ mod tests {
         let verdict_text =
             r#"{"approved":true,"issues":[],"summary":"OK"}"#;
         for (id, sess) in [
-            (REVIEWER_ID, "s4"),
+            (BACKEND_REVIEWER_ID, "s4"),
             (TESTER_ID, "s5"),
         ] {
             responses.insert(
@@ -2078,7 +2133,7 @@ mod tests {
                 result: Ok(InvokeResult {
                     session_id: "s-coord".into(),
                     assistant_text:
-                        r#"{"route":"execute_plan","reasoning":"mock"}"#.into(),
+                        r#"{"route":"execute_plan","scope":"backend","reasoning":"mock"}"#.into(),
                     total_cost_usd: 0.0,
                     turn_count: 1,
                 }),
@@ -2784,7 +2839,7 @@ mod tests {
         responses.insert(PLANNER_ID.into(), ok_response("p", 0.0));
         responses.insert(BUILDER_ID.into(), ok_response("b", 0.0));
         responses.insert(
-            REVIEWER_ID.into(),
+            BACKEND_REVIEWER_ID.into(),
             rejected_verdict_response("unwrap on None"),
         );
         // Tester response is never consumed (Review rejection on
@@ -2842,7 +2897,7 @@ mod tests {
         responses.insert(COORDINATOR_ID.into(), execute_plan_decision_response());
         responses.insert(PLANNER_ID.into(), ok_response("p", 0.0));
         responses.insert(BUILDER_ID.into(), ok_response("b", 0.0));
-        responses.insert(REVIEWER_ID.into(), ok_verdict_response(0.0));
+        responses.insert(BACKEND_REVIEWER_ID.into(), ok_verdict_response(0.0));
         responses.insert(
             TESTER_ID.into(),
             rejected_verdict_response("test_foo failed"),
@@ -2894,7 +2949,7 @@ mod tests {
         responses.insert(PLANNER_ID.into(), ok_response("p", 0.0));
         responses.insert(BUILDER_ID.into(), ok_response("b", 0.0));
         responses.insert(
-            REVIEWER_ID.into(),
+            BACKEND_REVIEWER_ID.into(),
             ok_response("lol idk this isn't JSON", 0.0),
         );
         responses.insert(TESTER_ID.into(), ok_verdict_response(0.0));
@@ -2944,7 +2999,7 @@ mod tests {
         responses.insert(PLANNER_ID.into(), ok_response("p", 0.0));
         responses.insert(BUILDER_ID.into(), err_response("builder boom"));
         // These are never consumed since Builder errors first.
-        responses.insert(REVIEWER_ID.into(), ok_verdict_response(0.0));
+        responses.insert(BACKEND_REVIEWER_ID.into(), ok_verdict_response(0.0));
         responses.insert(TESTER_ID.into(), ok_verdict_response(0.0));
 
         let registry = Arc::new(JobRegistry::new());
@@ -3041,7 +3096,7 @@ mod tests {
             SCOUT_ID,
             PLANNER_ID,
             BUILDER_ID,
-            REVIEWER_ID,
+            BACKEND_REVIEWER_ID,
             TESTER_ID,
             COORDINATOR_ID,
         ] {
@@ -3185,7 +3240,7 @@ mod tests {
         let verdict_text =
             r#"{"approved":true,"issues":[],"summary":"OK"}"#;
         for (id, sess) in [
-            (REVIEWER_ID, "sess-review"),
+            (BACKEND_REVIEWER_ID, "sess-review"),
             (TESTER_ID, "sess-test"),
         ] {
             r.insert(
@@ -3209,7 +3264,7 @@ mod tests {
                 result: Ok(InvokeResult {
                     session_id: "sess-coord".into(),
                     assistant_text:
-                        r#"{"route":"execute_plan","reasoning":"mock"}"#
+                        r#"{"route":"execute_plan","scope":"backend","reasoning":"mock"}"#
                             .into(),
                     total_cost_usd: 0.0,
                     turn_count: 1,
@@ -3821,7 +3876,7 @@ mod tests {
             vec![ok_response("build-A", 0.0), ok_response("build-B", 0.0)],
         );
         responses.insert(
-            REVIEWER_ID.into(),
+            BACKEND_REVIEWER_ID.into(),
             vec![
                 rejected_verdict_response("missing import"),
                 ok_verdict_response(0.0),
@@ -3897,7 +3952,7 @@ mod tests {
         responses.insert(PLANNER_ID.into(), vec![ok_response("p", 0.0)]);
         responses.insert(BUILDER_ID.into(), vec![ok_response("b", 0.0)]);
         responses.insert(
-            REVIEWER_ID.into(),
+            BACKEND_REVIEWER_ID.into(),
             vec![rejected_verdict_response("rev fail")],
         );
         responses.insert(TESTER_ID.into(), vec![ok_verdict_response(0.0)]);
@@ -3968,7 +4023,7 @@ mod tests {
             vec![ok_response("b1", 0.0), ok_response("b2", 0.0)],
         );
         responses.insert(
-            REVIEWER_ID.into(),
+            BACKEND_REVIEWER_ID.into(),
             vec![ok_verdict_response(0.0)],
         );
         responses.insert(
@@ -4030,7 +4085,7 @@ mod tests {
         );
         responses.insert(PLANNER_ID.into(), vec![ok_response("p", 0.0)]);
         responses.insert(BUILDER_ID.into(), vec![ok_response("b", 0.0)]);
-        responses.insert(REVIEWER_ID.into(), vec![ok_verdict_response(0.0)]);
+        responses.insert(BACKEND_REVIEWER_ID.into(), vec![ok_verdict_response(0.0)]);
         responses.insert(
             TESTER_ID.into(),
             vec![rejected_verdict_response("test fail")],
@@ -4093,7 +4148,7 @@ mod tests {
         responses.insert(PLANNER_ID.into(), vec![ok_response("p", 0.0)]);
         responses.insert(BUILDER_ID.into(), vec![ok_response("b", 0.0)]);
         responses.insert(
-            REVIEWER_ID.into(),
+            BACKEND_REVIEWER_ID.into(),
             vec![rejected_verdict_response("force retry")],
         );
         responses.insert(TESTER_ID.into(), vec![ok_verdict_response(0.0)]);
@@ -4159,7 +4214,7 @@ mod tests {
         // file+line populated so the bullet renders the [high] tag
         // and the "src/foo.rs:42" location.
         responses.insert(
-            REVIEWER_ID.into(),
+            BACKEND_REVIEWER_ID.into(),
             vec![
                 rich_rejected_verdict("high", "src/foo.rs", 42, "missing semicolon"),
                 ok_verdict_response(0.0),
@@ -4263,7 +4318,7 @@ mod tests {
         responses.insert(PLANNER_ID.into(), vec![ok_response("p", 0.0)]);
         responses.insert(BUILDER_ID.into(), vec![ok_response("b", 0.0)]);
         responses.insert(
-            REVIEWER_ID.into(),
+            BACKEND_REVIEWER_ID.into(),
             vec![rejected_verdict_response("force retries")],
         );
         responses.insert(TESTER_ID.into(), vec![ok_verdict_response(0.0)]);
@@ -4370,7 +4425,7 @@ mod tests {
         );
         // Reviewer rejects attempt 1, never reached on attempt 2.
         responses.insert(
-            REVIEWER_ID.into(),
+            BACKEND_REVIEWER_ID.into(),
             vec![rejected_verdict_response("fix me")],
         );
         responses.insert(TESTER_ID.into(), vec![ok_verdict_response(0.0)]);
@@ -4483,7 +4538,7 @@ mod tests {
             ],
         );
         responses.insert(
-            REVIEWER_ID.into(),
+            BACKEND_REVIEWER_ID.into(),
             vec![
                 rejected_verdict_response("rev fail"),
                 ok_verdict_response(0.0),
@@ -4557,7 +4612,7 @@ mod tests {
         // than a "no scripted response" mock error.
         responses.insert(PLANNER_ID.into(), ok_response("unused-plan", 0.0));
         responses.insert(BUILDER_ID.into(), ok_response("unused-build", 0.0));
-        responses.insert(REVIEWER_ID.into(), ok_verdict_response(0.0));
+        responses.insert(BACKEND_REVIEWER_ID.into(), ok_verdict_response(0.0));
         responses.insert(TESTER_ID.into(), ok_verdict_response(0.0));
 
         let mock = Arc::new(MockTransport::new(responses));
@@ -4589,7 +4644,7 @@ mod tests {
         let seen = mock.seen();
         let plan_calls = seen.iter().filter(|(id, _)| id == PLANNER_ID).count();
         let build_calls = seen.iter().filter(|(id, _)| id == BUILDER_ID).count();
-        let review_calls = seen.iter().filter(|(id, _)| id == REVIEWER_ID).count();
+        let review_calls = seen.iter().filter(|(id, _)| id == BACKEND_REVIEWER_ID).count();
         let test_calls = seen.iter().filter(|(id, _)| id == TESTER_ID).count();
         assert_eq!(plan_calls, 0, "ResearchOnly must not invoke Planner");
         assert_eq!(build_calls, 0, "ResearchOnly must not invoke Builder");
@@ -4804,6 +4859,102 @@ mod tests {
                 stage.state
             );
         }
+    }
+
+    /// W3-12g — Classify stage carries the parsed `scope` field.
+    /// Mock Coordinator returns `scope=frontend`; the FSM stamps it
+    /// onto `stages[1].coordinator_decision.scope` verbatim.
+    #[tokio::test]
+    async fn fsm_classify_emits_scope_in_decision() {
+        let (app, _pool, _dir) = mock_app_with_pool().await;
+        let mut responses = happy_5_stage_responses(
+            "s", "p", "b", 0.0, 0.0, 0.0,
+        );
+        // Override the coordinator response with a frontend-scoped one.
+        responses.insert(
+            COORDINATOR_ID.into(),
+            execute_plan_frontend_decision_response(),
+        );
+        let fsm = CoordinatorFsm::new(
+            synthetic_registry(),
+            MockTransport::new(responses),
+            Arc::new(JobRegistry::new()),
+            Duration::from_secs(5),
+        );
+        let outcome = fsm
+            .run_job(
+                app.handle(),
+                "ws-scope-emit".into(),
+                "rebuild SwarmJobDetail".into(),
+            )
+            .await
+            .expect("FSM ok");
+        assert_eq!(outcome.final_state, JobState::Done);
+        // Stages[1] is Classify; its decision must carry scope=Frontend.
+        let classify = &outcome.stages[1];
+        assert_eq!(classify.state, JobState::Classify);
+        let decision = classify
+            .coordinator_decision
+            .as_ref()
+            .expect("classify decision present");
+        assert_eq!(decision.route, CoordinatorRoute::ExecutePlan);
+        assert_eq!(decision.scope, CoordinatorScope::Frontend);
+    }
+
+    /// W3-12g — when scope=Frontend lands, the FSM still uses the
+    /// backend chain (BACKEND_BUILDER_ID + BACKEND_REVIEWER_ID).
+    /// Scope-aware dispatch is W3-12h's territory; the warning log
+    /// in the run loop is the only behavioral difference here.
+    /// We assert dispatch via `stage.specialist_id` rather than
+    /// capturing the warn log (the latter requires a tracing
+    /// subscriber harness that's not justified for one assertion).
+    #[tokio::test]
+    async fn fsm_scope_frontend_logs_warning_but_uses_backend_chain() {
+        let (app, _pool, _dir) = mock_app_with_pool().await;
+        let mut responses = happy_5_stage_responses(
+            "s", "p", "b", 0.0, 0.0, 0.0,
+        );
+        responses.insert(
+            COORDINATOR_ID.into(),
+            execute_plan_frontend_decision_response(),
+        );
+        let fsm = CoordinatorFsm::new(
+            synthetic_registry(),
+            MockTransport::new(responses),
+            Arc::new(JobRegistry::new()),
+            Duration::from_secs(5),
+        );
+        let outcome = fsm
+            .run_job(
+                app.handle(),
+                "ws-scope-fe".into(),
+                "frontend goal".into(),
+            )
+            .await
+            .expect("FSM ok");
+        // Full 6-stage flow (Scout + Classify + Plan + Build + Review
+        // + Test) — same shape as the backend happy path.
+        assert_eq!(outcome.final_state, JobState::Done);
+        assert_eq!(outcome.stages.len(), 6);
+        // W3-12g contract: scope=Frontend must NOT route to
+        // FrontendBuilder / FrontendReviewer. The build stage is
+        // dispatched to backend-builder; the review stage to
+        // backend-reviewer.
+        assert_eq!(outcome.stages[3].state, JobState::Build);
+        assert_eq!(outcome.stages[3].specialist_id, BUILDER_ID);
+        assert_eq!(outcome.stages[3].specialist_id, "backend-builder");
+        assert_eq!(outcome.stages[4].state, JobState::Review);
+        assert_eq!(outcome.stages[4].specialist_id, BACKEND_REVIEWER_ID);
+        assert_eq!(outcome.stages[4].specialist_id, "backend-reviewer");
+        // The decision still carries scope=Frontend so W3-12h has
+        // the routing data when its dispatch logic ships.
+        assert_eq!(
+            outcome.stages[1]
+                .coordinator_decision
+                .as_ref()
+                .map(|d| d.scope),
+            Some(CoordinatorScope::Frontend)
+        );
     }
 
     /// `render_classify_prompt` substitutes the goal and scout

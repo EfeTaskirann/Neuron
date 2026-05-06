@@ -582,11 +582,15 @@ mod tests {
         );
     }
 
-    /// All six bundled profiles load — the same gate the registry
-    /// passes on a clean install. Coordinator joined the bundle
-    /// in W3-12f for Option B routing decisions.
+    /// All eight bundled profiles load — the same gate the registry
+    /// passes on a clean install. W3-12g renamed `reviewer` to
+    /// `backend-reviewer` and added `frontend-builder` +
+    /// `frontend-reviewer` to the bundle so the Coordinator's
+    /// scope classification has a full backend/frontend roster
+    /// available (FSM dispatch still uses the backend chain in
+    /// 12g; 12h activates scope-aware dispatch).
     #[test]
-    fn bundled_six_profiles_present() {
+    fn bundled_eight_profiles_present() {
         let registry = ProfileRegistry::load_from(None).expect("load");
         let mut ids: Vec<&str> = registry
             .list()
@@ -598,13 +602,69 @@ mod tests {
             ids,
             vec![
                 "backend-builder",
+                "backend-reviewer",
                 "coordinator",
+                "frontend-builder",
+                "frontend-reviewer",
                 "integration-tester",
                 "planner",
-                "reviewer",
                 "scout",
             ]
         );
+    }
+
+    /// Eight bundled profiles must have distinct ids — duplicates
+    /// inside the bundled set would surface as a hard load error,
+    /// but a separate sanity test catches future mistakes earlier
+    /// (e.g. someone copy-pastes a frontmatter block and forgets to
+    /// change the `id:` field).
+    #[test]
+    fn bundled_eight_profiles_have_distinct_ids() {
+        let registry = ProfileRegistry::load_from(None).expect("load");
+        let ids: Vec<String> = registry
+            .list()
+            .iter()
+            .map(|p| p.id.clone())
+            .collect();
+        let mut sorted = ids.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(
+            ids.len(),
+            sorted.len(),
+            "duplicate ids in bundled profile set: {ids:?}"
+        );
+        assert_eq!(ids.len(), 8, "expected 8 bundled profiles, got {ids:?}");
+    }
+
+    /// Every bundled `.md` parses cleanly. Implicit in
+    /// `bundled_eight_profiles_present`, but the dedicated probe
+    /// surfaces frontmatter bugs in a single profile file faster
+    /// than the aggregate test (which fails on the first parse
+    /// error, not the count assertion).
+    #[test]
+    fn bundled_eight_profiles_load_without_error() {
+        let registry =
+            ProfileRegistry::load_from(None).expect("load all bundled");
+        for id in [
+            "backend-builder",
+            "backend-reviewer",
+            "coordinator",
+            "frontend-builder",
+            "frontend-reviewer",
+            "integration-tester",
+            "planner",
+            "scout",
+        ] {
+            let profile = registry
+                .get(id)
+                .unwrap_or_else(|| panic!("bundled profile `{id}` missing"));
+            assert!(
+                !profile.body.is_empty(),
+                "bundled profile `{id}` has empty body"
+            );
+            assert_eq!(profile.id, id);
+        }
     }
 
     #[test]

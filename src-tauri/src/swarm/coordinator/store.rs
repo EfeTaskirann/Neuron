@@ -1072,7 +1072,7 @@ mod tests {
         reg.update("j-verdict", |j| {
             j.stages.push(StageResult {
                 state: JobState::Review,
-                specialist_id: "reviewer".into(),
+                specialist_id: "backend-reviewer".into(),
                 assistant_text: "ok".into(),
                 session_id: "s-r".into(),
                 total_cost_usd: 0.001,
@@ -1122,6 +1122,9 @@ mod tests {
 
         let decision = CoordinatorDecision {
             route: CoordinatorRoute::ResearchOnly,
+            // W3-12g: scope is required on the wire shape; persisted
+            // legacy rows default to Backend via serde.
+            scope: crate::swarm::coordinator::decision::CoordinatorScope::Backend,
             reasoning: "explain-only goal; Scout findings cover it".into(),
         };
         let decision_clone = decision.clone();
@@ -1165,6 +1168,68 @@ mod tests {
             Some(&decision)
         );
         assert_eq!(detail.stages[1].state, JobState::Classify);
+    }
+
+    /// WP-W3-12g — `CoordinatorDecision.scope` round-trips through
+    /// SQLite (route + scope + reasoning all bit-for-bit). Sister
+    /// test to `coordinator_decision_persists_across_app_restart`
+    /// pinning the new `scope` field specifically — guards against
+    /// future serializer drift dropping the field on the wire.
+    #[tokio::test]
+    async fn coordinator_decision_round_trips_through_sqlite_with_scope() {
+        use crate::swarm::coordinator::decision::{
+            CoordinatorDecision, CoordinatorRoute, CoordinatorScope,
+        };
+        let (pool, _dir) = fresh_pool().await;
+        let reg = JobRegistry::with_pool(pool.clone());
+        reg.try_acquire_workspace(
+            "ws-scope",
+            fixture_job("j-scope", "g", 0),
+        )
+        .await
+        .expect("acquire");
+
+        let decision = CoordinatorDecision {
+            route: CoordinatorRoute::ExecutePlan,
+            scope: CoordinatorScope::Frontend,
+            reasoning: "frontend goal; execute via FE chain".into(),
+        };
+        let decision_clone = decision.clone();
+        reg.update("j-scope", |j| {
+            j.stages.push(StageResult {
+                state: JobState::Classify,
+                specialist_id: "coordinator".into(),
+                assistant_text: serde_json::to_string(&decision_clone)
+                    .unwrap(),
+                session_id: "s-cls".into(),
+                total_cost_usd: 0.001,
+                duration_ms: 5,
+                verdict: None,
+                coordinator_decision: Some(decision_clone),
+            });
+            j.state = JobState::Done;
+        })
+        .await
+        .expect("update");
+
+        let detail = get_job_detail(&pool, "j-scope")
+            .await
+            .expect("query")
+            .expect("Some");
+        let reloaded = detail.stages[0]
+            .coordinator_decision
+            .as_ref()
+            .expect("decision present after reload");
+        // Field-by-field assertion so a regression on any of the
+        // three points the failure at the right line.
+        assert_eq!(reloaded.route, CoordinatorRoute::ExecutePlan);
+        assert_eq!(reloaded.scope, CoordinatorScope::Frontend);
+        assert_eq!(
+            reloaded.reasoning,
+            "frontend goal; execute via FE chain"
+        );
+        // Sanity: the entire struct round-trips by value too.
+        assert_eq!(reloaded, &decision);
     }
 
     /// Migration 0008 adds `decision_json` to `swarm_stages`.

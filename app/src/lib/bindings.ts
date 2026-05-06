@@ -281,10 +281,17 @@ export type CallToolResult = {
  * 
  *  `reasoning` is a one-sentence rationale per the OUTPUT CONTRACT;
  *  the FSM treats it as informational only — the routing branch
- *  keys off `route` alone.
+ *  keys off `route` alone in W3-12g (scope is logged but not
+ *  dispatched on; W3-12h activates scope-aware dispatch).
+ * 
+ *  **Backwards compat (W3-12g):** the `scope` field carries a
+ *  `#[serde(default = ...)]` attribute so pre-12g rows in
+ *  `swarm_stages.decision_json` (which lack the field) deserialize
+ *  with `scope=Backend`.
  */
 export type CoordinatorDecision = {
 	route: CoordinatorRoute,
+	scope?: CoordinatorScope,
 	reasoning: string,
 };
 
@@ -302,6 +309,21 @@ export type CoordinatorDecision = {
  *    Coordinator output is unparseable.
  */
 export type CoordinatorRoute = "research_only" | "execute_plan";
+
+/**
+ *  Surface the Coordinator's decision applies to (W3-12g §5). Wire
+ *  form is snake_case (`"backend"` / `"frontend"` / `"fullstack"`)
+ *  so the frontend bindings match the persona OUTPUT CONTRACT.
+ * 
+ *  In W3-12g this field is **observed but not acted on** — the FSM
+ *  always dispatches `BACKEND_BUILDER_ID` + `BACKEND_REVIEWER_ID`
+ *  regardless of scope. W3-12h activates scope-aware dispatch
+ *  (Backend → BB+BR; Frontend → FB+FR; Fullstack → BB+FB+BR+FR).
+ *  A `tracing::warn!` fires when scope is `Frontend` or `Fullstack`
+ *  so the routing data's correctness is observable before the
+ *  dispatch logic ships.
+ */
+export type CoordinatorScope = "backend" | "frontend" | "fullstack";
 
 /**
  *  Health payload returned to the frontend. Field names use
