@@ -276,6 +276,7 @@ mod tests {
             "edges",
             "mailbox",
             "nodes",
+            "orchestrator_messages",
             "pane_lines",
             "panes",
             "runs",
@@ -294,7 +295,7 @@ mod tests {
             "schema tables drift — re-run `cargo sqlx prepare` after \
              updating migrations and update this test"
         );
-        assert_eq!(names.len(), 15);
+        assert_eq!(names.len(), 16);
     }
 
     /// Acceptance: every connection the pool hands out enforces FKs.
@@ -352,8 +353,8 @@ mod tests {
         // Migration count grows as the schema evolves. Update this
         // when adding a new file under `migrations/`.
         assert_eq!(
-            count, 8,
-            "eight migrations recorded (0001 + 0002 + 0003 + 0004 + 0005 + 0006 + 0007 + 0008)"
+            count, 9,
+            "nine migrations recorded (0001 + 0002 + 0003 + 0004 + 0005 + 0006 + 0007 + 0008 + 0009)"
         );
     }
 

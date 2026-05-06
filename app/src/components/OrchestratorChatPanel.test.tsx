@@ -4,11 +4,17 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import type { ReactNode } from 'react';
 
 // Mock the bindings layer so the panel sees controlled
-// `swarmOrchestratorDecide` and `swarmRunJob` calls.
+// `swarmOrchestratorDecide` and `swarmRunJob` calls. WP-W3-12k2
+// added the persistent-history surface; the new IPC mocks default
+// to "empty history / no-op writes" so existing tests keep
+// asserting purely against the in-memory chat state.
 vi.mock('../lib/bindings', () => ({
   commands: {
     swarmOrchestratorDecide: vi.fn(),
     swarmRunJob: vi.fn(),
+    swarmOrchestratorHistory: vi.fn(),
+    swarmOrchestratorClearHistory: vi.fn(),
+    swarmOrchestratorLogJob: vi.fn(),
   },
 }));
 
@@ -60,9 +66,24 @@ beforeEach(async () => {
   const { commands } = await import('../lib/bindings');
   vi.mocked(commands.swarmOrchestratorDecide).mockReset();
   vi.mocked(commands.swarmRunJob).mockReset();
+  vi.mocked(commands.swarmOrchestratorHistory).mockReset();
+  vi.mocked(commands.swarmOrchestratorClearHistory).mockReset();
+  vi.mocked(commands.swarmOrchestratorLogJob).mockReset();
   vi.mocked(commands.swarmRunJob).mockResolvedValue({
     status: 'ok',
     data: JOB_OK,
+  });
+  vi.mocked(commands.swarmOrchestratorHistory).mockResolvedValue({
+    status: 'ok',
+    data: [],
+  });
+  vi.mocked(commands.swarmOrchestratorClearHistory).mockResolvedValue({
+    status: 'ok',
+    data: null,
+  });
+  vi.mocked(commands.swarmOrchestratorLogJob).mockResolvedValue({
+    status: 'ok',
+    data: null,
   });
 });
 
@@ -195,5 +216,101 @@ describe('OrchestratorChatPanel', () => {
       /type a message/i,
     ) as HTMLTextAreaElement;
     expect(textarea).toBeDisabled();
+  });
+
+  // ------------------------------------------------------------ //
+  // WP-W3-12k2 — persistent history seed + clear button          //
+  // ------------------------------------------------------------ //
+
+  it('seeds messages from history on mount', async () => {
+    const { commands } = await import('../lib/bindings');
+    // Seed a tiny thread: user msg → orchestrator outcome → job row.
+    vi.mocked(commands.swarmOrchestratorHistory).mockResolvedValue({
+      status: 'ok',
+      data: [
+        {
+          id: 1,
+          workspaceId: 'default',
+          role: 'user',
+          content: 'önceki mesaj',
+          goal: null,
+          createdAtMs: 100,
+        },
+        {
+          id: 2,
+          workspaceId: 'default',
+          role: 'orchestrator',
+          content: JSON.stringify({
+            action: 'direct_reply',
+            text: 'önceki cevap',
+            reasoning: 'r',
+          }),
+          goal: null,
+          createdAtMs: 200,
+        },
+        {
+          id: 3,
+          workspaceId: 'default',
+          role: 'job',
+          content: 'a-1234abcd5678',
+          goal: 'önceki goal',
+          createdAtMs: 300,
+        },
+      ],
+    });
+    renderPanel();
+    // User bubble.
+    await waitFor(() =>
+      expect(screen.getByText('önceki mesaj')).toBeInTheDocument(),
+    );
+    // Orchestrator bubble.
+    expect(screen.getByText('önceki cevap')).toBeInTheDocument();
+    // Job bubble.
+    expect(
+      screen.getByRole('button', { name: 'a-1234ab' }),
+    ).toBeInTheDocument();
+    expect(commands.swarmOrchestratorHistory).toHaveBeenCalledWith(
+      'default',
+      null,
+    );
+  });
+
+  it('clear chat button clears local messages and invalidates history', async () => {
+    const { commands } = await import('../lib/bindings');
+    vi.mocked(commands.swarmOrchestratorHistory).mockResolvedValue({
+      status: 'ok',
+      data: [
+        {
+          id: 1,
+          workspaceId: 'default',
+          role: 'user',
+          content: 'temizlenecek',
+          goal: null,
+          createdAtMs: 100,
+        },
+      ],
+    });
+    const { qc } = renderPanel();
+    await waitFor(() =>
+      expect(screen.getByText('temizlenecek')).toBeInTheDocument(),
+    );
+    const invalidateSpy = vi.spyOn(qc, 'invalidateQueries');
+    const clearBtn = screen.getByRole('button', { name: /clear chat/i });
+    expect(clearBtn).not.toBeDisabled();
+    await act(async () => {
+      fireEvent.click(clearBtn);
+    });
+    await waitFor(() =>
+      expect(commands.swarmOrchestratorClearHistory).toHaveBeenCalledWith(
+        'default',
+      ),
+    );
+    // Local bubble removed.
+    await waitFor(() =>
+      expect(screen.queryByText('temizlenecek')).not.toBeInTheDocument(),
+    );
+    expect(invalidateSpy).toHaveBeenCalledWith({
+      queryKey: ['orchestrator-history', 'default'],
+    });
   });
 });

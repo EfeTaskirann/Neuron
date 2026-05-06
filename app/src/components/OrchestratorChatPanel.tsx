@@ -5,25 +5,38 @@
 // directly, ask a clarifying question, or refine the goal and
 // dispatch a swarm job.
 //
-// Stateless per W3-12k1 — each `swarm:orchestrator_decide` call
-// is independent. Chat history is local component state only;
-// W3-12k-2 will layer SQLite persistence on top so reload
-// preserves the thread.
+// W3-12k1 shipped the stateless brain. W3-12k3 shipped this UI
+// with React-only state. W3-12k2 (this revision) layers SQLite
+// persistence on top:
+//
+// - On mount: `useOrchestratorHistory(workspaceId)` reads the
+//   persisted thread and seeds the local `messages` state.
+// - On every successful decide / dispatch / clear: invalidate the
+//   history query so subsequent mounts see the latest thread.
+// - "Clear chat" button (top-right of the history area) calls
+//   `useClearOrchestratorHistory` and resets local state.
 //
 // Submit flow:
-//   1. Append user bubble.
-//   2. Call `useOrchestratorDecide` → outcome.
+//   1. Append user bubble to local state (immediate echo).
+//   2. Call `useOrchestratorDecide` → outcome (backend persists user
+//      row before invoke + orchestrator row after parse).
 //   3. Append orchestrator bubble (action-tinted).
-//   4. If `action === 'dispatch'`, chain `useRunSwarmJob` with
-//      the refined `outcome.text` and append a job bubble that
-//      links into the right pane (SwarmJobDetail) via
-//      `onSelectJob`.
-//   5. On any failure, render an inline error banner above the
+//   4. If `action === 'dispatch'`, chain `useRunSwarmJob` then
+//      `useLogOrchestratorJob` to record the dispatched job; append
+//      a job bubble that links into the right pane (SwarmJobDetail)
+//      via `onSelectJob`.
+//   5. Invalidate `['orchestrator-history', workspaceId]` so the
+//      next mount picks up the persisted rows.
+//   6. On any failure, render an inline error banner above the
 //      input row; the user can retry.
-import { useState, useRef, useEffect } from 'react';
-import type { OrchestratorAction } from '../lib/bindings';
+import { useState, useRef, useEffect, useMemo } from 'react';
+import { useQueryClient } from '@tanstack/react-query';
+import type { OrchestratorAction, OrchestratorMessage, OrchestratorOutcome } from '../lib/bindings';
 import { useOrchestratorDecide } from '../hooks/useOrchestratorDecide';
 import { useRunSwarmJob } from '../hooks/useRunSwarmJob';
+import { useOrchestratorHistory } from '../hooks/useOrchestratorHistory';
+import { useClearOrchestratorHistory } from '../hooks/useClearOrchestratorHistory';
+import { useLogOrchestratorJob } from '../hooks/useLogOrchestratorJob';
 
 export type ChatMessage =
   | { role: 'user'; text: string; ts: number }
@@ -41,16 +54,93 @@ interface Props {
   onSelectJob: (jobId: string) => void;
 }
 
+/**
+ * Map a persisted `OrchestratorMessage` (DB shape) to the local
+ * `ChatMessage` (UI shape). Orchestrator rows JSON-decode the
+ * `content` column back into the typed outcome — a parse failure
+ * surfaces as a degraded `direct_reply` bubble carrying the raw
+ * content so the user sees *something* rather than a missing row.
+ */
+function persistedToChat(msg: OrchestratorMessage): ChatMessage {
+  switch (msg.role) {
+    case 'user':
+      return { role: 'user', text: msg.content, ts: msg.createdAtMs };
+    case 'orchestrator': {
+      try {
+        const outcome: OrchestratorOutcome = JSON.parse(msg.content);
+        return {
+          role: 'orchestrator',
+          action: outcome.action,
+          text: outcome.text,
+          reasoning: outcome.reasoning,
+          ts: msg.createdAtMs,
+        };
+      } catch {
+        return {
+          role: 'orchestrator',
+          action: 'direct_reply',
+          text: msg.content,
+          reasoning: '',
+          ts: msg.createdAtMs,
+        };
+      }
+    }
+    case 'job':
+      return {
+        role: 'job',
+        jobId: msg.content,
+        goal: msg.goal ?? '',
+        ts: msg.createdAtMs,
+      };
+  }
+}
+
 export function OrchestratorChatPanel({
   workspaceId,
   onSelectJob,
 }: Props): JSX.Element {
-  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  // `localMessages` carries new bubbles the user has produced this
+  // session (typed → user, decided → orchestrator, dispatched →
+  // job). The displayed list is `[...seedMessages, ...localMessages]`
+  // where `seedMessages` is the persisted thread from
+  // `useOrchestratorHistory`. Splitting the two sources keeps the
+  // seed-vs-live boundary explicit and avoids the "setState inside
+  // useEffect" anti-pattern (the seed is derived, not assigned).
+  //
+  // `cleared` is a one-way local override: clicking "Clear chat"
+  // sets it `true` so the seed is hidden until a remount. New
+  // local bubbles still render (the user can keep chatting after a
+  // clear) but the persisted seed is suppressed in favour of the
+  // empty-after-clear thread.
+  const [localMessages, setLocalMessages] = useState<ChatMessage[]>([]);
+  const [cleared, setCleared] = useState(false);
   const [input, setInput] = useState('');
   const [error, setError] = useState<string | null>(null);
   const decide = useOrchestratorDecide();
   const runJob = useRunSwarmJob();
+  const logJob = useLogOrchestratorJob();
+  const clearHistory = useClearOrchestratorHistory();
+  const history = useOrchestratorHistory(workspaceId);
+  const qc = useQueryClient();
   const historyRef = useRef<HTMLDivElement>(null);
+
+  // Persisted thread mapped to chat shape. `cleared` flips this to
+  // `[]` after the Clear button fires; `useMemo` recomputes only on
+  // the inputs that matter so an unrelated re-render doesn't churn
+  // the displayed list. Subsequent invalidations of the history
+  // query will refetch the seed — we suppress that with `cleared`
+  // until a fresh mount, otherwise mid-session "Clear chat" would
+  // briefly flicker the old thread back in if the cache hadn't
+  // yet realized it was stale.
+  const seedMessages = useMemo<ChatMessage[]>(() => {
+    if (cleared) return [];
+    return history.data ? history.data.map(persistedToChat) : [];
+  }, [history.data, cleared]);
+
+  const messages = useMemo<ChatMessage[]>(
+    () => [...seedMessages, ...localMessages],
+    [seedMessages, localMessages],
+  );
 
   // Auto-scroll history to bottom on new message / pending state
   // change so the latest bubble is always visible without manual
@@ -69,10 +159,10 @@ export function OrchestratorChatPanel({
     setError(null);
     setInput('');
     const userTs = Date.now();
-    setMessages((m) => [...m, { role: 'user', text, ts: userTs }]);
+    setLocalMessages((m) => [...m, { role: 'user', text, ts: userTs }]);
     try {
       const outcome = await decide.mutateAsync({ workspaceId, userMessage: text });
-      setMessages((m) => [
+      setLocalMessages((m) => [
         ...m,
         {
           role: 'orchestrator',
@@ -87,7 +177,7 @@ export function OrchestratorChatPanel({
           workspaceId,
           goal: outcome.text,
         });
-        setMessages((m) => [
+        setLocalMessages((m) => [
           ...m,
           {
             role: 'job',
@@ -96,14 +186,61 @@ export function OrchestratorChatPanel({
             ts: Date.now(),
           },
         ]);
+        // Persist the job row so the chat thread shows it on next
+        // mount. Failure here is non-fatal — the in-memory bubble
+        // already rendered; only the next mount misses it.
+        try {
+          await logJob.mutateAsync({
+            workspaceId,
+            jobId: jobOutcome.jobId,
+            goal: outcome.text,
+          });
+        } catch {
+          // Non-fatal — see WP §"Notes / risks".
+        }
       }
+      // We deliberately do NOT invalidate
+      // `['orchestrator-history']` mid-session: the seed snapshot
+      // taken at mount + the locally appended bubbles already cover
+      // the displayed thread, and a refetch would duplicate every
+      // turn (seed re-arrives WITH the just-persisted user +
+      // orchestrator rows). The next mount re-runs the query
+      // automatically via TanStack's mount-time fetch.
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
   }
 
+  function handleClear(): void {
+    clearHistory.mutate(workspaceId, {
+      onSuccess: () => {
+        // Suppress the seed and drop any local bubbles so the
+        // displayed list is empty until the next user turn.
+        setCleared(true);
+        setLocalMessages([]);
+        setError(null);
+        // Invalidate so a follow-up mount (or post-reload load)
+        // sees the empty thread instead of stale cached data.
+        qc.invalidateQueries({
+          queryKey: ['orchestrator-history', workspaceId],
+        });
+      },
+    });
+  }
+
   return (
     <div className="swarm-chat">
+      <div className="swarm-chat-toolbar">
+        <button
+          type="button"
+          className="btn ghost swarm-chat-clear-btn"
+          onClick={handleClear}
+          disabled={messages.length === 0 || clearHistory.isPending || submitting}
+          aria-label="Clear chat"
+        >
+          Clear chat
+        </button>
+      </div>
       <div className="swarm-chat-history" ref={historyRef}>
         {messages.length === 0 && (
           <div className="swarm-chat-empty">

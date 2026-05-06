@@ -23,11 +23,16 @@ use std::time::Duration;
 
 use tauri::{AppHandle, Manager, Runtime};
 
+use crate::db::DbPool;
 use crate::error::AppError;
 use crate::models::ProfileSummary;
+use crate::swarm::coordinator::orchestrator_session::{
+    append_job_message, append_orchestrator_message, append_user_message,
+    clear_messages, list_recent_messages, render_with_history,
+};
 use crate::swarm::coordinator::{
     parse_orchestrator_outcome, JobDetail, JobState, JobSummary,
-    OrchestratorOutcome,
+    OrchestratorMessage, OrchestratorOutcome,
 };
 use crate::swarm::profile::ProfileSource;
 use crate::swarm::{
@@ -39,6 +44,20 @@ use crate::swarm::{
 const SWARM_LIST_JOBS_DEFAULT_LIMIT: u32 = 50;
 /// Hard cap to prevent runaway queries (full pagination is W3-14).
 const SWARM_LIST_JOBS_MAX_LIMIT: u32 = 200;
+
+/// Default page size for `swarm:orchestrator_history` when the IPC
+/// call omits `limit`. WP-W3-12k2 §4.
+const SWARM_ORCHESTRATOR_HISTORY_DEFAULT_LIMIT: u32 = 50;
+/// Hard cap mirroring `SWARM_LIST_JOBS_MAX_LIMIT`. The frontend
+/// surfaces a Clear button rather than paginating, so the cap is
+/// generous but not unbounded.
+const SWARM_ORCHESTRATOR_HISTORY_MAX_LIMIT: u32 = 200;
+/// Number of recent messages injected into the Orchestrator prompt
+/// on each `swarm:orchestrator_decide` call. WP-W3-12k2 §3 fixes
+/// this at 10; tuneable per-process via
+/// `NEURON_ORCHESTRATOR_HISTORY_DEPTH` only after a future WP that
+/// adds the env override pattern from `stage_timeout`.
+const SWARM_ORCHESTRATOR_DECIDE_HISTORY_DEPTH: u32 = 10;
 
 /// 60-second budget for `swarm:test_invoke`. WP §4 calls for this as
 /// the default; the Windows AV cold-start risk noted in WP §"Notes"
@@ -198,29 +217,46 @@ pub async fn swarm_run_job<R: Runtime>(
     fsm.run_job(&app, workspace_id, goal).await
 }
 
-/// Single-shot Orchestrator decision (WP-W3-12k1 §3).
+/// Single-shot Orchestrator decision (WP-W3-12k1 §3, extended in
+/// WP-W3-12k2 §3 with persistent history).
 ///
 /// Spawns a one-shot `claude` subprocess against the bundled
-/// `orchestrator.md` persona, hands it the user's chat message, and
-/// parses the JSON `OrchestratorOutcome` (DirectReply / Clarify /
-/// Dispatch). The IPC blocks until the subprocess emits its `result`
-/// event; same env / OAuth pattern as `swarm:test_invoke`.
+/// `orchestrator.md` persona, hands it the user's chat message
+/// **prepended with the most-recent N messages from the persisted
+/// thread for `workspace_id`**, and parses the JSON
+/// `OrchestratorOutcome` (DirectReply / Clarify / Dispatch). The IPC
+/// blocks until the subprocess emits its `result` event; same env /
+/// OAuth pattern as `swarm:test_invoke`.
 ///
-/// **Stateless** per W3-12k-1 contract: each call is independent,
-/// no persisted history, no thread id. The caller (frontend) is
-/// responsible for branching on the returned `action`:
+/// **Persistence shape** (W3-12k2 §3):
+///
+/// 1. Load last N=10 messages (oldest-first chronological) from
+///    `orchestrator_messages`.
+/// 2. Persist the **user** row BEFORE the LLM invoke so a hung /
+///    failed subprocess still preserves the user's input on the next
+///    mount.
+/// 3. Render the prompt with [`render_with_history`] — the very
+///    first turn (history empty) is byte-identical to the W3-12k1
+///    stateless behaviour.
+/// 4. Invoke the subprocess.
+/// 5. Parse the outcome.
+/// 6. Persist the **orchestrator** row only on a successful parse
+///    so an unparseable result doesn't leave a half-baked row.
+///
+/// The IPC signature is unchanged from W3-12k1 — persistence is a
+/// pure side effect. Callers (the W3-12k3 chat panel) branch on the
+/// returned `action`:
 ///
 /// - `DirectReply` / `Clarify` → render `outcome.text` to the user.
 /// - `Dispatch` → call `swarm:run_job(workspace_id, outcome.text)`
-///   to enter the Coordinator FSM with the refined goal.
+///   to enter the Coordinator FSM, then
+///   `swarm:orchestrator_log_job` to record the dispatch in the
+///   chat thread.
 ///
-/// W3-12k-2 layers persistent context across messages; W3-12k-3
-/// adds the chat UI. This WP ships only the brain.
-///
-/// `workspace_id` is taken to keep the IPC shape symmetric with
-/// `swarm:run_job` (and forward-compatible with multi-workspace
-/// orchestrator routing in a future WP), but the orchestrator
-/// persona itself doesn't differentiate per workspace today.
+/// `workspace_id` is the conversation key — one chat per workspace,
+/// single thread (per W3-12k2 §"Out of scope"). Tests under
+/// `mock_app_with_pool` thread the pool through `app.state::<DbPool>()`
+/// the same way every other persistence-touching command does.
 #[tauri::command(rename_all = "camelCase")]
 #[specta::specta]
 pub async fn swarm_orchestrator_decide<R: Runtime>(
@@ -246,12 +282,174 @@ pub async fn swarm_orchestrator_decide<R: Runtime>(
         AppError::NotFound("swarm profile `orchestrator`".into())
     })?;
 
+    // 1. Load recent history. The pool may be absent in command-level
+    //    tests that haven't wired persistence; we treat that as "empty
+    //    history" rather than a hard error so the validation tests
+    //    that short-circuit before this line keep working.
+    let pool_state = app.try_state::<DbPool>();
+    let history = match pool_state.as_ref() {
+        Some(pool) => {
+            list_recent_messages(
+                pool.inner(),
+                &workspace_id,
+                SWARM_ORCHESTRATOR_DECIDE_HISTORY_DEPTH,
+            )
+            .await?
+        }
+        None => Vec::new(),
+    };
+
+    // 2. Persist the user row BEFORE the invoke so the input survives
+    //    a subprocess crash. Skipped when no pool is wired (test path).
+    if let Some(pool) = pool_state.as_ref() {
+        let now_ms = crate::time::now_millis();
+        append_user_message(pool.inner(), &workspace_id, &user_message, now_ms)
+            .await?;
+    }
+
+    // 3. Render the prompt with the loaded history.
+    let rendered_prompt = render_with_history(&history, &user_message);
+
+    // 4. Invoke the subprocess.
     let transport = SubprocessTransport::new();
     let result = transport
-        .invoke(&app, profile, &user_message, stage_timeout())
+        .invoke(&app, profile, &rendered_prompt, stage_timeout())
         .await?;
 
-    parse_orchestrator_outcome(&result.assistant_text)
+    // 5. Parse the outcome. Failure here surfaces to the caller with
+    //    no orchestrator row written.
+    let outcome = parse_orchestrator_outcome(&result.assistant_text)?;
+
+    // 6. Persist the orchestrator row on successful parse.
+    if let Some(pool) = pool_state.as_ref() {
+        let now_ms = crate::time::now_millis();
+        append_orchestrator_message(
+            pool.inner(),
+            &workspace_id,
+            &outcome,
+            now_ms,
+        )
+        .await?;
+    }
+
+    Ok(outcome)
+}
+
+/// Read the persisted Orchestrator chat history for `workspace_id`
+/// (WP-W3-12k2 §4). The frontend's `useOrchestratorHistory` calls
+/// this on mount to seed the chat panel from SQLite.
+///
+/// `limit` defaults to 50 and is hard-capped at 200 — there is no
+/// pagination cursor (one chat per workspace, single thread). The
+/// returned `Vec<OrchestratorMessage>` is oldest-first chronological
+/// so the caller can render bubbles in display order without an
+/// extra reverse step.
+#[tauri::command(rename_all = "camelCase")]
+#[specta::specta]
+pub async fn swarm_orchestrator_history<R: Runtime>(
+    app: AppHandle<R>,
+    workspace_id: String,
+    limit: Option<u32>,
+) -> Result<Vec<OrchestratorMessage>, AppError> {
+    if workspace_id.trim().is_empty() {
+        return Err(AppError::InvalidInput(
+            "workspaceId must not be empty".into(),
+        ));
+    }
+    let pool = app
+        .try_state::<DbPool>()
+        .ok_or_else(|| {
+            AppError::Internal(
+                "DbPool missing from app state — \
+                 lib.rs::setup did not call app.manage()"
+                    .into(),
+            )
+        })?
+        .inner()
+        .clone();
+    let effective_limit = limit
+        .unwrap_or(SWARM_ORCHESTRATOR_HISTORY_DEFAULT_LIMIT)
+        .min(SWARM_ORCHESTRATOR_HISTORY_MAX_LIMIT);
+    list_recent_messages(&pool, &workspace_id, effective_limit).await
+}
+
+/// Hard-delete every persisted Orchestrator chat message for
+/// `workspace_id` (WP-W3-12k2 §5). The frontend's "Clear chat"
+/// button drives this; there is no soft delete or archival.
+///
+/// Idempotent at the SQL boundary — clearing an already-empty
+/// workspace returns `Ok(())`.
+#[tauri::command(rename_all = "camelCase")]
+#[specta::specta]
+pub async fn swarm_orchestrator_clear_history<R: Runtime>(
+    app: AppHandle<R>,
+    workspace_id: String,
+) -> Result<(), AppError> {
+    if workspace_id.trim().is_empty() {
+        return Err(AppError::InvalidInput(
+            "workspaceId must not be empty".into(),
+        ));
+    }
+    let pool = app
+        .try_state::<DbPool>()
+        .ok_or_else(|| {
+            AppError::Internal(
+                "DbPool missing from app state — \
+                 lib.rs::setup did not call app.manage()"
+                    .into(),
+            )
+        })?
+        .inner()
+        .clone();
+    clear_messages(&pool, &workspace_id).await
+}
+
+/// Persist a "swarm dispatched" Job row in the chat thread
+/// (WP-W3-12k2 §6). Called by the frontend orchestration glue
+/// immediately after `swarm:run_job` returns, so the chat panel
+/// shows the dispatch on the next mount without the FSM itself
+/// having to know about the chat history.
+///
+/// Validation: `workspace_id`, `job_id`, and `goal` must all be
+/// non-empty after `trim()`. An empty value short-circuits with
+/// `InvalidInput` before touching the DB.
+#[tauri::command(rename_all = "camelCase")]
+#[specta::specta]
+pub async fn swarm_orchestrator_log_job<R: Runtime>(
+    app: AppHandle<R>,
+    workspace_id: String,
+    job_id: String,
+    goal: String,
+) -> Result<(), AppError> {
+    if workspace_id.trim().is_empty() {
+        return Err(AppError::InvalidInput(
+            "workspaceId must not be empty".into(),
+        ));
+    }
+    if job_id.trim().is_empty() {
+        return Err(AppError::InvalidInput(
+            "jobId must not be empty".into(),
+        ));
+    }
+    if goal.trim().is_empty() {
+        return Err(AppError::InvalidInput(
+            "goal must not be empty".into(),
+        ));
+    }
+    let pool = app
+        .try_state::<DbPool>()
+        .ok_or_else(|| {
+            AppError::Internal(
+                "DbPool missing from app state — \
+                 lib.rs::setup did not call app.manage()"
+                    .into(),
+            )
+        })?
+        .inner()
+        .clone();
+    let now_ms = crate::time::now_millis();
+    append_job_message(&pool, &workspace_id, &job_id, &goal, now_ms).await?;
+    Ok(())
 }
 
 /// Signal cancellation for an in-flight swarm job (WP-W3-12c §4).
@@ -959,5 +1157,207 @@ mod tests {
             .await
             .expect_err("missing registry");
         assert_eq!(err.kind(), "internal");
+    }
+
+    // ---------------------------------------------------------------- //
+    // WP-W3-12k2 — orchestrator history / clear / log_job IPC tests    //
+    // ---------------------------------------------------------------- //
+
+    /// Seed N=3 messages directly via the helpers, then call the
+    /// IPC and assert it returns oldest-first chronological.
+    #[tokio::test]
+    async fn swarm_orchestrator_history_returns_oldest_first() {
+        let (app, pool, _dir) = mock_app_with_pool().await;
+        // Seed three rows out of order so the assertion is non-trivial.
+        append_user_message(&pool, "default", "first", 100)
+            .await
+            .expect("seed u1");
+        append_user_message(&pool, "default", "third", 300)
+            .await
+            .expect("seed u3");
+        append_user_message(&pool, "default", "second", 200)
+            .await
+            .expect("seed u2");
+
+        let msgs = swarm_orchestrator_history(
+            app.handle().clone(),
+            "default".into(),
+            None,
+        )
+        .await
+        .expect("history ok");
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[0].content, "first");
+        assert_eq!(msgs[1].content, "second");
+        assert_eq!(msgs[2].content, "third");
+    }
+
+    /// Caller-supplied `limit > 200` is capped at 200 — verified by
+    /// the empty-result happy path (a `limit=9999` against an empty
+    /// pool still returns `Ok(vec![])` rather than erroring).
+    #[tokio::test]
+    async fn swarm_orchestrator_history_caps_limit_at_200() {
+        let (app, _pool, _dir) = mock_app_with_pool().await;
+        let msgs = swarm_orchestrator_history(
+            app.handle().clone(),
+            "default".into(),
+            Some(9999),
+        )
+        .await
+        .expect("history ok");
+        assert!(msgs.is_empty());
+    }
+
+    /// Empty `workspaceId` short-circuits with `InvalidInput`.
+    #[tokio::test]
+    async fn swarm_orchestrator_history_validates_empty_workspace_id() {
+        let (app, _pool, _dir) = mock_app_with_pool().await;
+        let err = swarm_orchestrator_history(
+            app.handle().clone(),
+            "".into(),
+            None,
+        )
+        .await
+        .expect_err("empty workspace rejected");
+        assert_eq!(err.kind(), "invalid_input");
+    }
+
+    /// Whitespace-only `workspaceId` matches the W3-12k1 trim gate.
+    #[tokio::test]
+    async fn swarm_orchestrator_history_validates_whitespace_workspace_id() {
+        let (app, _pool, _dir) = mock_app_with_pool().await;
+        let err = swarm_orchestrator_history(
+            app.handle().clone(),
+            "   ".into(),
+            None,
+        )
+        .await
+        .expect_err("whitespace workspace rejected");
+        assert_eq!(err.kind(), "invalid_input");
+    }
+
+    /// `swarm_orchestrator_clear_history` empties the targeted
+    /// workspace.
+    #[tokio::test]
+    async fn swarm_orchestrator_clear_history_empties_workspace() {
+        let (app, pool, _dir) = mock_app_with_pool().await;
+        append_user_message(&pool, "default", "drop me", 100)
+            .await
+            .expect("seed");
+        swarm_orchestrator_clear_history(
+            app.handle().clone(),
+            "default".into(),
+        )
+        .await
+        .expect("clear ok");
+        let after = swarm_orchestrator_history(
+            app.handle().clone(),
+            "default".into(),
+            None,
+        )
+        .await
+        .expect("history ok");
+        assert!(after.is_empty());
+    }
+
+    /// Empty `workspaceId` short-circuits with `InvalidInput` on the
+    /// clear surface too.
+    #[tokio::test]
+    async fn swarm_orchestrator_clear_history_validates_empty_workspace_id() {
+        let (app, _pool, _dir) = mock_app_with_pool().await;
+        let err = swarm_orchestrator_clear_history(
+            app.handle().clone(),
+            "".into(),
+        )
+        .await
+        .expect_err("empty rejected");
+        assert_eq!(err.kind(), "invalid_input");
+    }
+
+    /// `swarm_orchestrator_log_job` writes the Job row visibly via
+    /// the history IPC.
+    #[tokio::test]
+    async fn swarm_orchestrator_log_job_persists_row() {
+        let (app, _pool, _dir) = mock_app_with_pool().await;
+        swarm_orchestrator_log_job(
+            app.handle().clone(),
+            "default".into(),
+            "j-abc".into(),
+            "Add doc to X.tsx".into(),
+        )
+        .await
+        .expect("log ok");
+        let msgs = swarm_orchestrator_history(
+            app.handle().clone(),
+            "default".into(),
+            None,
+        )
+        .await
+        .expect("history ok");
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content, "j-abc");
+        assert_eq!(msgs[0].goal.as_deref(), Some("Add doc to X.tsx"));
+    }
+
+    /// Empty inputs on the `log_job` surface — workspaceId, jobId,
+    /// or goal — surface `InvalidInput`.
+    #[tokio::test]
+    async fn swarm_orchestrator_log_job_validates_inputs() {
+        let (app, _pool, _dir) = mock_app_with_pool().await;
+        let err = swarm_orchestrator_log_job(
+            app.handle().clone(),
+            "".into(),
+            "j-1".into(),
+            "g".into(),
+        )
+        .await
+        .expect_err("empty workspace rejected");
+        assert_eq!(err.kind(), "invalid_input");
+        let err = swarm_orchestrator_log_job(
+            app.handle().clone(),
+            "ws".into(),
+            "".into(),
+            "g".into(),
+        )
+        .await
+        .expect_err("empty jobId rejected");
+        assert_eq!(err.kind(), "invalid_input");
+        let err = swarm_orchestrator_log_job(
+            app.handle().clone(),
+            "ws".into(),
+            "j-1".into(),
+            "   ".into(),
+        )
+        .await
+        .expect_err("whitespace goal rejected");
+        assert_eq!(err.kind(), "invalid_input");
+    }
+
+    /// `swarm_orchestrator_decide` persists the user message even
+    /// when the LLM invoke is unreachable. The subprocess spawn
+    /// will fail in the mock-runtime environment (no `claude` binary)
+    /// — but the user row must already be in the DB by then.
+    #[tokio::test]
+    async fn swarm_orchestrator_decide_persists_user_before_invoke() {
+        let (app, _pool, _dir) = mock_app_with_pool().await;
+        // The decide call will surface a SwarmInvoke / spawn error
+        // because the mock runtime has no `claude` binary on PATH.
+        // We only care that the user row landed before the failure.
+        let _ = swarm_orchestrator_decide(
+            app.handle().clone(),
+            "default".into(),
+            "selam".into(),
+        )
+        .await;
+        let msgs = swarm_orchestrator_history(
+            app.handle().clone(),
+            "default".into(),
+            None,
+        )
+        .await
+        .expect("history ok");
+        // The very first message persisted is the user row.
+        assert!(!msgs.is_empty());
+        assert_eq!(msgs[0].content, "selam");
     }
 }

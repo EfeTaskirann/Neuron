@@ -10,6 +10,9 @@ vi.mock('../lib/bindings', () => ({
     swarmRunJob: vi.fn(),
     swarmCancelJob: vi.fn(),
     swarmOrchestratorDecide: vi.fn(),
+    swarmOrchestratorHistory: vi.fn(),
+    swarmOrchestratorClearHistory: vi.fn(),
+    swarmOrchestratorLogJob: vi.fn(),
   },
 }));
 
@@ -114,6 +117,18 @@ beforeEach(async () => {
       text: 'ship a feature',
       reasoning: 'concrete',
     },
+  });
+  vi.mocked(commands.swarmOrchestratorHistory).mockResolvedValue({
+    status: 'ok',
+    data: [],
+  });
+  vi.mocked(commands.swarmOrchestratorClearHistory).mockResolvedValue({
+    status: 'ok',
+    data: null,
+  });
+  vi.mocked(commands.swarmOrchestratorLogJob).mockResolvedValue({
+    status: 'ok',
+    data: null,
   });
 });
 

@@ -166,31 +166,81 @@ export const commands = {
 	 */
 	swarmRunJob: (workspaceId: string, goal: string) => typedError<JobOutcome, AppErrorWire>(__TAURI_INVOKE("swarm_run_job", { workspaceId, goal })),
 	/**
-	 *  Single-shot Orchestrator decision (WP-W3-12k1 §3).
+	 *  Single-shot Orchestrator decision (WP-W3-12k1 §3, extended in
+	 *  WP-W3-12k2 §3 with persistent history).
 	 * 
 	 *  Spawns a one-shot `claude` subprocess against the bundled
-	 *  `orchestrator.md` persona, hands it the user's chat message, and
-	 *  parses the JSON `OrchestratorOutcome` (DirectReply / Clarify /
-	 *  Dispatch). The IPC blocks until the subprocess emits its `result`
-	 *  event; same env / OAuth pattern as `swarm:test_invoke`.
+	 *  `orchestrator.md` persona, hands it the user's chat message
+	 *  **prepended with the most-recent N messages from the persisted
+	 *  thread for `workspace_id`**, and parses the JSON
+	 *  `OrchestratorOutcome` (DirectReply / Clarify / Dispatch). The IPC
+	 *  blocks until the subprocess emits its `result` event; same env /
+	 *  OAuth pattern as `swarm:test_invoke`.
 	 * 
-	 *  **Stateless** per W3-12k-1 contract: each call is independent,
-	 *  no persisted history, no thread id. The caller (frontend) is
-	 *  responsible for branching on the returned `action`:
+	 *  **Persistence shape** (W3-12k2 §3):
+	 * 
+	 *  1. Load last N=10 messages (oldest-first chronological) from
+	 *     `orchestrator_messages`.
+	 *  2. Persist the **user** row BEFORE the LLM invoke so a hung /
+	 *     failed subprocess still preserves the user's input on the next
+	 *     mount.
+	 *  3. Render the prompt with [`render_with_history`] — the very
+	 *     first turn (history empty) is byte-identical to the W3-12k1
+	 *     stateless behaviour.
+	 *  4. Invoke the subprocess.
+	 *  5. Parse the outcome.
+	 *  6. Persist the **orchestrator** row only on a successful parse
+	 *     so an unparseable result doesn't leave a half-baked row.
+	 * 
+	 *  The IPC signature is unchanged from W3-12k1 — persistence is a
+	 *  pure side effect. Callers (the W3-12k3 chat panel) branch on the
+	 *  returned `action`:
 	 * 
 	 *  - `DirectReply` / `Clarify` → render `outcome.text` to the user.
 	 *  - `Dispatch` → call `swarm:run_job(workspace_id, outcome.text)`
-	 *    to enter the Coordinator FSM with the refined goal.
+	 *    to enter the Coordinator FSM, then
+	 *    `swarm:orchestrator_log_job` to record the dispatch in the
+	 *    chat thread.
 	 * 
-	 *  W3-12k-2 layers persistent context across messages; W3-12k-3
-	 *  adds the chat UI. This WP ships only the brain.
-	 * 
-	 *  `workspace_id` is taken to keep the IPC shape symmetric with
-	 *  `swarm:run_job` (and forward-compatible with multi-workspace
-	 *  orchestrator routing in a future WP), but the orchestrator
-	 *  persona itself doesn't differentiate per workspace today.
+	 *  `workspace_id` is the conversation key — one chat per workspace,
+	 *  single thread (per W3-12k2 §"Out of scope"). Tests under
+	 *  `mock_app_with_pool` thread the pool through `app.state::<DbPool>()`
+	 *  the same way every other persistence-touching command does.
 	 */
 	swarmOrchestratorDecide: (workspaceId: string, userMessage: string) => typedError<OrchestratorOutcome, AppErrorWire>(__TAURI_INVOKE("swarm_orchestrator_decide", { workspaceId, userMessage })),
+	/**
+	 *  Read the persisted Orchestrator chat history for `workspace_id`
+	 *  (WP-W3-12k2 §4). The frontend's `useOrchestratorHistory` calls
+	 *  this on mount to seed the chat panel from SQLite.
+	 * 
+	 *  `limit` defaults to 50 and is hard-capped at 200 — there is no
+	 *  pagination cursor (one chat per workspace, single thread). The
+	 *  returned `Vec<OrchestratorMessage>` is oldest-first chronological
+	 *  so the caller can render bubbles in display order without an
+	 *  extra reverse step.
+	 */
+	swarmOrchestratorHistory: (workspaceId: string, limit: number | null) => typedError<OrchestratorMessage[], AppErrorWire>(__TAURI_INVOKE("swarm_orchestrator_history", { workspaceId, limit })),
+	/**
+	 *  Hard-delete every persisted Orchestrator chat message for
+	 *  `workspace_id` (WP-W3-12k2 §5). The frontend's "Clear chat"
+	 *  button drives this; there is no soft delete or archival.
+	 * 
+	 *  Idempotent at the SQL boundary — clearing an already-empty
+	 *  workspace returns `Ok(())`.
+	 */
+	swarmOrchestratorClearHistory: (workspaceId: string) => typedError<null, AppErrorWire>(__TAURI_INVOKE("swarm_orchestrator_clear_history", { workspaceId })),
+	/**
+	 *  Persist a "swarm dispatched" Job row in the chat thread
+	 *  (WP-W3-12k2 §6). Called by the frontend orchestration glue
+	 *  immediately after `swarm:run_job` returns, so the chat panel
+	 *  shows the dispatch on the next mount without the FSM itself
+	 *  having to know about the chat history.
+	 * 
+	 *  Validation: `workspace_id`, `job_id`, and `goal` must all be
+	 *  non-empty after `trim()`. An empty value short-circuits with
+	 *  `InvalidInput` before touching the DB.
+	 */
+	swarmOrchestratorLogJob: (workspaceId: string, jobId: string, goal: string) => typedError<null, AppErrorWire>(__TAURI_INVOKE("swarm_orchestrator_log_job", { workspaceId, jobId, goal })),
 	/**
 	 *  Signal cancellation for an in-flight swarm job (WP-W3-12c §4).
 	 * 
@@ -587,6 +637,45 @@ export type Node = {
  *    refined goal the frontend will pass to the Coordinator FSM.
  */
 export type OrchestratorAction = "direct_reply" | "clarify" | "dispatch";
+
+/**
+ *  One persisted chat message. The `content` column's interpretation
+ *  depends on `role`; the `goal` column is populated only for `Job`
+ *  rows.
+ * 
+ *  Free-form by role:
+ * 
+ *  - `User`: `content` is the raw user text; `goal` is `None`.
+ *  - `Orchestrator`: `content` is a JSON-encoded
+ *    `OrchestratorOutcome`; `goal` is `None`.
+ *  - `Job`: `content` is the dispatched `job_id`; `goal` carries the
+ *    refined goal that the Coordinator FSM was started with.
+ * 
+ *  `rename_all = "camelCase"` so the wire shape matches the rest of
+ *  the swarm domain types (`JobSummary`, `JobOutcome`, etc.). The
+ *  `OrchestratorOutcome` JSON inside `content` is serialized
+ *  independently and keeps its own field naming (snake_case via the
+ *  W3-12k1 OUTPUT CONTRACT).
+ */
+export type OrchestratorMessage = {
+	id: number,
+	workspaceId: string,
+	role: OrchestratorMessageRole,
+	content: string,
+	goal: string | null,
+	createdAtMs: number,
+};
+
+/**
+ *  Three-way tag identifying which role authored a persisted chat
+ *  message. Wire form is snake_case so the frontend bindings match
+ *  the OUTPUT CONTRACT verbatim:
+ * 
+ *  - `User` → `"user"`        — user-typed text.
+ *  - `Orchestrator` → `"orchestrator"` — assistant outcome bubble.
+ *  - `Job` → `"job"`          — "swarm dispatched" footer bubble.
+ */
+export type OrchestratorMessageRole = "user" | "orchestrator" | "job";
 
 /**
  *  Single-shot Orchestrator decision. `text` carries the active

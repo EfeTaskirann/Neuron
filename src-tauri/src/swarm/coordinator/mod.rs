@@ -29,6 +29,7 @@ pub mod decision;
 pub mod fsm;
 pub mod job;
 pub mod orchestrator;
+pub mod orchestrator_session;
 pub(crate) mod store;
 pub mod verdict;
 
@@ -40,5 +41,8 @@ pub use job::{
 };
 pub use orchestrator::{
     parse_orchestrator_outcome, OrchestratorAction, OrchestratorOutcome,
+};
+pub use orchestrator_session::{
+    OrchestratorMessage, OrchestratorMessageRole,
 };
 pub use verdict::{parse_verdict, Verdict, VerdictIssue, VerdictSeverity};
