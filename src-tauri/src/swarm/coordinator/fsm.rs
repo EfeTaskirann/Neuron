@@ -266,7 +266,8 @@ impl<T: Transport> CoordinatorFsm<T> {
             last_error: None,
         };
         self.registry
-            .try_acquire_workspace(&workspace_id, job)?;
+            .try_acquire_workspace(&workspace_id, job)
+            .await?;
 
         // 3. Hold the workspace lock through the entire run via
         //    a Drop guard — protects the panic-unwind path.
@@ -359,9 +360,11 @@ impl<T: Transport> CoordinatorFsm<T> {
                         stage: stage.clone(),
                     },
                 );
-                self.registry.update(&job_id, |j| {
-                    j.stages.push(stage);
-                })?;
+                self.registry
+                    .update(&job_id, |j| {
+                        j.stages.push(stage);
+                    })
+                    .await?;
                 text
             }
             StageOutcome::Err(e) => {
@@ -369,11 +372,12 @@ impl<T: Transport> CoordinatorFsm<T> {
                     &job_id,
                     &workspace_id,
                     Some(e.to_string()),
-                )?;
+                )
+                .await?;
                 return self.emit_finished_and_build(app, &job_id);
             }
             StageOutcome::Cancelled => {
-                self.finalize_cancelled(&job_id, &workspace_id)?;
+                self.finalize_cancelled(&job_id, &workspace_id).await?;
                 return self.emit_finished_and_build(app, &job_id);
             }
         };
@@ -401,9 +405,11 @@ impl<T: Transport> CoordinatorFsm<T> {
                         stage: stage.clone(),
                     },
                 );
-                self.registry.update(&job_id, |j| {
-                    j.stages.push(stage);
-                })?;
+                self.registry
+                    .update(&job_id, |j| {
+                        j.stages.push(stage);
+                    })
+                    .await?;
                 text
             }
             StageOutcome::Err(e) => {
@@ -411,11 +417,12 @@ impl<T: Transport> CoordinatorFsm<T> {
                     &job_id,
                     &workspace_id,
                     Some(e.to_string()),
-                )?;
+                )
+                .await?;
                 return self.emit_finished_and_build(app, &job_id);
             }
             StageOutcome::Cancelled => {
-                self.finalize_cancelled(&job_id, &workspace_id)?;
+                self.finalize_cancelled(&job_id, &workspace_id).await?;
                 return self.emit_finished_and_build(app, &job_id);
             }
         };
@@ -442,20 +449,23 @@ impl<T: Transport> CoordinatorFsm<T> {
                         stage: stage.clone(),
                     },
                 );
-                self.registry.update(&job_id, |j| {
-                    j.stages.push(stage);
-                })?;
+                self.registry
+                    .update(&job_id, |j| {
+                        j.stages.push(stage);
+                    })
+                    .await?;
             }
             StageOutcome::Err(e) => {
                 self.finalize_failed(
                     &job_id,
                     &workspace_id,
                     Some(e.to_string()),
-                )?;
+                )
+                .await?;
                 return self.emit_finished_and_build(app, &job_id);
             }
             StageOutcome::Cancelled => {
-                self.finalize_cancelled(&job_id, &workspace_id)?;
+                self.finalize_cancelled(&job_id, &workspace_id).await?;
                 return self.emit_finished_and_build(app, &job_id);
             }
         }
@@ -464,11 +474,14 @@ impl<T: Transport> CoordinatorFsm<T> {
         //    The Drop guards will also fire on scope exit — both
         //    `release_workspace` and `unregister_cancel` are
         //    idempotent.
-        self.registry.update(&job_id, |j| {
-            j.state = JobState::Done;
-        })?;
         self.registry
-            .release_workspace(&workspace_id, &job_id);
+            .update(&job_id, |j| {
+                j.state = JobState::Done;
+            })
+            .await?;
+        self.registry
+            .release_workspace(&workspace_id, &job_id)
+            .await;
         self.emit_finished_and_build(app, &job_id)
     }
 
@@ -497,9 +510,13 @@ impl<T: Transport> CoordinatorFsm<T> {
         job_id: &str,
         notify: &Notify,
     ) -> StageOutcome {
-        if let Err(e) = self.registry.update(job_id, |j| {
-            j.state = state;
-        }) {
+        if let Err(e) = self
+            .registry
+            .update(job_id, |j| {
+                j.state = state;
+            })
+            .await
+        {
             return StageOutcome::Err(e);
         }
         emit_swarm_event(
@@ -560,17 +577,21 @@ impl<T: Transport> CoordinatorFsm<T> {
     /// Mark the job `Failed`, record `last_error`, release the
     /// workspace lock. Used on every error short-circuit so the
     /// happy path's tail block stays unpolluted.
-    fn finalize_failed(
+    async fn finalize_failed(
         &self,
         job_id: &str,
         workspace_id: &str,
         last_error: Option<String>,
     ) -> Result<(), AppError> {
-        self.registry.update(job_id, |j| {
-            j.state = JobState::Failed;
-            j.last_error = last_error;
-        })?;
-        self.registry.release_workspace(workspace_id, job_id);
+        self.registry
+            .update(job_id, |j| {
+                j.state = JobState::Failed;
+                j.last_error = last_error;
+            })
+            .await?;
+        self.registry
+            .release_workspace(workspace_id, job_id)
+            .await;
         Ok(())
     }
 
@@ -579,7 +600,7 @@ impl<T: Transport> CoordinatorFsm<T> {
     /// and the `Finished` event both surface a stable, structured
     /// signal that callers can match on. Cancel is a flavor of
     /// failure: `final_state` is `Failed`.
-    fn finalize_cancelled(
+    async fn finalize_cancelled(
         &self,
         job_id: &str,
         workspace_id: &str,
@@ -589,11 +610,15 @@ impl<T: Transport> CoordinatorFsm<T> {
             %workspace_id,
             "swarm job cancelled by user; finalizing as Failed"
         );
-        self.registry.update(job_id, |j| {
-            j.state = JobState::Failed;
-            j.last_error = Some(CANCELLED_LAST_ERROR.to_string());
-        })?;
-        self.registry.release_workspace(workspace_id, job_id);
+        self.registry
+            .update(job_id, |j| {
+                j.state = JobState::Failed;
+                j.last_error = Some(CANCELLED_LAST_ERROR.to_string());
+            })
+            .await?;
+        self.registry
+            .release_workspace(workspace_id, job_id)
+            .await;
         Ok(())
     }
 
@@ -659,8 +684,22 @@ struct WorkspaceGuard {
 
 impl Drop for WorkspaceGuard {
     fn drop(&mut self) {
-        self.registry
-            .release_workspace(&self.workspace_id, &self.job_id);
+        // `release_workspace` is now async (W3-12b) but `Drop` is
+        // sync. The happy/error paths in `run_job_inner` always
+        // call `release_workspace().await` explicitly before
+        // returning, so this Drop is purely a panic-unwind seatbelt.
+        // Spawning a one-shot task on the Tauri runtime ensures the
+        // in-memory map (and the SQLite lock row, if a pool is
+        // wired) gets cleaned up after a panic without forcing
+        // every Drop call site to be async. The `release_workspace`
+        // method is itself idempotent, so a stale spawn after the
+        // explicit release is a no-op.
+        let registry = Arc::clone(&self.registry);
+        let workspace_id = std::mem::take(&mut self.workspace_id);
+        let job_id = std::mem::take(&mut self.job_id);
+        tauri::async_runtime::spawn(async move {
+            registry.release_workspace(&workspace_id, &job_id).await;
+        });
     }
 }
 
@@ -1282,6 +1321,76 @@ mod tests {
         }
     }
 
+    /// Integration smoke (`#[ignore]`) — WP-W3-12b acceptance.
+    /// Drives the W3-12a happy-path goal against a SQLite-backed
+    /// registry and asserts the persisted footprint after
+    /// completion: 1 Done job, 3 stage rows, 0 workspace_locks.
+    /// CI lacks the binary so this stays opt-in via
+    /// `cargo test -- --ignored`. Owner runs it manually post-commit.
+    ///
+    /// Time budget: 3 × 180s = 540s worst-case (matches the W3-12a
+    /// integration smoke).
+    #[tokio::test]
+    #[ignore = "requires real `claude` binary + Pro/Max subscription"]
+    async fn integration_persistence_survives_real_claude_chain() {
+        use crate::swarm::transport::SubprocessTransport;
+
+        let stage_secs = std::env::var("NEURON_SWARM_STAGE_TIMEOUT_SEC")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(180);
+
+        let (app, _pool, _dir) = mock_app_with_pool().await;
+        let (test_pool, _pool_dir) =
+            crate::test_support::fresh_pool().await;
+        let profiles = bundled_registry();
+        let transport = SubprocessTransport::new();
+        let registry =
+            Arc::new(JobRegistry::with_pool(test_pool.clone()));
+        let fsm = CoordinatorFsm::new(
+            profiles,
+            transport,
+            Arc::clone(&registry),
+            Duration::from_secs(stage_secs),
+        );
+        // Reuse the canonical W3-12a goal. Path-free / CWD-agnostic.
+        let goal = "Find the `impl ProfileRegistry` block in \
+            profile.rs and add a one-line public method \
+            `pub fn profile_count(&self) -> usize { self.profiles.len() }` \
+            right after the existing `list` method. Just the method. \
+            Do NOT add a unit test, do NOT add doc comments, do NOT \
+            run cargo check.";
+        let outcome = fsm
+            .run_job(app.handle(), "default".into(), goal.into())
+            .await
+            .expect("FSM returns Ok");
+        assert_eq!(outcome.final_state, JobState::Done);
+
+        // Persisted footprint matches the WP §"acceptance gate":
+        // 1 Done job + 3 stage rows + 0 workspace_locks.
+        let done_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM swarm_jobs WHERE state = 'done'",
+        )
+        .fetch_one(&test_pool)
+        .await
+        .expect("count done");
+        assert_eq!(done_count, 1, "exactly one Done job persisted");
+        let stage_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM swarm_stages")
+                .fetch_one(&test_pool)
+                .await
+                .expect("count stages");
+        assert_eq!(stage_count, 3, "three stage rows persisted");
+        let lock_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM swarm_workspace_locks",
+        )
+        .fetch_one(&test_pool)
+        .await
+        .expect("count locks");
+        assert_eq!(lock_count, 0, "workspace lock cleared on Done");
+    }
+
     /// Integration smoke (`#[ignore]`) — drives the real `claude`
     /// chain and signals a cancel after the first `StageStarted`
     /// event lands. CI lacks the binary and an OAuth session so
@@ -1434,6 +1543,272 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+    }
+
+    // ----------------------------------------------------------------
+    // WP-W3-12b — parameterized regressions against a SQLite-backed
+    // registry. Picks 3 representative behaviors so the SQL path is
+    // covered without doubling the FSM test surface; the dedicated
+    // store tests cover the per-op SQL semantics.
+    // ----------------------------------------------------------------
+
+    /// Build a SQLite-backed registry by chaining the test pool
+    /// helper. Returns the registry + the pool's owning TempDir so
+    /// callers can keep the file alive for the test's lifetime.
+    async fn pool_backed_registry() -> (
+        Arc<JobRegistry>,
+        crate::db::DbPool,
+        tempfile::TempDir,
+    ) {
+        let (pool, dir) = crate::test_support::fresh_pool().await;
+        (
+            Arc::new(JobRegistry::with_pool(pool.clone())),
+            pool,
+            dir,
+        )
+    }
+
+    /// Pool-backed happy path: the FSM walks SCOUT/PLAN/BUILD
+    /// against a SQLite-backed registry; on completion the
+    /// `swarm_jobs` row is `done`, three `swarm_stages` rows, no
+    /// `swarm_workspace_locks`.
+    #[tokio::test]
+    async fn fsm_happy_path_walks_three_stages_with_pool() {
+        let (app, _pool, _dir) = mock_app_with_pool().await;
+        let (registry, pool, _reg_dir) = pool_backed_registry().await;
+        let mut responses: HashMap<String, MockResponse> = HashMap::new();
+        responses.insert(SCOUT_ID.into(), ok_response("scout findings", 0.01));
+        responses.insert(PLANNER_ID.into(), ok_response("plan steps", 0.02));
+        responses.insert(BUILDER_ID.into(), ok_response("build done", 0.03));
+        let fsm = CoordinatorFsm::new(
+            synthetic_registry(),
+            MockTransport::new(responses),
+            Arc::clone(&registry),
+            Duration::from_secs(5),
+        );
+        let outcome = fsm
+            .run_job(app.handle(), "ws-pool-happy".into(), "g".into())
+            .await
+            .expect("ok");
+        assert_eq!(outcome.final_state, JobState::Done);
+        assert_eq!(outcome.stages.len(), 3);
+
+        let job_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM swarm_jobs WHERE state = 'done'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(job_count, 1);
+        let stage_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM swarm_stages")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(stage_count, 3);
+        let lock_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM swarm_workspace_locks",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(lock_count, 0, "lock released after Done");
+    }
+
+    /// Pool-backed scout failure: zero stage rows, job row
+    /// `failed`, last_error matches the boom string, lock cleared.
+    #[tokio::test]
+    async fn fsm_scout_failure_short_circuits_with_pool() {
+        let (app, _pool, _dir) = mock_app_with_pool().await;
+        let (registry, pool, _reg_dir) = pool_backed_registry().await;
+        let mut responses: HashMap<String, MockResponse> = HashMap::new();
+        responses.insert(SCOUT_ID.into(), err_response("scout boom"));
+        responses.insert(PLANNER_ID.into(), ok_response("u", 0.0));
+        responses.insert(BUILDER_ID.into(), ok_response("u", 0.0));
+        let fsm = CoordinatorFsm::new(
+            synthetic_registry(),
+            MockTransport::new(responses),
+            Arc::clone(&registry),
+            Duration::from_secs(5),
+        );
+        let outcome = fsm
+            .run_job(app.handle(), "ws-pool-fail".into(), "g".into())
+            .await
+            .expect("ok");
+        assert_eq!(outcome.final_state, JobState::Failed);
+        assert!(outcome.stages.is_empty());
+
+        let last_error: Option<String> = sqlx::query_scalar(
+            "SELECT last_error FROM swarm_jobs WHERE workspace_id = ?",
+        )
+        .bind("ws-pool-fail")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(last_error
+            .as_deref()
+            .unwrap_or("")
+            .contains("scout boom"));
+        let stage_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM swarm_stages")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(stage_count, 0);
+        let lock_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM swarm_workspace_locks",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(lock_count, 0);
+    }
+
+    /// Pool-backed planner failure: scout stage row persists,
+    /// plan/build do not. Final job state is `failed`, lock cleared.
+    #[tokio::test]
+    async fn fsm_planner_failure_persists_partial_stages_with_pool() {
+        let (app, _pool, _dir) = mock_app_with_pool().await;
+        let (registry, pool, _reg_dir) = pool_backed_registry().await;
+        let mut responses: HashMap<String, MockResponse> = HashMap::new();
+        responses.insert(SCOUT_ID.into(), ok_response("scout", 0.01));
+        responses.insert(PLANNER_ID.into(), err_response("plan boom"));
+        responses.insert(BUILDER_ID.into(), ok_response("u", 0.0));
+        let fsm = CoordinatorFsm::new(
+            synthetic_registry(),
+            MockTransport::new(responses),
+            Arc::clone(&registry),
+            Duration::from_secs(5),
+        );
+        let outcome = fsm
+            .run_job(app.handle(), "ws-pool-plan".into(), "g".into())
+            .await
+            .expect("ok");
+        assert_eq!(outcome.final_state, JobState::Failed);
+        assert_eq!(outcome.stages.len(), 1);
+
+        let stage_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM swarm_stages")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(stage_count, 1, "scout stage row persisted");
+        let stage_state: String = sqlx::query_scalar(
+            "SELECT state FROM swarm_stages WHERE idx = 0",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(stage_state, "scout");
+        let lock_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM swarm_workspace_locks",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(lock_count, 0);
+    }
+
+    /// Pool-backed cancel-during-build: cancel mid-flight, the job
+    /// row is `failed` with the canonical `cancelled by user`
+    /// last_error and the lock row is gone.
+    #[tokio::test]
+    async fn fsm_cancel_during_build_persists_failed_with_pool() {
+        let (app, _pool, _dir) = mock_app_with_pool().await;
+        let (registry, pool, _reg_dir) = pool_backed_registry().await;
+        // Make build slow so cancel can land mid-stage.
+        let mut responses: HashMap<String, MockResponse> = HashMap::new();
+        responses.insert(SCOUT_ID.into(), MockResponse {
+            result: Ok(InvokeResult {
+                session_id: "s".into(),
+                assistant_text: "scout".into(),
+                total_cost_usd: 0.01,
+                turn_count: 1,
+            }),
+            sleep: Some(Duration::from_millis(10)),
+        });
+        responses.insert(PLANNER_ID.into(), MockResponse {
+            result: Ok(InvokeResult {
+                session_id: "p".into(),
+                assistant_text: "plan".into(),
+                total_cost_usd: 0.01,
+                turn_count: 1,
+            }),
+            sleep: Some(Duration::from_millis(10)),
+        });
+        responses.insert(BUILDER_ID.into(), MockResponse {
+            result: Ok(InvokeResult {
+                session_id: "b".into(),
+                assistant_text: "build".into(),
+                total_cost_usd: 0.01,
+                turn_count: 1,
+            }),
+            sleep: Some(Duration::from_millis(1500)),
+        });
+        let fsm = Arc::new(CoordinatorFsm::new(
+            synthetic_registry(),
+            MockTransport::new(responses),
+            Arc::clone(&registry),
+            Duration::from_secs(5),
+        ));
+        let job_id = "j-pool-cancel".to_string();
+        let events = capture_events(&app, &job_id);
+        let app_handle = app.handle().clone();
+        let fsm_for_task = Arc::clone(&fsm);
+        let job_id_for_task = job_id.clone();
+        let task = tokio::spawn(async move {
+            fsm_for_task
+                .run_job_with_id(
+                    &app_handle,
+                    job_id_for_task,
+                    "ws-pool-cancel".into(),
+                    "g".into(),
+                )
+                .await
+        });
+
+        // Wait for build's StageStarted then cancel.
+        wait_for_events(&events, Duration::from_secs(3), |evts| {
+            evts.iter().any(|e| {
+                e.kind == KIND_STAGE_STARTED
+                    && e.json
+                        .get("state")
+                        .and_then(|v| v.as_str())
+                        == Some("build")
+            })
+        })
+        .await;
+        registry.signal_cancel(&job_id).expect("signal");
+
+        let outcome = task.await.expect("task ok").expect("FSM ok");
+        assert_eq!(outcome.final_state, JobState::Failed);
+        assert_eq!(
+            outcome.last_error.as_deref(),
+            Some(CANCELLED_LAST_ERROR)
+        );
+
+        let on_disk_state: String = sqlx::query_scalar(
+            "SELECT state FROM swarm_jobs WHERE id = ?",
+        )
+        .bind(&job_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(on_disk_state, "failed");
+        let last_error: Option<String> = sqlx::query_scalar(
+            "SELECT last_error FROM swarm_jobs WHERE id = ?",
+        )
+        .bind(&job_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(last_error.as_deref(), Some(CANCELLED_LAST_ERROR));
+        let lock_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM swarm_workspace_locks",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(lock_count, 0);
     }
 
     /// Sanity: the registry indeed has `scout`/`planner`/

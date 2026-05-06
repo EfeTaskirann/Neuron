@@ -52,7 +52,7 @@ matching WP file is authored.
 | WP-W3-11 | Swarm runtime foundation (claude subprocess substrate) | done (`f1596f8`) | shipped 2026-05-05 | WP-W3-01 | M |
 | WP-W3-12a | Coordinator FSM skeleton (in-memory, blocking, 3-state happy path) | done (`5890841`) | shipped 2026-05-05 | WP-W3-11 | M |
 | WP-W3-12b | Coordinator FSM — SQLite persistence + restart recovery | TBD | not-started | WP-W3-12a | M |
-| WP-W3-12c | Coordinator FSM — streaming Tauri events + cancel mid-job (backend only; React hook → W3-14) | TBD | not-started | WP-W3-12a | M |
+| WP-W3-12c | Coordinator FSM — streaming Tauri events + cancel mid-job (backend only; React hook → W3-14) | done (`3cb6be1`) | shipped 2026-05-05 | WP-W3-12a | M |
 | WP-W3-12d | Coordinator FSM — REVIEW/TEST states + Verdict schema + retry feedback + Coordinator LLM brain (Option B) | TBD | not-started | WP-W3-12a (ideally also 12b) | L |
 
 Sizes (rough, in sub-agent days): S = 0.5–1 day, M = 1–2 days,

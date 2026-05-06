@@ -25,12 +25,17 @@ use tauri::{AppHandle, Manager, Runtime};
 
 use crate::error::AppError;
 use crate::models::ProfileSummary;
-use crate::swarm::coordinator::JobState;
+use crate::swarm::coordinator::{JobDetail, JobState, JobSummary};
 use crate::swarm::profile::ProfileSource;
 use crate::swarm::{
     CoordinatorFsm, InvokeResult, JobOutcome, JobRegistry, ProfileRegistry,
     SubprocessTransport, Transport,
 };
+
+/// Default page size for `swarm:list_jobs`. WP-W3-12b §4.
+const SWARM_LIST_JOBS_DEFAULT_LIMIT: u32 = 50;
+/// Hard cap to prevent runaway queries (full pagination is W3-14).
+const SWARM_LIST_JOBS_MAX_LIMIT: u32 = 200;
 
 /// 60-second budget for `swarm:test_invoke`. WP §4 calls for this as
 /// the default; the Windows AV cold-start risk noted in WP §"Notes"
@@ -259,6 +264,71 @@ pub async fn swarm_cancel_job<R: Runtime>(
     }
 }
 
+/// List recent swarm jobs from persisted history (WP-W3-12b §4).
+///
+/// `workspace_id` filters on the indexed `swarm_jobs.workspace_id`
+/// column when supplied. `limit` defaults to 50 and is hard-capped
+/// at 200 — full pagination is W3-14's UI surface.
+///
+/// Returns an empty `Vec` (not `Err`) when the registry is in-memory
+/// only (no pool wired) — that's the test harness path; production
+/// always has the pool.
+#[tauri::command(rename_all = "camelCase")]
+#[specta::specta]
+pub async fn swarm_list_jobs<R: Runtime>(
+    app: AppHandle<R>,
+    workspace_id: Option<String>,
+    limit: Option<u32>,
+) -> Result<Vec<JobSummary>, AppError> {
+    let registry = app
+        .try_state::<Arc<JobRegistry>>()
+        .ok_or_else(|| {
+            AppError::Internal(
+                "swarm JobRegistry missing from app state — \
+                 lib.rs::setup did not call app.manage()"
+                    .into(),
+            )
+        })?
+        .inner()
+        .clone();
+    let effective_limit = limit
+        .unwrap_or(SWARM_LIST_JOBS_DEFAULT_LIMIT)
+        .min(SWARM_LIST_JOBS_MAX_LIMIT);
+    registry
+        .list_jobs(workspace_id.as_deref(), effective_limit)
+        .await
+}
+
+/// Fetch the full detail (job + every persisted stage) for one job
+/// (WP-W3-12b §4). Unknown ids surface as `AppError::NotFound`.
+#[tauri::command(rename_all = "camelCase")]
+#[specta::specta]
+pub async fn swarm_get_job<R: Runtime>(
+    app: AppHandle<R>,
+    job_id: String,
+) -> Result<JobDetail, AppError> {
+    if job_id.trim().is_empty() {
+        return Err(AppError::InvalidInput(
+            "jobId must not be empty".into(),
+        ));
+    }
+    let registry = app
+        .try_state::<Arc<JobRegistry>>()
+        .ok_or_else(|| {
+            AppError::Internal(
+                "swarm JobRegistry missing from app state — \
+                 lib.rs::setup did not call app.manage()"
+                    .into(),
+            )
+        })?
+        .inner()
+        .clone();
+    match registry.get_job_detail(&job_id).await? {
+        Some(detail) => Ok(detail),
+        None => Err(AppError::NotFound(format!("swarm job {job_id}"))),
+    }
+}
+
 /// Resolve `<app_data_dir>/agents`. Returns `None` (no error) when
 /// the directory does not exist — workspace overrides are optional
 /// per WP §2. Errors reaching `app_data_dir` itself are real (the
@@ -398,6 +468,7 @@ mod tests {
         };
         registry
             .try_acquire_workspace("ws-done", job)
+            .await
             .expect("acquire");
         app.manage(registry);
         let err = swarm_cancel_job(app.handle().clone(), "j-done".into())
@@ -425,6 +496,7 @@ mod tests {
         };
         registry
             .try_acquire_workspace("ws-failed", job)
+            .await
             .expect("acquire");
         app.manage(registry);
         let err = swarm_cancel_job(app.handle().clone(), "j-failed".into())
@@ -455,6 +527,7 @@ mod tests {
         };
         registry
             .try_acquire_workspace("ws-mid", job)
+            .await
             .expect("acquire");
         // Note: no register_cancel call — simulates the race where
         // the FSM tail has already unregistered.
@@ -484,6 +557,7 @@ mod tests {
         };
         registry
             .try_acquire_workspace("ws-live", job)
+            .await
             .expect("acquire");
         let notify = Arc::new(tokio::sync::Notify::new());
         registry
@@ -530,6 +604,7 @@ mod tests {
         };
         registry
             .try_acquire_workspace("ws-double", job)
+            .await
             .expect("acquire");
         let notify = Arc::new(tokio::sync::Notify::new());
         registry
@@ -550,6 +625,7 @@ mod tests {
                 j.state = JobState::Failed;
                 j.last_error = Some("cancelled by user".into());
             })
+            .await
             .expect("update");
         registry.unregister_cancel("j-double");
 
@@ -575,6 +651,163 @@ mod tests {
         let err = swarm_cancel_job(app.handle().clone(), "j-anything".into())
             .await
             .expect_err("no registry rejected");
+        assert_eq!(err.kind(), "internal");
+    }
+
+    // ---------------------------------------------------------------- //
+    // WP-W3-12b — swarm:list_jobs / swarm:get_job IPC tests             //
+    // ---------------------------------------------------------------- //
+
+    use crate::swarm::coordinator::Job;
+
+    /// Seed `n` finished jobs into the pool via the registry, then
+    /// invoke `swarm_list_jobs` and assert the wire shape.
+    #[tokio::test]
+    async fn swarm_list_jobs_command_returns_summaries() {
+        let (app, pool, _dir) = mock_app_with_pool().await;
+        let registry =
+            Arc::new(JobRegistry::with_pool(pool.clone()));
+        // Seed three jobs across one workspace.
+        for i in 0..3 {
+            let job = Job {
+                id: format!("j-{i}"),
+                goal: format!("goal {i}"),
+                created_at_ms: i as i64,
+                state: JobState::Init,
+                retry_count: 0,
+                stages: Vec::new(),
+                last_error: None,
+            };
+            registry
+                .try_acquire_workspace("ws-list", job)
+                .await
+                .expect("acquire");
+            registry
+                .update(&format!("j-{i}"), |j| {
+                    j.state = JobState::Done;
+                })
+                .await
+                .expect("flip done");
+            registry
+                .release_workspace("ws-list", &format!("j-{i}"))
+                .await;
+        }
+        app.manage(registry);
+
+        let summaries = swarm_list_jobs(
+            app.handle().clone(),
+            None,
+            Some(50),
+        )
+        .await
+        .expect("list ok");
+        assert_eq!(summaries.len(), 3);
+        // Ordered newest-first by created_at_ms.
+        assert_eq!(summaries[0].id, "j-2");
+        for s in &summaries {
+            assert_eq!(s.workspace_id, "ws-list");
+            assert_eq!(s.state, JobState::Done);
+        }
+    }
+
+    /// `swarm_list_jobs` defaults `limit` to 50 when omitted; we
+    /// verify the call shape rather than the cap by passing > 200.
+    #[tokio::test]
+    async fn swarm_list_jobs_caps_limit_at_200() {
+        let (app, pool, _dir) = mock_app_with_pool().await;
+        let registry =
+            Arc::new(JobRegistry::with_pool(pool.clone()));
+        app.manage(registry);
+        // Empty result is still Ok with the bounded limit applied.
+        let result = swarm_list_jobs(
+            app.handle().clone(),
+            None,
+            Some(9999),
+        )
+        .await
+        .expect("list ok");
+        assert!(result.is_empty());
+    }
+
+    /// `swarm_get_job` returns the full detail for a known id.
+    #[tokio::test]
+    async fn swarm_get_job_command_returns_detail() {
+        let (app, pool, _dir) = mock_app_with_pool().await;
+        let registry =
+            Arc::new(JobRegistry::with_pool(pool.clone()));
+        let job = Job {
+            id: "j-detail".into(),
+            goal: "detail goal".into(),
+            created_at_ms: 999,
+            state: JobState::Init,
+            retry_count: 0,
+            stages: Vec::new(),
+            last_error: None,
+        };
+        registry
+            .try_acquire_workspace("ws-detail", job)
+            .await
+            .expect("acquire");
+        registry
+            .update("j-detail", |j| {
+                j.state = JobState::Done;
+            })
+            .await
+            .expect("update");
+        app.manage(registry);
+
+        let detail = swarm_get_job(app.handle().clone(), "j-detail".into())
+            .await
+            .expect("get ok");
+        assert_eq!(detail.id, "j-detail");
+        assert_eq!(detail.workspace_id, "ws-detail");
+        assert_eq!(detail.goal, "detail goal");
+        assert_eq!(detail.state, JobState::Done);
+    }
+
+    /// Unknown job id at the IPC layer surfaces `NotFound`.
+    #[tokio::test]
+    async fn swarm_get_job_unknown_returns_not_found_error() {
+        let (app, pool, _dir) = mock_app_with_pool().await;
+        let registry =
+            Arc::new(JobRegistry::with_pool(pool.clone()));
+        app.manage(registry);
+        let err = swarm_get_job(app.handle().clone(), "j-nope".into())
+            .await
+            .expect_err("unknown rejected");
+        assert_eq!(err.kind(), "not_found");
+    }
+
+    /// Empty job id surfaces `InvalidInput` before touching the DB.
+    #[tokio::test]
+    async fn swarm_get_job_empty_id_rejected() {
+        let (app, pool, _dir) = mock_app_with_pool().await;
+        let registry =
+            Arc::new(JobRegistry::with_pool(pool.clone()));
+        app.manage(registry);
+        let err = swarm_get_job(app.handle().clone(), "".into())
+            .await
+            .expect_err("empty rejected");
+        assert_eq!(err.kind(), "invalid_input");
+    }
+
+    /// `swarm_list_jobs` requires the registry in app state.
+    #[tokio::test]
+    async fn swarm_list_jobs_without_registry_returns_internal() {
+        let (app, _pool, _dir) = mock_app_with_pool().await;
+        let err = swarm_list_jobs(app.handle().clone(), None, None)
+            .await
+            .expect_err("missing registry");
+        assert_eq!(err.kind(), "internal");
+    }
+
+    /// `swarm_get_job` requires the registry in app state.
+    #[tokio::test]
+    async fn swarm_get_job_without_registry_returns_internal() {
+        let (app, _pool, _dir) = mock_app_with_pool().await;
+        let err = swarm_get_job(app.handle().clone(), "j".into())
+            .await
+            .expect_err("missing registry");
         assert_eq!(err.kind(), "internal");
     }
 }

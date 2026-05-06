@@ -187,6 +187,23 @@ export const commands = {
 	 *  callers should treat both as "cancel acknowledged".
 	 */
 	swarmCancelJob: (jobId: string) => typedError<null, AppErrorWire>(__TAURI_INVOKE("swarm_cancel_job", { jobId })),
+	/**
+	 *  List recent swarm jobs from persisted history (WP-W3-12b §4).
+	 * 
+	 *  `workspace_id` filters on the indexed `swarm_jobs.workspace_id`
+	 *  column when supplied. `limit` defaults to 50 and is hard-capped
+	 *  at 200 — full pagination is W3-14's UI surface.
+	 * 
+	 *  Returns an empty `Vec` (not `Err`) when the registry is in-memory
+	 *  only (no pool wired) — that's the test harness path; production
+	 *  always has the pool.
+	 */
+	swarmListJobs: (workspaceId: string | null, limit: number | null) => typedError<JobSummary[], AppErrorWire>(__TAURI_INVOKE("swarm_list_jobs", { workspaceId, limit })),
+	/**
+	 *  Fetch the full detail (job + every persisted stage) for one job
+	 *  (WP-W3-12b §4). Unknown ids surface as `AppError::NotFound`.
+	 */
+	swarmGetJob: (jobId: string) => typedError<JobDetail, AppErrorWire>(__TAURI_INVOKE("swarm_get_job", { jobId })),
 };
 
 /* Types */
@@ -304,6 +321,29 @@ export type InvokeResult = {
 };
 
 /**
+ *  Full job-detail wire-shape returned by `swarm:get_job` (WP-W3-12b §4).
+ *  Same fields as `Job` plus the aggregated `total_cost_usd` /
+ *  `total_duration_ms` and `finished_at_ms` pulled from the DB row.
+ * 
+ *  `Job` itself stays internal to the FSM so the in-memory
+ *  bookkeeping fields (`retry_count` for W3-12d, etc.) don't have
+ *  to ship to the wire before they have a frontend consumer.
+ */
+export type JobDetail = {
+	id: string,
+	workspaceId: string,
+	goal: string,
+	createdAtMs: number,
+	finishedAtMs: number | null,
+	state: JobState,
+	retryCount: number,
+	stages: StageResult[],
+	lastError: string | null,
+	totalCostUsd: number,
+	totalDurationMs: number,
+};
+
+/**
  *  Final outcome returned by `swarm:run_job`. Mirrors `Job` minus
  *  the lifecycle bookkeeping fields the IPC caller doesn't need
  *  (no `state` mid-run, no `created_at_ms` since the wall-clock
@@ -347,6 +387,28 @@ export type JobState = "init" | "scout" | "plan" | "build" |
  *  `Job.last_error`.
  */
 "failed";
+
+/**
+ *  Slim wire-shape returned by `swarm:list_jobs` (WP-W3-12b §4).
+ *  Drops the per-stage `assistant_text` / `session_id` payload so
+ *  the recent-jobs panel can render N jobs without N × per-stage
+ *  payload bloat.
+ * 
+ *  `goal` is **char**-truncated to 200 chars at the SQL helper
+ *  layer (not byte-truncated — Turkish characters!) so the IPC
+ *  always returns a renderable string of bounded size.
+ */
+export type JobSummary = {
+	id: string,
+	workspaceId: string,
+	goal: string,
+	createdAtMs: number,
+	finishedAtMs: number | null,
+	state: JobState,
+	stageCount: number,
+	totalCostUsd: number,
+	lastError: string | null,
+};
 
 /**
  *  One row of `mailbox`. Wire keys `from`/`to` match the terminal-data

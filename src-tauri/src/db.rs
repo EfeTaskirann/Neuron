@@ -283,6 +283,9 @@ mod tests {
             "server_tools",
             "servers",
             "settings",
+            "swarm_jobs",
+            "swarm_stages",
+            "swarm_workspace_locks",
             "workflows",
         ];
         assert_eq!(
@@ -291,7 +294,7 @@ mod tests {
             "schema tables drift — re-run `cargo sqlx prepare` after \
              updating migrations and update this test"
         );
-        assert_eq!(names.len(), 12);
+        assert_eq!(names.len(), 15);
     }
 
     /// Acceptance: every connection the pool hands out enforces FKs.
@@ -349,8 +352,8 @@ mod tests {
         // Migration count grows as the schema evolves. Update this
         // when adding a new file under `migrations/`.
         assert_eq!(
-            count, 5,
-            "five migrations recorded (0001 + 0002 + 0003 + 0004 + 0005)"
+            count, 6,
+            "six migrations recorded (0001 + 0002 + 0003 + 0004 + 0005 + 0006)"
         );
     }
 

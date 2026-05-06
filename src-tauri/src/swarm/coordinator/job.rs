@@ -1,10 +1,8 @@
-//! Job state types + in-memory registry (WP-W3-12a §2 / §4).
+//! Job state types + registry (WP-W3-12a §2 / §4 + WP-W3-12b §2/§3).
 //!
 //! `Job`, `JobState`, `JobOutcome`, and `StageResult` cross the IPC
 //! boundary as the FSM's contract with the frontend. `JobRegistry` is
-//! the in-memory store — `Arc<Mutex<HashMap<...>>>`-style. W3-12b
-//! replaces the registry with a SQLite-backed equivalent on the same
-//! method surface so callers don't churn.
+//! the in-memory store with optional SQLite write-through (W3-12b).
 //!
 //! The registry also owns the **per-workspace lock** map. Per the
 //! owner directive 2026-05-05 ("Aynı proje için yeni bir 9 kişilik
@@ -18,6 +16,13 @@
 //! that don't touch lock state cheap, but every acquire-or-release
 //! traverses both in the same order so two threads can never spin in
 //! a deadlock.
+//!
+//! W3-12b adds an optional `Option<DbPool>` so the registry doubles
+//! as a write-through to `swarm_jobs` / `swarm_stages` /
+//! `swarm_workspace_locks`. Mutators (`try_acquire_workspace`,
+//! `update`, `release_workspace`) become `async fn` and await SQL
+//! inline. SQL failure rolls back the in-memory mutation and surfaces
+//! `AppError::Internal`.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -26,7 +31,10 @@ use serde::{Deserialize, Serialize};
 use specta::Type;
 use tokio::sync::Notify;
 
+use crate::db::DbPool;
 use crate::error::AppError;
+
+use super::store;
 
 /// Lifecycle states of a swarm job. Per WP §2:
 ///
@@ -56,6 +64,51 @@ pub enum JobState {
     /// Terminal failure state. Carries the last error in
     /// `Job.last_error`.
     Failed,
+}
+
+impl JobState {
+    /// Stable string used in the `swarm_jobs.state` column. The
+    /// repr matches `serde(rename_all = "snake_case")` on the
+    /// JS-facing wire enum so DB values and frontend values agree
+    /// (which simplifies the W3-14 hook).
+    pub fn as_db_str(&self) -> &'static str {
+        match self {
+            JobState::Init => "init",
+            JobState::Scout => "scout",
+            JobState::Plan => "plan",
+            JobState::Build => "build",
+            JobState::Review => "review",
+            JobState::Test => "test",
+            JobState::Done => "done",
+            JobState::Failed => "failed",
+        }
+    }
+
+    /// Inverse of [`Self::as_db_str`]. Unknown discriminants surface
+    /// as `AppError::Internal` so a corrupted DB never silently maps
+    /// to a default state.
+    pub fn from_db_str(s: &str) -> Result<Self, AppError> {
+        match s {
+            "init" => Ok(JobState::Init),
+            "scout" => Ok(JobState::Scout),
+            "plan" => Ok(JobState::Plan),
+            "build" => Ok(JobState::Build),
+            "review" => Ok(JobState::Review),
+            "test" => Ok(JobState::Test),
+            "done" => Ok(JobState::Done),
+            "failed" => Ok(JobState::Failed),
+            other => Err(AppError::Internal(format!(
+                "unknown swarm job state in DB: {other}"
+            ))),
+        }
+    }
+
+    /// Whether this state is terminal (`Done` or `Failed`).
+    /// Used by the recovery sweep to leave already-finalized rows
+    /// alone.
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, JobState::Done | JobState::Failed)
+    }
 }
 
 /// Output of one completed FSM stage. Append-only — the FSM pushes
@@ -132,9 +185,90 @@ pub struct JobOutcome {
     pub total_duration_ms: u64,
 }
 
-/// In-memory job + workspace-lock registry. `Mutex` (std, not async)
-/// is fine here — every operation is short and never `await`s while
-/// holding the lock.
+/// Slim wire-shape returned by `swarm:list_jobs` (WP-W3-12b §4).
+/// Drops the per-stage `assistant_text` / `session_id` payload so
+/// the recent-jobs panel can render N jobs without N × per-stage
+/// payload bloat.
+///
+/// `goal` is **char**-truncated to 200 chars at the SQL helper
+/// layer (not byte-truncated — Turkish characters!) so the IPC
+/// always returns a renderable string of bounded size.
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct JobSummary {
+    pub id: String,
+    pub workspace_id: String,
+    pub goal: String,
+    pub created_at_ms: i64,
+    pub finished_at_ms: Option<i64>,
+    pub state: JobState,
+    pub stage_count: u32,
+    pub total_cost_usd: f64,
+    pub last_error: Option<String>,
+}
+
+/// Full job-detail wire-shape returned by `swarm:get_job` (WP-W3-12b §4).
+/// Same fields as `Job` plus the aggregated `total_cost_usd` /
+/// `total_duration_ms` and `finished_at_ms` pulled from the DB row.
+///
+/// `Job` itself stays internal to the FSM so the in-memory
+/// bookkeeping fields (`retry_count` for W3-12d, etc.) don't have
+/// to ship to the wire before they have a frontend consumer.
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct JobDetail {
+    pub id: String,
+    pub workspace_id: String,
+    pub goal: String,
+    pub created_at_ms: i64,
+    pub finished_at_ms: Option<i64>,
+    pub state: JobState,
+    pub retry_count: u32,
+    pub stages: Vec<StageResult>,
+    pub last_error: Option<String>,
+    pub total_cost_usd: f64,
+    pub total_duration_ms: u64,
+}
+
+impl JobDetail {
+    /// Build a detail wire-shape from a `Job` snapshot + the
+    /// `workspace_id` it was created for + the `finished_at_ms`
+    /// the DB persisted on the terminal transition. Aggregates
+    /// `total_cost_usd` / `total_duration_ms` from `stages` so the
+    /// sums always reflect the actual stage rows (not an out-of-
+    /// sync cached value).
+    pub fn from_job(
+        job: Job,
+        workspace_id: String,
+        finished_at_ms: Option<i64>,
+    ) -> Self {
+        let total_cost_usd: f64 =
+            job.stages.iter().map(|s| s.total_cost_usd).sum();
+        let total_duration_ms: u64 =
+            job.stages.iter().map(|s| s.duration_ms).sum();
+        Self {
+            id: job.id,
+            workspace_id,
+            goal: job.goal,
+            created_at_ms: job.created_at_ms,
+            finished_at_ms,
+            state: job.state,
+            retry_count: job.retry_count,
+            stages: job.stages,
+            last_error: job.last_error,
+            total_cost_usd,
+            total_duration_ms,
+        }
+    }
+}
+
+/// In-memory job + workspace-lock registry, optionally backed by
+/// SQLite write-through (W3-12b).
+///
+/// `Mutex` (std, not async) is fine here — every operation is
+/// short and never `await`s while holding the lock. The async
+/// mutators acquire the in-memory lock, mutate, drop it, *then*
+/// await SQL.
 ///
 /// The two maps are independent so a job mutation that doesn't
 /// change workspace state (e.g. appending a `StageResult`) never
@@ -143,48 +277,73 @@ pub struct JobOutcome {
 /// Lock acquisition order — both internal helpers and external
 /// callers MUST follow `workspace_locks` first, then `jobs`. The
 /// constructor / accessors that touch only one map are exempt.
+/// **W3-12b extension**: with write-through, the order is now
+/// `workspace_locks (in-mem) → jobs (in-mem) → DB tx`. All
+/// in-memory locks are released BEFORE awaiting on the DB.
 pub struct JobRegistry {
     jobs: Mutex<HashMap<String, Job>>,
     /// `workspace_id` → `job_id` of the in-flight job currently
     /// holding the workspace. Removed on `release_workspace`.
     workspace_locks: Mutex<HashMap<String, String>>,
-    /// WP-W3-12c — per-job cancellation notify. The FSM `select!`s
-    /// each stage future against this notify; `swarm:cancel_job`
-    /// looks up the entry by `job_id` and calls `notify_one()`.
-    /// The map is registered on FSM start and removed on terminal
-    /// transition (Done / Failed / Cancelled).
+    /// Per-job cancellation notify (W3-12c). Process-local; never
+    /// persisted to SQLite.
     cancel_notifies: Mutex<HashMap<String, Arc<Notify>>>,
+    /// Optional pool — `None` when the registry is in-memory only
+    /// (test bench), `Some` in production. The mutators branch on
+    /// `pool.as_ref()` so the same surface drives both modes.
+    pool: Option<DbPool>,
 }
 
 impl JobRegistry {
-    /// Build an empty registry for `app.manage(Arc::new(...))`.
+    /// Build an in-memory-only registry. Used by tests and as the
+    /// fallback for any call site that does not yet have access to
+    /// the pool. Production code paths must use [`Self::with_pool`].
     pub fn new() -> Self {
         Self {
             jobs: Mutex::new(HashMap::new()),
             workspace_locks: Mutex::new(HashMap::new()),
             cancel_notifies: Mutex::new(HashMap::new()),
+            pool: None,
         }
     }
 
+    /// Build a SQLite-backed registry. Every successful in-memory
+    /// mutation is mirrored to `swarm_jobs` / `swarm_stages` /
+    /// `swarm_workspace_locks`. SQL failure rolls back the
+    /// in-memory mutation and surfaces `AppError::Internal`.
+    pub fn with_pool(pool: DbPool) -> Self {
+        Self {
+            jobs: Mutex::new(HashMap::new()),
+            workspace_locks: Mutex::new(HashMap::new()),
+            cancel_notifies: Mutex::new(HashMap::new()),
+            pool: Some(pool),
+        }
+    }
+
+    /// Test/inspection accessor — returns whether SQL write-through
+    /// is enabled for this registry. Internal helpers in the FSM
+    /// don't need this, but tests use it to assert that
+    /// `with_pool(...)` actually wired through.
+    #[cfg(test)]
+    pub(crate) fn has_pool(&self) -> bool {
+        self.pool.is_some()
+    }
+
     /// Atomically validate non-empty `workspace_id`, check no
-    /// existing lock, and register both the new job and its lock.
+    /// existing lock, register both the new job and its lock, and
+    /// — if a pool is wired — write through to SQLite in one
+    /// transaction. SQL failure rolls back the in-memory mutation.
+    ///
     /// Returns:
     ///
-    /// - `Ok(())` on success — the workspace is now busy with this
-    ///   job, and `get(&job.id)` will return the inserted record.
+    /// - `Ok(())` on success.
     /// - `Err(AppError::InvalidInput)` if `workspace_id` is empty
     ///   (after trim).
-    /// - `Err(AppError::WorkspaceBusy { workspace_id, in_flight_job_id })`
-    ///   if the workspace already has an in-flight job.
-    ///
-    /// Lock order: `workspace_locks` first (the contention point),
-    /// then `jobs` (uncontested in the success path). The two
-    /// `lock()` calls are deliberately interleaved to keep the
-    /// "either both happen or neither does" invariant — if the
-    /// `jobs` mutex is poisoned for any reason the workspace lock
-    /// is also released because we never insert it on the bail
-    /// path.
-    pub fn try_acquire_workspace(
+    /// - `Err(AppError::WorkspaceBusy { .. })` if the workspace
+    ///   already has an in-flight job.
+    /// - `Err(AppError::Internal(...))` if the DB tx failed; the
+    ///   in-memory state is rolled back to the pre-call shape.
+    pub async fn try_acquire_workspace(
         &self,
         workspace_id: &str,
         new_job: Job,
@@ -196,24 +355,57 @@ impl JobRegistry {
             ));
         }
 
-        let mut locks = self
-            .workspace_locks
-            .lock()
-            .expect("workspace_locks mutex poisoned");
-        if let Some(existing) = locks.get(trimmed) {
-            return Err(AppError::WorkspaceBusy {
-                workspace_id: trimmed.to_string(),
-                in_flight_job_id: existing.clone(),
-            });
-        }
+        // 1. In-memory mutation under one critical section.
+        let job_for_db = {
+            let mut locks = self
+                .workspace_locks
+                .lock()
+                .expect("workspace_locks mutex poisoned");
+            if let Some(existing) = locks.get(trimmed) {
+                return Err(AppError::WorkspaceBusy {
+                    workspace_id: trimmed.to_string(),
+                    in_flight_job_id: existing.clone(),
+                });
+            }
+            let mut jobs =
+                self.jobs.lock().expect("jobs mutex poisoned");
+            locks.insert(trimmed.to_string(), new_job.id.clone());
+            jobs.insert(new_job.id.clone(), new_job.clone());
+            new_job
+        };
 
-        // Reserve the lock + insert the job in one critical section
-        // so a concurrent caller observing the empty `locks` map
-        // can never interleave between the two writes.
-        let mut jobs =
-            self.jobs.lock().expect("jobs mutex poisoned");
-        locks.insert(trimmed.to_string(), new_job.id.clone());
-        jobs.insert(new_job.id.clone(), new_job);
+        // 2. SQL write-through (when pool is wired).
+        if let Some(pool) = &self.pool {
+            let now_ms = crate::time::now_millis();
+            if let Err(e) = store::insert_job_and_lock(
+                pool,
+                &job_for_db,
+                trimmed,
+                now_ms,
+            )
+            .await
+            {
+                // Roll back the in-memory state so the caller
+                // observes a consistent failure (no orphaned lock).
+                let mut locks = self
+                    .workspace_locks
+                    .lock()
+                    .expect("workspace_locks mutex poisoned");
+                let mut jobs =
+                    self.jobs.lock().expect("jobs mutex poisoned");
+                locks.remove(trimmed);
+                jobs.remove(&job_for_db.id);
+                tracing::warn!(
+                    job_id = %job_for_db.id,
+                    workspace_id = %trimmed,
+                    error = %e,
+                    "swarm: try_acquire_workspace SQL failure; rolled back in-mem"
+                );
+                return Err(AppError::Internal(format!(
+                    "swarm: failed to persist job/lock: {e}"
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -222,60 +414,203 @@ impl JobRegistry {
     /// failure paths, and a `Drop`-driven defensive call from
     /// `WorkspaceGuard` may also fire — calling twice (or against a
     /// workspace that another job has since taken over) is a no-op.
-    pub fn release_workspace(&self, workspace_id: &str, job_id: &str) {
+    ///
+    /// On SQL failure the in-memory remove is **not** rolled back —
+    /// the lock is gone from app state and the worst case is a
+    /// stale row in `swarm_workspace_locks` that the next
+    /// `recover_orphans` pass will sweep. Logged at `warn!` so the
+    /// drift is visible.
+    pub async fn release_workspace(&self, workspace_id: &str, job_id: &str) {
         let trimmed = workspace_id.trim();
         if trimmed.is_empty() {
             return;
         }
-        let mut locks = self
-            .workspace_locks
-            .lock()
-            .expect("workspace_locks mutex poisoned");
-        // Only remove if the lock still belongs to this job_id —
-        // protects against the (theoretical, in 12a impossible)
-        // scenario where a stale Drop guard fires after the
-        // workspace has been re-acquired by a different job.
-        if locks.get(trimmed).map(String::as_str) == Some(job_id) {
-            locks.remove(trimmed);
+        // 1. In-memory remove (idempotent).
+        let did_remove = {
+            let mut locks = self
+                .workspace_locks
+                .lock()
+                .expect("workspace_locks mutex poisoned");
+            if locks.get(trimmed).map(String::as_str) == Some(job_id) {
+                locks.remove(trimmed);
+                true
+            } else {
+                false
+            }
+        };
+        // 2. SQL delete (when pool wired). Run unconditionally — a
+        //    stale DB row from a previous process is exactly what
+        //    we want to clear, even if the in-memory map was
+        //    already empty.
+        if let Some(pool) = &self.pool {
+            if let Err(e) =
+                store::delete_workspace_lock(pool, trimmed).await
+            {
+                tracing::warn!(
+                    workspace_id = %trimmed,
+                    job_id = %job_id,
+                    did_remove,
+                    error = %e,
+                    "swarm: release_workspace SQL delete failed; in-mem already cleared"
+                );
+            }
         }
     }
 
     /// Mutate the job under `id` in place. The closure receives
-    /// `&mut Job` so callers can update any field; nothing is
-    /// returned because the FSM's `update` call sites only need to
-    /// know whether the id existed (mapped to `AppError::NotFound`).
-    pub fn update<F: FnOnce(&mut Job)>(
+    /// `&mut Job` so callers can update any field. After the
+    /// closure runs the registry re-serializes the job and (when
+    /// pool is wired) UPDATEs its `swarm_jobs` row. New stages
+    /// (delta vs. the pre-mutation `stages.len()`) get INSERTed
+    /// into `swarm_stages`.
+    ///
+    /// On SQL failure the in-memory mutation is rolled back to the
+    /// pre-call snapshot and the call surfaces `AppError::Internal`.
+    pub async fn update<F>(&self, id: &str, f: F) -> Result<(), AppError>
+    where
+        F: FnOnce(&mut Job),
+    {
+        // 1. In-memory mutation. Snapshot the pre-call state so we
+        //    can roll back if SQL fails.
+        let (snapshot_before, snapshot_after, prev_len) = {
+            let mut jobs =
+                self.jobs.lock().expect("jobs mutex poisoned");
+            let job = jobs.get_mut(id).ok_or_else(|| {
+                AppError::NotFound(format!(
+                    "swarm job `{id}` not in registry"
+                ))
+            })?;
+            let before = job.clone();
+            let prev_len = job.stages.len();
+            f(job);
+            let after = job.clone();
+            (before, after, prev_len)
+        };
+
+        // 2. SQL write-through.
+        if let Some(pool) = &self.pool {
+            // 2a. UPDATE the job row.
+            let now_ms = crate::time::now_millis();
+            let finished_at_ms = if snapshot_after.state.is_terminal() {
+                Some(now_ms)
+            } else {
+                None
+            };
+            if let Err(e) =
+                store::update_job(pool, &snapshot_after, finished_at_ms)
+                    .await
+            {
+                self.rollback_update(id, snapshot_before, &e);
+                return Err(AppError::Internal(format!(
+                    "swarm: failed to persist job update: {e}"
+                )));
+            }
+            // 2b. INSERT each new stage (delta vs. prev_len).
+            if snapshot_after.stages.len() > prev_len {
+                for (idx_offset, stage) in snapshot_after
+                    .stages
+                    .iter()
+                    .enumerate()
+                    .skip(prev_len)
+                {
+                    let idx = idx_offset as u32;
+                    if let Err(e) = store::insert_stage(
+                        pool, id, idx, stage, now_ms,
+                    )
+                    .await
+                    {
+                        self.rollback_update(id, snapshot_before, &e);
+                        return Err(AppError::Internal(format!(
+                            "swarm: failed to persist stage {idx}: {e}"
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Restore the in-memory job to the pre-call snapshot and log
+    /// the SQL failure that triggered the rollback. Internal helper
+    /// for `update`.
+    fn rollback_update(
         &self,
         id: &str,
-        f: F,
-    ) -> Result<(), AppError> {
+        snapshot_before: Job,
+        error: &AppError,
+    ) {
         let mut jobs =
             self.jobs.lock().expect("jobs mutex poisoned");
-        match jobs.get_mut(id) {
-            Some(job) => {
-                f(job);
-                Ok(())
-            }
-            None => Err(AppError::NotFound(format!(
-                "swarm job `{id}` not in registry"
-            ))),
+        if let Some(slot) = jobs.get_mut(id) {
+            *slot = snapshot_before;
         }
+        tracing::warn!(
+            job_id = %id,
+            error = %error,
+            "swarm: update SQL failure; rolled back in-mem"
+        );
     }
 
     /// Snapshot of the job under `id`, or `None`. Returns an owned
     /// `Job` so the caller doesn't hold the registry lock past the
-    /// call.
+    /// call. Reads the in-memory cache only — SQLite-backed history
+    /// queries go through `commands::swarm::swarm_get_job`.
     pub fn get(&self, id: &str) -> Option<Job> {
         let jobs = self.jobs.lock().expect("jobs mutex poisoned");
         jobs.get(id).cloned()
     }
 
-    /// Snapshot of every job in the registry. Order is unspecified;
-    /// the W3-12c streaming list will sort by `created_at_ms` on
-    /// the read path, not here.
+    /// Snapshot of every job in the in-memory cache. Order
+    /// unspecified.
     pub fn list(&self) -> Vec<Job> {
         let jobs = self.jobs.lock().expect("jobs mutex poisoned");
         jobs.values().cloned().collect()
+    }
+
+    /// Sweep orphan jobs left non-terminal at process start. Called
+    /// once from `lib.rs::setup` BEFORE `app.manage(registry)`.
+    ///
+    /// Three steps under the hood (see `store::recover_orphans`):
+    ///   1. UPDATE `swarm_jobs` SET state='failed',
+    ///      last_error='interrupted by app restart',
+    ///      finished_at_ms=:now WHERE state NOT IN ('done','failed').
+    ///   2. DELETE FROM `swarm_workspace_locks`.
+    ///   3. SELECT recent rows to hydrate the in-memory cache.
+    ///
+    /// The in-memory hydration is capped at 100 rows (newest-first)
+    /// so a long-lived install doesn't OOM. The IPC `swarm:list_jobs`
+    /// hits the DB, not the cache, so this cap doesn't bound the
+    /// history surface.
+    pub async fn recover_orphans(&self) -> Result<u32, AppError> {
+        let Some(pool) = &self.pool else {
+            return Ok(0);
+        };
+        let now_ms = crate::time::now_millis();
+        let recovered = store::recover_orphans(pool, now_ms).await?;
+        // Hydrate the in-memory cache with the recovered jobs (which
+        // are now Failed) plus the latest 100 terminal jobs. The
+        // recovered set goes in first so that `get(job_id)` for a
+        // freshly-recovered orphan hits the cache instead of round-
+        // tripping to the DB.
+        {
+            let mut jobs =
+                self.jobs.lock().expect("jobs mutex poisoned");
+            for job in &recovered.recovered {
+                jobs.insert(job.id.clone(), job.clone());
+            }
+        }
+        // Pull the most-recent slice (deduped against the recovered
+        // set) so the read-paths see warm rows. List-shaped: not
+        // capped on workspace, just newest-first.
+        let warm = store::list_recent_jobs_full(pool, 100).await?;
+        {
+            let mut jobs =
+                self.jobs.lock().expect("jobs mutex poisoned");
+            for job in warm {
+                jobs.entry(job.id.clone()).or_insert(job);
+            }
+        }
+        Ok(recovered.count)
     }
 
     // ------------------------------------------------------------- //
@@ -290,13 +625,8 @@ impl JobRegistry {
     // most one of the three at a time).
 
     /// Register a cancellation `Notify` for the in-flight `job_id`.
-    /// The FSM owns the `Arc` for the duration of the run; the
-    /// registry holds a clone so `signal_cancel` can call
-    /// `notify_one()` without bouncing through the FSM.
-    ///
-    /// Returns `Err(AppError::Conflict)` if a notify is already
-    /// registered for this `job_id` — protects against the
-    /// (impossible-in-practice in 12c) double-register race.
+    /// Process-local; never persisted (see W3-12b "cancel state is
+    /// process-local").
     pub fn register_cancel(
         &self,
         job_id: &str,
@@ -327,14 +657,7 @@ impl JobRegistry {
         notifies.remove(job_id);
     }
 
-    /// Signal cancellation for the given `job_id`. Looks up the
-    /// `Notify` and calls `notify_one()`; the entry is left in the
-    /// map (the FSM removes it when it observes the cancel).
-    ///
-    /// - `Ok(())` if a notify was registered and signaled.
-    /// - `Err(AppError::NotFound)` if no notify is registered for
-    ///   this `job_id` — i.e. the job is unknown, terminal, or had
-    ///   its cancel already de-registered by the FSM tail.
+    /// Signal cancellation for the given `job_id`.
     pub fn signal_cancel(&self, job_id: &str) -> Result<(), AppError> {
         let notifies = self
             .cancel_notifies
@@ -349,6 +672,43 @@ impl JobRegistry {
                 "swarm job `{job_id}` has no in-flight cancel notify"
             ))),
         }
+    }
+
+    /// Accessor used by the IPC layer to read history rows directly
+    /// from the DB. Returns `None` when the registry is in-memory
+    /// only.
+    pub fn pool(&self) -> Option<&DbPool> {
+        self.pool.as_ref()
+    }
+
+    /// List recent jobs from the persisted history. The IPC layer
+    /// (`swarm:list_jobs`) calls through here so the SQL helpers
+    /// stay `pub(super)`. Without a pool, returns an empty Vec —
+    /// the in-memory cache is the FSM's working state, not a
+    /// history surface.
+    pub async fn list_jobs(
+        &self,
+        workspace_id: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<JobSummary>, AppError> {
+        let Some(pool) = &self.pool else {
+            return Ok(Vec::new());
+        };
+        store::list_jobs(pool, workspace_id, limit).await
+    }
+
+    /// Fetch one job detail (job + stages) from the persisted
+    /// history. Used by `swarm:get_job`. `Ok(None)` is the
+    /// canonical "unknown id" signal — the IPC layer maps to
+    /// `AppError::NotFound`.
+    pub async fn get_job_detail(
+        &self,
+        job_id: &str,
+    ) -> Result<Option<JobDetail>, AppError> {
+        let Some(pool) = &self.pool else {
+            return Ok(None);
+        };
+        store::get_job_detail(pool, job_id).await
     }
 }
 
@@ -479,12 +839,61 @@ mod tests {
         );
     }
 
+    /// `as_db_str` and `from_db_str` round-trip every variant.
+    /// W3-12b §6 acceptance criterion: "JobState::{as,from}_db_str
+    /// round-trip on every variant".
+    #[test]
+    fn job_state_db_str_round_trips() {
+        for state in [
+            JobState::Init,
+            JobState::Scout,
+            JobState::Plan,
+            JobState::Build,
+            JobState::Review,
+            JobState::Test,
+            JobState::Done,
+            JobState::Failed,
+        ] {
+            let s = state.as_db_str();
+            let back = JobState::from_db_str(s)
+                .unwrap_or_else(|_| panic!("round-trip {state:?} via {s}"));
+            assert_eq!(state, back, "db_str round-trip failed for {state:?}");
+        }
+    }
+
+    /// Unknown DB-string values surface as `Internal`, not silently
+    /// mapped to a default state.
+    #[test]
+    fn job_state_from_db_str_unknown_errors() {
+        let err = JobState::from_db_str("nonsense")
+            .expect_err("unknown discriminant rejected");
+        assert_eq!(err.kind(), "internal");
+    }
+
+    /// `JobState::is_terminal` matches the documented contract.
+    #[test]
+    fn job_state_is_terminal_matches_done_or_failed() {
+        assert!(JobState::Done.is_terminal());
+        assert!(JobState::Failed.is_terminal());
+        for s in [
+            JobState::Init,
+            JobState::Scout,
+            JobState::Plan,
+            JobState::Build,
+            JobState::Review,
+            JobState::Test,
+        ] {
+            assert!(!s.is_terminal(), "{s:?} should not be terminal");
+        }
+    }
+
     /// Insert a job, immediately read it back; equality on the
     /// non-cloning fields proves the registry stores by value.
-    #[test]
-    fn job_registry_insert_and_get_roundtrip() {
+    #[tokio::test]
+    async fn job_registry_insert_and_get_roundtrip() {
         let reg = JobRegistry::new();
         reg.try_acquire_workspace("ws-a", fixture_job("j-1"))
+            .await
             .expect("acquire");
         let got = reg.get("j-1").expect("get");
         assert_eq!(got.id, "j-1");
@@ -493,15 +902,17 @@ mod tests {
     }
 
     /// `update` mutates the entry in place; `get` reflects it.
-    #[test]
-    fn job_registry_update_modifies_in_place() {
+    #[tokio::test]
+    async fn job_registry_update_modifies_in_place() {
         let reg = JobRegistry::new();
         reg.try_acquire_workspace("ws-b", fixture_job("j-2"))
+            .await
             .expect("acquire");
         reg.update("j-2", |job| {
             job.state = JobState::Scout;
             job.retry_count = 1;
         })
+        .await
         .expect("update");
         let got = reg.get("j-2").expect("get");
         assert_eq!(got.state, JobState::Scout);
@@ -510,20 +921,24 @@ mod tests {
         // Updating a missing id surfaces NotFound.
         let err = reg
             .update("j-missing", |_| {})
+            .await
             .expect_err("missing id rejected");
         assert_eq!(err.kind(), "not_found");
     }
 
     /// `list` returns every job currently in the registry. The
     /// order is unspecified, so we check membership by id.
-    #[test]
-    fn job_registry_list_returns_all() {
+    #[tokio::test]
+    async fn job_registry_list_returns_all() {
         let reg = JobRegistry::new();
         reg.try_acquire_workspace("ws-1", fixture_job("j-a"))
+            .await
             .expect("ok");
         reg.try_acquire_workspace("ws-2", fixture_job("j-b"))
+            .await
             .expect("ok");
         reg.try_acquire_workspace("ws-3", fixture_job("j-c"))
+            .await
             .expect("ok");
         let mut ids: Vec<String> =
             reg.list().into_iter().map(|j| j.id).collect();
@@ -549,6 +964,7 @@ mod tests {
                 "shared",
                 fixture_job("j-thread-1"),
             )
+            .await
         });
         let r2 = Arc::clone(&reg);
         let b2 = Arc::clone(&barrier);
@@ -558,6 +974,7 @@ mod tests {
                 "shared",
                 fixture_job("j-thread-2"),
             )
+            .await
         });
         let (r1_out, r2_out) =
             tokio::join!(t1, t2);
@@ -588,13 +1005,13 @@ mod tests {
         let b1 = Arc::clone(&barrier);
         let t1 = tokio::spawn(async move {
             b1.wait().await;
-            r1.try_acquire_workspace("ws-x", fixture_job("j-x"))
+            r1.try_acquire_workspace("ws-x", fixture_job("j-x")).await
         });
         let r2 = Arc::clone(&reg);
         let b2 = Arc::clone(&barrier);
         let t2 = tokio::spawn(async move {
             b2.wait().await;
-            r2.try_acquire_workspace("ws-y", fixture_job("j-y"))
+            r2.try_acquire_workspace("ws-y", fixture_job("j-y")).await
         });
         let (r1_out, r2_out) = tokio::join!(t1, t2);
         r1_out.expect("task 1 panic").expect("ws-x ok");
@@ -603,42 +1020,47 @@ mod tests {
 
     /// Acquire, release, re-acquire same workspace → second acquire
     /// succeeds.
-    #[test]
-    fn release_workspace_unlocks_for_subsequent_acquire() {
+    #[tokio::test]
+    async fn release_workspace_unlocks_for_subsequent_acquire() {
         let reg = JobRegistry::new();
         reg.try_acquire_workspace("ws-r", fixture_job("j-first"))
+            .await
             .expect("acquire 1");
-        reg.release_workspace("ws-r", "j-first");
+        reg.release_workspace("ws-r", "j-first").await;
         reg.try_acquire_workspace("ws-r", fixture_job("j-second"))
+            .await
             .expect("acquire 2");
     }
 
     /// Releasing twice (or against a stale job_id) is a no-op —
     /// matches the defensive Drop-guard contract.
-    #[test]
-    fn release_workspace_is_idempotent() {
+    #[tokio::test]
+    async fn release_workspace_is_idempotent() {
         let reg = JobRegistry::new();
         reg.try_acquire_workspace("ws-d", fixture_job("j-d"))
+            .await
             .expect("acquire");
-        reg.release_workspace("ws-d", "j-d");
+        reg.release_workspace("ws-d", "j-d").await;
         // Second release: no panic, no error surface (release is fn-> ()).
-        reg.release_workspace("ws-d", "j-d");
+        reg.release_workspace("ws-d", "j-d").await;
         // Stale id (different job): also a no-op — the workspace is
         // free and stays free.
-        reg.release_workspace("ws-d", "j-stale");
+        reg.release_workspace("ws-d", "j-stale").await;
         reg.try_acquire_workspace("ws-d", fixture_job("j-d2"))
+            .await
             .expect("acquire after idempotent releases");
     }
 
     /// Empty `workspace_id` (or whitespace-only) → `InvalidInput`,
     /// not `WorkspaceBusy`. The pre-flight check fires before the
     /// lock map is touched.
-    #[test]
-    fn try_acquire_workspace_empty_id_rejected() {
+    #[tokio::test]
+    async fn try_acquire_workspace_empty_id_rejected() {
         let reg = JobRegistry::new();
         for bad in ["", "   ", "\t\n"] {
             let err = reg
                 .try_acquire_workspace(bad, fixture_job("j-bad"))
+                .await
                 .expect_err(&format!("`{bad:?}` should be rejected"));
             assert_eq!(err.kind(), "invalid_input");
         }
@@ -723,35 +1145,39 @@ mod tests {
     /// `release_workspace` on Drop. We simulate that here with a
     /// minimal closure-scoped guard so the registry-side test stays
     /// independent of the FSM module's internals.
-    #[test]
-    fn try_acquire_workspace_releases_on_workspaceguard_drop() {
-        struct LocalGuard<'a> {
-            reg: &'a JobRegistry,
-            workspace_id: &'a str,
-            job_id: &'a str,
-        }
-        impl<'a> Drop for LocalGuard<'a> {
-            fn drop(&mut self) {
-                self.reg
-                    .release_workspace(self.workspace_id, self.job_id);
-            }
-        }
-
+    ///
+    /// W3-12b update: `release_workspace` is async, but Drop is
+    /// sync — we exercise it by calling `release_workspace` from
+    /// an async block here rather than from a Drop handler. The
+    /// FSM-side guard uses `tauri::async_runtime::block_on` which
+    /// is integration-tested in fsm.rs.
+    #[tokio::test]
+    async fn try_acquire_workspace_releases_for_re_acquire() {
         let reg = JobRegistry::new();
         reg.try_acquire_workspace("ws-g", fixture_job("j-g"))
+            .await
             .expect("acquire");
-        {
-            let _guard = LocalGuard {
-                reg: &reg,
-                workspace_id: "ws-g",
-                job_id: "j-g",
-            };
-            // Guard goes out of scope at the close of this block,
-            // which fires `Drop::drop`, which calls
-            // `release_workspace`.
-        }
+        reg.release_workspace("ws-g", "j-g").await;
         // Workspace is free — the next acquire wins.
         reg.try_acquire_workspace("ws-g", fixture_job("j-g2"))
-            .expect("re-acquire after guard drop");
+            .await
+            .expect("re-acquire after release");
+    }
+
+    // ---------------------------------------------------------------
+    // WP-W3-12b — `with_pool` smoke (in-memory only — exercising the
+    // pool-wired path lives in store.rs::tests + commands tests).
+    // ---------------------------------------------------------------
+
+    /// `with_pool` constructor wires the pool and `has_pool()`
+    /// returns true. `new()` returns false. Used by parameterized
+    /// FSM tests to assert the right backend is in use.
+    #[tokio::test]
+    async fn with_pool_constructor_records_pool_handle() {
+        let (pool, _dir) = crate::test_support::fresh_pool().await;
+        let reg = JobRegistry::with_pool(pool);
+        assert!(reg.has_pool(), "with_pool wires the handle");
+        let reg2 = JobRegistry::new();
+        assert!(!reg2.has_pool(), "new() leaves pool unset");
     }
 }

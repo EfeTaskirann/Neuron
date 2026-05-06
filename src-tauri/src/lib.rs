@@ -109,6 +109,8 @@ pub fn specta_builder_for_export() -> tauri_specta::Builder<tauri::Wry> {
             commands::swarm::swarm_test_invoke::<tauri::Wry>,
             commands::swarm::swarm_run_job::<tauri::Wry>,
             commands::swarm::swarm_cancel_job::<tauri::Wry>,
+            commands::swarm::swarm_list_jobs::<tauri::Wry>,
+            commands::swarm::swarm_get_job::<tauri::Wry>,
         ])
         // Register the AppError once on the builder so the type lands
         // in `bindings.ts` as a referenceable shape rather than being
@@ -178,22 +180,51 @@ pub fn run() {
                 }
             }
 
+            // WP-W3-12a / W3-12b — install the SQLite-backed swarm
+            // `JobRegistry`. `swarm:run_job` serializes per-workspace
+            // calls through it; `Arc` so multiple concurrent commands
+            // share the same lock state. The pool comes from the
+            // already-managed `DbPool` so every state transition
+            // writes through to `swarm_jobs` / `swarm_stages` /
+            // `swarm_workspace_locks`.
+            //
+            // BEFORE `app.manage(registry)`: run the orphan recovery
+            // sweep so any non-terminal job left over by a previous
+            // process is finalized as `Failed { last_error: 'interrupted
+            // by app restart' }` and its workspace lock cleared. The
+            // recovered set is hydrated into the registry's in-memory
+            // cache, capped at 100 rows.
+            //
+            // Placed BEFORE the TerminalRegistry per WP-W3-12b so any
+            // future code path that constructs `CoordinatorFsm` during
+            // startup finds the registry in app state.
+            let pool_for_registry = app
+                .state::<db::DbPool>()
+                .inner()
+                .clone();
+            let job_registry = std::sync::Arc::new(
+                crate::swarm::coordinator::JobRegistry::with_pool(
+                    pool_for_registry,
+                ),
+            );
+            let registry_for_recovery = std::sync::Arc::clone(&job_registry);
+            let recovered = tauri::async_runtime::block_on(async move {
+                registry_for_recovery.recover_orphans().await
+            })?;
+            if recovered > 0 {
+                tracing::warn!(
+                    count = recovered,
+                    "swarm: recovered {} orphan job(s) interrupted by previous process",
+                    recovered
+                );
+            }
+            app.manage(job_registry);
+
             // WP-W2-06 — install an empty terminal PTY registry. Each
             // `terminal:spawn` adds a pane to it; the shutdown hook
             // below tears them all down on app exit so no shell
             // processes outlive the app on next launch.
             app.manage(sidecar::terminal::TerminalRegistry::new());
-
-            // WP-W3-12a — install the in-memory swarm `JobRegistry`
-            // so `swarm:run_job` can serialize per-workspace calls.
-            // `Arc` so multiple concurrent commands share the same
-            // lock state; cloning the `Arc` is cheap. W3-12b
-            // replaces this with a SQLite-backed registry on the
-            // same surface.
-            let job_registry = std::sync::Arc::new(
-                crate::swarm::coordinator::JobRegistry::new(),
-            );
-            app.manage(job_registry);
 
             // WP-W3-06 — start the OTLP export sweep iff the
             // collector endpoint is configured. The loop is silent
