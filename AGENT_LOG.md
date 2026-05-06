@@ -4,6 +4,43 @@ Running journal of agent-driven changes. Newest entry on top. See `AGENTS.md` §
 
 ---
 
+## 2026-05-06T00:35Z WP-W3-12b completed
+
+- dispatch: **single sub-agent**; orchestrator drove all 3 manual integration smokes per the 2026-05-05 standing directive
+- sub-agent: general-purpose
+- files changed: 12 in commit `9f8b4de`
+  - new: `src-tauri/migrations/0006_swarm_jobs.sql`, `src-tauri/src/swarm/coordinator/store.rs`, `docs/work-packages/WP-W3-12b-sqlite-persistence.md`, `tasks/swarm-phase-2b.md`
+  - modified: `src-tauri/src/swarm/coordinator/{job,fsm,mod}.rs` (registry async + JobSummary/JobDetail + recover_orphans + WorkspaceGuard async drop), `src-tauri/src/commands/swarm.rs` (+`swarm_list_jobs` + `swarm_get_job`), `src-tauri/src/lib.rs` (`with_pool` wiring + recover_orphans block_on at startup), `src-tauri/src/db.rs` (migration count 5→6, table count 12→15), `app/src/lib/bindings.ts` (+2 commands +2 types), `docs/work-packages/WP-W3-overview.md` (W3-12c flipped to done)
+- commit SHA: `9f8b4de`
+- acceptance: ✅ pass
+  - `cargo check` → exit 0
+  - `cargo test --lib` → exit 0, **254 passed; 0 failed; 8 ignored** (223 prior + 31 new unit; 7 prior ignored + 1 new ignored integration)
+  - `pnpm gen:bindings/check/typecheck/test/lint` → all 0 (gen:bindings:check exit 1 pre-commit expected)
+  - **orchestrator-driven 3-test integration smoke suite** (Windows + Pro/Max OAuth):
+    - `integration_persistence_survives_real_claude_chain` (NEW) → Done in **104.56s** ✅; DB has 1 Done job + 3 stage rows + 0 workspace_lock rows post-completion
+    - `integration_fsm_drives_real_claude_chain` (W3-12a regression) → Done in **101.05s** ✅
+    - `integration_cancel_during_real_claude_chain` (W3-12c regression) → Cancelled in **32.69s** ✅
+- key implementation choices
+  - **Write-through, async, inline.** All three mutators (`try_acquire_workspace`, `update`, `release_workspace`) are async and await SQL inline. No fire-and-forget background writer (would race tests, no value gained vs. the 1-3ms WAL-mode write latency).
+  - **`JobRegistry::new()` kept for tests** — in-memory only; pool=None. `with_pool(pool)` is the production path. Test plumbing largely unchanged; pool-backed FSM regression tests opt in by constructing `with_pool` instead of `new`.
+  - **`sqlx::query` (string-query), not `sqlx::query!` (offline cache)** — per WP constraint. ~12 queries across `store.rs` + `job.rs` use the runtime-checked variants. `.sqlx/` cache untouched (still holds the W2-02 macro entry).
+  - **Orphan recovery is destructive of in-flight context.** Non-terminal jobs become `Failed { last_error: "interrupted by app restart" }`; locks released. Cancel-vs-restart distinction lost in the audit trail (both Failed). W3-12d's retry surface (with W3-14 UI) re-runs orphaned goals cleanly.
+  - **`WorkspaceGuard::drop` panic-seatbelt** uses `tauri::async_runtime::spawn` to call the now-async `release_workspace` from a sync Drop. Idempotent — happy paths still explicitly await release before returning, so the spawn only fires on panic-unwind.
+  - **`JobSummary.goal` char-truncated to 200** at the SQL helper layer (NOT byte-truncated; Turkish multibyte chars stay intact). Truncation at SQL time keeps the wire serialization predictable.
+  - **`recover_orphans` runs in `setup` via `block_on`** before `app.manage(registry)`. Mirrors the existing `db::init` pattern. Logs orphan count via `tracing::warn!` if non-zero.
+- bindings regenerated: yes (+`swarmListJobs`, +`swarmGetJob`, +`JobSummary`, +`JobDetail`)
+- branch: `main` (local; not pushed; **54 commits ahead of `origin/main`** post-`9f8b4de`)
+- deviations
+  - **Migration table count 12 → 15** (not 14). The WP §"Notes / risks" estimated 14 ("existing 11 + 3 new"), but the actual pre-WP baseline was 12 (counted: agents/edges/mailbox/nodes/pane_lines/panes/runs/runs_spans/server_tools/servers/settings/workflows). Sub-agent surfaced this; orchestrator confirmed via DB introspection. Updated `db.rs::tests::migration_creates_all_expected_tables` to 15.
+- known caveats / followups
+  - **No resume-after-restart.** Orphan jobs are Failed; W3-12d adds the retry surface that re-runs them.
+  - **No pagination beyond 200-row cap.** W3-14 may add cursor-based pagination if recent-jobs panel grows.
+  - **No trim policy.** Old jobs accumulate; a separate sweep (parallel to W3-06's OTel trim) is a candidate W3-12b+ commit.
+  - **`Job` type still NOT exported in bindings**, but `JobDetail` (the wire-friendly equivalent without bookkeeping fields) IS, so frontend has the types it needs.
+- next: WP-W3-14 (React `useSwarmJob` hook + multi-pane UI surface). 12d (Verdict + retry + Coordinator brain) lands after 14 so the retry-from-orphan flow can be eyeballed in the UI.
+
+---
+
 ## 2026-05-05T22:15Z WP-W3-12c completed
 
 - dispatch: **single sub-agent** (orchestrator drafted WP + tasks file, sub-agent implemented backend Rust + bindings; orchestrator drove BOTH integration smokes per 2026-05-05 owner directive "terminalden smoke testlerini ayrıca sen yapabiliyorsan eğer onları da senin yapmanı istiyorum")
