@@ -1758,6 +1758,35 @@ mod tests {
     use std::collections::HashMap;
     use std::path::PathBuf;
 
+    /// RAII guard for test-scoped env var overrides. Used by
+    /// real-claude integration tests to isolate child cargo's
+    /// `CARGO_TARGET_DIR` so recursive `cargo test` doesn't
+    /// deadlock on the parent's binary lock (Windows LNK1104).
+    /// On Drop, restores the previous value (or unsets if absent).
+    /// Process-global env mutation; safe because the integration
+    /// suite runs `--test-threads=1`.
+    struct TestEnvGuard {
+        key: &'static str,
+        prev: Option<std::ffi::OsString>,
+    }
+
+    impl TestEnvGuard {
+        fn set(key: &'static str, val: &std::ffi::OsStr) -> Self {
+            let prev = std::env::var_os(key);
+            std::env::set_var(key, val);
+            Self { key, prev }
+        }
+    }
+
+    impl Drop for TestEnvGuard {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
     fn ok_response(text: &str, cost: f64) -> MockResponse {
         MockResponse {
             result: Ok(InvokeResult {
@@ -5797,11 +5826,36 @@ mod tests {
     async fn integration_fullstack_chain_real_claude() {
         use crate::swarm::transport::SubprocessTransport;
 
+        // Isolate the child cargo's target dir so IntegrationTester
+        // running `cargo test`/`cargo check` inside this very `cargo
+        // test` doesn't deadlock on the parent's binary lock
+        // (Windows LNK1104 + lock-amplified Fullstack hang observed
+        // 2026-05-06: 1h 43min hung run). Setting CARGO_TARGET_DIR
+        // to an isolated temp dir before subprocess env is captured
+        // makes the inner cargo write to its own dir; outer test
+        // binary stays unlocked. Process-global env mutation is
+        // tolerated because the integration tests run with
+        // `--test-threads=1` (W3-12c onward) so no other test
+        // overlaps.
+        let isolated_target = std::env::temp_dir().join(format!(
+            "neuron-fullstack-test-target-{}",
+            ulid::Ulid::new()
+        ));
+        let _target_dir_guard = TestEnvGuard::set(
+            "CARGO_TARGET_DIR",
+            isolated_target.as_os_str(),
+        );
+
+        // Stage timeout default 600s (vs 180s elsewhere) because the
+        // isolated CARGO_TARGET_DIR forces IntegrationTester to do a
+        // fresh full crate compile + test on the Test stage, which
+        // can take 5-8 min on Windows cold caches. Override via
+        // NEURON_SWARM_STAGE_TIMEOUT_SEC for fast machines.
         let stage_secs = std::env::var("NEURON_SWARM_STAGE_TIMEOUT_SEC")
             .ok()
             .and_then(|s| s.trim().parse::<u64>().ok())
             .filter(|n| *n > 0)
-            .unwrap_or(180);
+            .unwrap_or(600);
 
         let (app, _pool, _dir) = mock_app_with_pool().await;
         let profiles = bundled_registry();
@@ -5814,15 +5868,25 @@ mod tests {
             Duration::from_secs(stage_secs),
         );
         // Textbook fullstack edit: one Rust file, one TSX file,
-        // both doc-only.
-        let goal = "Add a one-line doc comment to TWO files: \
-            (1) above the `Job` struct definition in \
-            src-tauri/src/swarm/coordinator/job.rs, briefly noting that \
-            Job carries the full lifecycle of a swarm run; \
-            (2) above the `formatRelativeMs` function exported from \
-            app/src/components/SwarmJobList.tsx, briefly noting that \
-            the helper rounds to the nearest minute. \
-            Just the two doc comments. Do not change behavior.";
+        // both doc-only. Imperative wording ("EXECUTE: Edit ...")
+        // is intentional — earlier passes had Coordinator
+        // misclassify the goal as `research_only` because the
+        // descriptive phrasing ("briefly noting that …") tripped
+        // its researchy-keyword heuristic. Strong imperative +
+        // explicit "Edit … add the line …" forces execute_plan.
+        let goal = "EXECUTE: Edit two source files. \
+            (1) Edit src-tauri/src/swarm/coordinator/job.rs. Add a \
+            one-line `///` doc comment immediately above the line \
+            `pub struct Job {`. The comment text must be exactly: \
+            `/// Carries the full lifecycle of a swarm run.` \
+            (2) Edit app/src/components/SwarmJobList.tsx. Add a \
+            one-line `// ` comment immediately above the line \
+            `export function formatRelativeMs`. The comment text \
+            must be exactly: \
+            `// Rounds elapsed ms to the nearest minute granularity.` \
+            Do not change any behavior. Do not add tests. \
+            This is an execute_plan task that requires editing both \
+            files (backend + frontend = fullstack scope).";
         let outcome = fsm
             .run_job(app.handle(), "default".into(), goal.into())
             .await
@@ -5835,8 +5899,10 @@ mod tests {
         assert_eq!(
             outcome.final_state,
             JobState::Done,
-            "expected Done, got {:?} (stages: {:?})",
+            "expected Done, got {:?} (last_error: {:?}, last_verdict: {:?}, retry_count: ?, stages: {:?})",
             outcome.final_state,
+            outcome.last_error,
+            outcome.last_verdict,
             stage_summary,
         );
         assert_eq!(outcome.stages.len(), 8);

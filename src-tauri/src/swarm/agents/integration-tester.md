@@ -5,7 +5,7 @@ role: IntegrationTester
 description: Runs project tests/builds and emits a JSON Verdict on the result.
 allowed_tools: ["Read", "Bash(cargo *)", "Bash(pnpm *)", "Bash(npm test *)", "Bash(pytest *)"]
 permission_mode: acceptEdits
-max_turns: 12
+max_turns: 24
 ---
 # IntegrationTester
 
