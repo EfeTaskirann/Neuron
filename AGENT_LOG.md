@@ -4,6 +4,39 @@ Running journal of agent-driven changes. Newest entry on top. See `AGENTS.md` §
 
 ---
 
+## 2026-05-07T00:55Z WP-W3-12k1 completed — 9th agent (Orchestrator) profile + brain shipped
+
+- dispatch: **single sub-agent**; no integration smoke (mock tests sufficient per WP §5)
+- sub-agent: general-purpose
+- files changed: 9 in commit `0da252e`
+  - new: `docs/work-packages/WP-W3-12k1-orchestrator-brain.md`, `src-tauri/src/swarm/agents/orchestrator.md` (9th bundled profile), `src-tauri/src/swarm/coordinator/orchestrator.rs` (OrchestratorAction enum, OrchestratorOutcome struct, parse_orchestrator_outcome 4-step robust parser)
+  - modified: `src-tauri/src/swarm/coordinator/mod.rs` (re-export), `src-tauri/src/commands/swarm.rs` (+`swarm_orchestrator_decide` IPC + validation tests; profiles_list test rename 8 → 9), `src-tauri/src/lib.rs` (specta registration), `src-tauri/src/swarm/profile.rs` (bundled_eight_* → bundled_nine_*), `app/src/lib/bindings.ts` (regen +`OrchestratorAction` +`OrchestratorOutcome` +`swarmOrchestratorDecide`), `docs/work-packages/WP-W3-overview.md` (W3-12j flipped done; W3-12k1/k2/k3 status rows added)
+- commit SHA: `0da252e`
+- acceptance: ✅ pass
+  - `cargo check` → exit 0
+  - `cargo test --lib` → exit 0, **364 passed; 0 failed; 12 ignored** (349 prior + 15 new)
+  - `pnpm gen:bindings/check/typecheck/test/lint` → all 0
+  - **No real-claude integration smoke this WP** (per WP §5: parser + validation tests cover the surface; W3-11/12d already prove substrate; end-to-end Orchestrator flow gets validated in W3-12k-3 UI integration).
+- key implementation choices
+  - **9-agent vision now COMPLETE at the bundled-profile level.** Orchestrator is the 9th and final agent from architectural report §2.1. swarm:profiles_list returns 9 entries alphabetically: backend-builder, backend-reviewer, coordinator, frontend-builder, frontend-reviewer, integration-tester, orchestrator, planner, scout.
+  - **Stateless one-shot decision.** Each `swarm:orchestrator_decide` call is independent — spawns a new claude subprocess, parses the JSON, returns. No persistent session yet (W3-12k-2 territory).
+  - **Three actions: DirectReply / Clarify / Dispatch.** The Orchestrator decides per user message. Dispatch returns a refined goal text the frontend feeds into `swarm:run_job` directly. Clarify returns a question. DirectReply returns a short answer.
+  - **Parser duplicated** (per W3-12f's documented pattern): `parse_orchestrator_outcome` mirrors `parse_verdict` (W3-12d) and `parse_decision` (W3-12f) but doesn't generalize. Diverging error messages + future divergence flexibility justify the duplication; module-level doc comment in `orchestrator.rs` references the rationale.
+  - **One mock-transport command test omitted.** `swarm_orchestrator_decide_command_returns_outcome_via_mock_transport` not implemented because the command instantiates `SubprocessTransport::new()` inline (matching W3-11's `swarm_test_invoke` pattern). Injecting MockTransport requires app-state threading or generic parameters — a refactor larger than the WP scopes. Sub-agent added 2 extra parser tests + 4 validator tests instead. End-to-end Orchestrator flow validation deferred to W3-12k-3 UI work.
+  - **NO new SwarmJobEvent variant.** Orchestrator decision is one-shot, not a long-running job; no event channel.
+  - **NO Coordinator FSM behavior change.** Orchestrator sits ABOVE Coordinator architecturally; FSM doesn't know about it. Frontend chains: `orchestrator_decide` → `run_job` (when action=Dispatch).
+- bindings regenerated: yes (+`OrchestratorAction` enum, +`OrchestratorOutcome` struct, +`commands.swarmOrchestratorDecide(workspaceId, userMessage)`)
+- branch: `main` (pushed; **0 commits ahead of `origin/main`** post-`0da252e`)
+- known caveats / followups
+  - **No conversation memory.** A user typing two messages back-to-back gets two independent Orchestrator decisions. W3-12k-2 adds persistent session + history-aware decisions; until then, the frontend (W3-12k-3) can workaround by manually concatenating recent messages into one user_message.
+  - **No UI surfacing yet.** The IPC + types are in `bindings.ts`; W3-12k-3 builds the chat panel.
+  - **Multi-workspace routing not yet differentiated.** `workspace_id` is carried but the Orchestrator persona doesn't change behavior across workspaces. Future polish.
+  - **Streaming response not supported.** One-shot IPC; full text returned at once. Streaming is a future polish if user wants progressive display.
+  - **`profile.rs` doc comment top-of-file** still says "three personas" — pre-existing minor stale comment from W3-11 era; not in 12k-1 scope. Cosmetic.
+- next: W3-12k-2 (persistent Orchestrator session + conversation history) and W3-12k-3 (chat panel UI replacing SwarmGoalForm). After 12k-3 the 9-agent vision is fully UX-complete.
+
+---
+
 ## 2026-05-07T00:25Z WP-W3-12j completed (with documented LLM-persona integration-smoke caveat)
 
 - dispatch: **single sub-agent**; orchestrator drove integration smoke
