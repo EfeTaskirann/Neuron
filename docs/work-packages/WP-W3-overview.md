@@ -61,7 +61,9 @@ matching WP file is authored.
 | WP-W3-12h | Coordinator FSM — scope-aware single-domain dispatch (Backend / Frontend) | done (`e0e9f9c`) | shipped 2026-05-06 | WP-W3-12g | M |
 | WP-W3-12i | Coordinator FSM — Fullstack sequential dispatch (BB+BR then FB+FR) | done (`8955dc3` + smoke fix `059d704`) | shipped 2026-05-06 | WP-W3-12h | M |
 | WP-W3-12j | Coordinator FSM — Fullstack parallel dispatch (Builder ∥ Builder, Reviewer ∥ Reviewer) | TBD | not-started | WP-W3-12i | M |
-| WP-W3-12k | Orchestrator user-facing chat layer (9th agent: PM dış kapı) | future | not-started | WP-W3-12h+ | L |
+| WP-W3-12k1 | Orchestrator brain — stateless one-shot decision (9th bundled profile) | TBD | not-started | WP-W3-12j | M |
+| WP-W3-12k2 | Orchestrator persistent session (conversation history + context-aware decisions) | future | not-started | WP-W3-12k1 | M |
+| WP-W3-12k3 | Orchestrator UI chat panel (replaces SwarmGoalForm) | future | not-started | WP-W3-12k1 | M |
 | WP-W3-14 | Swarm UI route (chat-shape, recent-jobs panel, cancel/rerun) | done (`2ace648`) | shipped 2026-05-06 | WP-W3-12a/b/c | M |
 
 Sizes (rough, in sub-agent days): S = 0.5–1 day, M = 1–2 days,

@@ -28,6 +28,7 @@
 pub mod decision;
 pub mod fsm;
 pub mod job;
+pub mod orchestrator;
 pub(crate) mod store;
 pub mod verdict;
 
@@ -36,5 +37,8 @@ pub use fsm::{CoordinatorFsm, MAX_RETRIES};
 pub use job::{
     Job, JobDetail, JobOutcome, JobRegistry, JobState, JobSummary,
     StageResult, SwarmJobEvent,
+};
+pub use orchestrator::{
+    parse_orchestrator_outcome, OrchestratorAction, OrchestratorOutcome,
 };
 pub use verdict::{parse_verdict, Verdict, VerdictIssue, VerdictSeverity};

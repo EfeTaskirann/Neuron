@@ -25,7 +25,10 @@ use tauri::{AppHandle, Manager, Runtime};
 
 use crate::error::AppError;
 use crate::models::ProfileSummary;
-use crate::swarm::coordinator::{JobDetail, JobState, JobSummary};
+use crate::swarm::coordinator::{
+    parse_orchestrator_outcome, JobDetail, JobState, JobSummary,
+    OrchestratorOutcome,
+};
 use crate::swarm::profile::ProfileSource;
 use crate::swarm::{
     CoordinatorFsm, InvokeResult, JobOutcome, JobRegistry, ProfileRegistry,
@@ -195,6 +198,62 @@ pub async fn swarm_run_job<R: Runtime>(
     fsm.run_job(&app, workspace_id, goal).await
 }
 
+/// Single-shot Orchestrator decision (WP-W3-12k1 §3).
+///
+/// Spawns a one-shot `claude` subprocess against the bundled
+/// `orchestrator.md` persona, hands it the user's chat message, and
+/// parses the JSON `OrchestratorOutcome` (DirectReply / Clarify /
+/// Dispatch). The IPC blocks until the subprocess emits its `result`
+/// event; same env / OAuth pattern as `swarm:test_invoke`.
+///
+/// **Stateless** per W3-12k-1 contract: each call is independent,
+/// no persisted history, no thread id. The caller (frontend) is
+/// responsible for branching on the returned `action`:
+///
+/// - `DirectReply` / `Clarify` → render `outcome.text` to the user.
+/// - `Dispatch` → call `swarm:run_job(workspace_id, outcome.text)`
+///   to enter the Coordinator FSM with the refined goal.
+///
+/// W3-12k-2 layers persistent context across messages; W3-12k-3
+/// adds the chat UI. This WP ships only the brain.
+///
+/// `workspace_id` is taken to keep the IPC shape symmetric with
+/// `swarm:run_job` (and forward-compatible with multi-workspace
+/// orchestrator routing in a future WP), but the orchestrator
+/// persona itself doesn't differentiate per workspace today.
+#[tauri::command(rename_all = "camelCase")]
+#[specta::specta]
+pub async fn swarm_orchestrator_decide<R: Runtime>(
+    app: AppHandle<R>,
+    workspace_id: String,
+    user_message: String,
+) -> Result<OrchestratorOutcome, AppError> {
+    if workspace_id.trim().is_empty() {
+        return Err(AppError::InvalidInput(
+            "workspaceId must not be empty".into(),
+        ));
+    }
+    if user_message.trim().is_empty() {
+        return Err(AppError::InvalidInput(
+            "userMessage must not be empty".into(),
+        ));
+    }
+
+    let workspace_dir = workspace_agents_dir(&app)?;
+    let registry =
+        ProfileRegistry::load_from(workspace_dir.as_deref())?;
+    let profile = registry.get("orchestrator").ok_or_else(|| {
+        AppError::NotFound("swarm profile `orchestrator`".into())
+    })?;
+
+    let transport = SubprocessTransport::new();
+    let result = transport
+        .invoke(&app, profile, &user_message, stage_timeout())
+        .await?;
+
+    parse_orchestrator_outcome(&result.assistant_text)
+}
+
 /// Signal cancellation for an in-flight swarm job (WP-W3-12c §4).
 ///
 /// Looks up `job_id` in the `JobRegistry`. Returns:
@@ -357,13 +416,15 @@ mod tests {
     use crate::test_support::mock_app_with_pool;
 
     /// Acceptance: on a fresh install (no `<app_data_dir>/agents/`),
-    /// `swarm:profiles_list` returns exactly the eight bundled
+    /// `swarm:profiles_list` returns exactly the nine bundled
     /// profiles (W3-12d added reviewer + integration-tester; W3-12f
     /// added the coordinator brain; W3-12g renamed `reviewer` to
     /// `backend-reviewer` and added `frontend-builder` +
-    /// `frontend-reviewer`) in deterministic alphabetical order.
+    /// `frontend-reviewer`; W3-12k1 added the orchestrator brain
+    /// inserted alphabetically between `integration-tester` and
+    /// `planner`) in deterministic alphabetical order.
     #[tokio::test]
-    async fn profiles_list_returns_eight_bundled() {
+    async fn profiles_list_returns_nine_bundled() {
         let (app, _pool, _dir) = mock_app_with_pool().await;
         let summaries = swarm_profiles_list(app.handle().clone())
             .await
@@ -379,6 +440,7 @@ mod tests {
                 "frontend-builder",
                 "frontend-reviewer",
                 "integration-tester",
+                "orchestrator",
                 "planner",
                 "scout",
             ]
@@ -431,6 +493,72 @@ mod tests {
         )
         .await
         .expect_err("empty rejected");
+        assert_eq!(err.kind(), "invalid_input");
+    }
+
+    // ---------------------------------------------------------------- //
+    // WP-W3-12k1 — swarm:orchestrator_decide validation tests           //
+    // ---------------------------------------------------------------- //
+
+    /// Empty `workspace_id` short-circuits before any subprocess
+    /// spawn happens; the IPC surfaces `InvalidInput`.
+    #[tokio::test]
+    async fn swarm_orchestrator_decide_command_validates_empty_workspace_id() {
+        let (app, _pool, _dir) = mock_app_with_pool().await;
+        let err = swarm_orchestrator_decide(
+            app.handle().clone(),
+            "".into(),
+            "selam".into(),
+        )
+        .await
+        .expect_err("empty workspace rejected");
+        assert_eq!(err.kind(), "invalid_input");
+    }
+
+    /// Whitespace-only `workspace_id` is treated identically to
+    /// empty (`trim().is_empty()` gate). The same gate exists on
+    /// `swarm:run_job` so the two surfaces stay symmetric.
+    #[tokio::test]
+    async fn swarm_orchestrator_decide_command_rejects_whitespace_workspace_id() {
+        let (app, _pool, _dir) = mock_app_with_pool().await;
+        let err = swarm_orchestrator_decide(
+            app.handle().clone(),
+            "   ".into(),
+            "selam".into(),
+        )
+        .await
+        .expect_err("whitespace workspace rejected");
+        assert_eq!(err.kind(), "invalid_input");
+    }
+
+    /// Empty `user_message` short-circuits; the IPC surfaces
+    /// `InvalidInput`. The Orchestrator is not allowed to invent a
+    /// goal from an empty message.
+    #[tokio::test]
+    async fn swarm_orchestrator_decide_command_validates_empty_message() {
+        let (app, _pool, _dir) = mock_app_with_pool().await;
+        let err = swarm_orchestrator_decide(
+            app.handle().clone(),
+            "ws-1".into(),
+            "".into(),
+        )
+        .await
+        .expect_err("empty message rejected");
+        assert_eq!(err.kind(), "invalid_input");
+    }
+
+    /// Whitespace-only `user_message` is treated identically to
+    /// empty. Mirrors the validator on `workspace_id`.
+    #[tokio::test]
+    async fn swarm_orchestrator_decide_command_rejects_whitespace_message() {
+        let (app, _pool, _dir) = mock_app_with_pool().await;
+        let err = swarm_orchestrator_decide(
+            app.handle().clone(),
+            "ws-1".into(),
+            "   \t\n".into(),
+        )
+        .await
+        .expect_err("whitespace message rejected");
         assert_eq!(err.kind(), "invalid_input");
     }
 

@@ -166,6 +166,32 @@ export const commands = {
 	 */
 	swarmRunJob: (workspaceId: string, goal: string) => typedError<JobOutcome, AppErrorWire>(__TAURI_INVOKE("swarm_run_job", { workspaceId, goal })),
 	/**
+	 *  Single-shot Orchestrator decision (WP-W3-12k1 §3).
+	 * 
+	 *  Spawns a one-shot `claude` subprocess against the bundled
+	 *  `orchestrator.md` persona, hands it the user's chat message, and
+	 *  parses the JSON `OrchestratorOutcome` (DirectReply / Clarify /
+	 *  Dispatch). The IPC blocks until the subprocess emits its `result`
+	 *  event; same env / OAuth pattern as `swarm:test_invoke`.
+	 * 
+	 *  **Stateless** per W3-12k-1 contract: each call is independent,
+	 *  no persisted history, no thread id. The caller (frontend) is
+	 *  responsible for branching on the returned `action`:
+	 * 
+	 *  - `DirectReply` / `Clarify` → render `outcome.text` to the user.
+	 *  - `Dispatch` → call `swarm:run_job(workspace_id, outcome.text)`
+	 *    to enter the Coordinator FSM with the refined goal.
+	 * 
+	 *  W3-12k-2 layers persistent context across messages; W3-12k-3
+	 *  adds the chat UI. This WP ships only the brain.
+	 * 
+	 *  `workspace_id` is taken to keep the IPC shape symmetric with
+	 *  `swarm:run_job` (and forward-compatible with multi-workspace
+	 *  orchestrator routing in a future WP), but the orchestrator
+	 *  persona itself doesn't differentiate per workspace today.
+	 */
+	swarmOrchestratorDecide: (workspaceId: string, userMessage: string) => typedError<OrchestratorOutcome, AppErrorWire>(__TAURI_INVOKE("swarm_orchestrator_decide", { workspaceId, userMessage })),
+	/**
 	 *  Signal cancellation for an in-flight swarm job (WP-W3-12c §4).
 	 * 
 	 *  Looks up `job_id` in the `JobRegistry`. Returns:
@@ -543,6 +569,45 @@ export type Node = {
 	title: string,
 	meta: string,
 	status: string,
+};
+
+/**
+ *  Three-way routing decision the Orchestrator emits per user
+ *  message. Wire form is snake_case
+ *  (`"direct_reply"` / `"clarify"` / `"dispatch"`) so the frontend
+ *  bindings match the persona OUTPUT CONTRACT verbatim.
+ * 
+ *  - `DirectReply` — the assistant answers the user directly. The
+ *    `OrchestratorOutcome.text` carries the answer.
+ *  - `Clarify` — the user's message is too ambiguous to dispatch.
+ *    The `OrchestratorOutcome.text` carries a clarifying question
+ *    to show back to the user.
+ *  - `Dispatch` — the user's message is concrete enough to feed
+ *    `swarm:run_job`. The `OrchestratorOutcome.text` carries the
+ *    refined goal the frontend will pass to the Coordinator FSM.
+ */
+export type OrchestratorAction = "direct_reply" | "clarify" | "dispatch";
+
+/**
+ *  Single-shot Orchestrator decision. `text` carries the active
+ *  payload depending on `action`:
+ * 
+ *  - `DirectReply`: assistant's answer to show the user.
+ *  - `Clarify`: clarifying question to show the user.
+ *  - `Dispatch`: refined goal the frontend feeds into
+ *    `swarm:run_job`.
+ * 
+ *  `reasoning` is a one-sentence rationale per the OUTPUT CONTRACT;
+ *  it's informational only — the frontend branches off `action`.
+ * 
+ *  **Stateless** per W3-12k1 contract: this struct is the entire
+ *  per-call return surface. No persisted history, no thread id, no
+ *  turn count. W3-12k-2 layers persistent context on top.
+ */
+export type OrchestratorOutcome = {
+	action: OrchestratorAction,
+	text: string,
+	reasoning: string,
 };
 
 /**

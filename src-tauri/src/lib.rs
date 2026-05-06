@@ -108,6 +108,7 @@ pub fn specta_builder_for_export() -> tauri_specta::Builder<tauri::Wry> {
             commands::swarm::swarm_profiles_list::<tauri::Wry>,
             commands::swarm::swarm_test_invoke::<tauri::Wry>,
             commands::swarm::swarm_run_job::<tauri::Wry>,
+            commands::swarm::swarm_orchestrator_decide::<tauri::Wry>,
             commands::swarm::swarm_cancel_job::<tauri::Wry>,
             commands::swarm::swarm_list_jobs::<tauri::Wry>,
             commands::swarm::swarm_get_job::<tauri::Wry>,
