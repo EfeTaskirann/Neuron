@@ -1,14 +1,28 @@
 // `SwarmJobDetail` — right-pane detail surface. Header summarises
-// the job (full goal, state pill, total cost / duration). Stage
-// list is one row per `StageResult` with an expand-on-click
-// assistant_text excerpt. Footer shows Cancel (non-terminal) and
-// Rerun (Failed only) per WP-W3-14 §4.
+// the job (full goal, state pill, total cost / duration, retry
+// counter when retries fired). Stage list is one row per
+// `StageResult` with an expand-on-click assistant_text excerpt
+// and a per-stage Verdict block when present. Footer shows
+// Cancel (non-terminal) and Rerun (Failed only) per WP-W3-14 §4.
+//
+// Verdict + retry rendering is the W3-14 follow-up
+// (post-W3-12d/e): backend ships the data, this surface makes
+// it visible.
 import { useState } from 'react';
-import type { StageResult } from '../lib/bindings';
+import type {
+  StageResult,
+  Verdict,
+  VerdictIssue,
+} from '../lib/bindings';
 import { useSwarmJob } from '../hooks/useSwarmJob';
 import { useCancelSwarmJob } from '../hooks/useCancelSwarmJob';
 import { useRunSwarmJob } from '../hooks/useRunSwarmJob';
 import { isRunningState, pillClass, formatRelativeMs } from './SwarmJobList';
+
+// Mirrors `MAX_RETRIES` const in `swarm/coordinator/fsm.rs`. Kept
+// inline (not on the IPC) so changing it server-side requires a
+// small follow-up here too — preferable to silent drift.
+const MAX_RETRIES = 2;
 
 interface Props {
   jobId: string | null;
@@ -36,6 +50,7 @@ export function SwarmJobDetail({ jobId, workspaceId }: Props): JSX.Element {
   }
   const running = isRunningState(job.state);
   const failed = job.state === 'failed';
+  const retried = job.retryCount > 0;
   return (
     <div className="swarm-detail">
       <header className="swarm-detail-head">
@@ -44,6 +59,14 @@ export function SwarmJobDetail({ jobId, workspaceId }: Props): JSX.Element {
             {running && <span className="pulse-dot" />}
             {job.state}
           </span>
+          {retried && (
+            <span
+              className="pill swarm-retry-pill"
+              title="FSM looped back via Verdict feedback (W3-12e retry loop)"
+            >
+              ↻ Attempt {job.retryCount + 1}/{MAX_RETRIES + 1}
+            </span>
+          )}
           <span className="swarm-detail-meta mute">
             {formatRelativeMs(job.createdAtMs)}
           </span>
@@ -57,6 +80,12 @@ export function SwarmJobDetail({ jobId, workspaceId }: Props): JSX.Element {
         <div className="swarm-detail-goal">{job.goal}</div>
         {job.lastError && (
           <div className="swarm-detail-error">{job.lastError}</div>
+        )}
+        {job.lastVerdict && job.lastVerdict.approved === false && (
+          <VerdictBlock
+            verdict={job.lastVerdict}
+            heading="Last verdict (rejected)"
+          />
         )}
       </header>
 
@@ -107,7 +136,11 @@ function StageRow({ stage }: { stage: StageResult }): JSX.Element {
   // Stages always render with the "ok" colour after they're
   // pushed onto `stages` — by FSM contract a stage only appears
   // on the success path. The mid-stage running indicator lives
-  // on the header pill, not here.
+  // on the header pill, not here. Reviewer / IntegrationTester
+  // stages additionally surface their Verdict (approved or
+  // not — W3-12d data made visible here).
+  const isVerdictStage =
+    stage.state === 'review' || stage.state === 'test';
   return (
     <div className="swarm-stage" data-state={stage.state}>
       <div className="swarm-stage-head">
@@ -119,6 +152,16 @@ function StageRow({ stage }: { stage: StageResult }): JSX.Element {
         <span className="swarm-stage-meta mute">
           ${stage.totalCostUsd.toFixed(4)}
         </span>
+        {isVerdictStage && stage.verdict && (
+          <span
+            className={`pill ${
+              stage.verdict.approved ? 'st-ok' : 'st-fail'
+            }`}
+            title={stage.verdict.summary}
+          >
+            {stage.verdict.approved ? '✓ approved' : '✗ rejected'}
+          </span>
+        )}
       </div>
       <div
         className={`swarm-stage-body${truncated ? ' truncated' : ''}`}
@@ -127,7 +170,57 @@ function StageRow({ stage }: { stage: StageResult }): JSX.Element {
       >
         {display}
       </div>
+      {isVerdictStage && stage.verdict && (
+        <VerdictBlock verdict={stage.verdict} />
+      )}
     </div>
+  );
+}
+
+function VerdictBlock({
+  verdict,
+  heading,
+}: {
+  verdict: Verdict;
+  heading?: string;
+}): JSX.Element {
+  return (
+    <div
+      className={`swarm-verdict ${
+        verdict.approved ? 'approved' : 'rejected'
+      }`}
+    >
+      {heading && <div className="swarm-verdict-heading">{heading}</div>}
+      <div className="swarm-verdict-summary">{verdict.summary}</div>
+      {verdict.issues.length > 0 && (
+        <ul className="swarm-verdict-issues">
+          {verdict.issues.map((issue, i) => (
+            <VerdictIssueRow key={i} issue={issue} />
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+function VerdictIssueRow({ issue }: { issue: VerdictIssue }): JSX.Element {
+  const loc =
+    issue.file && issue.line
+      ? `${issue.file}:${issue.line}`
+      : issue.file ?? null;
+  return (
+    <li
+      className="swarm-verdict-issue"
+      data-severity={issue.severity}
+    >
+      <span
+        className={`pill swarm-sev-${issue.severity}`}
+      >
+        {issue.severity}
+      </span>
+      {loc && <span className="swarm-issue-loc mono">{loc}</span>}
+      <span className="swarm-issue-msg">{issue.msg}</span>
+    </li>
   );
 }
 

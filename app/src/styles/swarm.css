@@ -255,3 +255,106 @@
   padding-top: 12px;
   border-top: 1px solid var(--border);
 }
+
+/* ---------- Verdict + retry rendering (W3-12d/e follow-up) ---------- */
+
+.swarm-retry-pill {
+  background: color-mix(in oklch, var(--neuron-amber-500, var(--syn-warn, #d97706)) 18%, transparent);
+  color: color-mix(in oklch, var(--neuron-amber-500, var(--syn-warn, #d97706)) 70%, var(--foreground));
+  border: 1px solid color-mix(in oklch, var(--neuron-amber-500, var(--syn-warn, #d97706)) 35%, transparent);
+}
+
+.swarm-verdict {
+  margin-top: 8px;
+  padding: 10px 12px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  font-size: 12px;
+}
+
+.swarm-verdict.approved {
+  border-color: color-mix(in oklch, var(--syn-ok, #10b981) 30%, transparent);
+  background: color-mix(in oklch, var(--syn-ok, #10b981) 6%, transparent);
+}
+
+.swarm-verdict.rejected {
+  border-color: color-mix(in oklch, var(--syn-error) 35%, transparent);
+  background: color-mix(in oklch, var(--syn-error) 8%, transparent);
+}
+
+.swarm-verdict-heading {
+  font-size: 11.5px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted-foreground);
+  margin-bottom: 6px;
+}
+
+.swarm-verdict-summary {
+  font-size: 12.5px;
+  line-height: 1.45;
+  color: var(--foreground);
+  white-space: pre-wrap;
+}
+
+.swarm-verdict-issues {
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.swarm-verdict-issue {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: var(--radius-sm, 4px);
+  background: var(--background);
+  border: 1px solid var(--border);
+  font-size: 11.5px;
+}
+
+.swarm-verdict-issue[data-severity='high'] {
+  border-color: color-mix(in oklch, var(--syn-error) 30%, transparent);
+}
+
+.swarm-verdict-issue[data-severity='med'] {
+  border-color: color-mix(in oklch, var(--neuron-amber-500, var(--syn-warn, #d97706)) 30%, transparent);
+}
+
+.swarm-issue-loc {
+  font-size: 11px;
+  color: var(--muted-foreground);
+  flex-shrink: 0;
+}
+
+.swarm-issue-msg {
+  flex: 1;
+  color: var(--foreground);
+  line-height: 1.4;
+}
+
+.pill.swarm-sev-high {
+  background: color-mix(in oklch, var(--syn-error) 18%, transparent);
+  color: color-mix(in oklch, var(--syn-error) 80%, var(--foreground));
+}
+
+.pill.swarm-sev-med {
+  background: color-mix(in oklch, var(--neuron-amber-500, var(--syn-warn, #d97706)) 18%, transparent);
+  color: color-mix(in oklch, var(--neuron-amber-500, var(--syn-warn, #d97706)) 75%, var(--foreground));
+}
+
+.pill.swarm-sev-low {
+  background: var(--surface-2);
+  color: var(--muted-foreground);
+}
+
+.pill.st-fail {
+  background: color-mix(in oklch, var(--syn-error) 16%, transparent);
+  color: color-mix(in oklch, var(--syn-error) 80%, var(--foreground));
+}
