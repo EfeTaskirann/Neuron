@@ -41,7 +41,7 @@ use crate::swarm::transport::Transport;
 use super::job::{
     Job, JobOutcome, JobRegistry, JobState, StageResult, SwarmJobEvent,
 };
-use super::verdict::{parse_verdict, Verdict};
+use super::verdict::{parse_verdict, Verdict, VerdictIssue, VerdictSeverity};
 
 /// Maximum number of retries the FSM allows before falling through
 /// to `Failed`. Exported as a `pub const` so W3-12d's Verdict-gated
@@ -135,6 +135,31 @@ proje türüne göre). Verdict'i şu JSON şemasında ver, başka hiçbir \
 \n\
 {{ \"approved\": <bool>, \"issues\": [...], \"summary\": \"...\" }}\n";
 
+/// PLAN stage prompt template used on the retry path (W3-12e §4).
+/// Carries the previous plan + the rejecting Verdict's issues so the
+/// Planner can produce a corrected plan rather than starting from
+/// scratch. The `{gate}` substitution is `"Reviewer"` or
+/// `"IntegrationTester"` — the human-readable label of the gate that
+/// triggered the retry. Substitutions: `{goal}`, `{scout_output}`,
+/// `{verdict_issues}`, `{previous_plan}`, `{gate}`.
+const RETRY_PLAN_PROMPT_TEMPLATE: &str = "Hedef: {goal}\n\
+\n\
+Scout bulguları:\n\
+\n\
+{scout_output}\n\
+\n\
+ÖNCEKİ DENEMENİZ {gate} aşamasında REDDEDİLDİ. {gate}'ın bulduğu \
+sorunlar:\n\
+\n\
+{verdict_issues}\n\
+\n\
+Önceki plan (reddedildi):\n\
+\n\
+{previous_plan}\n\
+\n\
+Bu sorunları çözecek yeni bir plan üret. Yalnızca reddedilen \
+sorunlara odaklan; mevcut başarılı kısımları yeniden tasarlama.\n";
+
 /// Render the SCOUT prompt by substituting `{goal}`. Free fn so
 /// the prompt-template test can call it without a full FSM.
 fn render_scout_prompt(goal: &str) -> String {
@@ -174,6 +199,85 @@ fn render_test_prompt(goal: &str, build: &str) -> String {
     TEST_PROMPT_TEMPLATE
         .replace("{goal}", goal)
         .replace("{build}", build)
+}
+
+/// Render the retry-Plan prompt (W3-12e §4). `gate` must be either
+/// `JobState::Review` or `JobState::Test`; the human-readable label
+/// `"Reviewer"` / `"IntegrationTester"` is interpolated into the
+/// prompt. Other states would be a programmer error — the run loop
+/// only invokes this helper from the Verdict-rejected branches of
+/// the Review/Test gates.
+///
+/// `{verdict_issues}` is rendered as a Markdown-style bullet list
+/// via `verdict_issues_as_bullets`; an empty issue list falls back
+/// to a sentinel string so the prompt body always contains a
+/// non-empty issues section.
+fn render_retry_plan_prompt(
+    goal: &str,
+    scout_output: &str,
+    previous_plan: &str,
+    verdict: &Verdict,
+    gate: JobState,
+) -> String {
+    let gate_label = retry_gate_label(gate);
+    let issues = verdict_issues_as_bullets(&verdict.issues);
+    RETRY_PLAN_PROMPT_TEMPLATE
+        .replace("{goal}", goal)
+        .replace("{scout_output}", scout_output)
+        .replace("{verdict_issues}", &issues)
+        .replace("{previous_plan}", previous_plan)
+        // `{gate}` appears twice in the template so a single
+        // `replace` covers both occurrences.
+        .replace("{gate}", gate_label)
+}
+
+/// Human-readable label for the retry-triggering gate. Surfaces in
+/// the retry-Plan prompt so the Planner reads "Reviewer aşamasında"
+/// or "IntegrationTester aşamasında" instead of the wire form.
+///
+/// Falls back to `"Reviewer"` for any non-Review/Test state — the
+/// retry loop never calls this with another state, but the fallback
+/// keeps the function total and avoids a `panic!` in a hot path.
+fn retry_gate_label(state: JobState) -> &'static str {
+    match state {
+        JobState::Test => "IntegrationTester",
+        // Review is the canonical default; any other state would be
+        // a programmer bug elsewhere in the FSM and the surface that
+        // calls this helper already filters to {Review, Test}.
+        _ => "Reviewer",
+    }
+}
+
+/// Render a Verdict's issue list as a Markdown bullet list. Each
+/// line is `- [{severity}] {file}:{line}: {message}`, with omitted
+/// `file`/`line` collapsed to a single em-dash so the bullet stays
+/// aligned. An empty issue list returns a sentinel string so the
+/// retry prompt body always contains a non-empty issues section.
+///
+/// Pulled out as a private fn (not a method on `Verdict`) so the
+/// surface that knows about prompt templates owns the rendering;
+/// `Verdict` itself stays a pure data type.
+fn verdict_issues_as_bullets(issues: &[VerdictIssue]) -> String {
+    if issues.is_empty() {
+        return "(Ayrıntılı issue listesi sağlanmadı.)".to_string();
+    }
+    issues
+        .iter()
+        .map(|i| {
+            let loc = match (&i.file, &i.line) {
+                (Some(f), Some(l)) => format!("{f}:{l}"),
+                (Some(f), None) => f.clone(),
+                _ => "—".to_string(),
+            };
+            let sev = match i.severity {
+                VerdictSeverity::High => "high",
+                VerdictSeverity::Med => "med",
+                VerdictSeverity::Low => "low",
+            };
+            format!("- [{sev}] {loc}: {msg}", msg = i.message)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Pure-Rust transition table for the happy path. The FSM run loop
@@ -410,8 +514,14 @@ impl<T: Transport> CoordinatorFsm<T> {
         // 7. Walk the chain. Each stage races its future against
         //    `notify.notified()`; cancellation short-circuits the
         //    chain by emitting `Cancelled` and finalizing as Failed.
+        //
+        //    W3-12e: SCOUT runs once, then PLAN/BUILD/REVIEW/TEST
+        //    sit inside `'retry_loop` so a Verdict-rejected gate can
+        //    loop back to PLAN with the rejection feedback piped
+        //    into the prompt. The retry budget is `MAX_RETRIES`;
+        //    rejections beyond it fall through to `Failed`.
 
-        // SCOUT stage.
+        // SCOUT stage — runs once per job, even across retries.
         let scout_prompt = render_scout_prompt(&goal);
         let scout_text = match self
             .run_stage_with_cancel(
@@ -456,174 +566,359 @@ impl<T: Transport> CoordinatorFsm<T> {
             }
         };
 
-        // PLAN stage.
-        let plan_prompt = render_plan_prompt(&goal, &scout_text);
-        let plan_text = match self
-            .run_stage_with_cancel(
-                app,
-                JobState::Plan,
-                &planner,
-                &plan_prompt,
-                &job_id,
-                &notify,
-            )
-            .await
-        {
-            StageOutcome::Ok(stage) => {
-                let text = stage.assistant_text.clone();
-                emit_swarm_event(
+        // 7b. Plan/Build/Review/Test loop. The first iteration runs
+        //     with the canonical Plan prompt; subsequent iterations
+        //     fire only on a Verdict rejection within the retry
+        //     budget and rebuild Plan from the rejecting verdict's
+        //     issues + the previous plan via
+        //     `render_retry_plan_prompt`. `last_plan_text` keeps the
+        //     prior plan around so the retry prompt can quote it
+        //     verbatim.
+        let mut last_plan_text: Option<String> = None;
+        loop {
+            // PLAN — branches on `retry_count`. The first attempt
+            // uses the canonical template; retries quote the prior
+            // plan + verdict issues.
+            let plan_prompt = {
+                let snapshot = self.registry.get(&job_id).ok_or_else(|| {
+                    AppError::Internal(format!(
+                        "swarm job `{job_id}` vanished from registry mid-loop"
+                    ))
+                })?;
+                if snapshot.retry_count == 0 {
+                    render_plan_prompt(&goal, &scout_text)
+                } else {
+                    let prev_plan = last_plan_text.as_deref().unwrap_or("");
+                    // `last_verdict` is set by the rejection branch
+                    // before the loop continues; absence here would
+                    // be a programmer bug, but we degrade rather
+                    // than panic in a hot path.
+                    let prev_verdict = snapshot
+                        .last_verdict
+                        .clone()
+                        .unwrap_or_else(|| Verdict {
+                            approved: false,
+                            issues: Vec::new(),
+                            summary: String::new(),
+                        });
+                    let gate = snapshot
+                        .last_rejecting_gate()
+                        .unwrap_or(JobState::Review);
+                    render_retry_plan_prompt(
+                        &goal,
+                        &scout_text,
+                        prev_plan,
+                        &prev_verdict,
+                        gate,
+                    )
+                }
+            };
+
+            let plan_text = match self
+                .run_stage_with_cancel(
                     app,
+                    JobState::Plan,
+                    &planner,
+                    &plan_prompt,
                     &job_id,
-                    &SwarmJobEvent::StageCompleted {
-                        job_id: job_id.clone(),
-                        stage: stage.clone(),
-                    },
-                );
-                self.registry
-                    .update(&job_id, |j| {
-                        j.stages.push(stage);
-                    })
-                    .await?;
-                text
-            }
-            StageOutcome::Err(e) => {
-                self.finalize_failed(
-                    &job_id,
-                    &workspace_id,
-                    Some(e.to_string()),
+                    &notify,
                 )
-                .await?;
-                return self.emit_finished_and_build(app, &job_id);
-            }
-            StageOutcome::Cancelled => {
-                self.finalize_cancelled(&job_id, &workspace_id).await?;
-                return self.emit_finished_and_build(app, &job_id);
-            }
-        };
+                .await
+            {
+                StageOutcome::Ok(stage) => {
+                    let text = stage.assistant_text.clone();
+                    emit_swarm_event(
+                        app,
+                        &job_id,
+                        &SwarmJobEvent::StageCompleted {
+                            job_id: job_id.clone(),
+                            stage: stage.clone(),
+                        },
+                    );
+                    self.registry
+                        .update(&job_id, |j| {
+                            j.stages.push(stage);
+                        })
+                        .await?;
+                    text
+                }
+                StageOutcome::Err(e) => {
+                    self.finalize_failed(
+                        &job_id,
+                        &workspace_id,
+                        Some(e.to_string()),
+                    )
+                    .await?;
+                    return self.emit_finished_and_build(app, &job_id);
+                }
+                StageOutcome::Cancelled => {
+                    self.finalize_cancelled(&job_id, &workspace_id).await?;
+                    return self.emit_finished_and_build(app, &job_id);
+                }
+            };
+            last_plan_text = Some(plan_text.clone());
 
-        // BUILD stage.
-        let build_prompt = render_build_prompt(&plan_text);
-        let build_text = match self
-            .run_stage_with_cancel(
-                app,
-                JobState::Build,
-                &builder,
-                &build_prompt,
-                &job_id,
-                &notify,
-            )
-            .await
-        {
-            StageOutcome::Ok(stage) => {
-                let text = stage.assistant_text.clone();
-                emit_swarm_event(
+            // BUILD.
+            let build_prompt = render_build_prompt(&plan_text);
+            let build_text = match self
+                .run_stage_with_cancel(
                     app,
+                    JobState::Build,
+                    &builder,
+                    &build_prompt,
                     &job_id,
-                    &SwarmJobEvent::StageCompleted {
-                        job_id: job_id.clone(),
-                        stage: stage.clone(),
-                    },
-                );
-                self.registry
-                    .update(&job_id, |j| {
-                        j.stages.push(stage);
-                    })
-                    .await?;
-                text
-            }
-            StageOutcome::Err(e) => {
-                self.finalize_failed(
-                    &job_id,
-                    &workspace_id,
-                    Some(e.to_string()),
+                    &notify,
                 )
+                .await
+            {
+                StageOutcome::Ok(stage) => {
+                    let text = stage.assistant_text.clone();
+                    emit_swarm_event(
+                        app,
+                        &job_id,
+                        &SwarmJobEvent::StageCompleted {
+                            job_id: job_id.clone(),
+                            stage: stage.clone(),
+                        },
+                    );
+                    self.registry
+                        .update(&job_id, |j| {
+                            j.stages.push(stage);
+                        })
+                        .await?;
+                    text
+                }
+                StageOutcome::Err(e) => {
+                    self.finalize_failed(
+                        &job_id,
+                        &workspace_id,
+                        Some(e.to_string()),
+                    )
+                    .await?;
+                    return self.emit_finished_and_build(app, &job_id);
+                }
+                StageOutcome::Cancelled => {
+                    self.finalize_cancelled(&job_id, &workspace_id).await?;
+                    return self.emit_finished_and_build(app, &job_id);
+                }
+            };
+
+            // REVIEW gate.
+            let review_prompt =
+                render_review_prompt(&goal, &plan_text, &build_text);
+            match self
+                .run_verdict_stage(
+                    app,
+                    JobState::Review,
+                    &reviewer,
+                    &review_prompt,
+                    &job_id,
+                    &notify,
+                )
+                .await?
+            {
+                VerdictStageOutcome::Approved(_) => {}
+                VerdictStageOutcome::Rejected(verdict) => {
+                    if self
+                        .try_start_retry(
+                            app,
+                            &job_id,
+                            JobState::Review,
+                            verdict.clone(),
+                        )
+                        .await?
+                    {
+                        continue;
+                    }
+                    self.finalize_failed_with_verdict(
+                        &job_id,
+                        &workspace_id,
+                        verdict,
+                    )
+                    .await?;
+                    return self.emit_finished_and_build(app, &job_id);
+                }
+                VerdictStageOutcome::ParseFailed(e) => {
+                    self.finalize_failed(
+                        &job_id,
+                        &workspace_id,
+                        Some(e.to_string()),
+                    )
+                    .await?;
+                    return self.emit_finished_and_build(app, &job_id);
+                }
+                VerdictStageOutcome::InvokeError(e) => {
+                    self.finalize_failed(
+                        &job_id,
+                        &workspace_id,
+                        Some(e.to_string()),
+                    )
+                    .await?;
+                    return self.emit_finished_and_build(app, &job_id);
+                }
+                VerdictStageOutcome::Cancelled => {
+                    self.finalize_cancelled(&job_id, &workspace_id).await?;
+                    return self.emit_finished_and_build(app, &job_id);
+                }
+            }
+
+            // TEST gate.
+            let test_prompt = render_test_prompt(&goal, &build_text);
+            match self
+                .run_verdict_stage(
+                    app,
+                    JobState::Test,
+                    &tester,
+                    &test_prompt,
+                    &job_id,
+                    &notify,
+                )
+                .await?
+            {
+                VerdictStageOutcome::Approved(_) => {}
+                VerdictStageOutcome::Rejected(verdict) => {
+                    if self
+                        .try_start_retry(
+                            app,
+                            &job_id,
+                            JobState::Test,
+                            verdict.clone(),
+                        )
+                        .await?
+                    {
+                        continue;
+                    }
+                    self.finalize_failed_with_verdict(
+                        &job_id,
+                        &workspace_id,
+                        verdict,
+                    )
+                    .await?;
+                    return self.emit_finished_and_build(app, &job_id);
+                }
+                VerdictStageOutcome::ParseFailed(e) => {
+                    self.finalize_failed(
+                        &job_id,
+                        &workspace_id,
+                        Some(e.to_string()),
+                    )
+                    .await?;
+                    return self.emit_finished_and_build(app, &job_id);
+                }
+                VerdictStageOutcome::InvokeError(e) => {
+                    self.finalize_failed(
+                        &job_id,
+                        &workspace_id,
+                        Some(e.to_string()),
+                    )
+                    .await?;
+                    return self.emit_finished_and_build(app, &job_id);
+                }
+                VerdictStageOutcome::Cancelled => {
+                    self.finalize_cancelled(&job_id, &workspace_id).await?;
+                    return self.emit_finished_and_build(app, &job_id);
+                }
+            }
+
+            // Both gates approved — happy path.
+            // 8. Mark Done and release the workspace lock. The Drop
+            //    guards will also fire on scope exit — both
+            //    `release_workspace` and `unregister_cancel` are
+            //    idempotent.
+            self.registry
+                .update(&job_id, |j| {
+                    j.state = JobState::Done;
+                })
                 .await?;
-                return self.emit_finished_and_build(app, &job_id);
-            }
-            StageOutcome::Cancelled => {
-                self.finalize_cancelled(&job_id, &workspace_id).await?;
-                return self.emit_finished_and_build(app, &job_id);
-            }
-        };
-
-        // REVIEW stage (W3-12d). Run reviewer, parse Verdict, and
-        // gate on `approved`.
-        let review_prompt =
-            render_review_prompt(&goal, &plan_text, &build_text);
-        match self
-            .run_verdict_stage(
-                app,
-                JobState::Review,
-                &reviewer,
-                &review_prompt,
-                &job_id,
-                &workspace_id,
-                &notify,
-            )
-            .await?
-        {
-            VerdictStageOutcome::Approved(_) => {}
-            VerdictStageOutcome::Rejected | VerdictStageOutcome::Terminated => {
-                return self.emit_finished_and_build(app, &job_id);
-            }
+            self.registry
+                .release_workspace(&workspace_id, &job_id)
+                .await;
+            return self.emit_finished_and_build(app, &job_id);
         }
+    }
 
-        // TEST stage (W3-12d). Same shape as Review.
-        let test_prompt = render_test_prompt(&goal, &build_text);
-        match self
-            .run_verdict_stage(
-                app,
-                JobState::Test,
-                &tester,
-                &test_prompt,
-                &job_id,
-                &workspace_id,
-                &notify,
-            )
-            .await?
-        {
-            VerdictStageOutcome::Approved(_) => {}
-            VerdictStageOutcome::Rejected | VerdictStageOutcome::Terminated => {
-                return self.emit_finished_and_build(app, &job_id);
-            }
+    /// Increment `retry_count`, stamp the rejecting Verdict on the
+    /// job, fire `RetryStarted`, and signal the run loop to continue.
+    /// Returns `Ok(true)` if a retry was started, `Ok(false)` if the
+    /// retry budget is exhausted (caller should finalize the job
+    /// as Failed-with-verdict).
+    ///
+    /// `attempt` on the wire is 1-indexed: the first retry is
+    /// `attempt=2`, the second is `attempt=3`. The pre-increment
+    /// `retry_count` is the count of retries that *finished*; this
+    /// helper bumps it to "the count of retries that have started"
+    /// before firing the event so the wire value reads as the
+    /// upcoming attempt number.
+    async fn try_start_retry<R: Runtime>(
+        &self,
+        app: &AppHandle<R>,
+        job_id: &str,
+        gate: JobState,
+        verdict: Verdict,
+    ) -> Result<bool, AppError> {
+        let snapshot = self.registry.get(job_id).ok_or_else(|| {
+            AppError::Internal(format!(
+                "swarm job `{job_id}` vanished from registry mid-retry"
+            ))
+        })?;
+        if snapshot.retry_count >= MAX_RETRIES {
+            return Ok(false);
         }
-
-        // 8. Happy path: mark Done and release the workspace lock.
-        //    The Drop guards will also fire on scope exit — both
-        //    `release_workspace` and `unregister_cancel` are
-        //    idempotent.
+        // Increment retry_count, transition state back to Plan, and
+        // stamp `last_verdict` so the retry-Plan prompt can quote
+        // the rejection. We do this in one `update` so the SQL
+        // write-through sees the consistent shape.
         self.registry
-            .update(&job_id, |j| {
-                j.state = JobState::Done;
+            .update(job_id, |j| {
+                j.retry_count += 1;
+                j.state = JobState::Plan;
+                j.last_verdict = Some(verdict.clone());
             })
             .await?;
-        self.registry
-            .release_workspace(&workspace_id, &job_id)
-            .await;
-        self.emit_finished_and_build(app, &job_id)
+        let attempt = snapshot.retry_count.saturating_add(2);
+        emit_swarm_event(
+            app,
+            job_id,
+            &SwarmJobEvent::RetryStarted {
+                job_id: job_id.to_string(),
+                attempt,
+                max_retries: MAX_RETRIES,
+                triggered_by: gate,
+                verdict,
+            },
+        );
+        Ok(true)
     }
 
     /// Run a Review or Test stage end-to-end: invoke the specialist,
-    /// parse the Verdict from `assistant_text`, branch on
-    /// `approved`. Pulled into a helper because both gates have the
-    /// exact same shape (only the prompt + state differ).
+    /// parse the Verdict from `assistant_text`, append the stage,
+    /// emit `StageCompleted`. Pulled into a helper because both
+    /// gates have the same shape (only the prompt + state differ).
+    ///
+    /// W3-12e refactor: this helper no longer finalizes the job on
+    /// rejection / parse-failure / invoke-error — the run loop owns
+    /// that decision because it needs the rejecting Verdict to feed
+    /// the retry-Plan prompt (or, on retry-budget exhaustion, to
+    /// stamp `last_verdict` on the Failed job).
     ///
     /// Returns:
     ///
-    /// - `Approved(verdict)` — invoke succeeded, parse succeeded,
-    ///   `approved=true`. The stage is appended to `Job.stages`
-    ///   with `verdict` populated; the FSM should advance.
-    /// - `Rejected` — invoke succeeded, parse succeeded,
-    ///   `approved=false`. The stage is appended with the verdict;
-    ///   the job is finalized as Failed with `last_verdict` set.
-    ///   FSM tail should emit `Finished` and return.
-    /// - `Terminated` — invoke errored, was cancelled, or the
-    ///   verdict was unparseable. Job is already finalized; FSM
-    ///   tail should emit `Finished` and return.
+    /// - `Approved(verdict)` — invoke + parse succeeded;
+    ///   `approved=true`. Stage appended with `verdict` populated.
+    /// - `Rejected(verdict)` — invoke + parse succeeded;
+    ///   `approved=false`. Stage appended with the verdict; the run
+    ///   loop decides retry vs. finalize.
+    /// - `ParseFailed(err)` — invoke succeeded but the assistant
+    ///   text wasn't a parseable Verdict. Stage IS appended with
+    ///   `verdict=None` so the W3-14 UI sees the raw text.
+    /// - `InvokeError(err)` — `transport.invoke` returned an error.
+    ///   No stage appended.
+    /// - `Cancelled` — cancel `Notify` fired mid-stage. `Cancelled`
+    ///   event already emitted; run loop should call
+    ///   `finalize_cancelled`.
     ///
-    /// `Result<...>` wraps so SQL failures during finalization
-    /// surface as `AppError::Internal` to the IPC caller (the FSM
-    /// loop already propagates this via `?`).
+    /// SQL failures during the in-helper `update` call surface as
+    /// `AppError` via `Result<...>`; the run loop propagates with `?`.
     async fn run_verdict_stage<R: Runtime>(
         &self,
         app: &AppHandle<R>,
@@ -631,7 +926,6 @@ impl<T: Transport> CoordinatorFsm<T> {
         profile: &Profile,
         prompt: &str,
         job_id: &str,
-        workspace_id: &str,
         notify: &Notify,
     ) -> Result<VerdictStageOutcome, AppError> {
         let mut stage = match self
@@ -640,38 +934,21 @@ impl<T: Transport> CoordinatorFsm<T> {
         {
             StageOutcome::Ok(s) => s,
             StageOutcome::Err(e) => {
-                self.finalize_failed(
-                    job_id,
-                    workspace_id,
-                    Some(e.to_string()),
-                )
-                .await?;
-                return Ok(VerdictStageOutcome::Terminated);
+                return Ok(VerdictStageOutcome::InvokeError(e));
             }
             StageOutcome::Cancelled => {
-                self.finalize_cancelled(job_id, workspace_id).await?;
-                return Ok(VerdictStageOutcome::Terminated);
+                return Ok(VerdictStageOutcome::Cancelled);
             }
         };
 
-        // Parse the verdict from the assistant text. If parse fails
-        // the FSM treats it as a stage failure — `last_error`
-        // carries the parse error message; `last_verdict` stays
-        // None because we never resolved a structured verdict.
+        // Parse the verdict from the assistant text. On parse
+        // failure we still append the stage + emit StageCompleted
+        // so the W3-14 UI sees the raw text (matches the streaming
+        // contract: "the listener observes everything that
+        // round-tripped through transport").
         let verdict = match parse_verdict(&stage.assistant_text) {
             Ok(v) => v,
             Err(e) => {
-                self.finalize_failed(
-                    job_id,
-                    workspace_id,
-                    Some(e.to_string()),
-                )
-                .await?;
-                // Even on parse failure we still emit the
-                // StageCompleted event so the W3-14 UI sees the raw
-                // assistant text; this matches the streaming
-                // contract ("the listener observes everything that
-                // round-tripped through transport").
                 emit_swarm_event(
                     app,
                     job_id,
@@ -685,7 +962,7 @@ impl<T: Transport> CoordinatorFsm<T> {
                         j.stages.push(stage);
                     })
                     .await?;
-                return Ok(VerdictStageOutcome::Terminated);
+                return Ok(VerdictStageOutcome::ParseFailed(e));
             }
         };
 
@@ -709,15 +986,10 @@ impl<T: Transport> CoordinatorFsm<T> {
             .await?;
 
         if verdict.rejected() {
-            self.finalize_failed_with_verdict(
-                job_id,
-                workspace_id,
-                verdict,
-            )
-            .await?;
-            return Ok(VerdictStageOutcome::Rejected);
+            Ok(VerdictStageOutcome::Rejected(verdict))
+        } else {
+            Ok(VerdictStageOutcome::Approved(verdict))
         }
-        Ok(VerdictStageOutcome::Approved(verdict))
     }
 
     /// Run one FSM stage end-to-end with cancellation support.
@@ -995,22 +1267,42 @@ enum StageOutcome {
     Cancelled,
 }
 
-/// Three-way outcome of a verdict-gated stage (Review / Test). Used
-/// internally by `run_verdict_stage` so the call site can pattern-
-/// match on three exhaustive cases without unwrapping nested Result
-/// types.
+/// Outcome of a verdict-gated stage (Review / Test). Used internally
+/// by `run_verdict_stage` so the run loop can pattern-match on five
+/// exhaustive cases without unwrapping nested Result types.
+///
+/// W3-12e refactor: the helper no longer finalizes the job itself on
+/// `Rejected` — the run loop owns the retry-vs-finalize choice and
+/// needs the parsed Verdict to feed the next Plan prompt. The
+/// `Approved` and `Rejected` payloads are the parsed Verdict; the
+/// other variants carry just enough context for the run loop to
+/// finalize the job (parse-failed text in `last_error`, the
+/// underlying `AppError` for stage errors, `Cancelled` for the
+/// cancel branch).
 enum VerdictStageOutcome {
-    /// Verdict.approved=true. FSM advances to the next stage. The
-    /// payload is the parsed Verdict so a future caller could
-    /// surface "approved with low-severity issues" even on the
-    /// success path; W3-12d itself doesn't read the value.
+    /// Verdict.approved=true. FSM advances to the next stage.
+    /// `Approved`'s payload IS read on the retry path's
+    /// happy-path-after-retry branch (no current consumer, but the
+    /// `#[allow(dead_code)]` annotation kept for forward parity).
     Approved(#[allow(dead_code)] Verdict),
-    /// Verdict.approved=false. Job is already finalized as Failed
-    /// with `last_verdict` populated; FSM tail emits Finished.
-    Rejected,
-    /// Stage error / cancellation / unparseable verdict. Job is
-    /// already finalized; FSM tail emits Finished.
-    Terminated,
+    /// Verdict.approved=false. The stage has been appended to
+    /// `Job.stages` with the verdict populated. The run loop
+    /// decides whether to retry or finalize via
+    /// `finalize_failed_with_verdict`.
+    Rejected(Verdict),
+    /// The assistant_text could not be parsed as a Verdict. The
+    /// stage IS appended (with `verdict=None`) so the W3-14 UI sees
+    /// the raw text. The run loop finalizes via `finalize_failed`
+    /// with the parse error in `last_error`.
+    ParseFailed(AppError),
+    /// `transport.invoke` returned an error before any verdict
+    /// could be parsed. No stage is appended. The run loop
+    /// finalizes via `finalize_failed`.
+    InvokeError(AppError),
+    /// Cancellation `Notify` fired before the stage could complete.
+    /// `Cancelled` event has already been emitted. The run loop
+    /// finalizes via `finalize_cancelled`.
+    Cancelled,
 }
 
 /// Stable last-error string the FSM writes when cancelled. Pulled
@@ -2215,10 +2507,11 @@ mod tests {
             REVIEWER_ID.into(),
             rejected_verdict_response("unwrap on None"),
         );
-        // Tester response is never consumed (Review rejection
-        // short-circuits the chain) but the mock requires entries
-        // to exist for any id the FSM might ask about; the FSM is
-        // careful to NOT call tester on the rejected path.
+        // Tester response is never consumed (Review rejection on
+        // every attempt short-circuits the chain at Review) but
+        // the mock requires entries for any id the FSM might ask
+        // about; the FSM is careful to NOT call tester on the
+        // rejected path.
         responses.insert(TESTER_ID.into(), ok_verdict_response(0.0));
 
         let registry = Arc::new(JobRegistry::new());
@@ -2233,12 +2526,19 @@ mod tests {
             .await
             .expect("FSM returns Ok with Failed outcome");
         assert_eq!(outcome.final_state, JobState::Failed);
-        // Stages: scout/plan/build (3) + review (1) — tester didn't run.
-        assert_eq!(outcome.stages.len(), 4);
-        assert_eq!(outcome.stages[3].state, JobState::Review);
-        assert!(outcome.stages[3].verdict.is_some());
+        // W3-12e: Reviewer rejecting on every attempt exhausts the
+        // retry budget. Stages: scout (1) + 3 × (plan/build/review)
+        // (= 9) = 10. Test never ran. retry_count = MAX_RETRIES.
+        assert_eq!(outcome.stages.len(), 10);
+        let final_review = outcome
+            .stages
+            .iter()
+            .rev()
+            .find(|s| s.state == JobState::Review)
+            .expect("review stage present");
+        assert!(final_review.verdict.is_some());
         assert_eq!(
-            outcome.stages[3].verdict.as_ref().map(|v| v.approved),
+            final_review.verdict.as_ref().map(|v| v.approved),
             Some(false)
         );
         // Job-level last_verdict is the rejected one; last_error
@@ -2250,8 +2550,9 @@ mod tests {
         assert_eq!(lv.issues[0].message, "unwrap on None");
     }
 
-    /// Tester returns `approved=false` → job finalizes Failed at
-    /// the Test gate with `last_verdict` populated.
+    /// Tester returns `approved=false` on every attempt → job
+    /// exhausts the retry budget and finalizes Failed at the Test
+    /// gate with `last_verdict` populated.
     #[tokio::test]
     async fn fsm_test_rejection_finalizes_failed_with_verdict() {
         let (app, _pool, _dir) = mock_app_with_pool().await;
@@ -2277,11 +2578,19 @@ mod tests {
             .await
             .expect("FSM returns Ok with Failed outcome");
         assert_eq!(outcome.final_state, JobState::Failed);
-        // Stages: scout/plan/build (3) + review (approved) + test (rejected) = 5.
-        assert_eq!(outcome.stages.len(), 5);
-        assert_eq!(outcome.stages[4].state, JobState::Test);
+        // W3-12e: Tester rejecting on every attempt exhausts the
+        // retry budget. Stages: scout (1) + 3 ×
+        // (plan/build/review/test) (= 12) = 13. retry_count =
+        // MAX_RETRIES.
+        assert_eq!(outcome.stages.len(), 13);
+        let final_test = outcome
+            .stages
+            .iter()
+            .rev()
+            .find(|s| s.state == JobState::Test)
+            .expect("test stage present");
         let test_verdict =
-            outcome.stages[4].verdict.as_ref().expect("test verdict");
+            final_test.verdict.as_ref().expect("test verdict");
         assert!(!test_verdict.approved);
         assert!(outcome.last_error.is_none());
         let lv = outcome.last_verdict.as_ref().expect("last_verdict set");
@@ -3009,5 +3318,910 @@ mod tests {
             "last event must be Finished; full sequence: {:?}",
             kinds
         );
+    }
+
+    // ----------------------------------------------------------------
+    // WP-W3-12e — retry feedback loop tests
+    // ----------------------------------------------------------------
+
+    /// Sequenced mock transport: pops one response per `profile.id`
+    /// per call, so retry-driven tests can script Reviewer to return
+    /// rejected-then-approved across two attempts. Records every
+    /// prompt the FSM sent for post-run assertion.
+    ///
+    /// Build via [`SequencedMock::new`] passing a HashMap from
+    /// profile id to a `Vec<MockResponse>`. The first call for a
+    /// given id consumes index 0, the second consumes index 1, etc.
+    /// If the queue is exhausted the transport returns the last
+    /// response repeatedly so a test that scripts e.g. Scout once
+    /// doesn't have to spell out a placeholder for every retry.
+    struct SequencedMock {
+        responses: std::sync::Mutex<HashMap<String, Vec<MockResponse>>>,
+        cursor: std::sync::Mutex<HashMap<String, usize>>,
+        seen: std::sync::Mutex<Vec<(String, String)>>,
+    }
+
+    impl SequencedMock {
+        fn new(responses: HashMap<String, Vec<MockResponse>>) -> Self {
+            Self {
+                responses: std::sync::Mutex::new(responses),
+                cursor: std::sync::Mutex::new(HashMap::new()),
+                seen: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn seen(&self) -> Vec<(String, String)> {
+            self.seen.lock().expect("seen poisoned").clone()
+        }
+
+        fn call_count(&self, id: &str) -> usize {
+            self.seen
+                .lock()
+                .expect("seen poisoned")
+                .iter()
+                .filter(|(pid, _)| pid == id)
+                .count()
+        }
+    }
+
+    impl Transport for SequencedMock {
+        async fn invoke<R: Runtime>(
+            &self,
+            _app: &AppHandle<R>,
+            profile: &Profile,
+            user_message: &str,
+            _timeout: Duration,
+        ) -> Result<InvokeResult, AppError> {
+            self.seen
+                .lock()
+                .expect("seen poisoned")
+                .push((profile.id.clone(), user_message.to_string()));
+
+            // Pull the response for this call, then advance the cursor.
+            let response_clone = {
+                let responses_guard =
+                    self.responses.lock().expect("responses poisoned");
+                let queue = responses_guard.get(&profile.id).ok_or_else(|| {
+                    AppError::SwarmInvoke(format!(
+                        "SequencedMock: no scripted responses for `{}`",
+                        profile.id
+                    ))
+                })?;
+                if queue.is_empty() {
+                    return Err(AppError::SwarmInvoke(format!(
+                        "SequencedMock: empty queue for `{}`",
+                        profile.id
+                    )));
+                }
+                let mut cursor_guard =
+                    self.cursor.lock().expect("cursor poisoned");
+                let idx = cursor_guard
+                    .entry(profile.id.clone())
+                    .or_insert(0);
+                let pick = (*idx).min(queue.len() - 1);
+                if *idx < queue.len() - 1 {
+                    *idx += 1;
+                }
+                let entry = &queue[pick];
+                MockResponse {
+                    result: entry.result.clone(),
+                    sleep: entry.sleep,
+                }
+            };
+
+            if let Some(sleep) = response_clone.sleep {
+                tokio::time::sleep(sleep).await;
+            }
+            response_clone.result
+        }
+    }
+
+    /// Wrapper letting an `&Arc<SequencedMock>` satisfy `T: Transport`
+    /// so prompt-inspection tests can keep a handle on the mock for
+    /// post-run `seen()` while still passing it by value to
+    /// `CoordinatorFsm::new`.
+    struct ArcSequencedMock(Arc<SequencedMock>);
+
+    impl Transport for ArcSequencedMock {
+        async fn invoke<R: Runtime>(
+            &self,
+            app: &AppHandle<R>,
+            profile: &Profile,
+            user_message: &str,
+            timeout: Duration,
+        ) -> Result<InvokeResult, AppError> {
+            self.0.invoke(app, profile, user_message, timeout).await
+        }
+    }
+
+    /// Build a rejected-verdict response with a custom severity +
+    /// file/line so the retry-prompt tests can assert on bullet
+    /// content. Differs from `rejected_verdict_response` (which only
+    /// supports the high-severity / no-file shape).
+    fn rich_rejected_verdict(
+        severity: &str,
+        file: &str,
+        line: u32,
+        msg: &str,
+    ) -> MockResponse {
+        let payload = format!(
+            r#"{{"approved":false,"issues":[{{"severity":"{sev}","file":"{file}","line":{line},"msg":"{msg}"}}],"summary":"rejected"}}"#,
+            sev = severity,
+            file = file,
+            line = line,
+            msg = msg.replace('\\', "\\\\").replace('"', "\\\""),
+        );
+        MockResponse {
+            result: Ok(InvokeResult {
+                session_id: "sess-rich-rej".into(),
+                assistant_text: payload,
+                total_cost_usd: 0.0,
+                turn_count: 1,
+            }),
+            sleep: None,
+        }
+    }
+
+    /// Reviewer rejects on attempt 1, approves on attempt 2.
+    /// Tester always approves. Final state Done, retry_count=1,
+    /// stages: scout (1) + 2 × (plan/build/review) (= 6) + test (1) = 8.
+    /// RetryStarted event fires once; Scout runs once.
+    #[tokio::test]
+    async fn fsm_review_reject_retries_within_budget() {
+        let (app, _pool, _dir) = mock_app_with_pool().await;
+        let registry = Arc::new(JobRegistry::new());
+
+        let mut responses: HashMap<String, Vec<MockResponse>> = HashMap::new();
+        responses.insert(
+            SCOUT_ID.into(),
+            vec![ok_response("scout findings", 0.0)],
+        );
+        responses.insert(
+            PLANNER_ID.into(),
+            vec![ok_response("plan-A", 0.0), ok_response("plan-B", 0.0)],
+        );
+        responses.insert(
+            BUILDER_ID.into(),
+            vec![ok_response("build-A", 0.0), ok_response("build-B", 0.0)],
+        );
+        responses.insert(
+            REVIEWER_ID.into(),
+            vec![
+                rejected_verdict_response("missing import"),
+                ok_verdict_response(0.0),
+            ],
+        );
+        responses.insert(TESTER_ID.into(), vec![ok_verdict_response(0.0)]);
+
+        let mock = Arc::new(SequencedMock::new(responses));
+        let fsm = CoordinatorFsm::new(
+            synthetic_registry(),
+            ArcSequencedMock(Arc::clone(&mock)),
+            Arc::clone(&registry),
+            Duration::from_secs(5),
+        );
+
+        let job_id = "j-rev-retry-ok".to_string();
+        let events = capture_events(&app, &job_id);
+        let outcome = fsm
+            .run_job_with_id(
+                app.handle(),
+                job_id.clone(),
+                "ws-rev-retry".into(),
+                "g".into(),
+            )
+            .await
+            .expect("FSM ok");
+        assert_eq!(outcome.final_state, JobState::Done);
+        assert_eq!(outcome.stages.len(), 8, "1 scout + 2x(plan/build/review) + test");
+        // Scout invoked exactly once.
+        assert_eq!(mock.call_count(SCOUT_ID), 1);
+        // Job-level retry_count == 1 (one full retry round).
+        let job = registry.get(&job_id).expect("job in registry");
+        assert_eq!(job.retry_count, 1);
+
+        // RetryStarted fires once.
+        let captured = events
+            .lock()
+            .expect("events poisoned")
+            .clone();
+        let retries: Vec<&CapturedEvent> = captured
+            .iter()
+            .filter(|e| e.kind == "retry_started")
+            .collect();
+        assert_eq!(retries.len(), 1, "one retry round");
+        let retry = retries[0];
+        assert_eq!(
+            retry.json.get("attempt").and_then(|v| v.as_u64()),
+            Some(2),
+            "first retry is attempt=2"
+        );
+        assert_eq!(
+            retry.json.get("triggered_by").and_then(|v| v.as_str()),
+            Some("review")
+        );
+    }
+
+    /// Reviewer rejects on every attempt → retry budget exhausts at
+    /// 3 attempts. Final Failed, retry_count=2, stages = 1 + 3×3 = 10.
+    /// RetryStarted fires twice.
+    #[tokio::test]
+    async fn fsm_review_reject_exhausts_retries() {
+        let (app, _pool, _dir) = mock_app_with_pool().await;
+        let registry = Arc::new(JobRegistry::new());
+
+        let mut responses: HashMap<String, Vec<MockResponse>> = HashMap::new();
+        responses.insert(SCOUT_ID.into(), vec![ok_response("s", 0.0)]);
+        responses.insert(PLANNER_ID.into(), vec![ok_response("p", 0.0)]);
+        responses.insert(BUILDER_ID.into(), vec![ok_response("b", 0.0)]);
+        responses.insert(
+            REVIEWER_ID.into(),
+            vec![rejected_verdict_response("rev fail")],
+        );
+        responses.insert(TESTER_ID.into(), vec![ok_verdict_response(0.0)]);
+
+        let mock = Arc::new(SequencedMock::new(responses));
+        let fsm = CoordinatorFsm::new(
+            synthetic_registry(),
+            ArcSequencedMock(Arc::clone(&mock)),
+            Arc::clone(&registry),
+            Duration::from_secs(5),
+        );
+        let job_id = "j-rev-exhaust".to_string();
+        let events = capture_events(&app, &job_id);
+        let outcome = fsm
+            .run_job_with_id(
+                app.handle(),
+                job_id.clone(),
+                "ws-rev-exhaust".into(),
+                "g".into(),
+            )
+            .await
+            .expect("FSM ok");
+        assert_eq!(outcome.final_state, JobState::Failed);
+        assert_eq!(outcome.stages.len(), 10);
+        let job = registry.get(&job_id).expect("job");
+        assert_eq!(job.retry_count, MAX_RETRIES);
+        assert!(outcome.last_verdict.is_some());
+
+        // RetryStarted fires twice (between attempts 1→2 and 2→3).
+        let captured = events.lock().expect("events poisoned").clone();
+        let retries: Vec<&CapturedEvent> = captured
+            .iter()
+            .filter(|e| e.kind == "retry_started")
+            .collect();
+        assert_eq!(retries.len(), 2);
+        // First retry: attempt=2; second retry: attempt=3.
+        assert_eq!(
+            retries[0].json.get("attempt").and_then(|v| v.as_u64()),
+            Some(2)
+        );
+        assert_eq!(
+            retries[1].json.get("attempt").and_then(|v| v.as_u64()),
+            Some(3)
+        );
+        // Tester never runs (Reviewer always rejects first).
+        assert_eq!(mock.call_count(TESTER_ID), 0);
+    }
+
+    /// Reviewer always approves; Tester rejects then approves.
+    /// Final Done, retry_count=1.
+    #[tokio::test]
+    async fn fsm_test_reject_retries_then_passes() {
+        let (app, _pool, _dir) = mock_app_with_pool().await;
+        let registry = Arc::new(JobRegistry::new());
+
+        let mut responses: HashMap<String, Vec<MockResponse>> = HashMap::new();
+        responses.insert(SCOUT_ID.into(), vec![ok_response("s", 0.0)]);
+        responses.insert(
+            PLANNER_ID.into(),
+            vec![ok_response("p1", 0.0), ok_response("p2", 0.0)],
+        );
+        responses.insert(
+            BUILDER_ID.into(),
+            vec![ok_response("b1", 0.0), ok_response("b2", 0.0)],
+        );
+        responses.insert(
+            REVIEWER_ID.into(),
+            vec![ok_verdict_response(0.0)],
+        );
+        responses.insert(
+            TESTER_ID.into(),
+            vec![
+                rejected_verdict_response("flaky test"),
+                ok_verdict_response(0.0),
+            ],
+        );
+
+        let mock = Arc::new(SequencedMock::new(responses));
+        let fsm = CoordinatorFsm::new(
+            synthetic_registry(),
+            ArcSequencedMock(Arc::clone(&mock)),
+            Arc::clone(&registry),
+            Duration::from_secs(5),
+        );
+        let job_id = "j-test-retry-ok".to_string();
+        let events = capture_events(&app, &job_id);
+        let outcome = fsm
+            .run_job_with_id(
+                app.handle(),
+                job_id.clone(),
+                "ws-test-retry".into(),
+                "g".into(),
+            )
+            .await
+            .expect("FSM ok");
+        assert_eq!(outcome.final_state, JobState::Done);
+        // 1 scout + 2x(plan/build/review/test) = 9.
+        assert_eq!(outcome.stages.len(), 9);
+        let job = registry.get(&job_id).expect("job");
+        assert_eq!(job.retry_count, 1);
+
+        let captured = events.lock().expect("events poisoned").clone();
+        let retry = captured
+            .iter()
+            .find(|e| e.kind == "retry_started")
+            .expect("RetryStarted fired");
+        assert_eq!(
+            retry.json.get("triggered_by").and_then(|v| v.as_str()),
+            Some("test")
+        );
+    }
+
+    /// Tester rejects on every attempt → retry budget exhausts.
+    /// Final Failed, retry_count=2, stages = 1 + 3×4 = 13.
+    #[tokio::test]
+    async fn fsm_test_reject_exhausts_retries() {
+        let (app, _pool, _dir) = mock_app_with_pool().await;
+        let registry = Arc::new(JobRegistry::new());
+
+        let mut responses: HashMap<String, Vec<MockResponse>> = HashMap::new();
+        responses.insert(SCOUT_ID.into(), vec![ok_response("s", 0.0)]);
+        responses.insert(PLANNER_ID.into(), vec![ok_response("p", 0.0)]);
+        responses.insert(BUILDER_ID.into(), vec![ok_response("b", 0.0)]);
+        responses.insert(REVIEWER_ID.into(), vec![ok_verdict_response(0.0)]);
+        responses.insert(
+            TESTER_ID.into(),
+            vec![rejected_verdict_response("test fail")],
+        );
+
+        let mock = Arc::new(SequencedMock::new(responses));
+        let fsm = CoordinatorFsm::new(
+            synthetic_registry(),
+            ArcSequencedMock(Arc::clone(&mock)),
+            Arc::clone(&registry),
+            Duration::from_secs(5),
+        );
+        let job_id = "j-test-exhaust".to_string();
+        let events = capture_events(&app, &job_id);
+        let outcome = fsm
+            .run_job_with_id(
+                app.handle(),
+                job_id.clone(),
+                "ws-test-exhaust".into(),
+                "g".into(),
+            )
+            .await
+            .expect("FSM ok");
+        assert_eq!(outcome.final_state, JobState::Failed);
+        assert_eq!(outcome.stages.len(), 13);
+        let job = registry.get(&job_id).expect("job");
+        assert_eq!(job.retry_count, MAX_RETRIES);
+
+        let captured = events.lock().expect("events poisoned").clone();
+        let retries: Vec<&CapturedEvent> = captured
+            .iter()
+            .filter(|e| e.kind == "retry_started")
+            .collect();
+        assert_eq!(retries.len(), 2);
+        for r in &retries {
+            assert_eq!(
+                r.json.get("triggered_by").and_then(|v| v.as_str()),
+                Some("test")
+            );
+        }
+    }
+
+    /// Scout runs exactly once across the full retry chain. Verified
+    /// against the SequencedMock's call counter.
+    #[tokio::test]
+    async fn fsm_scout_runs_once_across_retries() {
+        let (app, _pool, _dir) = mock_app_with_pool().await;
+        let registry = Arc::new(JobRegistry::new());
+
+        let mut responses: HashMap<String, Vec<MockResponse>> = HashMap::new();
+        // Scout queue has just one entry. Two retries → if Scout ran
+        // 3 times the SequencedMock would clamp to the last entry,
+        // but we assert the call counter directly so the regression
+        // is unambiguous.
+        responses.insert(SCOUT_ID.into(), vec![ok_response("scout", 0.0)]);
+        responses.insert(PLANNER_ID.into(), vec![ok_response("p", 0.0)]);
+        responses.insert(BUILDER_ID.into(), vec![ok_response("b", 0.0)]);
+        responses.insert(
+            REVIEWER_ID.into(),
+            vec![rejected_verdict_response("force retry")],
+        );
+        responses.insert(TESTER_ID.into(), vec![ok_verdict_response(0.0)]);
+
+        let mock = Arc::new(SequencedMock::new(responses));
+        let fsm = CoordinatorFsm::new(
+            synthetic_registry(),
+            ArcSequencedMock(Arc::clone(&mock)),
+            Arc::clone(&registry),
+            Duration::from_secs(5),
+        );
+        fsm.run_job_with_id(
+            app.handle(),
+            "j-scout-once".into(),
+            "ws-scout-once".into(),
+            "g".into(),
+        )
+        .await
+        .expect("FSM ok");
+        assert_eq!(
+            mock.call_count(SCOUT_ID),
+            1,
+            "Scout must run exactly once even across retries"
+        );
+        // Sanity: planner ran 3 times (one per attempt).
+        assert_eq!(mock.call_count(PLANNER_ID), 3);
+    }
+
+    /// On retry, the second Plan call's prompt contains the rejecting
+    /// gate label, the verdict's issue bullets (with severity and
+    /// file:line), and the previous plan text.
+    #[tokio::test]
+    async fn retry_plan_prompt_includes_verdict_issues() {
+        let (app, _pool, _dir) = mock_app_with_pool().await;
+        let registry = Arc::new(JobRegistry::new());
+
+        let mut responses: HashMap<String, Vec<MockResponse>> = HashMap::new();
+        responses.insert(SCOUT_ID.into(), vec![ok_response("scout-out", 0.0)]);
+        responses.insert(
+            PLANNER_ID.into(),
+            vec![
+                ok_response("PREVIOUS-PLAN-TEXT", 0.0),
+                ok_response("p2", 0.0),
+            ],
+        );
+        responses.insert(
+            BUILDER_ID.into(),
+            vec![ok_response("b1", 0.0), ok_response("b2", 0.0)],
+        );
+        // Rejecting verdict carries one high-severity issue with
+        // file+line populated so the bullet renders the [high] tag
+        // and the "src/foo.rs:42" location.
+        responses.insert(
+            REVIEWER_ID.into(),
+            vec![
+                rich_rejected_verdict("high", "src/foo.rs", 42, "missing semicolon"),
+                ok_verdict_response(0.0),
+            ],
+        );
+        responses.insert(TESTER_ID.into(), vec![ok_verdict_response(0.0)]);
+
+        let mock = Arc::new(SequencedMock::new(responses));
+        let fsm = CoordinatorFsm::new(
+            synthetic_registry(),
+            ArcSequencedMock(Arc::clone(&mock)),
+            Arc::clone(&registry),
+            Duration::from_secs(5),
+        );
+        let outcome = fsm
+            .run_job(app.handle(), "ws-prompt".into(), "G".into())
+            .await
+            .expect("FSM ok");
+        assert_eq!(outcome.final_state, JobState::Done);
+
+        let seen = mock.seen();
+        let plan_prompts: Vec<&str> = seen
+            .iter()
+            .filter(|(id, _)| id == PLANNER_ID)
+            .map(|(_, p)| p.as_str())
+            .collect();
+        assert_eq!(plan_prompts.len(), 2);
+        let retry_prompt = plan_prompts[1];
+        // Issue bullet shape: severity tag + file:line + message.
+        assert!(
+            retry_prompt.contains("[high]"),
+            "retry prompt missing [high] tag: {retry_prompt}"
+        );
+        assert!(
+            retry_prompt.contains("src/foo.rs:42"),
+            "retry prompt missing file:line: {retry_prompt}"
+        );
+        assert!(
+            retry_prompt.contains("missing semicolon"),
+            "retry prompt missing issue message: {retry_prompt}"
+        );
+        // Gate name renders as "Reviewer" (Review-rejected gate).
+        assert!(
+            retry_prompt.contains("Reviewer"),
+            "retry prompt missing gate label: {retry_prompt}"
+        );
+        // Previous plan body is quoted verbatim.
+        assert!(
+            retry_prompt.contains("PREVIOUS-PLAN-TEXT"),
+            "retry prompt missing previous plan: {retry_prompt}"
+        );
+    }
+
+    /// First-attempt Plan prompt is the canonical (non-retry)
+    /// template — no "REDDEDİLDİ" header, no issue bullets.
+    #[tokio::test]
+    async fn retry_plan_prompt_omitted_on_first_attempt() {
+        let (app, _pool, _dir) = mock_app_with_pool().await;
+        let registry = Arc::new(JobRegistry::new());
+        let responses = happy_5_stage_responses(
+            "scout", "plan", "build", 0.0, 0.0, 0.0,
+        );
+        let mock = Arc::new(MockTransport::new(responses));
+        let fsm = CoordinatorFsm::new(
+            synthetic_registry(),
+            ArcTransport(Arc::clone(&mock)),
+            Arc::clone(&registry),
+            Duration::from_secs(5),
+        );
+        fsm.run_job(app.handle(), "ws-first-attempt".into(), "G".into())
+            .await
+            .expect("FSM ok");
+        let seen = mock.seen();
+        let plan_prompt = seen
+            .iter()
+            .find(|(id, _)| id == PLANNER_ID)
+            .map(|(_, p)| p.as_str())
+            .expect("plan prompt recorded");
+        assert!(
+            !plan_prompt.contains("REDDEDİLDİ"),
+            "first-attempt prompt should not be the retry variant: {plan_prompt}"
+        );
+        assert!(
+            !plan_prompt.contains("Önceki plan"),
+            "first-attempt prompt should not quote a previous plan: {plan_prompt}"
+        );
+    }
+
+    /// `RetryStarted.attempt` is 1-indexed: 2 on the first retry, 3
+    /// on the second.
+    #[tokio::test]
+    async fn retry_started_event_fires_with_correct_attempt_number() {
+        let (app, _pool, _dir) = mock_app_with_pool().await;
+        let registry = Arc::new(JobRegistry::new());
+        let mut responses: HashMap<String, Vec<MockResponse>> = HashMap::new();
+        responses.insert(SCOUT_ID.into(), vec![ok_response("s", 0.0)]);
+        responses.insert(PLANNER_ID.into(), vec![ok_response("p", 0.0)]);
+        responses.insert(BUILDER_ID.into(), vec![ok_response("b", 0.0)]);
+        responses.insert(
+            REVIEWER_ID.into(),
+            vec![rejected_verdict_response("force retries")],
+        );
+        responses.insert(TESTER_ID.into(), vec![ok_verdict_response(0.0)]);
+        let mock = Arc::new(SequencedMock::new(responses));
+        let fsm = CoordinatorFsm::new(
+            synthetic_registry(),
+            ArcSequencedMock(Arc::clone(&mock)),
+            Arc::clone(&registry),
+            Duration::from_secs(5),
+        );
+        let job_id = "j-attempt-numbers".to_string();
+        let events = capture_events(&app, &job_id);
+        fsm.run_job_with_id(
+            app.handle(),
+            job_id.clone(),
+            "ws-attempt".into(),
+            "G".into(),
+        )
+        .await
+        .expect("FSM ok");
+        let captured = events.lock().expect("events poisoned").clone();
+        let attempts: Vec<u64> = captured
+            .iter()
+            .filter(|e| e.kind == "retry_started")
+            .filter_map(|e| e.json.get("attempt").and_then(|v| v.as_u64()))
+            .collect();
+        assert_eq!(attempts, vec![2, 3]);
+    }
+
+    /// `retry_count` round-trips through SQLite via the registry's
+    /// write-through. Mock-driven: write retry_count=1 on a
+    /// pool-backed registry, reload via `get_job_detail`, assert.
+    #[tokio::test]
+    async fn retry_count_persists_across_app_restart() {
+        let (registry, _pool, _reg_dir) = pool_backed_registry().await;
+        // Acquire a fresh job slot so `update` can mutate it.
+        let job = Job {
+            id: "j-restart".into(),
+            goal: "g".into(),
+            created_at_ms: 0,
+            state: JobState::Init,
+            retry_count: 0,
+            stages: Vec::new(),
+            last_error: None,
+            last_verdict: None,
+        };
+        registry
+            .try_acquire_workspace("ws-restart", job)
+            .await
+            .expect("acquire");
+        registry
+            .update("j-restart", |j| {
+                j.retry_count = 1;
+            })
+            .await
+            .expect("update retry_count");
+
+        // Reload via the SQL read path — same surface the IPC layer
+        // uses post-restart.
+        let detail = registry
+            .get_job_detail("j-restart")
+            .await
+            .expect("query")
+            .expect("row exists");
+        assert_eq!(detail.retry_count, 1);
+    }
+
+    /// Cancel during the retry attempt's Build stage. Drives
+    /// attempt 1 to a Reviewer rejection, then on attempt 2 the
+    /// Build mock is slow enough that signal_cancel lands
+    /// mid-Build. `Cancelled.cancelled_during == "build"`.
+    #[tokio::test]
+    async fn cancel_during_retry_attempt_2_records_correct_stage() {
+        let (app, _pool, _dir) = mock_app_with_pool().await;
+        let registry = Arc::new(JobRegistry::new());
+
+        let mut responses: HashMap<String, Vec<MockResponse>> = HashMap::new();
+        responses.insert(SCOUT_ID.into(), vec![ok_response("s", 0.0)]);
+        // Plan: fast on both attempts.
+        responses.insert(
+            PLANNER_ID.into(),
+            vec![ok_response("p1", 0.0), ok_response("p2", 0.0)],
+        );
+        // Build: fast on attempt 1, slow on attempt 2 so cancel lands
+        // mid-Build.
+        responses.insert(
+            BUILDER_ID.into(),
+            vec![
+                ok_response("b1", 0.0),
+                MockResponse {
+                    result: Ok(InvokeResult {
+                        session_id: "b2".into(),
+                        assistant_text: "b2".into(),
+                        total_cost_usd: 0.0,
+                        turn_count: 1,
+                    }),
+                    sleep: Some(Duration::from_millis(1500)),
+                },
+            ],
+        );
+        // Reviewer rejects attempt 1, never reached on attempt 2.
+        responses.insert(
+            REVIEWER_ID.into(),
+            vec![rejected_verdict_response("fix me")],
+        );
+        responses.insert(TESTER_ID.into(), vec![ok_verdict_response(0.0)]);
+
+        let mock = Arc::new(SequencedMock::new(responses));
+        let fsm = Arc::new(CoordinatorFsm::new(
+            synthetic_registry(),
+            ArcSequencedMock(Arc::clone(&mock)),
+            Arc::clone(&registry),
+            Duration::from_secs(5),
+        ));
+
+        let job_id = "j-cancel-retry".to_string();
+        let events = capture_events(&app, &job_id);
+        let app_handle = app.handle().clone();
+        let fsm_for_task = Arc::clone(&fsm);
+        let job_id_for_task = job_id.clone();
+        let task = tokio::spawn(async move {
+            fsm_for_task
+                .run_job_with_id(
+                    &app_handle,
+                    job_id_for_task,
+                    "ws-cancel-retry".into(),
+                    "G".into(),
+                )
+                .await
+        });
+
+        // Wait for RetryStarted then for the Build StageStarted of
+        // attempt 2 — at that point attempt-2's Build is awaiting
+        // the slow mock and a cancel signal will be caught by the
+        // tokio::select! in `run_stage_with_cancel`.
+        wait_for_events(&events, Duration::from_secs(3), |evts| {
+            evts.iter().any(|e| e.kind == "retry_started")
+        })
+        .await;
+        // The retry transitions back to Plan; once we've seen a
+        // StageStarted(build) AFTER the retry_started, we know we're
+        // mid-Build of attempt 2.
+        wait_for_events(&events, Duration::from_secs(3), |evts| {
+            // last build StageStarted index must come AFTER the
+            // retry_started index.
+            let retry_idx = evts
+                .iter()
+                .position(|e| e.kind == "retry_started");
+            let build_idx = evts
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| {
+                    e.kind == KIND_STAGE_STARTED
+                        && e.json.get("state").and_then(|v| v.as_str())
+                            == Some("build")
+                })
+                .map(|(i, _)| i)
+                .next_back();
+            matches!((retry_idx, build_idx), (Some(r), Some(b)) if b > r)
+        })
+        .await;
+
+        registry.signal_cancel(&job_id).expect("signal cancel ok");
+        let outcome =
+            task.await.expect("task ok").expect("FSM returns Ok");
+        assert_eq!(outcome.final_state, JobState::Failed);
+        assert_eq!(
+            outcome.last_error.as_deref(),
+            Some(CANCELLED_LAST_ERROR)
+        );
+
+        let captured = events.lock().expect("events poisoned").clone();
+        let cancelled = captured
+            .iter()
+            .find(|e| e.kind == KIND_CANCELLED)
+            .expect("Cancelled event captured");
+        assert_eq!(
+            cancelled
+                .json
+                .get("cancelled_during")
+                .and_then(|v| v.as_str()),
+            Some("build")
+        );
+    }
+
+    /// Mixed rejections: Reviewer rejects on attempt 1; on attempt 2
+    /// Reviewer approves but Tester rejects; on attempt 3 both
+    /// approve. Final Done, retry_count=2.
+    #[tokio::test]
+    async fn mixed_review_then_test_rejection_uses_one_retry_each() {
+        let (app, _pool, _dir) = mock_app_with_pool().await;
+        let registry = Arc::new(JobRegistry::new());
+        let mut responses: HashMap<String, Vec<MockResponse>> = HashMap::new();
+        responses.insert(SCOUT_ID.into(), vec![ok_response("s", 0.0)]);
+        responses.insert(
+            PLANNER_ID.into(),
+            vec![
+                ok_response("p1", 0.0),
+                ok_response("p2", 0.0),
+                ok_response("p3", 0.0),
+            ],
+        );
+        responses.insert(
+            BUILDER_ID.into(),
+            vec![
+                ok_response("b1", 0.0),
+                ok_response("b2", 0.0),
+                ok_response("b3", 0.0),
+            ],
+        );
+        responses.insert(
+            REVIEWER_ID.into(),
+            vec![
+                rejected_verdict_response("rev fail"),
+                ok_verdict_response(0.0),
+                ok_verdict_response(0.0),
+            ],
+        );
+        responses.insert(
+            TESTER_ID.into(),
+            vec![
+                rejected_verdict_response("test fail"),
+                ok_verdict_response(0.0),
+            ],
+        );
+        let mock = Arc::new(SequencedMock::new(responses));
+        let fsm = CoordinatorFsm::new(
+            synthetic_registry(),
+            ArcSequencedMock(Arc::clone(&mock)),
+            Arc::clone(&registry),
+            Duration::from_secs(5),
+        );
+        let job_id = "j-mixed".to_string();
+        let events = capture_events(&app, &job_id);
+        let outcome = fsm
+            .run_job_with_id(
+                app.handle(),
+                job_id.clone(),
+                "ws-mixed".into(),
+                "G".into(),
+            )
+            .await
+            .expect("FSM ok");
+        assert_eq!(outcome.final_state, JobState::Done);
+        let job = registry.get(&job_id).expect("job");
+        assert_eq!(job.retry_count, 2);
+        // 1 scout + attempt 1 (plan/build/review) + attempt 2
+        // (plan/build/review/test) + attempt 3 (plan/build/review/test)
+        // = 1 + 3 + 4 + 4 = 12.
+        assert_eq!(outcome.stages.len(), 12);
+
+        let captured = events.lock().expect("events poisoned").clone();
+        let triggers: Vec<&str> = captured
+            .iter()
+            .filter(|e| e.kind == "retry_started")
+            .filter_map(|e| {
+                e.json.get("triggered_by").and_then(|v| v.as_str())
+            })
+            .collect();
+        assert_eq!(triggers, vec!["review", "test"]);
+    }
+
+    /// `verdict_issues_as_bullets` empty-list sentinel.
+    #[test]
+    fn verdict_issues_as_bullets_handles_empty() {
+        let s = verdict_issues_as_bullets(&[]);
+        assert!(
+            s.contains("Ayrıntılı"),
+            "empty list should fall back to a sentinel: {s}"
+        );
+    }
+
+    /// `verdict_issues_as_bullets` with a mix of file/line shapes.
+    #[test]
+    fn verdict_issues_as_bullets_renders_severity_and_location() {
+        let issues = vec![
+            VerdictIssue {
+                severity: VerdictSeverity::High,
+                file: Some("a.rs".into()),
+                line: Some(10),
+                message: "msg-A".into(),
+            },
+            VerdictIssue {
+                severity: VerdictSeverity::Med,
+                file: Some("b.rs".into()),
+                line: None,
+                message: "msg-B".into(),
+            },
+            VerdictIssue {
+                severity: VerdictSeverity::Low,
+                file: None,
+                line: None,
+                message: "msg-C".into(),
+            },
+        ];
+        let s = verdict_issues_as_bullets(&issues);
+        assert!(s.contains("[high] a.rs:10: msg-A"));
+        assert!(s.contains("[med] b.rs: msg-B"));
+        assert!(s.contains("[low] —: msg-C"));
+    }
+
+    /// `render_retry_plan_prompt` substitutes goal, scout, prev plan,
+    /// gate label, and verdict issues into the template.
+    #[test]
+    fn render_retry_plan_prompt_substitutes_all_fields() {
+        let verdict = Verdict {
+            approved: false,
+            issues: vec![VerdictIssue {
+                severity: VerdictSeverity::High,
+                file: None,
+                line: None,
+                message: "boom".into(),
+            }],
+            summary: "no good".into(),
+        };
+        let p = render_retry_plan_prompt(
+            "GOAL-X",
+            "SCOUT-Y",
+            "PREV-Z",
+            &verdict,
+            JobState::Test,
+        );
+        assert!(p.contains("GOAL-X"));
+        assert!(p.contains("SCOUT-Y"));
+        assert!(p.contains("PREV-Z"));
+        assert!(p.contains("[high] —: boom"));
+        // Test gate renders as "IntegrationTester" (not "test").
+        assert!(p.contains("IntegrationTester"));
+        // Both occurrences of {gate} got substituted.
+        assert!(!p.contains("{gate}"));
     }
 }

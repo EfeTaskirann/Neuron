@@ -51,6 +51,18 @@ export function applySwarmEventToJobDetail(
       // The subsequent `finished` event carries the terminal
       // state (`Failed` with `last_error = "cancelled by user"`).
       return prev;
+    case 'retry_started':
+      // W3-12e: the FSM is looping back to PLAN with the
+      // rejecting verdict's feedback. Keep the cached `state`
+      // and `stages` as-is — the next `stage_started` carries
+      // the upcoming Plan transition. We DO bump `retryCount`
+      // so the optimistic cache reflects the same shape that
+      // `swarm:get_job` would return on the next poll.
+      return {
+        ...prev,
+        retryCount: event.attempt - 1,
+        lastVerdict: event.verdict,
+      };
     default: {
       const _exhaustive: never = event;
       void _exhaustive;

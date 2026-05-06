@@ -826,7 +826,29 @@ export type SwarmJobEvent =
  *  before the job is finalized as `Failed`. The next event on
  *  this channel is always `Finished`.
  */
-{ kind: "cancelled"; job_id: string; cancelled_during: JobState };
+{ kind: "cancelled"; job_id: string; cancelled_during: JobState } | 
+/**
+ *  Fires once per Verdict-rejected retry attempt (W3-12e). The
+ *  FSM emits this event AFTER incrementing `Job.retry_count`
+ *  and BEFORE re-entering the Plan stage of the next attempt.
+ * 
+ *  Field semantics:
+ * 
+ *  - `attempt` is **1-indexed** so the first retry is "attempt 2"
+ *    — the UI renders this as `Attempt {attempt} of {max_retries
+ *    + 1}`.
+ *  - `max_retries` is the budget cap (currently 2); included on
+ *    the wire so the UI doesn't have to import the const.
+ *  - `triggered_by` is the rejecting gate (`Review` or `Test`).
+ *  - `verdict` is the rejecting Verdict — same value the FSM
+ *    stamps onto `Job.last_verdict` before looping back.
+ * 
+ *  No `Cancelled` or `Finished` event fires on the retry
+ *  transition; the job is still running, just looping back.
+ *  Subsequent `StageStarted` / `StageCompleted` events on this
+ *  channel belong to the new attempt.
+ */
+{ kind: "retry_started"; job_id: string; attempt: number; max_retries: number; triggered_by: JobState; verdict: Verdict };
 
 /**
  *  One row of `server_tools`. Materialised by [`crate::mcp::registry`]

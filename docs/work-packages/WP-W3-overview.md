@@ -54,8 +54,8 @@ matching WP file is authored.
 | WP-W3-12b | Coordinator FSM — SQLite persistence + restart recovery | done (`9f8b4de`) | shipped 2026-05-06 | WP-W3-12a | M |
 | WP-W3-14 | Swarm UI route (chat-shape, recent-jobs panel, cancel/rerun) | TBD | not-started | WP-W3-12a/b/c | M |
 | WP-W3-12c | Coordinator FSM — streaming Tauri events + cancel mid-job (backend only; React hook → W3-14) | done (`3cb6be1`) | shipped 2026-05-05 | WP-W3-12a | M |
-| WP-W3-12d | Coordinator FSM — REVIEW + TEST states + Verdict schema + robust JSON parser (NO retry, NO Coordinator brain) | TBD | not-started | WP-W3-12a/b/c | M |
-| WP-W3-12e | Coordinator FSM — retry feedback loop (`MAX_RETRIES=2`, Verdict.rejected → Planner with feedback) | future | not-started | WP-W3-12d | M |
+| WP-W3-12d | Coordinator FSM — REVIEW + TEST states + Verdict schema + robust JSON parser (NO retry, NO Coordinator brain) | done (`ed98cf5`) | shipped 2026-05-06 | WP-W3-12a/b/c | M |
+| WP-W3-12e | Coordinator FSM — retry feedback loop (`MAX_RETRIES=2`, Verdict.rejected → Planner with feedback) | TBD | not-started | WP-W3-12d | M |
 | WP-W3-12f | Coordinator FSM — Coordinator LLM brain (Option B: on-demand routing) | future | not-started | WP-W3-12d | M |
 | WP-W3-14 | Swarm UI route (chat-shape, recent-jobs panel, cancel/rerun) | done (`2ace648`) | shipped 2026-05-06 | WP-W3-12a/b/c | M |
 

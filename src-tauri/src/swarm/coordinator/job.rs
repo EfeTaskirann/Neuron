@@ -179,6 +179,32 @@ pub struct Job {
     pub last_verdict: Option<Verdict>,
 }
 
+impl Job {
+    /// Walk `stages` newest-first looking for the most recent
+    /// Review/Test entry whose `verdict` came back rejected. Used by
+    /// the W3-12e retry loop to label the prior gate ("Reviewer" /
+    /// "IntegrationTester") in the retry-Plan prompt.
+    ///
+    /// Derived rather than stored so the Plan-on-retry path doesn't
+    /// require a new SQL column or a parallel field that can drift
+    /// out of sync with the persisted `stages` rows. `last_verdict`
+    /// alone tells *what* was rejected; this helper tells *which
+    /// gate* did the rejecting.
+    pub fn last_rejecting_gate(&self) -> Option<JobState> {
+        for stage in self.stages.iter().rev() {
+            if !matches!(stage.state, JobState::Review | JobState::Test) {
+                continue;
+            }
+            if let Some(verdict) = &stage.verdict {
+                if verdict.rejected() {
+                    return Some(stage.state);
+                }
+            }
+        }
+        None
+    }
+}
+
 /// Final outcome returned by `swarm:run_job`. Mirrors `Job` minus
 /// the lifecycle bookkeeping fields the IPC caller doesn't need
 /// (no `state` mid-run, no `created_at_ms` since the wall-clock
@@ -802,6 +828,32 @@ pub enum SwarmJobEvent {
         job_id: String,
         cancelled_during: JobState,
     },
+    /// Fires once per Verdict-rejected retry attempt (W3-12e). The
+    /// FSM emits this event AFTER incrementing `Job.retry_count`
+    /// and BEFORE re-entering the Plan stage of the next attempt.
+    ///
+    /// Field semantics:
+    ///
+    /// - `attempt` is **1-indexed** so the first retry is "attempt 2"
+    ///   — the UI renders this as `Attempt {attempt} of {max_retries
+    ///   + 1}`.
+    /// - `max_retries` is the budget cap (currently 2); included on
+    ///   the wire so the UI doesn't have to import the const.
+    /// - `triggered_by` is the rejecting gate (`Review` or `Test`).
+    /// - `verdict` is the rejecting Verdict — same value the FSM
+    ///   stamps onto `Job.last_verdict` before looping back.
+    ///
+    /// No `Cancelled` or `Finished` event fires on the retry
+    /// transition; the job is still running, just looping back.
+    /// Subsequent `StageStarted` / `StageCompleted` events on this
+    /// channel belong to the new attempt.
+    RetryStarted {
+        job_id: String,
+        attempt: u32,
+        max_retries: u32,
+        triggered_by: JobState,
+        verdict: Verdict,
+    },
 }
 
 impl Default for JobRegistry {
@@ -1205,5 +1257,130 @@ mod tests {
         assert!(reg.has_pool(), "with_pool wires the handle");
         let reg2 = JobRegistry::new();
         assert!(!reg2.has_pool(), "new() leaves pool unset");
+    }
+
+    // ---------------------------------------------------------------
+    // WP-W3-12e — last_rejecting_gate derivation
+    // ---------------------------------------------------------------
+
+    fn stage_with_verdict(state: JobState, approved: bool) -> StageResult {
+        StageResult {
+            state,
+            specialist_id: format!("{state:?}").to_lowercase(),
+            assistant_text: "x".into(),
+            session_id: "sess".into(),
+            total_cost_usd: 0.0,
+            duration_ms: 0,
+            verdict: Some(Verdict {
+                approved,
+                issues: Vec::new(),
+                summary: "s".into(),
+            }),
+        }
+    }
+
+    /// Empty stages → no rejecting gate.
+    #[test]
+    fn last_rejecting_gate_empty_stages_returns_none() {
+        let job = fixture_job("j-no-stages");
+        assert!(job.last_rejecting_gate().is_none());
+    }
+
+    /// All-approved chain → no rejecting gate.
+    #[test]
+    fn last_rejecting_gate_all_approved_returns_none() {
+        let mut job = fixture_job("j-all-ok");
+        job.stages.push(stage_with_verdict(JobState::Review, true));
+        job.stages.push(stage_with_verdict(JobState::Test, true));
+        assert!(job.last_rejecting_gate().is_none());
+    }
+
+    /// Reviewer rejected on the most recent attempt → returns Review.
+    #[test]
+    fn last_rejecting_gate_returns_review_when_review_rejected() {
+        let mut job = fixture_job("j-rev");
+        job.stages.push(stage_with_verdict(JobState::Review, false));
+        assert_eq!(job.last_rejecting_gate(), Some(JobState::Review));
+    }
+
+    /// Tester rejected after Reviewer approved → returns Test (the
+    /// most recent rejecting gate, NOT the most recent gate overall).
+    #[test]
+    fn last_rejecting_gate_returns_test_when_test_rejected() {
+        let mut job = fixture_job("j-test");
+        job.stages.push(stage_with_verdict(JobState::Review, true));
+        job.stages.push(stage_with_verdict(JobState::Test, false));
+        assert_eq!(job.last_rejecting_gate(), Some(JobState::Test));
+    }
+
+    /// Stages without verdicts (Scout/Plan/Build) are skipped.
+    #[test]
+    fn last_rejecting_gate_skips_non_verdict_stages() {
+        let mut job = fixture_job("j-mix");
+        // A Scout stage with `verdict=None` must not throw the helper
+        // off; only Review/Test entries with rejected verdicts count.
+        job.stages.push(StageResult {
+            state: JobState::Scout,
+            specialist_id: "scout".into(),
+            assistant_text: "sc".into(),
+            session_id: "s".into(),
+            total_cost_usd: 0.0,
+            duration_ms: 0,
+            verdict: None,
+        });
+        job.stages.push(stage_with_verdict(JobState::Review, false));
+        assert_eq!(job.last_rejecting_gate(), Some(JobState::Review));
+    }
+
+    /// Newest rejection wins — even if an earlier Review rejected,
+    /// the most recent rejecting gate is the one returned. This
+    /// matches the retry loop's intent: label the gate that just
+    /// triggered the upcoming retry, not an older one.
+    #[test]
+    fn last_rejecting_gate_returns_newest_rejection() {
+        let mut job = fixture_job("j-newest");
+        job.stages.push(stage_with_verdict(JobState::Review, false));
+        // Retry round: Reviewer approved this time, Tester rejected.
+        job.stages.push(stage_with_verdict(JobState::Plan, true)); // no verdict shape; helper ignores
+        job.stages.push(stage_with_verdict(JobState::Review, true));
+        job.stages.push(stage_with_verdict(JobState::Test, false));
+        assert_eq!(job.last_rejecting_gate(), Some(JobState::Test));
+    }
+
+    /// `SwarmJobEvent::RetryStarted` serializes to the documented
+    /// snake_case wire shape with all fields present at the top level.
+    #[test]
+    fn swarm_job_event_retry_started_serializes() {
+        let evt = SwarmJobEvent::RetryStarted {
+            job_id: "j-1".into(),
+            attempt: 2,
+            max_retries: 2,
+            triggered_by: JobState::Review,
+            verdict: Verdict {
+                approved: false,
+                issues: Vec::new(),
+                summary: "rejected".into(),
+            },
+        };
+        let json = serde_json::to_value(&evt).expect("serialize");
+        assert_eq!(
+            json.get("kind").and_then(|v| v.as_str()),
+            Some("retry_started")
+        );
+        assert_eq!(json.get("attempt").and_then(|v| v.as_u64()), Some(2));
+        assert_eq!(
+            json.get("max_retries").and_then(|v| v.as_u64()),
+            Some(2)
+        );
+        assert_eq!(
+            json.get("triggered_by").and_then(|v| v.as_str()),
+            Some("review"),
+            "triggered_by uses JobState's snake_case wire shape"
+        );
+        let verdict = json.get("verdict").expect("verdict embedded");
+        assert_eq!(
+            verdict.get("approved").and_then(|v| v.as_bool()),
+            Some(false)
+        );
     }
 }
