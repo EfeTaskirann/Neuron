@@ -4,6 +4,33 @@ Running journal of agent-driven changes. Newest entry on top. See `AGENTS.md` §
 
 ---
 
+## 2026-05-07 WP-W4-02 completed — SwarmAgentRegistry + lazy spawn lifecycle
+
+- dispatch: orchestrator-direct (continued context from W4-01).
+- files changed: 5 in commit `d4b81a0`
+  - new — Rust: `src-tauri/src/swarm/agent_registry.rs` (~660 lines including 14 unit tests + 1 ignored smoke)
+  - modified: `src-tauri/src/swarm/mod.rs` (re-export `SwarmAgentRegistry`, `AgentStatus`, `AgentStatusRow`); `src-tauri/src/commands/swarm.rs` (two new IPCs + 6 IPC validation tests); `src-tauri/src/lib.rs` (build registry in `setup`, `app.manage(...)`, register `RunEvent::ExitRequested` shutdown hook); `app/src/lib/bindings.ts` (regenerated — two new commands + `AgentStatus` + `AgentStatusRow` types)
+- contract: `docs/work-packages/WP-W4-02-swarm-agent-registry.md` (commit `7057858`)
+- commit SHA: `d4b81a0`
+- acceptance: ✅ all gates green
+  - `cargo build --lib` → exit 0
+  - `cargo test --lib` → 416 / 0 / 14 ignored (was 396 / 0 / 13; +14 unit + 6 IPC + 1 ignored smoke = 20 new tests, exceeds the WP's "≥ 12" requirement)
+  - `cargo check --all-targets` → exit 0
+  - `pnpm gen:bindings:check` → exit 0 post-commit
+  - `pnpm typecheck` → exit 0
+  - `pnpm lint` → exit 0
+  - `pnpm test --run` → 49 / 0 (frontend unchanged; W4-02 has no frontend)
+- key implementation choices:
+  - **Concrete over `PersistentSession`**: registry holds `Option<PersistentSession>` directly, not a `Box<dyn AgentSession>`. The trait-abstraction option was considered but rejected for W4-02 because the project deliberately avoids dyn-async patterns (existing `Transport` is generic-over-T). Tests cover the non-spawn paths via the bundled profile registry; the spawn path is exercised by the real-claude smoke. If a third caller appears we'll factor.
+  - **Outer `RwLock<HashMap>` + inner `Arc<Mutex<AgentSlot>>`**: structural changes (insert/remove) take the write lock briefly; reads (lookups, status snapshots) go through the read lock. Per-slot Mutex serialises turns against a single session (W4-01 contract — `PersistentSession` is not `Sync`) without blocking other agents in the same workspace.
+  - **Lazy spawn semantics**: registry never pre-spawns. The first `acquire_and_invoke_turn` for an (agent, workspace) pair takes the cold-start hit; subsequent turns reuse. `list_status` walks the bundled profile registry so untouched agents appear as `NotSpawned` rows — the W4-04 grid header gets a stable 9-row shape on first mount.
+  - **Turn-cap respawn**: hits `turns_taken >= turn_cap` → graceful shutdown of the existing session + fresh spawn before the new turn fires. Inline (no background task) so the caller's wait time matches the cold-start. Default 200 (well past typical context-bloat threshold for any single conversation), tunable via `NEURON_SWARM_AGENT_TURN_CAP`.
+  - **Crashed sessions auto-respawn**: any non-`Cancelled` error from `invoke_turn` flips the slot to `Crashed` and drops the session; the next acquire spawns fresh. Cancel keeps the session alive (W4-01 contract).
+  - **Workspace teardown wiring**: `RunEvent::ExitRequested` in lib.rs calls `agent_registry.shutdown_all().await`. This is the eager-kill side of the lifecycle contract — closing the app no longer leaves 9 orphan claude subprocesses on next launch.
+- next: WP-W4-03 (per-agent event channel `swarm:agent:{id}:event` for live UI streaming) — depends on W4-02. Then W4-04 (3×3 grid UI).
+
+---
+
 ## 2026-05-07 WP-W4-01 completed — PersistentSession transport (multi-turn claude subprocess)
 
 - dispatch: orchestrator-direct (no sub-agent — context still warm from W3 transport work; hand-off overhead higher than direct implementation).
