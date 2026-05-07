@@ -280,6 +280,26 @@ export const commands = {
 	 *  (WP-W3-12b §4). Unknown ids surface as `AppError::NotFound`.
 	 */
 	swarmGetJob: (jobId: string) => typedError<JobDetail, AppErrorWire>(__TAURI_INVOKE("swarm_get_job", { jobId })),
+	/**
+	 *  Read-only snapshot of every agent's status for `workspace_id`.
+	 *  One row per bundled / workspace-override profile (9 rows on a
+	 *  fresh install). The eventual W4-04 grid header drives off this
+	 *  shape.
+	 * 
+	 *  Validation: `workspace_id.trim().is_empty()` → `InvalidInput`.
+	 *  Missing registry state → `Internal` (defensive; `lib.rs::setup`
+	 *  always installs the registry on production runs).
+	 */
+	swarmAgentsListStatus: (workspaceId: string) => typedError<AgentStatusRow[], AppErrorWire>(__TAURI_INVOKE("swarm_agents_list_status", { workspaceId })),
+	/**
+	 *  Eager shutdown of every session for `workspace_id`. Idempotent;
+	 *  calling on an empty workspace returns `Ok(())`. Used by the
+	 *  W4-04 UI's "End swarm" affordance and (eventually) by the
+	 *  app-close lifecycle in `lib.rs`.
+	 * 
+	 *  Validation: `workspace_id.trim().is_empty()` → `InvalidInput`.
+	 */
+	swarmAgentsShutdownWorkspace: (workspaceId: string) => typedError<null, AppErrorWire>(__TAURI_INVOKE("swarm_agents_shutdown_workspace", { workspaceId })),
 };
 
 /* Types */
@@ -313,6 +333,63 @@ export type AgentPatch = {
 	model: string | null,
 	temp: number | null,
 	role: string | null,
+};
+
+/**
+ *  Per-agent status visible to the UI (eventually rendered by W4-04
+ *  grid header pills). Snake_case wire form per Charter.
+ */
+export type AgentStatus = 
+/**
+ *  Default for every (workspace, agent) pair before the first
+ *  lazy-spawn fires. The grid renders these as muted "—" pills.
+ */
+"not_spawned" | 
+/**
+ *  Spawning in flight. Brief — visible only across one
+ *  `acquire` window. Flips to `Idle` once the session is in the
+ *  registry.
+ */
+"spawning" | 
+// Session ready, no turn in flight.
+"idle" | 
+// `invoke_turn` is in flight against this session.
+"running" | 
+/**
+ *  Specialist emitted a `neuron_help` block (W4-05 will set
+ *  this; W4-02 never emits it but the variant is present so
+ *  W4-05 doesn't have to widen the type).
+ */
+"waiting_on_coordinator" | 
+/**
+ *  The session crashed (subprocess died unrecoverably). Will
+ *  be respawned on next `acquire_and_invoke_turn`. Distinct
+ *  from `NotSpawned` so the grid can surface a "this agent had
+ *  trouble" indicator separate from "this agent never ran".
+ */
+"crashed";
+
+/**
+ *  Wire shape for `swarm:agents:list_status`. Trimmed to what the
+ *  UI actually renders; richer per-agent diagnostics can be added
+ *  in a follow-up without breaking this surface.
+ */
+export type AgentStatusRow = {
+	workspaceId: string,
+	agentId: string,
+	status: AgentStatus,
+	/**
+	 *  `0` for un-touched agents — `NotSpawned` rows always have
+	 *  `turns_taken: 0`. After respawn under the turn-cap, this
+	 *  counter resets.
+	 */
+	turnsTaken: number,
+	/**
+	 *  Wall-clock ms since UNIX epoch of the most recent
+	 *  state-changing event (spawn, turn start, turn end, crash).
+	 *  `None` when `status == NotSpawned`.
+	 */
+	lastActivityMs: number | null,
 };
 
 /**

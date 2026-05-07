@@ -115,6 +115,8 @@ pub fn specta_builder_for_export() -> tauri_specta::Builder<tauri::Wry> {
             commands::swarm::swarm_cancel_job::<tauri::Wry>,
             commands::swarm::swarm_list_jobs::<tauri::Wry>,
             commands::swarm::swarm_get_job::<tauri::Wry>,
+            commands::swarm::swarm_agents_list_status::<tauri::Wry>,
+            commands::swarm::swarm_agents_shutdown_workspace::<tauri::Wry>,
         ])
         // Register the AppError once on the builder so the type lands
         // in `bindings.ts` as a referenceable shape rather than being
@@ -224,6 +226,35 @@ pub fn run() {
             }
             app.manage(job_registry);
 
+            // WP-W4-02 — install the workspace-scoped
+            // `SwarmAgentRegistry`. Owns the lifecycle of the W4-01
+            // `PersistentSession`s: lazy-spawn on first acquire,
+            // turn-cap respawn under `NEURON_SWARM_AGENT_TURN_CAP`,
+            // eager kill on app close (handled in the
+            // `RunEvent::ExitRequested` branch below).
+            //
+            // Bundled profiles are loaded once here and shared (Arc)
+            // by the registry. Workspace-override profiles
+            // (`<app_data_dir>/agents/*.md`) re-resolve per IPC call
+            // via `swarm_profiles_list` / `swarm_run_job`; they're
+            // not cached on the registry, so a user editing a
+            // workspace override mid-session will see it on the
+            // *next* registry method call (consistent with the rest
+            // of the swarm namespace).
+            let workspace_agents_dir =
+                app.path().app_data_dir().ok().map(|p| p.join("agents"));
+            let workspace_agents_dir =
+                workspace_agents_dir.filter(|p| p.is_dir());
+            let bundled_profiles = std::sync::Arc::new(
+                crate::swarm::ProfileRegistry::load_from(
+                    workspace_agents_dir.as_deref(),
+                )?,
+            );
+            let agent_registry = std::sync::Arc::new(
+                crate::swarm::SwarmAgentRegistry::new(bundled_profiles),
+            );
+            app.manage(agent_registry);
+
             // WP-W2-06 — install an empty terminal PTY registry. Each
             // `terminal:spawn` adds a pane to it; the shutdown hook
             // below tears them all down on app exit so no shell
@@ -306,6 +337,19 @@ pub fn run() {
                             cloned.shutdown_all(&pool_cloned).await;
                         });
                     }
+                }
+                // WP-W4-02 — kill every persistent agent session
+                // before the runtime exits. Same kill_on_drop seatbelt
+                // as the rest of the supervisors, but explicit
+                // shutdown is cleaner so claude exits via stdin EOF
+                // (graceful) rather than SIGKILL on the way out.
+                if let Some(agent_registry) = app
+                    .try_state::<std::sync::Arc<crate::swarm::SwarmAgentRegistry>>()
+                {
+                    let cloned = agent_registry.inner().clone();
+                    tauri::async_runtime::block_on(async move {
+                        let _ = cloned.shutdown_all().await;
+                    });
                 }
             }
         });

@@ -36,8 +36,8 @@ use crate::swarm::coordinator::{
 };
 use crate::swarm::profile::ProfileSource;
 use crate::swarm::{
-    CoordinatorFsm, InvokeResult, JobOutcome, JobRegistry, ProfileRegistry,
-    SubprocessTransport, Transport,
+    AgentStatusRow, CoordinatorFsm, InvokeResult, JobOutcome, JobRegistry,
+    ProfileRegistry, SubprocessTransport, SwarmAgentRegistry, Transport,
 };
 
 /// Default page size for `swarm:list_jobs`. WP-W3-12b §4.
@@ -584,6 +584,74 @@ pub async fn swarm_get_job<R: Runtime>(
         Some(detail) => Ok(detail),
         None => Err(AppError::NotFound(format!("swarm job {job_id}"))),
     }
+}
+
+// --------------------------------------------------------------------- //
+// W4-02 — SwarmAgentRegistry IPC                                         //
+// --------------------------------------------------------------------- //
+
+/// Read-only snapshot of every agent's status for `workspace_id`.
+/// One row per bundled / workspace-override profile (9 rows on a
+/// fresh install). The eventual W4-04 grid header drives off this
+/// shape.
+///
+/// Validation: `workspace_id.trim().is_empty()` → `InvalidInput`.
+/// Missing registry state → `Internal` (defensive; `lib.rs::setup`
+/// always installs the registry on production runs).
+#[tauri::command(rename_all = "camelCase")]
+#[specta::specta]
+pub async fn swarm_agents_list_status<R: Runtime>(
+    app: AppHandle<R>,
+    workspace_id: String,
+) -> Result<Vec<AgentStatusRow>, AppError> {
+    if workspace_id.trim().is_empty() {
+        return Err(AppError::InvalidInput(
+            "workspaceId must not be empty".into(),
+        ));
+    }
+    let registry = app
+        .try_state::<Arc<SwarmAgentRegistry>>()
+        .ok_or_else(|| {
+            AppError::Internal(
+                "SwarmAgentRegistry missing from app state — \
+                 lib.rs::setup did not call app.manage()"
+                    .into(),
+            )
+        })?
+        .inner()
+        .clone();
+    Ok(registry.list_status(&workspace_id).await)
+}
+
+/// Eager shutdown of every session for `workspace_id`. Idempotent;
+/// calling on an empty workspace returns `Ok(())`. Used by the
+/// W4-04 UI's "End swarm" affordance and (eventually) by the
+/// app-close lifecycle in `lib.rs`.
+///
+/// Validation: `workspace_id.trim().is_empty()` → `InvalidInput`.
+#[tauri::command(rename_all = "camelCase")]
+#[specta::specta]
+pub async fn swarm_agents_shutdown_workspace<R: Runtime>(
+    app: AppHandle<R>,
+    workspace_id: String,
+) -> Result<(), AppError> {
+    if workspace_id.trim().is_empty() {
+        return Err(AppError::InvalidInput(
+            "workspaceId must not be empty".into(),
+        ));
+    }
+    let registry = app
+        .try_state::<Arc<SwarmAgentRegistry>>()
+        .ok_or_else(|| {
+            AppError::Internal(
+                "SwarmAgentRegistry missing from app state — \
+                 lib.rs::setup did not call app.manage()"
+                    .into(),
+            )
+        })?
+        .inner()
+        .clone();
+    registry.shutdown_workspace(&workspace_id).await
 }
 
 /// Resolve `<app_data_dir>/agents`. Returns `None` (no error) when
@@ -1359,5 +1427,125 @@ mod tests {
         // The very first message persisted is the user row.
         assert!(!msgs.is_empty());
         assert_eq!(msgs[0].content, "selam");
+    }
+
+    // ---------------------------------------------------------------- //
+    // WP-W4-02 — swarm:agents:list_status / shutdown_workspace IPC     //
+    // ---------------------------------------------------------------- //
+
+    /// Empty `workspace_id` short-circuits with `InvalidInput` before
+    /// touching the registry.
+    #[tokio::test]
+    async fn swarm_agents_list_status_validates_empty_workspace_id() {
+        let (app, _pool, _dir) = mock_app_with_pool().await;
+        let registry = std::sync::Arc::new(
+            crate::swarm::SwarmAgentRegistry::new(std::sync::Arc::new(
+                ProfileRegistry::load_from(None).expect("load"),
+            )),
+        );
+        app.manage(registry);
+        let err =
+            swarm_agents_list_status(app.handle().clone(), "".into())
+                .await
+                .expect_err("empty rejected");
+        assert_eq!(err.kind(), "invalid_input");
+    }
+
+    /// Whitespace-only `workspace_id` rejected — same gate as the
+    /// other swarm IPCs.
+    #[tokio::test]
+    async fn swarm_agents_list_status_rejects_whitespace_workspace_id() {
+        let (app, _pool, _dir) = mock_app_with_pool().await;
+        let registry = std::sync::Arc::new(
+            crate::swarm::SwarmAgentRegistry::new(std::sync::Arc::new(
+                ProfileRegistry::load_from(None).expect("load"),
+            )),
+        );
+        app.manage(registry);
+        let err =
+            swarm_agents_list_status(app.handle().clone(), "   ".into())
+                .await
+                .expect_err("whitespace rejected");
+        assert_eq!(err.kind(), "invalid_input");
+    }
+
+    /// Missing registry state surfaces `Internal` — defensive path.
+    #[tokio::test]
+    async fn swarm_agents_list_status_without_registry_returns_internal() {
+        let (app, _pool, _dir) = mock_app_with_pool().await;
+        // Intentionally do NOT manage(SwarmAgentRegistry).
+        let err = swarm_agents_list_status(
+            app.handle().clone(),
+            "default".into(),
+        )
+        .await
+        .expect_err("missing registry");
+        assert_eq!(err.kind(), "internal");
+    }
+
+    /// Happy path — fresh registry returns 9 `NotSpawned` rows
+    /// alphabetically. Same shape `swarm:profiles_list` promises.
+    #[tokio::test]
+    async fn swarm_agents_list_status_returns_not_spawned_for_fresh_workspace() {
+        let (app, _pool, _dir) = mock_app_with_pool().await;
+        let registry = std::sync::Arc::new(
+            crate::swarm::SwarmAgentRegistry::new(std::sync::Arc::new(
+                ProfileRegistry::load_from(None).expect("load"),
+            )),
+        );
+        app.manage(registry);
+        let rows = swarm_agents_list_status(
+            app.handle().clone(),
+            "default".into(),
+        )
+        .await
+        .expect("ok");
+        assert_eq!(rows.len(), 9);
+        for r in &rows {
+            assert_eq!(
+                r.status,
+                crate::swarm::AgentStatus::NotSpawned
+            );
+            assert_eq!(r.turns_taken, 0);
+            assert!(r.last_activity_ms.is_none());
+        }
+    }
+
+    /// `shutdown_workspace` empty workspaceId rejected.
+    #[tokio::test]
+    async fn swarm_agents_shutdown_workspace_validates_empty_workspace_id() {
+        let (app, _pool, _dir) = mock_app_with_pool().await;
+        let registry = std::sync::Arc::new(
+            crate::swarm::SwarmAgentRegistry::new(std::sync::Arc::new(
+                ProfileRegistry::load_from(None).expect("load"),
+            )),
+        );
+        app.manage(registry);
+        let err = swarm_agents_shutdown_workspace(
+            app.handle().clone(),
+            "".into(),
+        )
+        .await
+        .expect_err("empty rejected");
+        assert_eq!(err.kind(), "invalid_input");
+    }
+
+    /// `shutdown_workspace` is idempotent — calling on an empty
+    /// workspace returns `Ok(())`.
+    #[tokio::test]
+    async fn swarm_agents_shutdown_workspace_idempotent_on_empty_registry() {
+        let (app, _pool, _dir) = mock_app_with_pool().await;
+        let registry = std::sync::Arc::new(
+            crate::swarm::SwarmAgentRegistry::new(std::sync::Arc::new(
+                ProfileRegistry::load_from(None).expect("load"),
+            )),
+        );
+        app.manage(registry);
+        swarm_agents_shutdown_workspace(
+            app.handle().clone(),
+            "default".into(),
+        )
+        .await
+        .expect("ok");
     }
 }

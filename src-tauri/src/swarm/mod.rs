@@ -26,6 +26,7 @@
 //! retry loop, broadcast / fan-out, multi-pane UI, MCP per-agent
 //! config, profile permission-mode enforcement) belong to W3-12+.
 
+pub mod agent_registry;
 pub mod binding;
 pub mod coordinator;
 pub mod persistent_session;
@@ -42,6 +43,9 @@ pub use binding::{
 pub use coordinator::{
     CoordinatorFsm, Job, JobOutcome, JobRegistry, JobState, StageResult,
     SwarmJobEvent, MAX_RETRIES,
+};
+pub use agent_registry::{
+    AgentStatus, AgentStatusRow, SwarmAgentRegistry,
 };
 pub use persistent_session::PersistentSession;
 pub use profile::{
