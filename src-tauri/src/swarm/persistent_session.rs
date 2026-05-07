@@ -35,6 +35,7 @@ use serde_json::{json, Value};
 use tauri::{AppHandle, Runtime};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::{Mutex, Notify};
 
 use crate::error::AppError;
@@ -46,6 +47,25 @@ use crate::swarm::transport::{
     classify_event, fmt_stderr_tail, write_persona_tmp, InvokeResult,
     RingBuffer, StreamEvent, STDERR_RING_CAPACITY,
 };
+
+/// Streaming event handed off to W4-03's per-agent event channel.
+/// Mirrors `crate::swarm::SwarmAgentEvent` minus the bookend variants
+/// (Spawned / TurnStarted / Result / Idle / Crashed) which the
+/// registry emits on its own. This local-to-the-module enum is the
+/// hot-path payload the read loop sends; the registry forwarder
+/// re-wraps each one into a `SwarmAgentEvent` before emitting on the
+/// Tauri channel.
+///
+/// Why a separate enum instead of `SwarmAgentEvent` directly:
+/// `persistent_session.rs` deliberately doesn't depend on
+/// `agent_registry.rs` (the dep would cycle on the registry's use of
+/// `PersistentSession`). Keeping a thin local enum + lifting at the
+/// registry boundary keeps the dep graph acyclic.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TurnStreamEvent {
+    AssistantText { delta: String },
+    ToolUse { name: String, input_summary: String },
+}
 
 /// Best-effort drain budget after a cancel signal: read up to this
 /// many bytes from stdout to preserve framing for the next turn.
@@ -168,11 +188,17 @@ impl PersistentSession {
     /// Send `user_message` as the next turn, await the next `result`
     /// event, return the parsed `InvokeResult`. Child stays alive on
     /// return.
+    ///
+    /// `event_sink` (W4-03): if `Some`, streaming `AssistantText` and
+    /// `ToolUse` events are forwarded to this channel as they arrive.
+    /// `None` preserves the W4-01 silent-mode behavior (orchestrator
+    /// decide IPC, unit tests).
     pub async fn invoke_turn(
         &mut self,
         user_message: &str,
         timeout: Duration,
         cancel: Arc<Notify>,
+        event_sink: Option<UnboundedSender<TurnStreamEvent>>,
     ) -> Result<InvokeResult, AppError> {
         // 1. Frame + write the user message. Stdin is NOT closed —
         //    that would signal "no more turns" to claude.
@@ -206,6 +232,7 @@ impl PersistentSession {
             &mut self.stdout,
             timeout,
             Some(Arc::clone(&cancel)),
+            event_sink.as_ref(),
         )
         .await;
 
@@ -353,6 +380,7 @@ async fn read_until_result(
     reader: &mut BufReader<ChildStdout>,
     timeout: Duration,
     cancel: Option<Arc<Notify>>,
+    event_sink: Option<&UnboundedSender<TurnStreamEvent>>,
 ) -> Result<InvokeResult, AppError> {
     let mut accum = InvokeAccum::default();
     let read_loop = async {
@@ -374,40 +402,63 @@ async fn read_until_result(
                             continue;
                         }
                     };
-                    match classify_event(&value) {
-                        StreamEvent::SystemInit { session_id } => {
-                            accum.session_id = Some(session_id);
-                        }
-                        StreamEvent::AssistantDelta { text } => {
-                            accum.assistant_text.push_str(&text);
-                        }
-                        StreamEvent::ResultSuccess {
-                            assistant_text,
-                            total_cost_usd,
-                            turn_count,
-                        } => {
-                            return Ok(InvokeResult {
-                                session_id: accum
-                                    .session_id
-                                    .clone()
-                                    .unwrap_or_default(),
-                                assistant_text: if !assistant_text
-                                    .is_empty()
-                                {
-                                    assistant_text
-                                } else {
-                                    accum.assistant_text.clone()
-                                },
+                    for ev in classify_event(&value) {
+                        match ev {
+                            StreamEvent::SystemInit { session_id } => {
+                                accum.session_id = Some(session_id);
+                            }
+                            StreamEvent::AssistantDelta { text } => {
+                                accum.assistant_text.push_str(&text);
+                                if let Some(tx) = event_sink {
+                                    let _ = tx.send(
+                                        TurnStreamEvent::AssistantText {
+                                            delta: text.clone(),
+                                        },
+                                    );
+                                }
+                            }
+                            StreamEvent::ToolUse {
+                                name,
+                                input_summary,
+                            } => {
+                                if let Some(tx) = event_sink {
+                                    let _ = tx.send(
+                                        TurnStreamEvent::ToolUse {
+                                            name: name.clone(),
+                                            input_summary:
+                                                input_summary.clone(),
+                                        },
+                                    );
+                                }
+                            }
+                            StreamEvent::ResultSuccess {
+                                assistant_text,
                                 total_cost_usd,
                                 turn_count,
-                            });
+                            } => {
+                                return Ok(InvokeResult {
+                                    session_id: accum
+                                        .session_id
+                                        .clone()
+                                        .unwrap_or_default(),
+                                    assistant_text: if !assistant_text
+                                        .is_empty()
+                                    {
+                                        assistant_text
+                                    } else {
+                                        accum.assistant_text.clone()
+                                    },
+                                    total_cost_usd,
+                                    turn_count,
+                                });
+                            }
+                            StreamEvent::ResultError { reason } => {
+                                return Err(AppError::SwarmInvoke(format!(
+                                    "swarm invoke error: {reason}"
+                                )));
+                            }
+                            StreamEvent::Other => {}
                         }
-                        StreamEvent::ResultError { reason } => {
-                            return Err(AppError::SwarmInvoke(format!(
-                                "swarm invoke error: {reason}"
-                            )));
-                        }
-                        StreamEvent::Other => {}
                     }
                 }
                 Ok(None) => {
@@ -589,40 +640,50 @@ mod tests {
                             Ok(v) => v,
                             Err(_) => continue,
                         };
-                        match classify_event(&v) {
-                            StreamEvent::SystemInit { session_id } => {
-                                accum.session_id = Some(session_id);
-                            }
-                            StreamEvent::AssistantDelta { text } => {
-                                accum.assistant_text.push_str(&text);
-                            }
-                            StreamEvent::ResultSuccess {
-                                assistant_text,
-                                total_cost_usd,
-                                turn_count,
-                            } => {
-                                return Ok(InvokeResult {
-                                    session_id: accum
-                                        .session_id
-                                        .clone()
-                                        .unwrap_or_default(),
-                                    assistant_text: if !assistant_text
-                                        .is_empty()
-                                    {
-                                        assistant_text
-                                    } else {
-                                        accum.assistant_text.clone()
-                                    },
+                        for ev in classify_event(&v) {
+                            match ev {
+                                StreamEvent::SystemInit { session_id } => {
+                                    accum.session_id = Some(session_id);
+                                }
+                                StreamEvent::AssistantDelta { text } => {
+                                    accum.assistant_text.push_str(&text);
+                                }
+                                StreamEvent::ToolUse { .. } => {
+                                    // Test helper doesn't surface
+                                    // ToolUse events — see the
+                                    // dedicated event-sink test for
+                                    // that path.
+                                }
+                                StreamEvent::ResultSuccess {
+                                    assistant_text,
                                     total_cost_usd,
                                     turn_count,
-                                });
+                                } => {
+                                    return Ok(InvokeResult {
+                                        session_id: accum
+                                            .session_id
+                                            .clone()
+                                            .unwrap_or_default(),
+                                        assistant_text: if !assistant_text
+                                            .is_empty()
+                                        {
+                                            assistant_text
+                                        } else {
+                                            accum.assistant_text.clone()
+                                        },
+                                        total_cost_usd,
+                                        turn_count,
+                                    });
+                                }
+                                StreamEvent::ResultError { reason } => {
+                                    return Err(AppError::SwarmInvoke(
+                                        format!(
+                                            "swarm invoke error: {reason}"
+                                        ),
+                                    ));
+                                }
+                                StreamEvent::Other => {}
                             }
-                            StreamEvent::ResultError { reason } => {
-                                return Err(AppError::SwarmInvoke(
-                                    format!("swarm invoke error: {reason}"),
-                                ));
-                            }
-                            StreamEvent::Other => {}
                         }
                     }
                     Ok(None) => {
@@ -890,6 +951,7 @@ mod tests {
                 "Reply with exactly the single word `ALPHA` and nothing else.",
                 Duration::from_secs(stage_secs),
                 Arc::clone(&cancel),
+                None,
             )
             .await
             .expect("turn 1 ok");
@@ -906,6 +968,7 @@ mod tests {
                 "What was the single word you just replied with? Answer in one word.",
                 Duration::from_secs(stage_secs),
                 cancel,
+                None,
             )
             .await
             .expect("turn 2 ok");

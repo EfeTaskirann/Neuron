@@ -45,7 +45,8 @@ pub use coordinator::{
     SwarmJobEvent, MAX_RETRIES,
 };
 pub use agent_registry::{
-    AgentStatus, AgentStatusRow, SwarmAgentRegistry,
+    agent_event_channel, AgentStatus, AgentStatusRow,
+    SwarmAgentEvent, SwarmAgentRegistry,
 };
 pub use persistent_session::PersistentSession;
 pub use profile::{

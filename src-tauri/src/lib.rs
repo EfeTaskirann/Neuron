@@ -129,6 +129,12 @@ pub fn specta_builder_for_export() -> tauri_specta::Builder<tauri::Wry> {
         // so frontend listeners can deserialize the payload with
         // strict types instead of `unknown`.
         .typ::<crate::swarm::coordinator::SwarmJobEvent>()
+        // WP-W4-03 — `SwarmAgentEvent` is the payload of the
+        // per-agent event channel `swarm:agent:{ws}:{id}:event`. Same
+        // explicit registration story as `SwarmJobEvent` since
+        // events are a side channel; the W4-04 grid panes
+        // deserialise this payload via the bindings.ts type.
+        .typ::<crate::swarm::SwarmAgentEvent>()
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]

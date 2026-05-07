@@ -26,11 +26,12 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use specta::Type;
-use tauri::{AppHandle, Runtime};
+use tauri::{AppHandle, Emitter, Runtime};
+use tokio::sync::mpsc;
 use tokio::sync::{Mutex, Notify, RwLock};
 
 use crate::error::AppError;
-use crate::swarm::persistent_session::PersistentSession;
+use crate::swarm::persistent_session::{PersistentSession, TurnStreamEvent};
 use crate::swarm::profile::ProfileRegistry;
 use crate::swarm::transport::InvokeResult;
 use crate::time::now_millis;
@@ -73,6 +74,64 @@ pub enum AgentStatus {
     /// from `NotSpawned` so the grid can surface a "this agent had
     /// trouble" indicator separate from "this agent never ran".
     Crashed,
+}
+
+/// W4-03 — payload of the per-(workspace, agent) event channel
+/// `swarm:agent:{workspace_id}:{agent_id}:event`. The W4-04 grid
+/// pane subscribes to one such channel per agent and renders a live
+/// transcript as events arrive.
+///
+/// Variants split into two groups:
+/// - **Bookend** (Spawned / TurnStarted / Result / Idle / Crashed):
+///   emitted by the registry around `invoke_turn` calls. Drive
+///   the pane status pill + cost-so-far counter.
+/// - **Streaming** (AssistantText / ToolUse / HelpRequest): emitted
+///   from inside `invoke_turn` via the `TurnStreamEvent` mpsc.
+///   Drive the live transcript renderer. `HelpRequest` is reserved
+///   here for W4-05 — the registry doesn't emit it in W4-03.
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SwarmAgentEvent {
+    /// `PersistentSession::spawn` succeeded; the registry slot just
+    /// flipped from `NotSpawned` → `Idle`. Carries the profile id
+    /// so the pane can render the persona name without a separate
+    /// IPC.
+    Spawned { profile_id: String },
+    /// `acquire_and_invoke_turn` is about to write a user message.
+    /// `turn_index` mirrors the registry's `turns_taken` BEFORE the
+    /// new turn (first turn is `turn_index: 0`).
+    TurnStarted { turn_index: u32 },
+    /// Streaming text delta from claude. May fire many times per
+    /// turn; the W4-04 pane appends to a per-turn buffer.
+    AssistantText { delta: String },
+    /// Claude is using a tool. `name` is the tool name (Read, Edit,
+    /// Glob, etc.); `input_summary` is a one-line truncation of the
+    /// tool input (capped via `TOOL_USE_INPUT_SUMMARY_CAP` in
+    /// `transport.rs`). The W4-04 pane shows "Scout is reading
+    /// SwarmJobList.tsx" badges.
+    ToolUse { name: String, input_summary: String },
+    /// Turn finished cleanly. Final assistant text + accounting.
+    Result {
+        assistant_text: String,
+        total_cost_usd: f64,
+        turn_count: u32,
+    },
+    /// Reserved for W4-05 — specialist emitted a `neuron_help`
+    /// JSON block. W4-03 never emits this; W4-05 wires the parser.
+    HelpRequest { reason: String, question: String },
+    /// Turn ended (success or cancel — not crash); slot is back to
+    /// `Idle`.
+    Idle,
+    /// Session crashed unrecoverably. Slot is `Crashed`; next
+    /// `acquire` will respawn.
+    Crashed { error: String },
+}
+
+/// Build the per-(workspace, agent) event channel name. Centralised
+/// so the frontend hook + the backend emit + tests all agree on the
+/// exact shape.
+pub fn agent_event_channel(workspace_id: &str, agent_id: &str) -> String {
+    format!("swarm:agent:{workspace_id}:{agent_id}:event")
 }
 
 /// Wire shape for `swarm:agents:list_status`. Trimmed to what the
@@ -207,6 +266,8 @@ impl SwarmAgentRegistry {
         //    Other agents in the same workspace can run in parallel.
         let mut slot = slot_arc.lock().await;
 
+        let channel = agent_event_channel(workspace_id, agent_id);
+
         // 3. Lazy spawn if needed. Also: turn-cap respawn — if the
         //    existing session has accumulated `turn_cap` turns, kill
         //    it and replace with a fresh one before this turn fires.
@@ -243,12 +304,51 @@ impl SwarmAgentRegistry {
                 })?;
             slot.session = Some(session);
             slot.turns_taken = 0;
+            // Emit Spawned now that the session is alive in the slot.
+            // Drop errors silently — emit failures shouldn't break
+            // the registry hot path.
+            let _ = app.emit(
+                &channel,
+                SwarmAgentEvent::Spawned {
+                    profile_id: profile.id.clone(),
+                },
+            );
         }
 
         // 4. Run the turn. Status flips to Running for the duration,
         //    then to Idle on success / Crashed on hard error.
         slot.status = AgentStatus::Running;
         slot.last_activity_ms = Some(now_millis());
+        let _ = app.emit(
+            &channel,
+            SwarmAgentEvent::TurnStarted {
+                turn_index: slot.turns_taken,
+            },
+        );
+
+        // Set up the streaming-event mpsc. The forwarder task
+        // lifts each TurnStreamEvent into a SwarmAgentEvent and
+        // emits it on the per-agent channel. The task exits when
+        // the sender drops (after invoke_turn returns).
+        let (tx, mut rx) = mpsc::unbounded_channel::<TurnStreamEvent>();
+        let app_for_forward = app.clone();
+        let channel_for_forward = channel.clone();
+        let forwarder = tokio::spawn(async move {
+            while let Some(ev) = rx.recv().await {
+                let payload = match ev {
+                    TurnStreamEvent::AssistantText { delta } => {
+                        SwarmAgentEvent::AssistantText { delta }
+                    }
+                    TurnStreamEvent::ToolUse { name, input_summary } => {
+                        SwarmAgentEvent::ToolUse {
+                            name,
+                            input_summary,
+                        }
+                    }
+                };
+                let _ = app_for_forward.emit(&channel_for_forward, payload);
+            }
+        });
 
         let session = slot.session.as_mut().ok_or_else(|| {
             // Should never fire — we just spawned above.
@@ -257,32 +357,54 @@ impl SwarmAgentRegistry {
             )
         })?;
         let outcome = session
-            .invoke_turn(user_message, timeout, cancel)
+            .invoke_turn(user_message, timeout, cancel, Some(tx))
             .await;
         slot.turns_taken = session.turns_taken();
         slot.last_activity_ms = Some(now_millis());
 
+        // Forwarder exits when the sender drops at end of scope; we
+        // don't need to await it explicitly, but joining bounds the
+        // event ordering so a late delta doesn't fire after Result.
+        // Best-effort — a forwarder panic shouldn't reach here, but
+        // ignore any join error.
+        let _ = forwarder.await;
+
         match outcome {
             Ok(result) => {
                 slot.status = AgentStatus::Idle;
+                let _ = app.emit(
+                    &channel,
+                    SwarmAgentEvent::Result {
+                        assistant_text: result.assistant_text.clone(),
+                        total_cost_usd: result.total_cost_usd,
+                        turn_count: result.turn_count,
+                    },
+                );
+                let _ = app.emit(&channel, SwarmAgentEvent::Idle);
                 Ok(result)
             }
             Err(AppError::Cancelled(msg)) => {
                 // Cancel keeps the session alive — flip back to
                 // Idle so the next acquire reuses it.
                 slot.status = AgentStatus::Idle;
+                let _ = app.emit(&channel, SwarmAgentEvent::Idle);
                 Err(AppError::Cancelled(msg))
             }
             Err(other) => {
                 // SwarmInvoke / Timeout / etc. → mark crashed,
                 // drop the session so the next acquire respawns.
                 slot.status = AgentStatus::Crashed;
+                let error_msg = other.message().to_string();
                 if let Some(dead) = slot.session.take() {
                     // Best-effort shutdown so the child doesn't
                     // linger as an orphan if its stdin/out pipes
                     // are still drainable.
                     let _ = dead.shutdown().await;
                 }
+                let _ = app.emit(
+                    &channel,
+                    SwarmAgentEvent::Crashed { error: error_msg },
+                );
                 Err(other)
             }
         }

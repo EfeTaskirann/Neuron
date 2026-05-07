@@ -1079,6 +1079,66 @@ export type StageResult = {
 };
 
 /**
+ *  W4-03 — payload of the per-(workspace, agent) event channel
+ *  `swarm:agent:{workspace_id}:{agent_id}:event`. The W4-04 grid
+ *  pane subscribes to one such channel per agent and renders a live
+ *  transcript as events arrive.
+ * 
+ *  Variants split into two groups:
+ *  - **Bookend** (Spawned / TurnStarted / Result / Idle / Crashed):
+ *    emitted by the registry around `invoke_turn` calls. Drive
+ *    the pane status pill + cost-so-far counter.
+ *  - **Streaming** (AssistantText / ToolUse / HelpRequest): emitted
+ *    from inside `invoke_turn` via the `TurnStreamEvent` mpsc.
+ *    Drive the live transcript renderer. `HelpRequest` is reserved
+ *    here for W4-05 — the registry doesn't emit it in W4-03.
+ */
+export type SwarmAgentEvent = 
+/**
+ *  `PersistentSession::spawn` succeeded; the registry slot just
+ *  flipped from `NotSpawned` → `Idle`. Carries the profile id
+ *  so the pane can render the persona name without a separate
+ *  IPC.
+ */
+{ kind: "spawned"; profile_id: string } | 
+/**
+ *  `acquire_and_invoke_turn` is about to write a user message.
+ *  `turn_index` mirrors the registry's `turns_taken` BEFORE the
+ *  new turn (first turn is `turn_index: 0`).
+ */
+{ kind: "turn_started"; turn_index: number } | 
+/**
+ *  Streaming text delta from claude. May fire many times per
+ *  turn; the W4-04 pane appends to a per-turn buffer.
+ */
+{ kind: "assistant_text"; delta: string } | 
+/**
+ *  Claude is using a tool. `name` is the tool name (Read, Edit,
+ *  Glob, etc.); `input_summary` is a one-line truncation of the
+ *  tool input (capped via `TOOL_USE_INPUT_SUMMARY_CAP` in
+ *  `transport.rs`). The W4-04 pane shows "Scout is reading
+ *  SwarmJobList.tsx" badges.
+ */
+{ kind: "tool_use"; name: string; input_summary: string } | 
+// Turn finished cleanly. Final assistant text + accounting.
+{ kind: "result"; assistant_text: string; total_cost_usd: number; turn_count: number } | 
+/**
+ *  Reserved for W4-05 — specialist emitted a `neuron_help`
+ *  JSON block. W4-03 never emits this; W4-05 wires the parser.
+ */
+{ kind: "help_request"; reason: string; question: string } | 
+/**
+ *  Turn ended (success or cancel — not crash); slot is back to
+ *  `Idle`.
+ */
+{ kind: "idle" } | 
+/**
+ *  Session crashed unrecoverably. Slot is `Crashed`; next
+ *  `acquire` will respawn.
+ */
+{ kind: "crashed"; error: string };
+
+/**
  *  Per-job lifecycle event streamed to `swarm:job:{job_id}:event`.
  * 
  *  One event name carries every transition in the FSM via a

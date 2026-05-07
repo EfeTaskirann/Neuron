@@ -59,6 +59,11 @@ pub(crate) const STDERR_RING_CAPACITY: usize = 64 * 1024;
 ///
 /// Public-within-crate so `tests` and future state-machine consumers
 /// can drive the parser independently of the spawn side.
+///
+/// As of W4-03, a single `assistant` line can produce multiple events
+/// (one `AssistantDelta` per text block PLUS one `ToolUse` per
+/// tool_use block) — `classify_event` returns `Vec<StreamEvent>`
+/// instead of a scalar.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum StreamEvent {
     /// `system.init` — carries the subprocess session id.
@@ -68,6 +73,15 @@ pub(crate) enum StreamEvent {
     /// `assistant` — one text delta to append to the running buffer.
     AssistantDelta {
         text: String,
+    },
+    /// W4-03 — `assistant` content carries a `tool_use` block.
+    /// Surfaced as a separate event so the live-feed UI can render
+    /// "Scout is reading X" while the model continues streaming text.
+    ToolUse {
+        name: String,
+        /// One-line truncation of the tool input (capped ~120 chars).
+        /// Full input lives in the eventual `ResultSuccess`.
+        input_summary: String,
     },
     /// `result.success` — final answer + accounting; reader stops.
     ResultSuccess {
@@ -80,8 +94,14 @@ pub(crate) enum StreamEvent {
     ResultError {
         reason: String,
     },
-    /// Recognised but uninteresting (`tool_use`, `ping`, etc.) — the
-    /// caller silently keeps reading.
+    /// Recognised but uninteresting (`ping`, `system.compact_boundary`,
+    /// etc.) — the caller silently keeps reading. Unused as of W4-03
+    /// (uninteresting events now land as an empty `Vec<StreamEvent>`
+    /// from `classify_event`); the variant is retained for forward
+    /// compatibility — a future event type that we want to log but
+    /// not act on can be classified as `Other` rather than threading
+    /// a separate enum through.
+    #[allow(dead_code)]
     Other,
 }
 
@@ -287,28 +307,40 @@ impl Transport for SubprocessTransport {
                                     continue;
                                 }
                             };
-                        match classify_event(&value) {
-                            StreamEvent::SystemInit { session_id } => {
-                                accum.session_id = Some(session_id);
+                        // W4-03: classify_event now returns Vec.
+                        // For one-shot transport we don't surface
+                        // ToolUse events (no event sink at this
+                        // layer); they're silently consumed. The
+                        // streaming side (PersistentSession + W4-03
+                        // event channel) is where ToolUse matters.
+                        for ev in classify_event(&value) {
+                            match ev {
+                                StreamEvent::SystemInit { session_id } => {
+                                    accum.session_id = Some(session_id);
+                                }
+                                StreamEvent::AssistantDelta { text } => {
+                                    accum.assistant_text.push_str(&text);
+                                }
+                                StreamEvent::ToolUse { .. } => {
+                                    // One-shot path: no event sink,
+                                    // tool_use is informational only.
+                                }
+                                StreamEvent::ResultSuccess {
+                                    assistant_text,
+                                    total_cost_usd,
+                                    turn_count,
+                                } => {
+                                    accum.final_text = Some(assistant_text);
+                                    accum.total_cost_usd = total_cost_usd;
+                                    accum.turn_count = turn_count;
+                                    accum.completed = true;
+                                    return Ok::<(), AppError>(());
+                                }
+                                StreamEvent::ResultError { reason } => {
+                                    return Err(AppError::SwarmInvoke(reason));
+                                }
+                                StreamEvent::Other => {}
                             }
-                            StreamEvent::AssistantDelta { text } => {
-                                accum.assistant_text.push_str(&text);
-                            }
-                            StreamEvent::ResultSuccess {
-                                assistant_text,
-                                total_cost_usd,
-                                turn_count,
-                            } => {
-                                accum.final_text = Some(assistant_text);
-                                accum.total_cost_usd = total_cost_usd;
-                                accum.turn_count = turn_count;
-                                accum.completed = true;
-                                return Ok::<(), AppError>(());
-                            }
-                            StreamEvent::ResultError { reason } => {
-                                return Err(AppError::SwarmInvoke(reason));
-                            }
-                            StreamEvent::Other => {}
                         }
                     }
                     Ok(None) => {
@@ -407,10 +439,28 @@ struct InvokeAccum {
     completed: bool,
 }
 
+/// Cap on the per-tool-use `input_summary` string fed into the
+/// `StreamEvent::ToolUse` event. Long tool inputs (e.g. a giant
+/// `Read` of a multi-MiB file path string) would otherwise spam the
+/// live-feed UI; ~120 chars is enough for "path: ..." or
+/// "pattern: ..., glob: ..." style summaries.
+pub(crate) const TOOL_USE_INPUT_SUMMARY_CAP: usize = 120;
+
 /// Classify one parsed JSON event from the `claude` stream-json
-/// output. Pulled out as a synchronous helper so unit tests can drive
-/// the line parser without spawning a real subprocess (WP §7).
-pub(crate) fn classify_event(value: &Value) -> StreamEvent {
+/// output into 0 or more `StreamEvent`s. Pulled out as a synchronous
+/// helper so unit tests can drive the line parser without spawning a
+/// real subprocess.
+///
+/// Returns:
+/// - `vec![]` for ignored / forward-compat events (returned as
+///   `Other` semantics — empty vec is the new "skip this line").
+/// - 1 event for `system.init` / `result.*`.
+/// - N events for `assistant` lines: one `AssistantDelta` if the
+///   content has any text blocks (concatenated) PLUS one `ToolUse`
+///   per tool_use block. Order matches the order they appear in the
+///   `content` array, with text concatenated up-front, so the
+///   caller can apply them in stream order.
+pub(crate) fn classify_event(value: &Value) -> Vec<StreamEvent> {
     let event_type = value.get("type").and_then(Value::as_str).unwrap_or("");
     match event_type {
         "system" => {
@@ -422,94 +472,151 @@ pub(crate) fn classify_event(value: &Value) -> StreamEvent {
                 if let Some(id) =
                     value.get("session_id").and_then(Value::as_str)
                 {
-                    return StreamEvent::SystemInit {
+                    return vec![StreamEvent::SystemInit {
                         session_id: id.to_string(),
-                    };
+                    }];
                 }
             }
-            StreamEvent::Other
+            vec![]
         }
-        "assistant" => {
-            // `message.content` is an array of blocks; we concat any
-            // `text` blocks into a single delta.
-            let text = value
-                .get("message")
-                .and_then(|m| m.get("content"))
-                .and_then(Value::as_array)
-                .map(|blocks| {
-                    let mut buf = String::new();
-                    for block in blocks {
-                        if block
-                            .get("type")
-                            .and_then(Value::as_str)
-                            == Some("text")
-                        {
-                            if let Some(t) = block
-                                .get("text")
-                                .and_then(Value::as_str)
-                            {
-                                buf.push_str(t);
-                            }
-                        }
-                    }
-                    buf
-                })
-                .unwrap_or_default();
-            if text.is_empty() {
-                StreamEvent::Other
-            } else {
-                StreamEvent::AssistantDelta { text }
-            }
-        }
-        "result" => {
-            let subtype = value
-                .get("subtype")
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            match subtype {
-                "success" => {
-                    let assistant_text = value
-                        .get("result")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string();
-                    let total_cost_usd = value
-                        .get("total_cost_usd")
-                        .and_then(Value::as_f64)
-                        .unwrap_or(0.0);
-                    // The CLI is inconsistent here across versions; we
-                    // accept either spelling so the transport survives
-                    // a minor bump.
-                    let turn_count = value
-                        .get("num_turns")
-                        .or_else(|| value.get("turn_count"))
-                        .and_then(Value::as_u64)
-                        .unwrap_or(0)
-                        as u32;
-                    StreamEvent::ResultSuccess {
-                        assistant_text,
-                        total_cost_usd,
-                        turn_count,
-                    }
-                }
-                "error" | "error_max_turns" | "error_during_execution" => {
-                    let reason = value
-                        .get("error")
-                        .and_then(Value::as_str)
-                        .or_else(|| {
-                            value.get("message").and_then(Value::as_str)
-                        })
-                        .unwrap_or("claude reported a result.error event")
-                        .to_string();
-                    StreamEvent::ResultError {
-                        reason: format!("{subtype}: {reason}"),
-                    }
-                }
-                _ => StreamEvent::Other,
-            }
-        }
-        _ => StreamEvent::Other,
+        "assistant" => classify_assistant_blocks(value),
+        "result" => classify_result_event(value),
+        _ => vec![],
     }
+}
+
+/// `assistant` line classifier. Walks `message.content[]`, concatenates
+/// `text` blocks into one `AssistantDelta`, emits one `ToolUse` per
+/// `tool_use` block.
+fn classify_assistant_blocks(value: &Value) -> Vec<StreamEvent> {
+    let blocks = match value
+        .get("message")
+        .and_then(|m| m.get("content"))
+        .and_then(Value::as_array)
+    {
+        Some(arr) => arr,
+        None => return vec![],
+    };
+    let mut events: Vec<StreamEvent> = Vec::new();
+    let mut text_buf = String::new();
+    for block in blocks {
+        let block_type =
+            block.get("type").and_then(Value::as_str).unwrap_or("");
+        match block_type {
+            "text" => {
+                if let Some(t) = block.get("text").and_then(Value::as_str)
+                {
+                    text_buf.push_str(t);
+                }
+            }
+            "tool_use" => {
+                let name = block
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_string();
+                let input_summary = summarize_tool_input(block.get("input"));
+                events.push(StreamEvent::ToolUse {
+                    name,
+                    input_summary,
+                });
+            }
+            _ => {}
+        }
+    }
+    if !text_buf.is_empty() {
+        events.insert(
+            0,
+            StreamEvent::AssistantDelta { text: text_buf },
+        );
+    }
+    events
+}
+
+/// `result` line classifier — unchanged shape vs pre-W4-03; just
+/// pulled out for symmetry with `classify_assistant_blocks`.
+fn classify_result_event(value: &Value) -> Vec<StreamEvent> {
+    let subtype = value
+        .get("subtype")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    match subtype {
+        "success" => {
+            let assistant_text = value
+                .get("result")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let total_cost_usd = value
+                .get("total_cost_usd")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0);
+            // The CLI is inconsistent here across versions; we
+            // accept either spelling so the transport survives a
+            // minor bump.
+            let turn_count = value
+                .get("num_turns")
+                .or_else(|| value.get("turn_count"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                as u32;
+            vec![StreamEvent::ResultSuccess {
+                assistant_text,
+                total_cost_usd,
+                turn_count,
+            }]
+        }
+        "error" | "error_max_turns" | "error_during_execution" => {
+            let reason = value
+                .get("error")
+                .and_then(Value::as_str)
+                .or_else(|| value.get("message").and_then(Value::as_str))
+                .unwrap_or("claude reported a result.error event")
+                .to_string();
+            vec![StreamEvent::ResultError {
+                reason: format!("{subtype}: {reason}"),
+            }]
+        }
+        _ => vec![],
+    }
+}
+
+/// Build a short "k1: v1, k2: v2" summary of a tool-input JSON
+/// object, capped at `TOOL_USE_INPUT_SUMMARY_CAP` chars (with a
+/// trailing "…" when truncated).
+fn summarize_tool_input(input: Option<&Value>) -> String {
+    let input = match input {
+        Some(v) => v,
+        None => return String::new(),
+    };
+    let summary = match input {
+        Value::Object(map) => {
+            let mut parts: Vec<String> = Vec::with_capacity(map.len());
+            for (k, v) in map {
+                let v_str = match v {
+                    Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                parts.push(format!("{k}: {v_str}"));
+            }
+            parts.join(", ")
+        }
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    };
+    truncate_with_ellipsis(&summary, TOOL_USE_INPUT_SUMMARY_CAP)
+}
+
+/// Truncate a string to at most `cap` chars (counted by `chars()`
+/// so we don't slice mid-codepoint), append "…" when truncated.
+fn truncate_with_ellipsis(s: &str, cap: usize) -> String {
+    if s.chars().count() <= cap {
+        return s.to_string();
+    }
+    let mut out: String =
+        s.chars().take(cap.saturating_sub(1)).collect();
+    out.push('…');
+    out
 }
 
 /// Materialise the persona body to disk so `--append-system-prompt-file`
@@ -604,6 +711,7 @@ mod tests {
 
     /// WP §7 — feed the line classifier a stream-json fixture and
     /// confirm it produces the correct sequence of `StreamEvent`s.
+    /// W4-03 extended `classify_event` to return `Vec<StreamEvent>`.
     #[test]
     fn stream_json_line_parser() {
         // 1. system.init
@@ -613,9 +721,9 @@ mod tests {
         .unwrap();
         assert_eq!(
             classify_event(&init),
-            StreamEvent::SystemInit {
+            vec![StreamEvent::SystemInit {
                 session_id: "sess-abc".into()
-            }
+            }]
         );
 
         // 2. assistant text delta (single text block).
@@ -625,21 +733,28 @@ mod tests {
         .unwrap();
         assert_eq!(
             classify_event(&asst1),
-            StreamEvent::AssistantDelta {
+            vec![StreamEvent::AssistantDelta {
                 text: "Hello ".into()
-            }
+            }]
         );
 
-        // 3. assistant text delta (mixed-block — only text counts).
+        // 3. assistant text + tool_use (W4-03 emits BOTH events;
+        //    text first, tool_use after).
         let asst2: Value = serde_json::from_str(
-            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"Read"},{"type":"text","text":"world"}]}}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"Read","input":{"path":"x.rs"}},{"type":"text","text":"world"}]}}"#,
         )
         .unwrap();
         assert_eq!(
             classify_event(&asst2),
-            StreamEvent::AssistantDelta {
-                text: "world".into()
-            }
+            vec![
+                StreamEvent::AssistantDelta {
+                    text: "world".into()
+                },
+                StreamEvent::ToolUse {
+                    name: "Read".into(),
+                    input_summary: "path: x.rs".into(),
+                },
+            ]
         );
 
         // 4. result.success — final answer, cost, turn count.
@@ -647,7 +762,9 @@ mod tests {
             r#"{"type":"result","subtype":"success","result":"Hello world","total_cost_usd":0.0123,"num_turns":2}"#,
         )
         .unwrap();
-        match classify_event(&result) {
+        let events = classify_event(&result);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
             StreamEvent::ResultSuccess {
                 assistant_text,
                 total_cost_usd,
@@ -655,7 +772,7 @@ mod tests {
             } => {
                 assert_eq!(assistant_text, "Hello world");
                 assert!((total_cost_usd - 0.0123).abs() < 1e-9);
-                assert_eq!(turn_count, 2);
+                assert_eq!(*turn_count, 2);
             }
             other => panic!("expected ResultSuccess, got {other:?}"),
         }
@@ -666,7 +783,9 @@ mod tests {
             r#"{"type":"result","subtype":"error","error":"OAuth expired"}"#,
         )
         .unwrap();
-        match classify_event(&err) {
+        let events = classify_event(&err);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
             StreamEvent::ResultError { reason } => {
                 assert!(reason.contains("error"));
                 assert!(reason.contains("OAuth expired"));
@@ -674,11 +793,11 @@ mod tests {
             other => panic!("expected ResultError, got {other:?}"),
         }
 
-        // 6. Forward-compat `Other` — unknown types are silently
-        //    ignored by the loop.
+        // 6. Forward-compat — unknown types produce empty Vec
+        //    (caller skips them).
         let unknown: Value =
             serde_json::from_str(r#"{"type":"ping"}"#).unwrap();
-        assert_eq!(classify_event(&unknown), StreamEvent::Other);
+        assert!(classify_event(&unknown).is_empty());
     }
 
     /// `turn_count` should also pick up the `turn_count` spelling
@@ -689,12 +808,72 @@ mod tests {
             r#"{"type":"result","subtype":"success","result":"ok","total_cost_usd":0,"turn_count":4}"#,
         )
         .unwrap();
-        match classify_event(&v) {
+        let events = classify_event(&v);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
             StreamEvent::ResultSuccess { turn_count, .. } => {
-                assert_eq!(turn_count, 4);
+                assert_eq!(*turn_count, 4);
             }
             other => panic!("expected ResultSuccess, got {other:?}"),
         }
+    }
+
+    /// W4-03 — tool_use block alone (no text) emits a single
+    /// `ToolUse` event.
+    #[test]
+    fn classify_event_parses_tool_use_alone() {
+        let v: Value = serde_json::from_str(
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"Glob","input":{"pattern":"*.rs"}}]}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            classify_event(&v),
+            vec![StreamEvent::ToolUse {
+                name: "Glob".into(),
+                input_summary: "pattern: *.rs".into(),
+            }]
+        );
+    }
+
+    /// W4-03 — long tool input is truncated to ~120 chars with a
+    /// trailing ellipsis so log spam is bounded.
+    #[test]
+    fn classify_event_truncates_long_tool_input() {
+        let huge = "x".repeat(500);
+        let line = format!(
+            r#"{{"type":"assistant","message":{{"role":"assistant","content":[{{"type":"tool_use","name":"Read","input":{{"path":"{huge}"}}}}]}}}}"#
+        );
+        let v: Value = serde_json::from_str(&line).unwrap();
+        let events = classify_event(&v);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            StreamEvent::ToolUse { name, input_summary } => {
+                assert_eq!(name, "Read");
+                assert_eq!(
+                    input_summary.chars().count(),
+                    TOOL_USE_INPUT_SUMMARY_CAP
+                );
+                assert!(input_summary.ends_with('…'));
+            }
+            other => panic!("expected ToolUse, got {other:?}"),
+        }
+    }
+
+    /// W4-03 — tool_use with no `input` field falls back to empty
+    /// summary (no panic).
+    #[test]
+    fn classify_event_tool_use_without_input() {
+        let v: Value = serde_json::from_str(
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"BashSummary"}]}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            classify_event(&v),
+            vec![StreamEvent::ToolUse {
+                name: "BashSummary".into(),
+                input_summary: String::new(),
+            }]
+        );
     }
 
     /// The ring buffer keeps only the most recent `capacity` bytes.
