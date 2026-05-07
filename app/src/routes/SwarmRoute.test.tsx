@@ -13,6 +13,7 @@ vi.mock('../lib/bindings', () => ({
     swarmOrchestratorHistory: vi.fn(),
     swarmOrchestratorClearHistory: vi.fn(),
     swarmOrchestratorLogJob: vi.fn(),
+    swarmAgentsListStatus: vi.fn(),
   },
 }));
 
@@ -130,11 +131,26 @@ beforeEach(async () => {
     status: 'ok',
     data: null,
   });
+  vi.mocked(commands.swarmAgentsListStatus).mockResolvedValue({
+    status: 'ok',
+    data: [],
+  });
 });
+
+/**
+ * W4-04 changed `SwarmRoute`'s default view to the 3×3 grid; the
+ * legacy chat-shaped view (jobs + chat panel + detail) is now
+ * gated behind a "Recent jobs" tab. These existing tests assert
+ * against the legacy view, so they need to switch the tab first.
+ */
+function switchToJobsView(): void {
+  fireEvent.click(screen.getByRole('button', { name: /recent jobs/i }));
+}
 
 describe('SwarmRoute', () => {
   it('renders the empty-state on the right pane until a job is selected', async () => {
     renderRoute();
+    switchToJobsView();
     expect(screen.getByText(/select a job from the left/i)).toBeInTheDocument();
     await waitFor(() =>
       expect(screen.getByText('do the running thing')).toBeInTheDocument(),
@@ -143,6 +159,7 @@ describe('SwarmRoute', () => {
 
   it('renders the OrchestratorChatPanel as the left-pane top section', async () => {
     renderRoute();
+    switchToJobsView();
     expect(
       screen.getByPlaceholderText(/type a message/i),
     ).toBeInTheDocument();
@@ -153,6 +170,7 @@ describe('SwarmRoute', () => {
 
   it('chat dispatch outcome fires swarmRunJob with the refined goal', async () => {
     renderRoute();
+    switchToJobsView();
     const { commands } = await import('../lib/bindings');
     const textarea = screen.getByPlaceholderText(/type a message/i) as HTMLTextAreaElement;
     fireEvent.change(textarea, { target: { value: 'EXECUTE: ship a feature' } });
@@ -172,6 +190,7 @@ describe('SwarmRoute', () => {
 
   it('clicking a job row populates the detail pane and shows Cancel for non-terminal jobs', async () => {
     renderRoute();
+    switchToJobsView();
     await waitFor(() =>
       expect(screen.getByText('do the running thing')).toBeInTheDocument(),
     );
@@ -188,6 +207,7 @@ describe('SwarmRoute', () => {
 
   it('shows Rerun (and hides Cancel) when a Failed job is selected', async () => {
     renderRoute();
+    switchToJobsView();
     await waitFor(() =>
       expect(screen.getByText('this one tipped over')).toBeInTheDocument(),
     );
@@ -200,6 +220,7 @@ describe('SwarmRoute', () => {
 
   it('clicking Cancel on a running job fires swarmCancelJob with the job id', async () => {
     renderRoute();
+    switchToJobsView();
     const { commands } = await import('../lib/bindings');
     await waitFor(() =>
       expect(screen.getByText('do the running thing')).toBeInTheDocument(),

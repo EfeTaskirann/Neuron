@@ -1,13 +1,276 @@
 /* WP-W3-14 — Swarm route. Layout-only additions; pills, buttons
    and pulse-dot styles come from app.css design-system tokens.
-   Two-pane grid mirrors RunsRoute's surrounding `.route` shell
-   so the topbar / sidebar inset stays in lock-step. */
+   W4-04 reshapes the route into a tab-switched layout: a "Live grid"
+   3×3 SwarmAgentGrid (default) and the W3-12k3 "Recent jobs" chat-
+   shaped triple as the alternate view. */
 
 .route-swarm {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 16px 20px 20px;
+  min-height: 0;
+}
+
+/* W4-04 view switcher — sits above the active view. Same `.seg`
+   token vocabulary the SettingsRoute uses for tab-style switchers,
+   bound to a route-local class so the layout doesn't fight other
+   `.seg` instances. */
+.swarm-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.swarm-view-seg button[aria-pressed="true"] {
+  background: var(--accent);
+  color: var(--bg);
+}
+
+/* Recent-jobs view inherits the original two-pane grid. Wrapped in
+   `.swarm-jobs-view` so the toolbar doesn't disturb the chat
+   panel's flex layout. */
+.swarm-jobs-view {
   display: grid;
   grid-template-columns: minmax(280px, 360px) 1fr;
   gap: 16px;
-  padding: 16px 20px 20px;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+/* ---------- W4-04 SwarmAgentGrid + AgentPane ----------
+   3×3 grid filling the route below the toolbar. Each pane is a
+   self-contained card with header / scrollable body / footer.
+   Tokens only — OKLCH per Charter §"Hard constraints" #4. */
+
+.swarm-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  grid-template-rows: repeat(3, 1fr);
+  gap: 12px;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.agent-pane {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+  /* Status-driven left border accent so each pane's mode is
+     legible at a glance. Default: muted border. Status overrides
+     below tint specific states. */
+  border-left: 3px solid oklch(0.45 0 0 / 0.4);
+  transition: border-left-color 200ms ease;
+}
+
+.agent-pane.status-running {
+  border-left-color: oklch(0.7 0.15 220);
+}
+.agent-pane.status-spawning {
+  border-left-color: oklch(0.75 0.12 90);
+}
+.agent-pane.status-idle {
+  border-left-color: oklch(0.55 0.1 150);
+}
+.agent-pane.status-waiting_on_coordinator {
+  border-left-color: oklch(0.7 0.15 60);
+}
+.agent-pane.status-crashed {
+  border-left-color: oklch(0.6 0.18 25);
+}
+
+.agent-pane-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+  background: oklch(from var(--card) calc(l - 0.02) c h);
+}
+
+.agent-pane-name {
+  font-weight: 600;
+  font-size: 13px;
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-pane-turns {
+  font-size: 11px;
+  color: var(--muted);
+  padding: 2px 6px;
+  border-radius: 999px;
+  background: oklch(from var(--card) calc(l - 0.04) c h);
+}
+
+.agent-pill {
+  font-size: 10px;
+  padding: 2px 8px;
+  text-transform: lowercase;
+  letter-spacing: 0.04em;
+}
+
+.agent-pill-not_spawned {
+  background: oklch(from var(--card) calc(l - 0.06) c h);
+  color: var(--muted);
+}
+.agent-pill-spawning {
+  background: oklch(0.75 0.12 90 / 0.18);
+  color: oklch(0.75 0.12 90);
+}
+.agent-pill-idle {
+  background: oklch(0.55 0.1 150 / 0.18);
+  color: oklch(0.6 0.1 150);
+}
+.agent-pill-running {
+  background: oklch(0.7 0.15 220 / 0.18);
+  color: oklch(0.7 0.15 220);
+}
+.agent-pill-waiting_on_coordinator {
+  background: oklch(0.7 0.15 60 / 0.18);
+  color: oklch(0.7 0.15 60);
+}
+.agent-pill-crashed {
+  background: oklch(0.6 0.18 25 / 0.18);
+  color: oklch(0.65 0.18 25);
+}
+
+.agent-pane-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 8px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.agent-pane-empty {
+  font-size: 12px;
+  font-style: italic;
+  padding: 4px 0;
+}
+
+.agent-pane-foot {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  border-top: 1px solid var(--border);
+  background: oklch(from var(--card) calc(l - 0.02) c h);
+  font-size: 11px;
+}
+
+.agent-pane-cost {
+  color: var(--fg);
+}
+.agent-pane-foot-sep {
+  color: var(--muted);
+}
+.agent-pane-activity {
+  color: var(--muted);
+}
+
+/* Event bubbles — distinct per-kind so the eye can scan a
+   transcript and know what's text vs. tool vs. result. */
+
+.agent-event {
+  padding: 4px 6px;
+  border-radius: var(--radius-sm);
+  word-break: break-word;
+}
+
+.agent-event .ev-tag {
+  display: inline-block;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  padding: 1px 5px;
+  border-radius: 3px;
+  margin-right: 6px;
+  background: oklch(from var(--card) calc(l - 0.05) c h);
+  color: var(--muted);
+}
+
+.ev-spawned,
+.ev-turn-started,
+.ev-idle {
+  background: transparent;
+  font-size: 11px;
+}
+
+.ev-assistant-text {
+  background: oklch(from var(--card) calc(l - 0.02) c h);
+  white-space: pre-wrap;
+}
+
+.ev-tool-use {
+  background: oklch(0.7 0.12 280 / 0.12);
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.ev-tool-name {
+  font-weight: 600;
+  color: oklch(0.7 0.12 280);
+}
+
+.ev-tool-input {
+  font-size: 11px;
+}
+
+.ev-result {
+  background: oklch(0.55 0.1 150 / 0.12);
+  border-left: 2px solid oklch(0.55 0.1 150);
+  padding: 6px 8px;
+}
+
+.ev-result .ev-meta {
+  font-size: 11px;
+  margin-left: 6px;
+}
+
+.ev-result-text {
+  margin-top: 4px;
+  white-space: pre-wrap;
+}
+
+.ev-help-request {
+  background: oklch(0.7 0.15 60 / 0.18);
+  border-left: 2px solid oklch(0.7 0.15 60);
+  padding: 6px 8px;
+}
+
+.ev-help-reason {
+  font-style: italic;
+  color: oklch(0.7 0.15 60);
+}
+
+.ev-help-question {
+  margin-top: 4px;
+}
+
+.ev-crashed {
+  background: oklch(0.6 0.18 25 / 0.18);
+  border-left: 2px solid oklch(0.6 0.18 25);
+  padding: 6px 8px;
+}
+
+.ev-error {
+  color: oklch(0.65 0.18 25);
+  font-family: var(--font-mono);
+  font-size: 11px;
 }
 
 .swarm-pane {

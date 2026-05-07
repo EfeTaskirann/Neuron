@@ -1,42 +1,69 @@
 // `SwarmRoute` — top-level orchestrator for the Swarm surface.
-// Two-pane layout (mirrors `RunsRoute`'s page-level structure):
-// left = Orchestrator chat panel + recent-jobs list; right =
-// selected job detail with live FSM state.
 //
-// W3-12k3 swap: the W3-14 SwarmGoalForm is replaced by the
-// chat-shaped OrchestratorChatPanel. Dispatch outcomes auto-
-// chain into `swarm:run_job` and surface the resulting job id
-// as a clickable bubble that drives `selectedJobId` (so the
-// right pane loads the new job's detail).
+// W4-04 swap: the W3-12k3 chat-shaped layout (chat panel + recent
+// jobs + selected job detail) becomes one of TWO views, gated by a
+// tab switcher:
+//   - "Live grid"   — the W4-04 3×3 SwarmAgentGrid (default)
+//   - "Recent jobs" — the W3-12k3 chat panel + jobs triple
 //
 // Workspace is the constant `"default"` per WP-W3-14 §2 — multi-
-// workspace UX is post-W3.
+// workspace UX is post-W4.
 import { useState } from 'react';
 import { OrchestratorChatPanel } from '../components/OrchestratorChatPanel';
 import { SwarmJobList } from '../components/SwarmJobList';
 import { SwarmJobDetail } from '../components/SwarmJobDetail';
+import { SwarmAgentGrid } from '../components/SwarmAgentGrid';
 
 const WORKSPACE_ID = 'default';
 
+type SwarmView = 'grid' | 'jobs';
+
 export function SwarmRoute(): JSX.Element {
+  const [view, setView] = useState<SwarmView>('grid');
   const [selectedJobId, setSelectedJobId] = useState<string | null>(null);
   return (
     <div className="route route-swarm">
-      <div className="swarm-pane swarm-pane-left">
-        <OrchestratorChatPanel
-          workspaceId={WORKSPACE_ID}
-          onSelectJob={setSelectedJobId}
-        />
-        <div className="swarm-list-title">Recent jobs</div>
-        <SwarmJobList
-          workspaceId={WORKSPACE_ID}
-          selectedJobId={selectedJobId}
-          onSelect={setSelectedJobId}
-        />
+      <div className="swarm-toolbar">
+        <div className="seg swarm-view-seg">
+          <button
+            type="button"
+            className={view === 'grid' ? 'active' : ''}
+            onClick={() => setView('grid')}
+            aria-pressed={view === 'grid'}
+          >
+            Live grid
+          </button>
+          <button
+            type="button"
+            className={view === 'jobs' ? 'active' : ''}
+            onClick={() => setView('jobs')}
+            aria-pressed={view === 'jobs'}
+          >
+            Recent jobs
+          </button>
+        </div>
       </div>
-      <div className="swarm-pane swarm-pane-right">
-        <SwarmJobDetail jobId={selectedJobId} workspaceId={WORKSPACE_ID} />
-      </div>
+      {view === 'grid' ? (
+        <SwarmAgentGrid workspaceId={WORKSPACE_ID} />
+      ) : (
+        <div className="swarm-jobs-view">
+          <div className="swarm-pane swarm-pane-left">
+            <OrchestratorChatPanel
+              workspaceId={WORKSPACE_ID}
+              onSelectJob={setSelectedJobId}
+            />
+            <div className="swarm-list-title">Recent jobs</div>
+            <SwarmJobList
+              workspaceId={WORKSPACE_ID}
+              selectedJobId={selectedJobId}
+              onSelect={setSelectedJobId}
+            />
+          </div>
+          <div className="swarm-pane swarm-pane-right">
+            <SwarmJobDetail jobId={selectedJobId} workspaceId={WORKSPACE_ID} />
+          </div>
+        </div>
+      )}
     </div>
   );
 }
