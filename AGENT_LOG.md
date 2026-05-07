@@ -4,6 +4,16 @@ Running journal of agent-driven changes. Newest entry on top. See `AGENTS.md` §
 
 ---
 
+## 2026-05-07 WP-W4-overview authored — persistent visible swarm planning lands
+
+- trigger: owner directive 2026-05-07 — "her ajan birer terminalde tek başına çalışsın, birbirleriyle iletişim de kurabilsin". Followed by four pinned architectural decisions: 1B persistent sessions / 2 3×3 grid / 3C Coordinator hub / 4A FSM stays.
+- file: `docs/work-packages/WP-W4-overview.md` (new)
+- contents: scope source, status table, dependency graph, per-WP rationale (W4-01 PersistentSession transport / W4-02 workspace-scoped registry + lazy spawn / W4-03 per-agent event channel / W4-04 AgentPane + 3×3 grid / W4-05 Coordinator hub + neuron_help contract / W4-06 FSM persistent-transport adapter / W4-07 mailbox swarm tab), out-of-scope, owner decisions resolved, relationship to W3 backlog (orthogonal — W3 backlog not blocked).
+- shape parity: follows the WP-W3-overview format verbatim — owner this is a planning doc, not a contract.
+- next: WP-W4-01 (PersistentSession transport) authoring + sub-agent dispatch.
+
+---
+
 ## 2026-05-07 smoke-test pass — orchestrator chat duplication fix + Scout max_turns bump
 
 - trigger: user requested manual smoke test of all features ("smoke test yap. Manuel olarak tüm özelliklerin çalışıp çalışmadığını kontrol et çalışmayan özellikleri başka özellikleri bozmayacak şekilde düzelt").
