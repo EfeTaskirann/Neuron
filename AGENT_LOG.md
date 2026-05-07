@@ -4,6 +4,19 @@ Running journal of agent-driven changes. Newest entry on top. See `AGENTS.md` §
 
 ---
 
+## 2026-05-07 smoke-test pass — orchestrator chat duplication fix
+
+- trigger: user requested manual smoke test of all features ("smoke test yap. Manuel olarak tüm özelliklerin çalışıp çalışmadığını kontrol et çalışmayan özellikleri başka özellikleri bozmayacak şekilde düzelt").
+- automated suite: `cargo test --lib` 388 pass / 0 fail / 12 ignored; `pnpm test` 48 pass; `pnpm typecheck`/`lint`/`build`/`gen:bindings:check` clean. `cargo check --all-targets` clean (4 pre-existing test-only warnings in `src-tauri/src/mcp/client.rs`, not introduced by this pass).
+- real-claude smoke: `integration_research_only_real_claude` passed in 71.99s on first try — proves the LLM subprocess pipe end-to-end. Additional verdict / frontend / fsm / persistence / cancel smokes were queued sequentially after the fix landed (see follow-up entries).
+- bug found and fixed: `useLogOrchestratorJob.onSettled` was invalidating `['orchestrator-history']` mid-session, causing the chat panel's seed-from-history refetch to merge with localMessages and double every user/orchestrator/job bubble after a `dispatch` outcome. The panel's design comment (`OrchestratorChatPanel.tsx`) already forbids mid-session invalidation; the hook just didn't honour the contract.
+- fix: drop the `onSettled` invalidate. Persistence still lands on disk; the next mount picks it up via the mount-time fetch.
+- regression test added in `OrchestratorChatPanel.test.tsx` ("dispatch flow does not duplicate bubbles…") — mocks history to return [] on initial fetch and the persisted thread on any later fetch, then asserts the user-typed string and job-link button each render exactly once. Verified the test fails with the bug present and passes with the fix in place.
+- commit SHA: `bf7bfe5`; pushed to `origin/main`.
+- frontend test count: 48 → 49.
+
+---
+
 ## 2026-05-07T01:25Z WP-W3-12k2 completed — 9-agent vision PRODUCTION-READY (persistent chat + context)
 
 - dispatch: **single sub-agent**; backend SQLite + frontend hook integration. No real-claude smoke (mock tests cover persistence + render; W3-11/12k1 cover substrate).
