@@ -4,11 +4,19 @@
 // the next mount renders the dispatched-job bubble between the
 // orchestrator outcome and the user's next message.
 //
-// Frontend orchestrates: `decide` → `runJob` → `logJob` → invalidate
-// history. Failure of the log step is non-fatal — the in-memory
-// bubble still shows; only the persisted thread misses the row.
-// Documented as a known race in WP §"Notes / risks".
-import { useMutation, useQueryClient } from '@tanstack/react-query';
+// Frontend orchestrates: `decide` → `runJob` → `logJob`. Failure of
+// the log step is non-fatal — the in-memory bubble still shows;
+// only the persisted thread misses the row. Documented as a known
+// race in WP §"Notes / risks".
+//
+// Why: a mid-session invalidate would refetch the history (now
+// containing the just-persisted user + orchestrator + job rows)
+// while the panel's `localMessages` still holds the same three
+// bubbles, doubling everything on screen. The panel relies on its
+// mount-time fetch to pick up persistence on the *next* mount —
+// see `OrchestratorChatPanel.tsx` ("we deliberately do NOT
+// invalidate `['orchestrator-history']` mid-session").
+import { useMutation } from '@tanstack/react-query';
 import { commands } from '../lib/bindings';
 import { unwrap } from '../lib/unwrap';
 
@@ -19,14 +27,8 @@ export interface LogOrchestratorJobInput {
 }
 
 export function useLogOrchestratorJob() {
-  const qc = useQueryClient();
   return useMutation<null, Error, LogOrchestratorJobInput>({
     mutationFn: ({ workspaceId, jobId, goal }) =>
       unwrap(commands.swarmOrchestratorLogJob(workspaceId, jobId, goal)),
-    onSettled: (_data, _err, vars) => {
-      qc.invalidateQueries({
-        queryKey: ['orchestrator-history', vars.workspaceId],
-      });
-    },
   });
 }

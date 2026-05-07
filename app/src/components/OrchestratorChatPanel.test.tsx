@@ -174,6 +174,70 @@ describe('OrchestratorChatPanel', () => {
     ).toBeInTheDocument();
   });
 
+  // Regression: a mid-session history invalidate would refetch the
+  // freshly persisted user/orchestrator/job rows while the panel's
+  // localMessages still held the same three bubbles, doubling each
+  // bubble on screen. The hook layer must NOT invalidate
+  // `['orchestrator-history']` from the dispatch chain — the panel
+  // relies on its mount-time fetch to pick up persistence on the
+  // next mount only.
+  it('dispatch flow does not duplicate bubbles even if the next history fetch would return the persisted thread', async () => {
+    const { commands } = await import('../lib/bindings');
+    // First fetch: empty (initial mount). Subsequent fetches: the
+    // would-be persisted thread. If the hook layer ever invalidates,
+    // the panel would refetch and double up — the regression guard
+    // counts each unique text exactly once.
+    const persistedThread = [
+      {
+        id: 1,
+        workspaceId: 'default',
+        role: 'user' as const,
+        content: 'EXECUTE: doc the thing',
+        goal: null,
+        createdAtMs: 100,
+      },
+      {
+        id: 2,
+        workspaceId: 'default',
+        role: 'orchestrator' as const,
+        content: JSON.stringify(DISPATCH),
+        goal: null,
+        createdAtMs: 200,
+      },
+      {
+        id: 3,
+        workspaceId: 'default',
+        role: 'job' as const,
+        content: JOB_OK.jobId,
+        goal: DISPATCH.text,
+        createdAtMs: 300,
+      },
+    ];
+    vi.mocked(commands.swarmOrchestratorHistory)
+      .mockResolvedValueOnce({ status: 'ok', data: [] })
+      .mockResolvedValue({ status: 'ok', data: persistedThread });
+    vi.mocked(commands.swarmOrchestratorDecide).mockResolvedValue({
+      status: 'ok',
+      data: DISPATCH,
+    });
+    renderPanel();
+    await typeAndSend('EXECUTE: doc the thing');
+    await waitFor(() =>
+      expect(commands.swarmOrchestratorLogJob).toHaveBeenCalledTimes(1),
+    );
+    // User bubble appears exactly once. (DISPATCH.text shows in
+    // both the orchestrator bubble *and* the job bubble's goal
+    // preview, so it isn't a unique-count check; the user-typed
+    // string and the job link are the clean duplicate canaries.)
+    await waitFor(() =>
+      expect(screen.getAllByText('EXECUTE: doc the thing')).toHaveLength(1),
+    );
+    // Job link button appears exactly once.
+    expect(
+      screen.getAllByRole('button', { name: JOB_OK.jobId.slice(0, 8) }),
+    ).toHaveLength(1);
+  });
+
   it('shows an error banner when orchestrator_decide rejects', async () => {
     const { commands } = await import('../lib/bindings');
     vi.mocked(commands.swarmOrchestratorDecide).mockResolvedValue({
