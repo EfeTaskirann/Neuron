@@ -449,6 +449,32 @@ export type CoordinatorDecision = {
 };
 
 /**
+ *  Coordinator's structured response to a help request. Three
+ *  outcomes covering the routing-decision space.
+ */
+export type CoordinatorHelpOutcome = 
+/**
+ *  Coordinator answers directly. The `answer` string gets
+ *  fed back to the specialist as a new turn ("Coordinator
+ *  says: ...") so the specialist resumes with the answer in
+ *  context. Status flips back to `Running`.
+ */
+{ action: "direct_answer"; answer: string } | 
+/**
+ *  Coordinator wants more information from the specialist
+ *  before answering. The `followup_question` is sent to the
+ *  specialist, which replies with another turn. The FSM
+ *  re-checks for `neuron_help` after that turn.
+ */
+{ action: "ask_back"; followup_question: string } | 
+/**
+ *  Coordinator wants to ask the user. The `user_question`
+ *  surfaces in the Orchestrator chat panel as a Clarify-shape
+ *  message and the specialist's job pauses pending user input.
+ */
+{ action: "escalate"; user_question: string };
+
+/**
  *  Routing rail the Coordinator picks for the job. Wire form is
  *  snake_case (`"research_only"` / `"execute_plan"`) so the
  *  frontend bindings match the persona OUTPUT CONTRACT verbatim.
@@ -508,6 +534,16 @@ export type Edge = {
 	 *  natively (`sqlx_sqlite::types::bool`).
 	 */
 	active: boolean,
+};
+
+/**
+ *  Specialist's structured "I'm blocked" payload. Mirrors the JSON
+ *  the persona emits — `reason` is a one-liner explanation,
+ *  `question` is what they want answered.
+ */
+export type HelpRequest = {
+	reason: string,
+	question: string,
 };
 
 /**

@@ -135,6 +135,14 @@ pub fn specta_builder_for_export() -> tauri_specta::Builder<tauri::Wry> {
         // events are a side channel; the W4-04 grid panes
         // deserialise this payload via the bindings.ts type.
         .typ::<crate::swarm::SwarmAgentEvent>()
+        // WP-W4-05 — `HelpRequest` and `CoordinatorHelpOutcome` are
+        // emitted on the per-agent event channel (HelpRequest variant)
+        // and consumed by the FSM (W4-06) for the
+        // specialist→Coordinator routing loop. Specta only walks
+        // types reachable from registered commands; explicit register
+        // mirrors the SwarmAgentEvent / SwarmJobEvent pattern.
+        .typ::<crate::swarm::HelpRequest>()
+        .typ::<crate::swarm::CoordinatorHelpOutcome>()
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]

@@ -29,6 +29,7 @@
 pub mod agent_registry;
 pub mod binding;
 pub mod coordinator;
+pub mod help_request;
 pub mod persistent_session;
 pub mod profile;
 pub mod transport;
@@ -47,6 +48,10 @@ pub use coordinator::{
 pub use agent_registry::{
     agent_event_channel, AgentStatus, AgentStatusRow,
     SwarmAgentEvent, SwarmAgentRegistry,
+};
+pub use help_request::{
+    parse_coordinator_help_outcome, parse_help_request,
+    process_help_request, CoordinatorHelpOutcome, HelpRequest,
 };
 pub use persistent_session::PersistentSession;
 pub use profile::{
