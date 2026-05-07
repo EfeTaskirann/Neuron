@@ -4,6 +4,34 @@ Running journal of agent-driven changes. Newest entry on top. See `AGENTS.md` §
 
 ---
 
+## 2026-05-07 WP-W4-03 completed — per-agent event channel + streaming AssistantText/ToolUse
+
+- dispatch: orchestrator-direct.
+- files changed: 8 in commit `ac009f6`
+  - new — Rust: (none new — extends existing modules)
+  - new — frontend: `app/src/hooks/useAgentEvents.ts` + `useAgentEvents.test.tsx`
+  - modified — Rust: `src-tauri/src/swarm/transport.rs` (`classify_event` → `Vec<StreamEvent>` + new `ToolUse` variant + `summarize_tool_input` + `TOOL_USE_INPUT_SUMMARY_CAP`); `src-tauri/src/swarm/persistent_session.rs` (new `TurnStreamEvent` enum + `event_sink` parameter on `invoke_turn`); `src-tauri/src/swarm/agent_registry.rs` (new `SwarmAgentEvent` enum + `agent_event_channel` helper + emit hooks + mpsc forwarder); `src-tauri/src/swarm/mod.rs` (re-exports); `src-tauri/src/lib.rs` (specta `SwarmAgentEvent` registration)
+  - regenerated: `app/src/lib/bindings.ts`
+- contract: `docs/work-packages/WP-W4-03-per-agent-event-channel.md` (commit `b7bd27f`)
+- commit SHA: `ac009f6`
+- acceptance: ✅ all gates green
+  - `cargo build --lib` → exit 0 (one minor `#[allow(dead_code)]` documented on `StreamEvent::Other`, retained for forward-compat)
+  - `cargo test --lib` → 416 / 0 / 13 → 419 / 0 / 14 ignored (+3 transport tests for ToolUse parsing / truncation / missing-input)
+  - `cargo check --all-targets` → exit 0
+  - `pnpm gen:bindings:check` → exit 0 post-commit
+  - `pnpm typecheck` → exit 0
+  - `pnpm lint` → exit 0
+  - `pnpm test --run` → 49 / 0 → 52 / 0 (+3 useAgentEvents tests: collects in order / ring-buffer cap / resubscribes on prop change)
+- key implementation choices:
+  - **`classify_event` → `Vec<StreamEvent>`**: a single `assistant` line can carry both text blocks AND tool_use blocks; emitting them as separate events through one return value let me keep the parser purely synchronous. Caller side updated in two places (`SubprocessTransport::invoke` and `PersistentSession::read_until_result`); behavior is unchanged on the existing one-shot path because the new ToolUse arm is silently consumed when no event sink is attached.
+  - **Local `TurnStreamEvent` enum in `persistent_session.rs`**: deliberately separate from `SwarmAgentEvent` to keep the dep graph acyclic (`agent_registry` already depends on `persistent_session`; the reverse edge would cycle). Registry forwarder lifts each `TurnStreamEvent` to a `SwarmAgentEvent` before emitting on the Tauri channel. Costs one trivial `match`; pays in cleaner module boundaries.
+  - **Forwarder task lifecycle**: per-`acquire_and_invoke_turn` mpsc + spawned forwarder. Sender drops at end of scope → forwarder exits naturally. We `await` the forwarder before emitting `Result`/`Idle`/`Crashed` so a late streaming delta can't fire after the bookend event (event ordering invariant the W4-04 grid will rely on).
+  - **`react-hooks/set-state-in-effect`**: initial draft of `useAgentEvents` reset `events` to `[]` inside the effect on (workspace, agent) change. The new ESLint plugin flagged it; rather than fight the lint with refs/keys, the hook now omits the reset and the W4-04 grid is expected to wrap each pane in `key={ws+agent}` to force remount on prop change. Documented in the hook header.
+  - **Channel name centralised**: `agent_event_channel(ws, agent)` helper exported from `agent_registry.rs` so the frontend hook + backend emit + tests all agree on the exact format. Mirrors W3-12c's job-channel pattern.
+- next: WP-W4-04 (AgentPane component + 3×3 SwarmAgentGrid) — depends on W4-03. The visible payoff.
+
+---
+
 ## 2026-05-07 WP-W4-02 completed — SwarmAgentRegistry + lazy spawn lifecycle
 
 - dispatch: orchestrator-direct (continued context from W4-01).
