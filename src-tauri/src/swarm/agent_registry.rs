@@ -410,6 +410,150 @@ impl SwarmAgentRegistry {
         }
     }
 
+    /// W4-06 — help-aware variant of `acquire_and_invoke_turn`.
+    /// After every specialist turn, scan the assistant_text for a
+    /// `neuron_help` block. On hit:
+    ///
+    /// 1. Set status → `WaitingOnCoordinator`, emit `HelpRequest` event
+    /// 2. Send the formatted help message to the Coordinator session
+    /// 3. Parse `CoordinatorHelpOutcome`:
+    ///    - `DirectAnswer` — feed back to the specialist as a new
+    ///      turn ("Coordinator says: ...") and loop
+    ///    - `AskBack` — feed the followup question back to the
+    ///      specialist as a new turn and loop
+    ///    - `Escalate` — return the user_question wrapped in
+    ///      `AppError::SwarmInvoke("escalated to user: ...")` so
+    ///      the FSM can surface it through the Orchestrator chat
+    ///
+    /// Loop bounded by `max_help_rounds` (default 3) — past the
+    /// cap we surface the last help_request as `SwarmInvoke` so
+    /// the FSM doesn't hang on an LLM stuck in a help-loop.
+    ///
+    /// Reviewer / Tester invocations should call the basic
+    /// `acquire_and_invoke_turn` (no help loop) — their output
+    /// contract is JSON Verdict; help-mode would conflict.
+    pub async fn acquire_and_invoke_turn_with_help<R: Runtime>(
+        self: &Arc<Self>,
+        app: &AppHandle<R>,
+        workspace_id: &str,
+        agent_id: &str,
+        user_message: &str,
+        timeout: Duration,
+        cancel: Arc<Notify>,
+        max_help_rounds: u32,
+    ) -> Result<InvokeResult, AppError> {
+        use crate::swarm::help_request::{
+            parse_help_request, process_help_request, CoordinatorHelpOutcome,
+        };
+
+        let mut current_user_message = user_message.to_string();
+        for round in 0..=max_help_rounds {
+            let result = self
+                .acquire_and_invoke_turn(
+                    app,
+                    workspace_id,
+                    agent_id,
+                    &current_user_message,
+                    timeout,
+                    Arc::clone(&cancel),
+                )
+                .await?;
+
+            // Specialist DID NOT emit help → return the result.
+            let help = match parse_help_request(&result.assistant_text) {
+                Some(h) => h,
+                None => return Ok(result),
+            };
+
+            // Cap reached: stop looping; surface the help request as
+            // a SwarmInvoke so the FSM treats it as a hard failure
+            // rather than an infinite loop.
+            if round == max_help_rounds {
+                return Err(AppError::SwarmInvoke(format!(
+                    "specialist `{agent_id}` exceeded help-loop cap \
+                     ({max_help_rounds} rounds); last reason: {} | \
+                     question: {}",
+                    help.reason, help.question
+                )));
+            }
+
+            // Mark the specialist as waiting + emit HelpRequest event.
+            // Status is per-agent so we have to re-acquire the slot
+            // briefly for the flip.
+            self.mark_waiting_on_coordinator(workspace_id, agent_id, &help)
+                .await;
+            let channel = agent_event_channel(workspace_id, agent_id);
+            let _ = app.emit(
+                &channel,
+                SwarmAgentEvent::HelpRequest {
+                    reason: help.reason.clone(),
+                    question: help.question.clone(),
+                },
+            );
+
+            // Ask Coordinator. Same `Self` for nested registry call.
+            let outcome = process_help_request(
+                self,
+                app,
+                workspace_id,
+                agent_id,
+                &help,
+                timeout,
+                Arc::clone(&cancel),
+            )
+            .await?;
+
+            // Translate outcome into the next-turn user message.
+            current_user_message = match outcome {
+                CoordinatorHelpOutcome::DirectAnswer { answer } => {
+                    format!(
+                        "Coordinator says: {answer}\n\n\
+                         Now resume your task with this answer in context."
+                    )
+                }
+                CoordinatorHelpOutcome::AskBack {
+                    followup_question,
+                } => {
+                    format!(
+                        "Coordinator asks for more info: {followup_question}\n\n\
+                         Reply with the requested detail (or, if you can't,\n\
+                         emit another `neuron_help` block with a refined question)."
+                    )
+                }
+                CoordinatorHelpOutcome::Escalate { user_question } => {
+                    return Err(AppError::SwarmInvoke(format!(
+                        "escalated to user: {user_question}"
+                    )));
+                }
+            };
+            // Loop continues with the new message.
+        }
+        // Unreachable: the for-loop returns from inside on the
+        // last iteration (`round == max_help_rounds` branch).
+        Err(AppError::Internal(
+            "help-loop iteration exceeded — should be unreachable".into(),
+        ))
+    }
+
+    /// Helper for the help loop — flips the per-agent status to
+    /// `WaitingOnCoordinator` between the specialist's
+    /// help-emitting turn and the Coordinator's response. Brief
+    /// (sub-second) so the UI catches the transition.
+    async fn mark_waiting_on_coordinator(
+        &self,
+        workspace_id: &str,
+        agent_id: &str,
+        _help: &crate::swarm::help_request::HelpRequest,
+    ) {
+        let key = (workspace_id.to_string(), agent_id.to_string());
+        let read = self.sessions.read().await;
+        if let Some(slot_arc) = read.get(&key) {
+            let mut slot = slot_arc.lock().await;
+            slot.status = AgentStatus::WaitingOnCoordinator;
+            slot.last_activity_ms = Some(now_millis());
+        }
+    }
+
     /// Read-only snapshot for `swarm:agents:list_status`. Cheap —
     /// clones the metadata, never the session itself. Returns one
     /// row per *bundled* profile in the registry (so the UI can
@@ -537,6 +681,124 @@ impl SwarmAgentRegistry {
     pub fn turn_cap(&self) -> u32 {
         self.turn_cap
     }
+}
+
+/// W4-06 — `Transport` adapter that drives invokes through the
+/// registry's persistent sessions instead of one-shot spawn-and-die.
+///
+/// The FSM (`CoordinatorFsm`) is generic over `T: Transport`. To
+/// rewire it to persistent sessions without touching its
+/// generic-over-T contract, we supply this adapter which
+/// implements `Transport::invoke` by calling
+/// `acquire_and_invoke_turn_with_help` on the underlying registry.
+///
+/// The help-loop is *transparent* to the FSM: the FSM thinks it's
+/// making one call against `T: Transport`; the registry's help-
+/// aware method internally routes specialist→Coordinator if the
+/// specialist's first turn emits `neuron_help`.
+///
+/// Why bake in the help-loop instead of leaving it to the FSM:
+/// - Keeps the FSM state machine simple — no new Blocked /
+///   CoordinatorQA states to add. Each FSM stage stays
+///   "specialist invoke → result".
+/// - Help is a per-turn concern, not a per-stage concern. Losing
+///   the help loop when the FSM transitions to the next stage
+///   would defeat its purpose.
+///
+/// Reviewer / Tester stages: the FSM invokes them via
+/// `RegistryTransport` too; their persona contracts forbid
+/// `neuron_help` blocks (output is JSON Verdict), so the help
+/// branch never fires. Defense-in-depth: even if the parser saw a
+/// stray `neuron_help` in a Verdict's `summary` field, the
+/// outer-fence detection + reviewer's strict JSON shape means the
+/// help-loop won't activate spuriously.
+pub struct RegistryTransport {
+    workspace_id: String,
+    registry: Arc<SwarmAgentRegistry>,
+    cancel: Arc<Notify>,
+    max_help_rounds: u32,
+}
+
+impl RegistryTransport {
+    /// Default cap on help-loop rounds. Picked empirically: 3 is
+    /// enough to handle "specialist asks → coordinator answers →
+    /// specialist asks follow-up → coordinator answers" plus one
+    /// safety margin. Past 3 rounds the LLM is usually stuck.
+    pub const DEFAULT_HELP_ROUNDS: u32 = 3;
+
+    /// Construct a transport bound to one workspace + cancel notify.
+    pub fn new(
+        workspace_id: String,
+        registry: Arc<SwarmAgentRegistry>,
+        cancel: Arc<Notify>,
+    ) -> Self {
+        Self {
+            workspace_id,
+            registry,
+            cancel,
+            max_help_rounds: Self::DEFAULT_HELP_ROUNDS,
+        }
+    }
+
+    /// Builder for tests / FSM that want to disable the help loop
+    /// entirely (e.g. Reviewer/Tester invokes).
+    pub fn with_max_help_rounds(mut self, n: u32) -> Self {
+        self.max_help_rounds = n;
+        self
+    }
+}
+
+impl crate::swarm::transport::Transport for RegistryTransport {
+    fn invoke<R: Runtime>(
+        &self,
+        app: &AppHandle<R>,
+        profile: &crate::swarm::profile::Profile,
+        user_message: &str,
+        timeout: Duration,
+    ) -> impl std::future::Future<Output = Result<InvokeResult, AppError>>
+           + Send {
+        let registry = Arc::clone(&self.registry);
+        let workspace_id = self.workspace_id.clone();
+        let agent_id = profile.id.clone();
+        let user_message = user_message.to_string();
+        let cancel = Arc::clone(&self.cancel);
+        let max_rounds = self.max_help_rounds;
+        async move {
+            if max_rounds == 0 {
+                // help-loop disabled — call the basic acquire path.
+                registry
+                    .acquire_and_invoke_turn(
+                        &app_clone(app),
+                        &workspace_id,
+                        &agent_id,
+                        &user_message,
+                        timeout,
+                        cancel,
+                    )
+                    .await
+            } else {
+                registry
+                    .acquire_and_invoke_turn_with_help(
+                        &app_clone(app),
+                        &workspace_id,
+                        &agent_id,
+                        &user_message,
+                        timeout,
+                        cancel,
+                        max_rounds,
+                    )
+                    .await
+            }
+        }
+    }
+}
+
+/// Workaround for `AppHandle: Clone` not being object-safe through
+/// the Transport trait's `&AppHandle` parameter. We need an owned
+/// AppHandle inside the async block that outlives the `&self`
+/// borrow; `app.clone()` gets us one.
+fn app_clone<R: Runtime>(app: &AppHandle<R>) -> AppHandle<R> {
+    app.clone()
 }
 
 /// Resolve the per-process turn cap. Same env-reading shape as

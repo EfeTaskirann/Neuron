@@ -212,7 +212,30 @@ pub async fn swarm_run_job<R: Runtime>(
         })?
         .inner()
         .clone();
-    let transport = SubprocessTransport::new();
+    // WP-W4-06 — drive the FSM through the persistent
+    // `RegistryTransport` (alongside the W3-12 `SubprocessTransport`).
+    // Sessions live in the workspace-scoped `SwarmAgentRegistry`;
+    // each FSM stage's invoke reuses the persistent session for
+    // that agent, and specialist→Coordinator help requests are
+    // handled transparently inside the registry adapter (max 3
+    // help rounds before the FSM sees a hard SwarmInvoke fallback).
+    let agent_registry = app
+        .try_state::<std::sync::Arc<SwarmAgentRegistry>>()
+        .ok_or_else(|| {
+            AppError::Internal(
+                "SwarmAgentRegistry missing from app state — \
+                 lib.rs::setup did not call app.manage()"
+                    .into(),
+            )
+        })?
+        .inner()
+        .clone();
+    let cancel = std::sync::Arc::new(tokio::sync::Notify::new());
+    let transport = crate::swarm::RegistryTransport::new(
+        workspace_id.clone(),
+        agent_registry,
+        cancel,
+    );
     let fsm = CoordinatorFsm::new(profiles, transport, registry, stage_timeout());
     fsm.run_job(&app, workspace_id, goal).await
 }

@@ -46,7 +46,7 @@ pub use coordinator::{
     SwarmJobEvent, MAX_RETRIES,
 };
 pub use agent_registry::{
-    agent_event_channel, AgentStatus, AgentStatusRow,
+    agent_event_channel, AgentStatus, AgentStatusRow, RegistryTransport,
     SwarmAgentEvent, SwarmAgentRegistry,
 };
 pub use help_request::{
