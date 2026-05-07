@@ -571,9 +571,11 @@ mod tests {
         // W3-12h bumped Scout max_turns from 6 to 10 after the
         // first frontend integration smoke (frontend-only doc-edit
         // goal) had Scout exhaust its 6-turn budget on Glob+Read+
-        // formatting. 10 gives headroom; cost not a concern per the
+        // formatting. The 2026-05-07 smoke pass found 10 still tight
+        // for frontend goals (Scout exhausted on a TSX investigation),
+        // so it was bumped again to 14. Cost not a concern per the
         // owner's quality-first directive (2026-05-06).
-        assert_eq!(scout.max_turns, 10);
+        assert_eq!(scout.max_turns, 14);
         assert!(!scout.body.is_empty());
         // source_path is diagnostics-only — assert it points into the
         // <bundled> virtual prefix, not a host path.
