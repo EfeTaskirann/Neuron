@@ -65,6 +65,57 @@ pub async fn mailbox_list(
     Ok(rows)
 }
 
+/// W4-07 — internal mailbox emit usable from non-command code
+/// (the swarm registry calls this during the help loop). Skips the
+/// `State<DbPool>` extractor since the caller has its own
+/// `DbPool` reference; preserves the same insert + event-emit
+/// shape as `mailbox_emit` so mailbox listeners on either path see
+/// identical wire data.
+///
+/// Convention for swarm entries: `from_pane` / `to_pane` use an
+/// `agent:<id>` prefix to disambiguate from terminal-pane entries
+/// (`pane:<uuid>`); `entry_type` follows `swarm.<verb>` (e.g.
+/// `swarm.help_request`, `swarm.help_direct_answer`,
+/// `swarm.help_ask_back`, `swarm.help_escalate`). Future
+/// frontend-side filter can branch on the `swarm.` prefix.
+pub async fn emit_internal<R: Runtime>(
+    app: &AppHandle<R>,
+    pool: &DbPool,
+    from_pane: &str,
+    to_pane: &str,
+    entry_type: &str,
+    summary: &str,
+) -> Result<MailboxEntry, AppError> {
+    if from_pane.trim().is_empty() {
+        return Err(AppError::InvalidInput("from must not be empty".into()));
+    }
+    if to_pane.trim().is_empty() {
+        return Err(AppError::InvalidInput("to must not be empty".into()));
+    }
+    let ts = now_seconds();
+    let id: i64 = sqlx::query_scalar(
+        "INSERT INTO mailbox (ts, from_pane, to_pane, type, summary) \
+         VALUES (?, ?, ?, ?, ?) RETURNING rowid",
+    )
+    .bind(ts)
+    .bind(from_pane)
+    .bind(to_pane)
+    .bind(entry_type)
+    .bind(summary)
+    .fetch_one(pool)
+    .await?;
+    let inserted = MailboxEntry {
+        id,
+        ts,
+        from_pane: from_pane.to_string(),
+        to_pane: to_pane.to_string(),
+        entry_type: entry_type.to_string(),
+        summary: summary.to_string(),
+    };
+    app.emit(events::MAILBOX_NEW, &inserted)?;
+    Ok(inserted)
+}
+
 /// Insert one row, return the inserted entry, **and** emit a
 /// `mailbox.new` Tauri event with that entry as payload (ADR-0006).
 #[tauri::command(rename_all = "camelCase")]

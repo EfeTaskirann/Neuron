@@ -26,7 +26,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use specta::Type;
-use tauri::{AppHandle, Emitter, Runtime};
+use tauri::{AppHandle, Emitter, Manager, Runtime};
 use tokio::sync::mpsc;
 use tokio::sync::{Mutex, Notify, RwLock};
 
@@ -491,6 +491,21 @@ impl SwarmAgentRegistry {
                 },
             );
 
+            // W4-07 — persist help request to mailbox for audit
+            // trail. Best-effort; a missing pool (test path) is
+            // silently skipped so unit tests still pass.
+            self.emit_help_mailbox(
+                app,
+                agent_id,
+                "coordinator",
+                "swarm.help_request",
+                &format!(
+                    "{} (reason: {})",
+                    help.question, help.reason
+                ),
+            )
+            .await;
+
             // Ask Coordinator. Same `Self` for nested registry call.
             let outcome = process_help_request(
                 self,
@@ -502,6 +517,32 @@ impl SwarmAgentRegistry {
                 Arc::clone(&cancel),
             )
             .await?;
+
+            // W4-07 — persist coordinator outcome to mailbox before
+            // routing back to the specialist. Three different
+            // `entry_type` strings to keep the trace filterable.
+            let (mb_kind, mb_summary) = match &outcome {
+                CoordinatorHelpOutcome::DirectAnswer { answer } => {
+                    ("swarm.help_direct_answer", answer.clone())
+                }
+                CoordinatorHelpOutcome::AskBack {
+                    followup_question,
+                } => (
+                    "swarm.help_ask_back",
+                    followup_question.clone(),
+                ),
+                CoordinatorHelpOutcome::Escalate { user_question } => {
+                    ("swarm.help_escalate", user_question.clone())
+                }
+            };
+            self.emit_help_mailbox(
+                app,
+                "coordinator",
+                agent_id,
+                mb_kind,
+                &mb_summary,
+            )
+            .await;
 
             // Translate outcome into the next-turn user message.
             current_user_message = match outcome {
@@ -533,6 +574,41 @@ impl SwarmAgentRegistry {
         Err(AppError::Internal(
             "help-loop iteration exceeded — should be unreachable".into(),
         ))
+    }
+
+    /// W4-07 — best-effort mailbox emit during the help loop.
+    /// `from_agent` and `to_agent` are bare agent ids (e.g.
+    /// `scout`, `coordinator`); the mailbox stores them with an
+    /// `agent:` prefix so future UI filters can distinguish them
+    /// from terminal-pane mailbox entries.
+    ///
+    /// Failures (missing pool, DB write error) are silently
+    /// dropped — the live event channel already carries the same
+    /// information for the W4-04 grid; mailbox is only the audit
+    /// trail. Test runs lacking a pool stay green.
+    async fn emit_help_mailbox<R: Runtime>(
+        &self,
+        app: &AppHandle<R>,
+        from_agent: &str,
+        to_agent: &str,
+        entry_type: &str,
+        summary: &str,
+    ) {
+        let pool = match app.try_state::<crate::db::DbPool>() {
+            Some(p) => p.inner().clone(),
+            None => return,
+        };
+        let from_pane = format!("agent:{from_agent}");
+        let to_pane = format!("agent:{to_agent}");
+        let _ = crate::commands::mailbox::emit_internal(
+            app,
+            &pool,
+            &from_pane,
+            &to_pane,
+            entry_type,
+            summary,
+        )
+        .await;
     }
 
     /// Helper for the help loop — flips the per-agent status to
