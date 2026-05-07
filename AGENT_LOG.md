@@ -4,13 +4,36 @@ Running journal of agent-driven changes. Newest entry on top. See `AGENTS.md` §
 
 ---
 
+## 2026-05-07 WP-W4-01 completed — PersistentSession transport (multi-turn claude subprocess)
+
+- dispatch: orchestrator-direct (no sub-agent — context still warm from W3 transport work; hand-off overhead higher than direct implementation).
+- files changed: 4 in commit `b1eec09`
+  - new — Rust: `src-tauri/src/swarm/persistent_session.rs` (~570 lines including tests)
+  - modified: `src-tauri/src/swarm/transport.rs` (visibility-only: `RingBuffer`, `STDERR_RING_CAPACITY`, `write_persona_tmp`, `fmt_stderr_tail` widened to `pub(crate)`); `src-tauri/src/swarm/mod.rs` (re-export `PersistentSession`); `src-tauri/src/error.rs` (new `Cancelled(String)` variant — distinct from `Timeout` and `SwarmInvoke` so the cancel path can be branched on by callers without parsing message text)
+- commit SHA: `b1eec09`
+- acceptance: ✅ all gates green
+  - `cargo build --lib` → exit 0
+  - `cargo test --lib` → 396 / 0 / 13 ignored (was 388 / 0 / 12; +8 unit tests + 1 ignored real-claude smoke)
+  - `pnpm gen:bindings` → no diff (AppError wire shape is `{kind, message}` regardless of variant; `Cancelled` lands purely server-side)
+  - regression: `integration_research_only_real_claude` PASS in 74s — proves the W3 one-shot path is untouched
+  - W4-01 acceptance: `integration_persistent_two_turn_real_claude` PASS in **8.69s** — proves session context carries (turn 2 recalls "ALPHA" from turn 1) AND that the persistent path is dramatically faster than per-turn cold-spawn (8.69s for 2 turns vs ~74s for a single research-only one-shot, both against the same `scout` profile)
+- key implementation choices:
+  - **Read loop duplicated, not extracted**: ~30 lines of stream-json read logic appear in both `SubprocessTransport::invoke` and `PersistentSession::read_until_result`. Extraction would require either an always-`Some` Notify on the one-shot path or a dyn trait split — both add more complexity than the duplication saves. Documented inline so a future third caller knows to factor.
+  - **Cancel semantics**: cancel truncates the in-flight turn (returns `AppError::Cancelled`), then best-effort drains stdout (4 KiB byte budget OR 500 ms wall budget, whichever fires first) so leftover bytes don't poison the next turn. Child stays alive — only `shutdown()` kills it.
+  - **`Cancelled` AppError variant**: rather than reusing `SwarmInvoke("cancelled by user")` (semantic mismatch) or `Conflict` (locking-flavored), introduced a domain-specific variant. Wire shape unchanged so the frontend bindings.ts is byte-identical; new `kind='cancelled'` discriminant is available for the future cancel UI affordance (W3-12c FSM cancel still emits a `Failed`/last_error payload — that path is untouched here, but a future WP could migrate it).
+  - **Persona tmp lifecycle**: same on-disk convention as one-shot (ULID-named under `<app_data_dir>/swarm/tmp/`), unlinked on `shutdown()` AND in the `Drop` impl as belt-and-suspenders. `kill_on_drop(true)` reaps the child if the caller forgets `shutdown()`.
+  - **Dummy `ChildStdin` for `mem::replace` in shutdown**: spawning `cmd /c rem` (Windows) / `true` (Unix) just to harvest a stdin pipe is the minimum-overhead workaround for not being able to move out of `&mut self` while `self` is in scope. Documented at the helper.
+- next: WP-W4-02 (workspace-scoped agent registry + lazy spawn lifecycle) — depends only on this WP. The W4 overview's authoring sequence calls for it next.
+
+---
+
 ## 2026-05-07 WP-W4-overview authored — persistent visible swarm planning lands
 
 - trigger: owner directive 2026-05-07 — "her ajan birer terminalde tek başına çalışsın, birbirleriyle iletişim de kurabilsin". Followed by four pinned architectural decisions: 1B persistent sessions / 2 3×3 grid / 3C Coordinator hub / 4A FSM stays.
 - file: `docs/work-packages/WP-W4-overview.md` (new)
 - contents: scope source, status table, dependency graph, per-WP rationale (W4-01 PersistentSession transport / W4-02 workspace-scoped registry + lazy spawn / W4-03 per-agent event channel / W4-04 AgentPane + 3×3 grid / W4-05 Coordinator hub + neuron_help contract / W4-06 FSM persistent-transport adapter / W4-07 mailbox swarm tab), out-of-scope, owner decisions resolved, relationship to W3 backlog (orthogonal — W3 backlog not blocked).
 - shape parity: follows the WP-W3-overview format verbatim — owner this is a planning doc, not a contract.
-- next: WP-W4-01 (PersistentSession transport) authoring + sub-agent dispatch.
+- WP-W4-01 contract: `docs/work-packages/WP-W4-01-persistent-session-transport.md` (new in commit `9c02e9d`).
 
 ---
 
