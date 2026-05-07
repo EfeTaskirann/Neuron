@@ -4,6 +4,72 @@ Running journal of agent-driven changes. Newest entry on top. See `AGENTS.md` §
 
 ---
 
+## 2026-05-07 WP-W4 closed — persistent visible swarm runtime
+
+All seven sub-WPs landed sequentially in one session. The W3 9-agent
+substrate is now visible (3×3 live grid), persistent (sessions
+survive across stages), and collaborative (specialists escalate to
+Coordinator via `neuron_help`).
+
+| Sub-WP | Title | Commit | Test delta |
+|---|---|---|---|
+| W4-01 | PersistentSession transport | `b1eec09` | Rust +8 +1 ignored |
+| W4-02 | SwarmAgentRegistry + lazy spawn | `d4b81a0` | Rust +20 +1 ignored |
+| W4-03 | Per-agent event channel | `ac009f6` | Rust +3, Frontend +3 |
+| W4-04 | SwarmAgentGrid + AgentPane | `5c52b99` | Frontend +13 |
+| W4-05 | neuron_help contract + Coordinator | `f7cf86f` | Rust +16 |
+| W4-06 | RegistryTransport + help loop + FSM | `ba9537e` | (FSM rewire; tests via existing) |
+| W4-07 | Swarm mailbox persistence | `ca28099` | (audit trail; tests via mailbox) |
+
+Final test counts: cargo test --lib **435 / 0 / 14 ignored**
+(was 388 / 0 / 12; +47 unit + 2 ignored real-claude smokes).
+pnpm test **65 / 0** (was 48 / 0; +17 frontend). pnpm typecheck /
+lint / build / gen:bindings:check all green.
+
+End-to-end runtime shape:
+- 9 `claude` subprocesses spawn lazily per workspace (Orchestrator
+  on first chat; the other 8 on first dispatch). Each lives until
+  workspace close OR turn-cap respawn (`NEURON_SWARM_AGENT_TURN_CAP=200`
+  default).
+- `swarm:run_job` drives the FSM through `RegistryTransport` →
+  `acquire_and_invoke_turn_with_help` so every specialist turn
+  goes through the help-loop check transparently. Coordinator
+  routing for blocked specialists handled inside the registry; FSM
+  state machine unchanged from W3 shape.
+- Per-agent event channel (`swarm:agent:{ws}:{id}:event`) emits
+  Spawned / TurnStarted / AssistantText (streaming) / ToolUse /
+  Result / HelpRequest / Idle / Crashed.
+- Live UI: `SwarmAgentGrid` renders all 9 agents in a fixed 3×3
+  slot layout with status pills, structured event transcripts,
+  and cumulative cost. Legacy chat-shape view (Orchestrator chat
+  + recent jobs) preserved behind a "Recent jobs" tab.
+- Mailbox persistence: every help-loop leg lands in the mailbox
+  table (`agent:<id>` from/to namespacing + `swarm.help_*` entry
+  type) for audit-trail. Live channel + persistent log split so
+  the grid sees events instantly while the audit query catches
+  history across remounts.
+
+Out of scope for W4 (per the overview):
+- ❌ Multi-workspace UX (one workspace per app install stays the rule)
+- ❌ Cross-app-restart session persistence (sessions in-memory only;
+  chat history persists per W3-12k2)
+- ❌ Reviewer/Tester help-via-Verdict-issue path (Reviewers + Tester
+  output JSON Verdict; can't drop into help mode without conflicting
+  with the verdict shape — reserved for a future WP that adds a
+  blocked-severity verdict variant)
+- ❌ Dedicated "Swarm comms" tab in mailbox UI (W4-07 ships
+  persistence; the dedicated filtered tab is a follow-up)
+- ❌ Per-event SQLite persistence (events are ephemeral; the W4-04
+  grid binds on mount and only sees events fired thereafter)
+
+Owner directive 2026-05-07 ("ben her ajanın görünmez bir subprocess
+olmasını istemiyorum her biri birer terminalde tek başına çalışan
+olarak çalışıcak. Aynı zamanda birbirleriyle iletişim de
+kurabilecek.") is now end-to-end satisfied via the W4-04 grid +
+W4-05/06 help-loop substrate.
+
+---
+
 ## 2026-05-07 WP-W4-03 completed — per-agent event channel + streaming AssistantText/ToolUse
 
 - dispatch: orchestrator-direct.
