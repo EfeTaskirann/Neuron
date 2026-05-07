@@ -48,7 +48,10 @@ use crate::swarm::profile::Profile;
 /// 64 KiB upper bound on the stderr ring buffer. Generous enough to
 /// hold a full `claude` traceback; small enough that the bound is
 /// hit only on adversarial output.
-const STDERR_RING_CAPACITY: usize = 64 * 1024;
+///
+/// Pub-within-crate so `persistent_session.rs` can dimension its own
+/// stderr drain to the same budget without re-litigating the size.
+pub(crate) const STDERR_RING_CAPACITY: usize = 64 * 1024;
 
 /// One classified line from the `claude` stream-json output. Mid-loop
 /// state (running assistant text, captured `session_id`) lives in the
@@ -512,7 +515,11 @@ pub(crate) fn classify_event(value: &Value) -> StreamEvent {
 /// Materialise the persona body to disk so `--append-system-prompt-file`
 /// has a path to read. Lives under `<app_data_dir>/swarm/tmp/<ulid>.md`
 /// so a clean reinstall sweeps it up alongside the SQLite DB.
-async fn write_persona_tmp<R: Runtime>(
+///
+/// Pub-within-crate so `persistent_session.rs` reuses the same on-disk
+/// convention (one tmp file per spawned session, same `<ulid>.md`
+/// naming).
+pub(crate) async fn write_persona_tmp<R: Runtime>(
     app: &AppHandle<R>,
     profile: &Profile,
 ) -> Result<PathBuf, AppError> {
@@ -540,20 +547,23 @@ async fn write_persona_tmp<R: Runtime>(
 }
 
 /// Tail-only ring buffer. `append` truncates oldest bytes when full.
-struct RingBuffer {
+///
+/// Pub-within-crate so `persistent_session.rs` reuses the same shape
+/// for its own stderr drain.
+pub(crate) struct RingBuffer {
     buf: Vec<u8>,
     capacity: usize,
 }
 
 impl RingBuffer {
-    fn new(capacity: usize) -> Self {
+    pub(crate) fn new(capacity: usize) -> Self {
         Self {
             buf: Vec::with_capacity(capacity.min(8 * 1024)),
             capacity,
         }
     }
 
-    fn append(&mut self, bytes: &[u8]) {
+    pub(crate) fn append(&mut self, bytes: &[u8]) {
         if bytes.len() >= self.capacity {
             // New burst alone exceeds capacity — keep only its tail.
             let start = bytes.len() - self.capacity;
@@ -569,13 +579,13 @@ impl RingBuffer {
         self.buf.extend_from_slice(bytes);
     }
 
-    fn tail_string(&self, max_bytes: usize) -> String {
+    pub(crate) fn tail_string(&self, max_bytes: usize) -> String {
         let start = self.buf.len().saturating_sub(max_bytes);
         String::from_utf8_lossy(&self.buf[start..]).into_owned()
     }
 }
 
-fn fmt_stderr_tail(tail: &str) -> String {
+pub(crate) fn fmt_stderr_tail(tail: &str) -> String {
     let trimmed = tail.trim();
     if trimmed.is_empty() {
         String::new()

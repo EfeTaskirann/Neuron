@@ -131,6 +131,18 @@ pub enum AppError {
         in_flight_job_id: String,
     },
 
+    /// WP-W4-01 — a wrapped operation observed a cancel signal before
+    /// completing. Surfaced by `PersistentSession::invoke_turn` when
+    /// its cancel `Notify` fires mid-read. Distinct from `Timeout`
+    /// (budget elapsed) and `SwarmInvoke` (subprocess error) so the
+    /// caller can branch — typically: cancel → leave session alive,
+    /// timeout / invoke-error → consider session unhealthy.
+    /// Frontend pattern-matches on `kind='cancelled'` to surface a
+    /// neutral "İptal edildi" indicator instead of the red error
+    /// banner.
+    #[error("cancelled: {0}")]
+    Cancelled(String),
+
     /// Catch-all for unclassified failures (panics-in-tasks, missing
     /// env, etc.). Frontend treats `internal` as a developer bug.
     #[error("internal error: {0}")]
@@ -156,6 +168,7 @@ impl AppError {
             Self::SwarmInvoke(_) => "swarm_invoke",
             Self::Timeout(_) => "timeout",
             Self::WorkspaceBusy { .. } => "workspace_busy",
+            Self::Cancelled(_) => "cancelled",
             Self::Internal(_) => "internal",
         }
     }
@@ -180,6 +193,7 @@ impl AppError {
             | Self::ClaudeBinaryMissing(m)
             | Self::SwarmInvoke(m)
             | Self::Timeout(m)
+            | Self::Cancelled(m)
             | Self::Internal(m) => Cow::Borrowed(m.as_str()),
             Self::WorkspaceBusy {
                 workspace_id,

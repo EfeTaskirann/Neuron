@@ -28,6 +28,7 @@
 
 pub mod binding;
 pub mod coordinator;
+pub mod persistent_session;
 pub mod profile;
 pub mod transport;
 
@@ -42,6 +43,7 @@ pub use coordinator::{
     CoordinatorFsm, Job, JobOutcome, JobRegistry, JobState, StageResult,
     SwarmJobEvent, MAX_RETRIES,
 };
+pub use persistent_session::PersistentSession;
 pub use profile::{
     PermissionMode, Profile, ProfileRegistry, ProfileSource,
 };
