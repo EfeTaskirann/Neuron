@@ -4,6 +4,123 @@ Running journal of agent-driven changes. Newest entry on top. See `AGENTS.md` §
 
 ---
 
+## 2026-05-09 WP-W5-01 implemented (VERIFICATION DEFERRED — toolchain unavailable in author session)
+
+- branch: `wp-w5-01-mailbox-eventbus-substrate` (NOT yet merged to `main`)
+- dispatch: orchestrator-direct. Sub-agent dispatch was the planned
+  pattern (per the WP-W5-01 contract authoring), but the author's
+  shell on this fresh-machine session had **no Rust / pnpm toolchain
+  installed** + the auto-mode classifier blocked toolchain installs.
+  Code authored directly using full context from the WP-W5-overview
+  + per-file research; cargo/pnpm verification gates **deferred** to
+  the user's verified dev shell.
+- files changed: 8 (4 new + 4 modified)
+  - new — planning: `docs/work-packages/WP-W5-overview.md`,
+    `docs/work-packages/WP-W5-01-mailbox-eventbus-substrate.md`
+  - new — Rust: `src-tauri/migrations/0010_mailbox_eventbus.sql`
+    (3 ALTER TABLE: kind / parent_id / payload_json columns on
+    mailbox), `src-tauri/src/swarm/mailbox_bus.rs` (~700 lines
+    including 13 unit tests)
+  - modified: `src-tauri/src/swarm/mod.rs` (re-export
+    MailboxBus / MailboxEvent / MailboxEnvelope),
+    `src-tauri/src/db.rs` (migration count assertion 9 → 10),
+    `src-tauri/src/commands/mailbox.rs` (+`mailbox_emit_typed` +
+    `mailbox_list_typed` IPCs + 2 IPC tests),
+    `src-tauri/src/lib.rs` (specta typ register MailboxEvent +
+    MailboxEnvelope; collect_commands += 2 mailbox IPCs;
+    `app.manage(Arc<MailboxBus>)` next to SwarmAgentRegistry)
+- commit SHA: TBD (this entry lands in the same commit)
+- acceptance: ⏸ DEFERRED — verification gates not run in this
+  session. Per WP-W5-01 §"Verification commands" the user must
+  run on their dev shell:
+  - [ ] `cd src-tauri && cargo build --lib && cargo test --lib`
+        (expected: ≥ 447 passed; baseline was 435 + 12-13 new
+        unit tests)
+  - [ ] `cargo check --all-targets`
+  - [ ] `pnpm gen:bindings` (regen `app/src/lib/bindings.ts` —
+        new `MailboxEvent` tagged union + `MailboxEnvelope`
+        interface + 2 commands)
+  - [ ] `pnpm gen:bindings:check` (post-commit)
+  - [ ] `pnpm typecheck && pnpm lint && pnpm test --run`
+        (frontend test count unchanged at 65)
+- key implementation choices
+  - **Single discriminator string for SQL + JSON wire**. The
+    `MailboxEvent::kind_str()` returns the same snake_case form
+    as serde's tagged-enum `kind` field (`task_dispatch`,
+    `agent_result`, …), so SQL filtering and JSON
+    deserialisation agree byte-for-byte. The original WP-W5-01
+    contract proposed dot-separated SQL form (`task.dispatch`)
+    + underscore wire form (`task_dispatch`); the dual-form
+    approach was dropped during implementation because every
+    callsite would need a kind_str-to-wire-name lookup table.
+    Single form is simpler and the existing legacy `type` column
+    (which has dots/colons) is untouched on legacy emit paths.
+  - **`payload_json` carries the full tagged-enum JSON**.
+    `serde_json::to_string(&event)` writes the whole object
+    including the `kind` tag; `from_row_parts` round-trips by
+    `serde_json::from_str`. For legacy rows where
+    `payload_json='{}'` (the migration default), the parser
+    splices `{"kind": kind_arg}` so MailboxEvent::Note
+    deserializes cleanly without any emitter-side change.
+  - **Per-workspace broadcast lazy-create on subscribe** but
+    NOT on emit. If no subscriber has ever called `subscribe()`
+    for a workspace, the emit path skips the broadcast (the SQL
+    log is the source of truth; broadcast is a wake-up
+    optimization). Avoids leaking empty Senders.
+  - **`SendError` silently swallowed** on emit. `broadcast::Sender::send`
+    returns Err only when no receivers are attached. Persist-without-
+    broadcast IS the correct semantics — agents may not be subscribed
+    yet during early job lifecycle.
+  - **Back-compat `mailbox:new` Tauri event still fires**. Every
+    `emit_typed` call also fires the legacy `mailbox:new` event
+    with the legacy `MailboxEntry` shape, so existing frontend
+    listeners (terminal pane mailbox panel) keep working unchanged.
+    The legacy `type` column is set to the same string as the new
+    `kind` column on emit_typed paths.
+  - **Outer RwLock<HashMap> + per-workspace broadcast::Sender**.
+    Mirrors the W4-02 SwarmAgentRegistry concurrency pattern.
+    Read-dominated path (existing-workspace lookup on every emit)
+    keeps the read lock; structural changes (new workspace) take
+    the write lock briefly.
+  - **Single-workspace SQL filter assumption documented**. The
+    mailbox table has no `workspace_id` column (W2-02 design); for
+    W5 single-workspace per Charter §9, `list_typed` filters by
+    kind only. Multi-workspace post-W5 will add the column +
+    filter; the bus's per-workspace channel map is already keyed
+    on `workspace_id` so the in-process surface is multi-workspace-
+    ready on day zero.
+  - **No `bindings.ts` regen this commit** — pnpm not available in
+    author session. The user runs `pnpm gen:bindings` after
+    toolchain install; gen:bindings:check will fail until they
+    do, alerting them.
+- bindings regenerated: NO (deferred; see above)
+- branch: `wp-w5-01-mailbox-eventbus-substrate` — not pushed.
+  User reviews + verifies + merges to `main` after running gates.
+- known caveats / followups
+  - **Verification deferred** — primary caveat. If `cargo build`
+    fails with a typo or signature mismatch, fix on user side
+    or via a follow-up sub-agent dispatch with toolchain in
+    scope.
+  - **Specta `serde_json::Value`** in `CoordinatorHelpOutcome.outcome`
+    surfaces in TS as `unknown`. Acceptable for W5-01 (the bus
+    stays decoupled from `swarm::help_request`'s typed
+    CoordinatorHelpOutcome; would otherwise create a module
+    cycle); W5-03 may switch to a typed shape if the brain
+    consumes the field structurally.
+  - **Migration 0010 down-migration** not authored — sqlx-cli
+    embedded migrations don't run reverses anyway, and SQLite
+    can't DROP COLUMN on older versions without a full rebuild.
+    The forward migration is permanent; rolling back W5-01
+    means restoring the DB from before the first launch on the
+    new schema.
+  - **No frontend hooks** for `mailbox:list_typed` — UI
+    consumption is W5-04's scope (job-state projector).
+- next: WP-W5-02 (agent mailbox subscription + auto-emit). The
+  contract is the next authored doc; sub-agent dispatch happens
+  after the user verifies W5-01 + installs toolchain.
+
+---
+
 ## 2026-05-07 WP-W4 closed — persistent visible swarm runtime
 
 All seven sub-WPs landed sequentially in one session. The W3 9-agent

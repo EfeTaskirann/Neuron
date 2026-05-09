@@ -2,11 +2,18 @@
 //!
 //! - `mailbox:list` `(sinceTs?)` → `MailboxEntry[]`
 //! - `mailbox:emit` `(entry)` → `MailboxEntry`
+//! - `mailbox:emit_typed` `(workspaceId, from, to, summary, parentId?, event)` → `MailboxEnvelope` (W5-01)
+//! - `mailbox:list_typed` `(kind?, sinceId?, limit?)` → `MailboxEnvelope[]` (W5-01)
 //!
 //! `mailbox:emit` MUST also fire a `mailbox:new` Tauri event (the
 //! Tauri-legal form of ADR-0006's `mailbox.new` — Tauri 2.10 forbids
 //! `.` in event names) whose payload equals the inserted
 //! `MailboxEntry`. See ADR-0006.
+//!
+//! `mailbox:emit_typed` (W5-01) routes through the
+//! `crate::swarm::MailboxBus` so it persists + broadcasts to
+//! in-process subscribers + fires the legacy `mailbox:new` Tauri
+//! event for back-compat.
 //!
 //! ## Stable id derivation
 //!
@@ -18,6 +25,8 @@
 //! `DELETE`, so the frontend's React keys stay stable across the
 //! mailbox lifecycle.
 
+use std::sync::Arc;
+
 use serde::Serialize;
 use specta::Type;
 use tauri::{AppHandle, Emitter, Runtime, State};
@@ -26,6 +35,7 @@ use crate::db::DbPool;
 use crate::error::AppError;
 use crate::events;
 use crate::models::{MailboxEntry, MailboxEntryInput};
+use crate::swarm::{MailboxBus, MailboxEnvelope, MailboxEvent};
 use crate::time::now_seconds;
 
 /// Optional input used by `mailbox:list` to scope to entries strictly
@@ -161,6 +171,63 @@ pub async fn mailbox_emit<R: Runtime>(
     // "Wire-format substitution" rationale).
     app.emit(events::MAILBOX_NEW, &inserted)?;
     Ok(inserted)
+}
+
+// ---------------------------------------------------------------------
+// W5-01 — typed event-bus IPCs
+// ---------------------------------------------------------------------
+
+/// W5-01 — typed emit for the mailbox event-bus. Persists +
+/// broadcasts (in-process) + fires the legacy `mailbox:new` Tauri
+/// event for back-compat. Use this from the W5-02 agent dispatcher,
+/// W5-03 Coordinator brain, and W5-05 cancel path.
+///
+/// `event` is a tagged `MailboxEvent` discriminated by `kind`; the
+/// SQL row's `kind` column mirrors the same string for indexed
+/// filtering. `summary` is the human-readable line that surfaces
+/// in the existing mailbox UI.
+#[tauri::command(rename_all = "camelCase")]
+#[specta::specta]
+pub async fn mailbox_emit_typed<R: Runtime>(
+    app: AppHandle<R>,
+    bus: State<'_, Arc<MailboxBus>>,
+    workspace_id: String,
+    from_pane: String,
+    to_pane: String,
+    summary: String,
+    parent_id: Option<i64>,
+    event: MailboxEvent,
+) -> Result<MailboxEnvelope, AppError> {
+    bus.emit_typed(
+        &app,
+        &workspace_id,
+        &from_pane,
+        &to_pane,
+        &summary,
+        parent_id,
+        event,
+    )
+    .await
+}
+
+/// W5-01 — typed list with kind filter + since-id cursor. Used by
+/// the W5-04 projector to replay events on mount and by the future
+/// "Swarm comms" tab UI.
+///
+/// Returns oldest-first so consumers can replay events in event-log
+/// order. `since_id` is exclusive (rows with `id > since_id`).
+/// `kind` matches against the SQL `kind` column verbatim — pass
+/// e.g. `"task_dispatch"` to get only dispatch events. `limit`
+/// defaults to 100, capped at 500.
+#[tauri::command(rename_all = "camelCase")]
+#[specta::specta]
+pub async fn mailbox_list_typed(
+    bus: State<'_, Arc<MailboxBus>>,
+    kind: Option<String>,
+    since_id: Option<i64>,
+    limit: Option<u32>,
+) -> Result<Vec<MailboxEnvelope>, AppError> {
+    bus.list_typed(kind.as_deref(), since_id, limit).await
 }
 
 #[cfg(test)]
@@ -336,5 +403,120 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(err.kind(), "invalid_input");
+    }
+
+    // -----------------------------------------------------------------
+    // W5-01 — typed IPC tests
+    // -----------------------------------------------------------------
+
+    /// Acceptance: mailbox_emit_typed validates empty inputs the
+    /// same way mailbox_emit does (workspace, from, to). Empty
+    /// summary is allowed (free-form note shape).
+    #[tokio::test]
+    async fn mailbox_emit_typed_validates_empty_inputs() {
+        let (_app, pool, _dir) = mock_app_with_pool().await;
+        let bus = Arc::new(MailboxBus::new(pool));
+        let app_with_bus = tauri::test::mock_builder()
+            .manage(bus.clone())
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .expect("mock app");
+        let handle = app_with_bus.handle().clone();
+        let state = app_with_bus.state::<Arc<MailboxBus>>();
+
+        let err = mailbox_emit_typed(
+            handle.clone(),
+            state.clone(),
+            "".into(),
+            "agent:scout".into(),
+            "agent:planner".into(),
+            "".into(),
+            None,
+            MailboxEvent::Note,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.kind(), "invalid_input");
+
+        let err = mailbox_emit_typed(
+            handle,
+            state,
+            "default".into(),
+            "".into(),
+            "agent:planner".into(),
+            "".into(),
+            None,
+            MailboxEvent::Note,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.kind(), "invalid_input");
+    }
+
+    /// Acceptance: mailbox_emit_typed → mailbox_list_typed round-trip.
+    /// Two emits, one filtered list, ordering preserved oldest-first.
+    #[tokio::test]
+    async fn mailbox_emit_typed_persists_and_lists_typed() {
+        let (_app, pool, _dir) = mock_app_with_pool().await;
+        let bus = Arc::new(MailboxBus::new(pool));
+        let app = tauri::test::mock_builder()
+            .manage(bus.clone())
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .expect("mock app");
+        let handle = app.handle().clone();
+        let state = app.state::<Arc<MailboxBus>>();
+
+        mailbox_emit_typed(
+            handle.clone(),
+            state.clone(),
+            "default".into(),
+            "agent:scout".into(),
+            "agent:planner".into(),
+            "go".into(),
+            None,
+            MailboxEvent::TaskDispatch {
+                job_id: "j-1".into(),
+                target: "agent:planner".into(),
+                prompt: "p".into(),
+                with_help_loop: true,
+            },
+        )
+        .await
+        .expect("emit dispatch");
+
+        mailbox_emit_typed(
+            handle,
+            state.clone(),
+            "default".into(),
+            "agent:planner".into(),
+            "agent:scout".into(),
+            "ok".into(),
+            None,
+            MailboxEvent::AgentResult {
+                job_id: "j-1".into(),
+                agent_id: "planner".into(),
+                assistant_text: "done".into(),
+                total_cost_usd: 0.0,
+                turn_count: 1,
+            },
+        )
+        .await
+        .expect("emit result");
+
+        let dispatches =
+            mailbox_list_typed(state.clone(), Some("task_dispatch".into()), None, None)
+                .await
+                .expect("list dispatches");
+        assert_eq!(dispatches.len(), 1);
+        assert!(matches!(
+            dispatches[0].event,
+            MailboxEvent::TaskDispatch { .. }
+        ));
+
+        let all = mailbox_list_typed(state, None, None, None)
+            .await
+            .expect("list all");
+        assert_eq!(all.len(), 2);
+        assert!(matches!(all[0].event, MailboxEvent::TaskDispatch { .. }));
+        assert!(matches!(all[1].event, MailboxEvent::AgentResult { .. }));
     }
 }

@@ -1,0 +1,50 @@
+-- 0010 — mailbox event-bus extension (WP-W5-01).
+--
+-- Extends the W2-02 mailbox table with three columns so it can carry
+-- structured event-bus payloads alongside the legacy terminal-pane and
+-- swarm-help-loop entries that already use the `type` + `summary`
+-- columns:
+--
+--   * `kind` — event-shape discriminator. Defaults to 'note' for
+--     existing rows and free-form mailbox uses; W5-driven emitters
+--     set it to one of the structured variants:
+--       'task_dispatch' / 'agent_result' / 'agent_help_request' /
+--       'coordinator_help_outcome' / 'job_started' /
+--       'job_finished' / 'job_cancel' / 'note'.
+--     Snake_case form matches `MailboxEvent`'s serde tag so SQL
+--     values and JSON wire values agree byte-for-byte.
+--
+--   * `parent_id` — reply-to / correlation reference. Points at the
+--     autoincrement `id` of another mailbox row (the PK from
+--     migration 0002). Used by W5-02 to chain `agent_result` back to
+--     its originating `task_dispatch`, and by W5-04 to derive retry
+--     attempts from repeated dispatches against the same target.
+--     Nullable: top-level events like `job_started` have no parent.
+--
+--     No FK is added. Mailbox rows are append-only and never deleted,
+--     so referential integrity holds via the emit path. A FK would
+--     force ON DELETE CASCADE / RESTRICT decisions that don't fit
+--     the append-only contract; W4-07 followed the same pattern.
+--
+--   * `payload_json` — typed body, defaults to '{}'. Lets W5-driven
+--     emitters carry structured payloads (dispatch prompt, agent
+--     result with cost and turn-count, verdict JSON, etc.) without
+--     squeezing them through `summary`. Legacy emitters keep
+--     `summary` for the human-readable line and leave `payload_json`
+--     at the default.
+--
+-- ALTER TABLE on SQLite is restricted; ADD COLUMN with a default is
+-- the only safe op (matches the WP-W3-12d / WP-W3-12f / WP-W4-07
+-- migration pattern). Backfill is implicit — every existing row gets
+-- the column defaults.
+--
+-- No new index. The current `idx_mailbox_ts` covers the time-ordered
+-- listing pattern; W5-01's `mailbox:list_typed` adds a `kind` filter
+-- but the wire shape pages by id (`since_id` cursor) so a sparse
+-- predicate-on-kind scan is cheap until row counts climb past
+-- mid-six-figures. If a future profiling pass shows hot reads
+-- scanning the kind column, add `idx_mailbox_kind_id` then.
+
+ALTER TABLE mailbox ADD COLUMN kind         TEXT NOT NULL DEFAULT 'note';
+ALTER TABLE mailbox ADD COLUMN parent_id    INTEGER;
+ALTER TABLE mailbox ADD COLUMN payload_json TEXT NOT NULL DEFAULT '{}';

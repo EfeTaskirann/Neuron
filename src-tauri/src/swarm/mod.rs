@@ -30,6 +30,7 @@ pub mod agent_registry;
 pub mod binding;
 pub mod coordinator;
 pub mod help_request;
+pub mod mailbox_bus;
 pub mod persistent_session;
 pub mod profile;
 pub mod transport;
@@ -53,6 +54,7 @@ pub use help_request::{
     parse_coordinator_help_outcome, parse_help_request,
     process_help_request, CoordinatorHelpOutcome, HelpRequest,
 };
+pub use mailbox_bus::{MailboxBus, MailboxEnvelope, MailboxEvent};
 pub use persistent_session::PersistentSession;
 pub use profile::{
     PermissionMode, Profile, ProfileRegistry, ProfileSource,

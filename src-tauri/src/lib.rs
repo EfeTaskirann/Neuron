@@ -95,6 +95,8 @@ pub fn specta_builder_for_export() -> tauri_specta::Builder<tauri::Wry> {
             // mailbox
             commands::mailbox::mailbox_list,
             commands::mailbox::mailbox_emit::<tauri::Wry>,
+            commands::mailbox::mailbox_emit_typed::<tauri::Wry>,
+            commands::mailbox::mailbox_list_typed,
             // secrets
             commands::secrets::secrets_set,
             commands::secrets::secrets_has,
@@ -143,6 +145,15 @@ pub fn specta_builder_for_export() -> tauri_specta::Builder<tauri::Wry> {
         // mirrors the SwarmAgentEvent / SwarmJobEvent pattern.
         .typ::<crate::swarm::HelpRequest>()
         .typ::<crate::swarm::CoordinatorHelpOutcome>()
+        // WP-W5-01 — `MailboxEvent` is the typed payload of the
+        // mailbox event-bus; `MailboxEnvelope` is the wire shape
+        // returned by `mailbox:emit_typed` / `mailbox:list_typed`.
+        // The bus also broadcasts envelopes in-process for the
+        // W5-02 agent dispatcher + W5-03 brain to subscribe to.
+        // Explicit register so the tagged-enum lands in bindings.ts
+        // (specta walks reachable types only).
+        .typ::<crate::swarm::MailboxEvent>()
+        .typ::<crate::swarm::MailboxEnvelope>()
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -268,6 +279,28 @@ pub fn run() {
                 crate::swarm::SwarmAgentRegistry::new(bundled_profiles),
             );
             app.manage(agent_registry);
+
+            // WP-W5-01 — install the mailbox event-bus. Per-workspace
+            // `tokio::broadcast` channels lazy-create on first
+            // subscribe / emit; the bus shares the same `DbPool` as
+            // the rest of the app so emits land in the existing
+            // `mailbox` table (extended with kind / parent_id /
+            // payload_json columns by migration 0010).
+            //
+            // Dependency order is: pool → JobRegistry → AgentRegistry
+            // → MailboxBus. The bus needs the pool but does not
+            // depend on either registry; it lands here so future
+            // setup code (W5-02 dispatcher, W5-03 brain) can read
+            // both `Arc<SwarmAgentRegistry>` and `Arc<MailboxBus>`
+            // from app state without ordering surprises.
+            let pool_for_bus = app
+                .state::<db::DbPool>()
+                .inner()
+                .clone();
+            let mailbox_bus = std::sync::Arc::new(
+                crate::swarm::MailboxBus::new(pool_for_bus),
+            );
+            app.manage(mailbox_bus);
 
             // WP-W2-06 — install an empty terminal PTY registry. Each
             // `terminal:spawn` adds a pane to it; the shutdown hook
