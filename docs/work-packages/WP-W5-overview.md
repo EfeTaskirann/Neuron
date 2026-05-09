@@ -64,12 +64,12 @@ matching WP file is authored.
 
 | ID | Title | Owner | Status | Blocked by | Size |
 |---|---|---|---|---|---|
-| WP-W5-01 | Mailbox event-bus substrate (kind / parent_id / requires_response columns + workspace broadcast channel) | TBD | not-started | — | M |
-| WP-W5-02 | Agent mailbox subscription + auto-emit (PersistentSession reads target=agent:&lt;id&gt; rows; emits `agent.result` after each turn) | TBD | not-started | WP-W5-01 | M |
-| WP-W5-03 | Coordinator brain protocol — broadcast dispatch (Coordinator persona emits structured `task.dispatch` events; loop driven by Coordinator's read-decide-emit cycle) | TBD | not-started | WP-W5-02 | L |
-| WP-W5-04 | Job state derived from mailbox + UI plumbing (`SwarmJobEvent` channel preserved, payloads sourced from mailbox subscription) | TBD | not-started | WP-W5-03 | M |
-| WP-W5-05 | Cancel + workspace serialization under message-bus (cancel via `job.cancel` mailbox event; workspace lock derived from `job.started`/`job.finished`) | TBD | not-started | WP-W5-03 | S |
-| WP-W5-06 | FSM deprecation + 435-test migration + final integration smoke (replace `swarm:run_job` with the v2 dispatcher; remove `coordinator::fsm`) | TBD | not-started | WP-W5-04, WP-W5-05 | L |
+| WP-W5-01 | Mailbox event-bus substrate (kind / parent_id / payload_json columns + workspace broadcast channel) | orchestrator-direct | **implemented 2026-05-09 (`1b92c63`); cargo/pnpm verification DEFERRED to user dev shell** | — | M |
+| WP-W5-02 | Agent mailbox subscription + auto-emit (`MailboxAgentDispatcher` per agent) | TBD | contract authored (`42a247d`); not started | WP-W5-01 (verified) | M |
+| WP-W5-03 | Coordinator brain protocol — broadcast dispatch (`CoordinatorBrain` + `BrainAction` parser + `swarm:run_job_v2`) | TBD | contract authored (`42a247d`); not started | WP-W5-02 | L |
+| WP-W5-04 | Job state derived from mailbox + UI plumbing (`JobProjector` synthesises `SwarmJobEvent` stream) | TBD | contract authored (`42a247d`); not started | WP-W5-03 | M |
+| WP-W5-05 | Cancel + workspace serialization under message-bus (`JobCancel` event + `JobStarted` workspace-busy guard) | TBD | contract authored (`42a247d`); not started | WP-W5-03 | S |
+| WP-W5-06 | FSM deprecation + 435-test migration + final integration smoke (replace `swarm:run_job` with the brain dispatcher; remove `coordinator::fsm`) | TBD | contract authored (`42a247d`); not started | WP-W5-04, WP-W5-05 | L |
 
 Sizes (rough, in sub-agent days): S = 0.5–1 day, M = 1–2 days,
 L = 3+ days. W5-03 and W5-06 are L; both are split candidates if
