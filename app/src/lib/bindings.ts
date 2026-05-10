@@ -1326,11 +1326,14 @@ export type Span = {
 };
 
 /**
- *  Output of one completed FSM stage. Append-only — the FSM pushes
- *  one entry per stage that produced a result (success path) and
- *  stops on the first failure (which still records the failed
- *  stage's name in `Job.last_error` but does NOT push a `StageResult`
- *  for the failed stage in W3-12a — see `CoordinatorFsm::run_job`).
+ *  Output of one completed dispatch / stage. Append-only — the
+ *  W5-04 projector pushes one entry per `MailboxEvent::AgentResult`
+ *  the brain consumed (success path), and the brain decides
+ *  whether to retry, escalate, or finish on a result the persona
+ *  classifies as failure. Pre-W5-06 this was populated by the
+ *  FSM's per-stage `transport.invoke` await; the data shape
+ *  stays the same so the frontend's `JobOutcome` reducer keeps
+ *  working.
  */
 export type StageResult = {
 	/**
