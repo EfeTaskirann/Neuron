@@ -1,8 +1,8 @@
 ---
 id: WP-W5-03
 title: Coordinator brain protocol + broadcast dispatch (mailbox-driven dispatch loop)
-owner: TBD
-status: not-started
+owner: sub-agent (Claude Opus 4.7 1M)
+status: shipped
 depends-on: [WP-W5-01, WP-W5-02]
 acceptance-gate: "New `CoordinatorBrain` service that subscribes to the workspace's `MailboxBus`, drives a dispatch loop on the Coordinator persona session, and emits `MailboxEvent::TaskDispatch` / `JobFinished` / `CoordinatorHelpOutcome` events based on parsed brain actions. New `swarm:run_job_v2` IPC parallel to `swarm:run_job` (the FSM-driven path stays). Updated `coordinator.md` persona with the dispatch-action JSON contract. Defense-in-depth `parse_brain_action` parser (4 strategies). Max-dispatches cap (default 30, env override). At least one real-claude integration smoke (`#[ignore]`d) drives a full job through the brain end-to-end. NO change to the existing FSM, `swarm:run_job` IPC, or W4-05 help-loop fallback. `cargo test --lib` ≥ 25 new unit tests; `pnpm typecheck` / `lint` / `gen:bindings:check` green."
 ---
@@ -452,4 +452,161 @@ in 03a; 03b adds the loop's edge cases.
 
 ## Result
 
-(Filled in by the sub-agent on completion.)
+**Shipped 2026-05-10** by sub-agent (Claude Opus 4.7 1M context) on
+branch `wp-w5-03-coordinator-brain`.
+
+### Verification gates
+
+| Gate | Result |
+| --- | --- |
+| `cargo build --lib` | ✅ 0 |
+| `cargo test --lib` | ✅ **499 passed / 0 failed / 15 ignored** (baseline 465 → 499; +34 new tests including the integration smoke) |
+| `cargo check --all-targets` | ✅ 0 |
+| `pnpm gen:bindings:check` | ✅ 0 (after committing regen) |
+| `pnpm typecheck` | ✅ 0 |
+| `pnpm lint` | ✅ 0 |
+| `pnpm test --run` | ✅ 64 passed / 1 failed — same `App.test.tsx > /3,824 tokens/` tr-TR `Intl.NumberFormat` flake noted in W5-01 / W5-02 baselines (predates W5) |
+
+### What landed
+
+1. **`src-tauri/src/swarm/brain.rs`** (NEW, ~1090 lines incl. tests) —
+   `BrainAction` discriminated union (Dispatch / Finish / AskUser /
+   HelpOutcome), `parse_brain_action` 4-step defense-in-depth parser,
+   `DEFAULT_MAX_DISPATCHES = 30` + `NEURON_BRAIN_MAX_DISPATCHES` env
+   override, `CoordinatorInvoker` trait + `SwarmRegistryCoordinatorInvoker`
+   production impl, `CoordinatorBrain::run` / `run_with_max` dispatch
+   loop with cancel + cap + parse-error guards. Help-outcome doesn't
+   count toward the cap. `body_json: String` instead of
+   `serde_json::Value` per the W5-01 specta-Type lesson.
+2. **`src-tauri/src/swarm/agents/coordinator.md`** — adds a
+   "Üçüncü görev: Dispatch protocol (W5-03)" section in Turkish
+   wrapping the four action shapes with examples and contract rules.
+3. **`src-tauri/src/swarm/agent_dispatcher.rs`** — wires the
+   `with_help_loop: true` branch. Extends `drive_invoke` to call the
+   new `run_invoke_with_help_loop` helper which parses the
+   specialist's `assistant_text` for `neuron_help` blocks, emits
+   `MailboxEvent::AgentHelpRequest`, awaits a matching
+   `CoordinatorHelpOutcome` (filter on `target_agent_id` + `job_id`),
+   parses `body_json` back into a typed
+   `CoordinatorHelpOutcome`, and feeds the result back to the
+   specialist. `MAX_HELP_ROUNDS = 3` matches
+   `RegistryTransport::DEFAULT_HELP_ROUNDS`. `with_help_loop: false`
+   remains the unchanged W5-02 path.
+4. **`src-tauri/src/commands/swarm.rs`** — adds `swarm_run_job_v2`
+   IPC. Mints `j-<ULID>`, acquires the workspace lock via the
+   existing `JobRegistry::try_acquire_workspace`, ensures
+   `MailboxAgentDispatcher`s exist for all 7 specialist agents,
+   awaits the brain, finalises with a stub `JobOutcome`. Plus a
+   `#[cfg(test)]` `swarm_run_job_v2_with_invoker` entry point so
+   tests can drive the IPC lifecycle without spawning real
+   `claude`.
+5. **`src-tauri/src/swarm/mod.rs`** — re-exports `BrainAction`,
+   `CoordinatorBrain`, `CoordinatorInvoker`,
+   `SwarmRegistryCoordinatorInvoker`, `parse_brain_action`,
+   `resolve_max_dispatches`, `BrainRunResult`,
+   `DEFAULT_MAX_DISPATCHES`.
+6. **`src-tauri/src/lib.rs`** — registers `swarm_run_job_v2` in
+   `collect_commands!` and `BrainAction` on the specta builder so
+   the type lands in `bindings.ts`.
+7. **`app/src/lib/bindings.ts`** — regenerated.
+
+### Test breakdown
+
+- **Parser** (12 tests): `parse_dispatch_action_basic`,
+  `parse_dispatch_action_with_default_help_loop`,
+  `parse_finish_action_done`, `parse_finish_action_failed`,
+  `parse_ask_user_action`, `parse_help_outcome_action_direct_answer`,
+  `parse_help_outcome_action_ask_back`,
+  `parse_help_outcome_action_escalate`,
+  `parse_handles_fenced_json_block`,
+  `parse_handles_first_balanced_object`,
+  `parse_rejects_unknown_action`, `parse_rejects_malformed_json`,
+  `resolve_max_dispatches_default`.
+- **Run loop** (13 tests):
+  `brain_emits_first_dispatch_after_job_started`,
+  `brain_consumes_agent_result_emits_next_dispatch`,
+  `brain_emits_finish_done_terminates_loop`,
+  `brain_emits_finish_failed_terminates_loop`,
+  `brain_emits_ask_user_terminates_with_ask_user_outcome`,
+  `brain_consumes_help_request_emits_help_outcome`,
+  `brain_max_dispatches_cap_terminates_with_failed`,
+  `brain_cancel_mid_loop_terminates_with_failed`,
+  `brain_handles_coordinator_session_crash`,
+  `brain_resumes_loop_after_help_outcome`,
+  `brain_emits_dispatch_with_correct_parent_id_chain`,
+  `brain_finish_outcome_other_than_done_or_failed_normalised_to_failed`,
+  `brain_handles_parse_error_as_failed`.
+- **Dispatcher help-loop** (4 tests):
+  `dispatcher_with_help_loop_routes_via_bus`,
+  `dispatcher_without_help_loop_does_not_emit_help_request`,
+  `dispatcher_with_help_loop_respects_max_rounds`,
+  `dispatcher_with_help_loop_escalate_surfaces_as_error_result`.
+- **`swarm_run_job_v2`** (4 tests): `run_job_v2_validates_inputs`,
+  `run_job_v2_workspace_busy_when_concurrent`,
+  `run_job_v2_runs_full_chain_via_mock_brain`,
+  `run_job_v2_returns_job_outcome_with_correct_shape`.
+- **Real-claude smoke** (1 `#[ignore]`d):
+  `integration_run_job_v2_real_claude` — compiled, NOT run (the
+  test must EXIST and COMPILE per WP §"Real-claude integration
+  smoke is OPTIONAL to actually run"; executing requires a live
+  claude OAuth session and ~10 min wall-clock).
+
+Total new: **34 tests** (well above the WP's ≥25 target).
+
+### Design notes
+
+- **`CoordinatorInvoker` trait** mirrors W5-02's `AgentInvoker`
+  shape (one method, `impl Future` return, no `async-trait` per
+  Charter). The brain owns its receiver lifecycle and
+  `last_envelope_id` chain to thread parent_id across rounds.
+- **HelpOutcome doesn't wait for an event** — after emitting
+  `CoordinatorHelpOutcome` the brain re-invokes the coordinator
+  immediately so it can decide on the next action (dispatch /
+  finish / etc.). The specialist's eventual reply lands as a
+  separate `AgentResult` later.
+- **Dispatcher `with_help_loop` branch** subscribes to a fresh
+  receiver per invoke task (cheap; lazy channel reuse in the
+  bus). Filter on `target_agent_id == agent_id && job_id == job_id`
+  keeps cross-agent help-outcomes from leaking. 120s timeout on
+  the help-outcome wait so a stuck coordinator doesn't hang the
+  dispatcher forever.
+- **Outcome normalisation**: `Finish` with anything other than
+  `"done"` becomes `"failed"` before emit, matching the W3-12d
+  hygiene rule. `AskUser` emits `JobFinished` with
+  `outcome="ask_user"` so the orchestrator chat panel (W5-04)
+  can route on it.
+- **Test isolation**: `swarm_run_job_v2_with_invoker` takes a
+  `spawn_dispatchers` flag; tests that mock the brain inline use
+  `false` so the real dispatchers don't race the test's helper
+  task to invoke `claude`.
+
+### Caveats / followups
+
+- **Job state derivation is stub-shaped**: the W5-03 stub
+  `JobOutcome` has empty `stages`, `total_cost_usd: 0.0`, and
+  derives `total_duration_ms` from wall clock. W5-04 will project
+  the bus event log into the canonical shape (per stage:
+  Verdict-aware, cost summed from `AgentResult.total_cost_usd`).
+- **Real-claude integration smoke is compiled-only**: per WP
+  acceptance the test must exist + compile but executing is
+  optional. Run with `$env:NEURON_BRAIN_MAX_DISPATCHES="15"; cargo
+  test --lib integration_run_job_v2_real_claude -- --ignored
+  --nocapture` — gated on Pro/Max OAuth + ~10min budget.
+- **AskUser flow incomplete**: W5-03 emits `JobFinished {outcome:
+  "ask_user", summary: <question>}` but the orchestrator chat
+  panel doesn't yet listen for the `ask_user` discriminator — the
+  question rides in `summary` until W5-04/polish surfaces it.
+- **Cancel + workspace lock migration deferred to W5-05**: today
+  the brain registers a per-job `Notify` so `swarm:cancel_job`
+  can reach the v2 path; the workspace lock + cancel notify
+  persistence stays on the existing `JobRegistry` shape.
+- **FSM stays alive**: `swarm:run_job` (FSM) and `swarm:run_job_v2`
+  (brain) coexist. W5-06 deletes the FSM after behavioural
+  comparison.
+
+### Commits
+
+1. `07ad3c4` `feat(WP-W5-03): CoordinatorBrain dispatch loop + persona protocol`
+2. `49641bb` `feat(WP-W5-03): agent_dispatcher with_help_loop functional path`
+3. `3546b36` `feat(WP-W5-03): swarm:run_job_v2 IPC + brain registration`
+4. (next) `feat(WP-W5-03): bindings regen + AGENT_LOG entry`

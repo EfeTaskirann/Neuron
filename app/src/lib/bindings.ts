@@ -351,6 +351,32 @@ export const commands = {
 	 *  consumers (W5-03 brain) can still read user intent.
 	 */
 	swarmAgentsDispatchToAgent: (workspaceId: string, agentId: string, prompt: string, jobId: string | null, withHelpLoop: boolean | null) => typedError<number, AppErrorWire>(__TAURI_INVOKE("swarm_agents_dispatch_to_agent", { workspaceId, agentId, prompt, jobId, withHelpLoop })),
+	/**
+	 *  Drive the W5-03 Coordinator brain dispatch loop to completion.
+	 *  Parallel to `swarm:run_job` (the FSM-driven path stays alive for
+	 *  regression smokes; W5-06 deletes it).
+	 * 
+	 *  Lifecycle:
+	 *  1. Mint a `j-<ULID>` if not preset; acquire the workspace lock
+	 *     via the existing `JobRegistry::try_acquire_workspace`.
+	 *  2. Ensure a `MailboxAgentDispatcher` exists for every specialist
+	 *     agent so dispatches the brain emits land on a real receiver
+	 *     immediately.
+	 *  3. Spawn the brain on `CoordinatorBrain::run` with the workspace's
+	 *     `MailboxBus` and the production `CoordinatorInvoker`.
+	 *  4. Await the brain's `BrainRunResult` and build a stub
+	 *     `JobOutcome`. The full job-state derivation from mailbox
+	 *     events is W5-04's scope; for W5-03 we surface a minimal shape
+	 *     so callers (manual smokes) get a structured result without
+	 *     a frontend reducer.
+	 *  5. Release the workspace lock.
+	 * 
+	 *  Returns the stub `JobOutcome` on success / failure paths.
+	 *  `final_state` maps from brain outcome:
+	 *    - `"done"` → `JobState::Done`
+	 *    - everything else (`"failed" | "ask_user"`) → `JobState::Failed`
+	 */
+	swarmRunJobV2: (workspaceId: string, goal: string) => typedError<JobOutcome, AppErrorWire>(__TAURI_INVOKE("swarm_run_job_v2", { workspaceId, goal })),
 };
 
 /* Types */
@@ -467,6 +493,49 @@ export type ApprovalBanner = {
 	added: number,
 	removed: number,
 };
+
+/**
+ *  One Coordinator-emitted action. Tagged on `action`; field names
+ *  stay snake_case (matching the W5-01 `MailboxEvent` precedent).
+ * 
+ *  `body_json` is `String`-typed (not `serde_json::Value`) because
+ *  `Value` does not implement `specta::Type`. The string carries
+ *  the serialised JSON payload of a `CoordinatorHelpOutcome`; the
+ *  W5-02 dispatcher (with_help_loop branch) parses it back via
+ *  `serde_json::from_str` before feeding to the specialist.
+ */
+export type BrainAction = 
+/**
+ *  Route a sub-task to a specialist. `target` is `agent:<id>`
+ *  per the W5-01 namespacing convention (NOT `<id>` alone —
+ *  the dispatcher's `parse_agent_target` strips the prefix).
+ *  `with_help_loop` defaults to `false` — opt-in per dispatch.
+ */
+{ action: "dispatch"; target: string; prompt: string; with_help_loop?: boolean } | 
+/**
+ *  Terminate the job. `outcome` is `"done" | "failed"`; any
+ *  other string is normalised to `"failed"` by the brain
+ *  before emitting `JobFinished` (matching the W3-12d
+ *  "outcome must be one of {done, failed}" hygiene rule).
+ */
+{ action: "finish"; outcome: string; summary: string } | 
+/**
+ *  Surface a question to the user. The orchestrator chat panel
+ *  (W5-04+) listens for `JobFinished { outcome: "ask_user" }`
+ *  and renders the question; for W5-03 the brain emits
+ *  `JobFinished` with `summary` carrying the question text.
+ */
+{ action: "ask_user"; question: string } | 
+/**
+ *  Resolve a specialist's `AgentHelpRequest`. `target` is
+ *  `agent:<id>` of the specialist being answered; `body_json`
+ *  is a serialised
+ *  `swarm::help_request::CoordinatorHelpOutcome`. The brain
+ *  emits `MailboxEvent::CoordinatorHelpOutcome` and continues
+ *  the dispatch loop — `HelpOutcome` does NOT count toward
+ *  the `max_dispatches` cap.
+ */
+{ action: "help_outcome"; target: string; body_json: string };
 
 /**
  *  Wire shape for `mcp:callTool` returns. Keeps a flat `{content,

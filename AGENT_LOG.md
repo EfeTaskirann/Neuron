@@ -4,6 +4,95 @@ Running journal of agent-driven changes. Newest entry on top. See `AGENTS.md` §
 
 ---
 
+## 2026-05-10 WP-W5-03 completed
+
+- sub-agent: general-purpose (Claude Opus 4.7 1M)
+- branch: `wp-w5-03-coordinator-brain` (off `main` at `1001128`)
+- commits: `07ad3c4` brain module + persona protocol,
+  `49641bb` agent_dispatcher with_help_loop functional path,
+  `3546b36` swarm:run_job_v2 IPC + brain registration,
+  + (this commit) bindings regen + AGENT_LOG / WP status flip
+- files changed: 8 (1 new, 7 modified) — `swarm/brain.rs` (NEW),
+  `swarm/agents/coordinator.md`, `swarm/agent_dispatcher.rs`,
+  `swarm/mod.rs`, `commands/swarm.rs`, `lib.rs`,
+  `app/src/lib/bindings.ts` (regen),
+  `docs/work-packages/WP-W5-03-coordinator-brain.md`
+- tests: 465 → **499** (+34 new); 0 failed; 15 ignored (+1 new
+  ignored: `integration_run_job_v2_real_claude`). New tests cover
+  `parse_brain_action` (12), `CoordinatorBrain::run` loop (13),
+  dispatcher `with_help_loop` branch (4), and
+  `swarm:run_job_v2` IPC (4 + 1 `#[ignore]`d smoke).
+- acceptance: ✅ all gates green
+  - `cargo build --lib` 0
+  - `cargo test --lib` **499 / 0 / 15** (target was ≥ 490)
+  - `cargo check --all-targets` 0
+  - `pnpm gen:bindings:check` 0
+  - `pnpm typecheck` 0
+  - `pnpm lint` 0
+  - `pnpm test --run` 64/65 — same pre-existing locale flake as
+    W5-01 / W5-02 baseline (`App.test.tsx > /3,824 tokens/`,
+    tr-TR `Intl.NumberFormat`, predates W5)
+- design notes:
+  - **W5-01 specta gotcha avoided**: `BrainAction::HelpOutcome`
+    uses `body_json: String` instead of `body: serde_json::Value`
+    because `Value` does not implement `specta::Type`. The
+    string carries a serialised `CoordinatorHelpOutcome` JSON;
+    the W5-02 dispatcher (with_help_loop branch) parses it back
+    via `serde_json::from_str` before feeding to the specialist.
+  - **`CoordinatorInvoker` trait** mirrors W5-02's
+    `AgentInvoker` (one method, `impl Future` return, no
+    `async-trait` dep). The brain owns its bus receiver +
+    `last_envelope_id` chain so the projector (W5-04) sees a
+    uniform reply-to chain across rounds.
+  - **HelpOutcome doesn't count toward the cap** — only
+    `Dispatch` actions are counted. Verified by
+    `brain_resumes_loop_after_help_outcome` running with
+    `max_dispatches=1` and threading through one help_outcome +
+    one dispatch + finish.
+  - **Outcome normalisation**: `Finish` with anything other than
+    `"done"` becomes `"failed"` before emit. `AskUser` emits
+    `JobFinished{outcome:"ask_user"}` so a future orchestrator
+    chat panel (W5-04) can route on it; for W5-03 the question
+    rides in `summary`.
+  - **Dispatcher `with_help_loop=true`**: subscribes to a fresh
+    bus receiver per invoke task, filters
+    `CoordinatorHelpOutcome` by `target_agent_id == this agent
+    && job_id == this job`, parses `body_json` back into a
+    typed `CoordinatorHelpOutcome`, feeds the answer back as the
+    next turn's user_message. `MAX_HELP_ROUNDS = 3` matches
+    `RegistryTransport::DEFAULT_HELP_ROUNDS`. 120s timeout on
+    the help-outcome wait so a stuck coordinator doesn't hang
+    the dispatcher forever.
+  - **`spawn_dispatchers: false` in test invoker entry-point**:
+    the run-full-chain test mocks the brain AND simulates the
+    dispatcher (its helper task watches for `task_dispatch` rows
+    and emits `AgentResult`). Without the toggle the real
+    dispatchers would race the helper to invoke `claude`. The
+    production IPC always passes `true`.
+- caveats / followups:
+  - **Job state derivation is stub-shaped**: W5-03 returns a
+    minimal `JobOutcome` (empty `stages`, `total_cost_usd:0.0`,
+    `total_duration_ms` from wall clock). W5-04 projects the bus
+    event log into the canonical shape (per-stage Verdict, cost
+    summed from `AgentResult.total_cost_usd`).
+  - **Real-claude smoke compiled-only**: per WP §"Real-claude
+    integration smoke is OPTIONAL to actually run" the test must
+    exist + compile but executing is opt-in (Pro/Max OAuth +
+    ~10min budget). Run with `$env:NEURON_BRAIN_MAX_DISPATCHES=
+    "15"; cargo test --lib integration_run_job_v2_real_claude
+    -- --ignored --nocapture` to verify against live `claude`.
+  - **Cancel + workspace lock migration deferred to W5-05**:
+    today the brain registers a per-job `Notify` so
+    `swarm:cancel_job` can reach the v2 path; the workspace
+    lock + cancel notify persistence stays on the existing
+    `JobRegistry` shape.
+  - **FSM stays alive**: `swarm:run_job` (FSM) + `swarm:run_job_v2`
+    (brain) coexist. W5-06 deletes the FSM after behavioural
+    comparison.
+- next: orchestrator should ff-merge `wp-w5-03-coordinator-brain`
+  → `main` and dispatch W5-04 (job-state projector +
+  `JobOutcome` derivation from mailbox events).
+
 ## 2026-05-10 WP-W5-02 completed
 
 - sub-agent: general-purpose (Claude Opus 4.7 1M)
