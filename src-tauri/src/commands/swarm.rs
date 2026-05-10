@@ -476,25 +476,46 @@ pub async fn swarm_orchestrator_log_job<R: Runtime>(
     Ok(())
 }
 
-/// Signal cancellation for an in-flight swarm job (WP-W3-12c §4).
+/// Signal cancellation for an in-flight swarm job (WP-W3-12c §4,
+/// WP-W5-05 source-switching).
 ///
-/// Looks up `job_id` in the `JobRegistry`. Returns:
+/// Discriminates on `swarm_jobs.source` (`'brain'` vs `'fsm'`):
 ///
-/// - `Ok(())` if the job was in-flight and the cancel signal was
-///   delivered. The FSM observes the signal at the next `select!`
-///   point, emits `Cancelled` then `Finished`, and finalizes the
-///   job as `Failed` with `last_error = "cancelled by user"`.
-/// - `Err(AppError::NotFound)` if no job with the given id exists
-///   in the registry.
-/// - `Err(AppError::Conflict)` if the job is already terminal
-///   (`Done`/`Failed`) — including a previous cancel that has
-///   already finalized.
+/// - **`source='brain'`** (W5-03 brain-driven jobs): emits
+///   `MailboxEvent::JobCancel` on the workspace's mailbox bus.
+///   The brain's dispatch-loop `select!` and every dispatcher's
+///   in-flight invoke notify pick it up and unwind. Returns
+///   `Ok(())` immediately — the IPC does not block on the
+///   cancel actually propagating (≤ 100ms in practice; same
+///   async semantics as the FSM cancel below).
+/// - **`source='fsm'` or no DB row** (legacy / W3 path): keeps
+///   the in-memory `JobRegistry::signal_cancel` flow. Returns:
+///     - `Ok(())` if the cancel signal landed on the FSM's per-
+///       job `Notify`. The FSM observes the signal at its next
+///       `select!` point, emits `Cancelled` then `Finished`,
+///       and finalizes the job as `Failed` with `last_error =
+///       "cancelled by user"`.
+///     - `Err(AppError::NotFound)` if no job with the given id
+///       exists in the registry.
+///     - `Err(AppError::Conflict)` if the job is already
+///       terminal (`Done`/`Failed`) — including a previous
+///       cancel that has already finalized.
+/// - **unknown source string**: returns
+///   `AppError::Internal(...)`. Defensive — only `'brain'` and
+///   `'fsm'` are written in production; any other value implies
+///   schema drift.
 ///
-/// Idempotency: a second cancel against the same in-flight job
-/// either returns `Ok(())` (signal sent again, FSM ignores it
-/// once finalized) or `Err(Conflict)` if the FSM has already
-/// removed the cancel notify on its tail. The race is benign;
-/// callers should treat both as "cancel acknowledged".
+/// Idempotency (FSM path): a second cancel against the same
+/// in-flight job either returns `Ok(())` (signal sent again, FSM
+/// ignores it once finalized) or `Err(Conflict)` if the FSM has
+/// already removed the cancel notify on its tail. The race is
+/// benign; callers should treat both as "cancel acknowledged".
+///
+/// Idempotency (brain path): the bus has no dedupe — a second
+/// cancel emits a second `JobCancel` row. The brain + dispatchers
+/// both treat the second as a no-op (the loop has already
+/// terminated). The mailbox row is informational; the SQL log
+/// remains the source of truth.
 #[tauri::command(rename_all = "camelCase")]
 #[specta::specta]
 pub async fn swarm_cancel_job<R: Runtime>(
@@ -519,29 +540,97 @@ pub async fn swarm_cancel_job<R: Runtime>(
         .inner()
         .clone();
 
-    // 1. Look up the job. Unknown id → NotFound.
-    let job = registry.get(&job_id).ok_or_else(|| {
-        AppError::NotFound(format!("swarm job `{job_id}`"))
-    })?;
-    // 2. Terminal jobs cannot be cancelled. The FSM has already
-    //    removed the cancel notify by the time `state` flips, so
-    //    we surface the precondition explicitly.
-    if matches!(job.state, JobState::Done | JobState::Failed) {
-        return Err(AppError::Conflict(format!(
-            "swarm job `{job_id}` is already terminal ({:?})",
-            job.state
-        )));
-    }
-    // 3. Signal cancel. NotFound here means the job finalized
-    //    between step 1 and step 3 — race; treat as Conflict so
-    //    the caller sees a single "already terminal" semantic
-    //    regardless of which side of the race they hit.
-    match registry.signal_cancel(&job_id) {
-        Ok(()) => Ok(()),
-        Err(AppError::NotFound(_)) => Err(AppError::Conflict(format!(
-            "swarm job `{job_id}` is already terminal"
+    // WP-W5-05 — discriminate on `swarm_jobs.source`. Tests in the
+    // FSM cancel suite use a `JobRegistry::new()` (no pool) so the
+    // `swarm_jobs` row is never written; in that case the source
+    // query returns `None` and we fall through to the legacy FSM
+    // path. Production always has the pool wired.
+    let source: Option<String> =
+        if let Some(pool) = app.try_state::<crate::db::DbPool>() {
+            sqlx::query_scalar(
+                "SELECT source FROM swarm_jobs WHERE id = ?",
+            )
+            .bind(&job_id)
+            .fetch_optional(pool.inner())
+            .await?
+        } else {
+            None
+        };
+
+    match source.as_deref() {
+        Some("brain") => {
+            // Look up the workspace_id so the JobCancel lands on
+            // the right per-workspace broadcast channel. The
+            // brain + dispatcher subscribers filter by job_id,
+            // but the channel routing is per-workspace.
+            let pool = app
+                .try_state::<crate::db::DbPool>()
+                .ok_or_else(|| {
+                    AppError::Internal(
+                        "DbPool missing from app state — \
+                         lib.rs::setup did not call app.manage()"
+                            .into(),
+                    )
+                })?
+                .inner()
+                .clone();
+            let workspace_id: String = sqlx::query_scalar(
+                "SELECT workspace_id FROM swarm_jobs WHERE id = ?",
+            )
+            .bind(&job_id)
+            .fetch_one(&pool)
+            .await?;
+            let bus = app
+                .try_state::<Arc<MailboxBus>>()
+                .ok_or_else(|| {
+                    AppError::Internal(
+                        "MailboxBus missing from app state — \
+                         lib.rs::setup did not call app.manage()"
+                            .into(),
+                    )
+                })?
+                .inner()
+                .clone();
+            bus.emit_typed(
+                &app,
+                &workspace_id,
+                "agent:user",
+                "agent:coordinator",
+                &format!("cancel requested for {job_id}"),
+                None,
+                MailboxEvent::JobCancel {
+                    job_id: job_id.clone(),
+                },
+            )
+            .await?;
+            Ok(())
+        }
+        Some("fsm") | None => {
+            // Legacy W3 FSM path — preserved verbatim from
+            // WP-W3-12c §4. Stays in place until W5-06 deletes
+            // the FSM.
+            let job = registry.get(&job_id).ok_or_else(|| {
+                AppError::NotFound(format!("swarm job `{job_id}`"))
+            })?;
+            if matches!(job.state, JobState::Done | JobState::Failed) {
+                return Err(AppError::Conflict(format!(
+                    "swarm job `{job_id}` is already terminal ({:?})",
+                    job.state
+                )));
+            }
+            match registry.signal_cancel(&job_id) {
+                Ok(()) => Ok(()),
+                Err(AppError::NotFound(_)) => {
+                    Err(AppError::Conflict(format!(
+                        "swarm job `{job_id}` is already terminal"
+                    )))
+                }
+                Err(other) => Err(other),
+            }
+        }
+        Some(other) => Err(AppError::Internal(format!(
+            "unknown swarm_jobs.source: {other}"
         ))),
-        Err(other) => Err(other),
     }
 }
 
@@ -1592,6 +1681,188 @@ mod tests {
             .await
             .expect_err("no registry rejected");
         assert_eq!(err.kind(), "internal");
+    }
+
+    // ---------------------------------------------------------------- //
+    // WP-W5-05 — swarm:cancel_job source-switching                       //
+    // ---------------------------------------------------------------- //
+
+    /// Helper: seed one `swarm_jobs` row directly. Mirrors the
+    /// projector's `persist_job_init` shape but bypasses it so the
+    /// test stays under the IPC's verification contract.
+    async fn seed_swarm_job_row(
+        pool: &crate::db::DbPool,
+        id: &str,
+        workspace_id: &str,
+        state: &str,
+        source: &str,
+    ) {
+        sqlx::query(
+            "INSERT INTO swarm_jobs \
+             (id, workspace_id, goal, created_at_ms, state, retry_count, last_error, finished_at_ms, last_verdict_json, source) \
+             VALUES (?, ?, 'g', 0, ?, 0, NULL, NULL, NULL, ?)",
+        )
+        .bind(id)
+        .bind(workspace_id)
+        .bind(state)
+        .bind(source)
+        .execute(pool)
+        .await
+        .expect("seed swarm_jobs row");
+    }
+
+    /// Acceptance: `source='brain'` triggers a `MailboxEvent::JobCancel`
+    /// emit on the workspace's bus. The IPC returns `Ok(())` once the
+    /// emit lands; the brain + dispatchers pick the event up via
+    /// their broadcast subscribers (covered by W5-02 / W5-03 unit
+    /// tests).
+    #[tokio::test]
+    async fn cancel_job_brain_source_emits_job_cancel_event() {
+        let (app, pool, _dir) = mock_app_with_pool().await;
+        let registry = Arc::new(JobRegistry::new());
+        app.manage(registry);
+        let bus = Arc::new(crate::swarm::MailboxBus::new(pool.clone()));
+        app.manage(Arc::clone(&bus));
+
+        // Seed a brain-driven job in the DB. No matching registry
+        // entry needed — the brain path doesn't consult the
+        // in-memory JobRegistry.
+        seed_swarm_job_row(&pool, "j-brain", "ws-1", "scout", "brain").await;
+
+        // Subscribe BEFORE the cancel so we don't miss the broadcast.
+        let mut rx = bus.subscribe("ws-1").await;
+
+        swarm_cancel_job(app.handle().clone(), "j-brain".into())
+            .await
+            .expect("cancel ok");
+
+        // The mailbox row must land with `kind='job_cancel'` carrying
+        // our job_id.
+        let env = tokio::time::timeout(
+            Duration::from_secs(1),
+            rx.recv(),
+        )
+        .await
+        .expect("broadcast received within 1s")
+        .expect("envelope");
+        match env.event {
+            crate::swarm::MailboxEvent::JobCancel { job_id } => {
+                assert_eq!(job_id, "j-brain");
+            }
+            other => panic!("expected JobCancel; got {other:?}"),
+        }
+        // Persisted row exists.
+        let kind: String = sqlx::query_scalar(
+            "SELECT kind FROM mailbox WHERE rowid = ?",
+        )
+        .bind(env.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(kind, "job_cancel");
+    }
+
+    /// Acceptance: `source='fsm'` keeps the legacy in-memory
+    /// `JobRegistry::signal_cancel` path. Mirrors
+    /// `cancel_in_flight_with_notify_returns_ok` but seeds the DB
+    /// row too so the source-switch hits the `'fsm'` branch.
+    #[tokio::test]
+    async fn cancel_job_fsm_source_signals_notify() {
+        use crate::swarm::coordinator::Job;
+        let (app, pool, _dir) = mock_app_with_pool().await;
+        let registry = Arc::new(JobRegistry::new());
+
+        // In-memory registry entry — needed for the FSM path.
+        let job = Job {
+            id: "j-fsm".into(),
+            goal: "g".into(),
+            created_at_ms: 0,
+            state: JobState::Scout,
+            retry_count: 0,
+            stages: Vec::new(),
+            last_error: None,
+            last_verdict: None,
+            source: Job::default_source(),
+        };
+        registry
+            .try_acquire_workspace("ws-fsm", job)
+            .await
+            .expect("acquire");
+        let notify = Arc::new(tokio::sync::Notify::new());
+        registry
+            .register_cancel("j-fsm", Arc::clone(&notify))
+            .expect("register");
+        app.manage(Arc::clone(&registry));
+
+        // DB row with source='fsm' so the source-query lands the
+        // FSM branch.
+        seed_swarm_job_row(&pool, "j-fsm", "ws-fsm", "scout", "fsm").await;
+
+        let waiter = tokio::spawn(async move {
+            notify.notified().await;
+        });
+        tokio::task::yield_now().await;
+
+        swarm_cancel_job(app.handle().clone(), "j-fsm".into())
+            .await
+            .expect("cancel ok");
+
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("waiter wakes within 1s")
+            .expect("waiter task panicked");
+    }
+
+    /// Acceptance: any unknown source string surfaces `Internal`.
+    /// Defensive — production only writes `'brain'` or `'fsm'`,
+    /// so this branch protects against schema drift.
+    #[tokio::test]
+    async fn cancel_job_unknown_source_returns_internal_error() {
+        let (app, pool, _dir) = mock_app_with_pool().await;
+        let registry = Arc::new(JobRegistry::new());
+        app.manage(registry);
+        // No bus needed — the unknown branch short-circuits before
+        // any bus lookup.
+
+        seed_swarm_job_row(
+            &pool,
+            "j-weird",
+            "ws-1",
+            "scout",
+            "totally-made-up",
+        )
+        .await;
+
+        let err = swarm_cancel_job(app.handle().clone(), "j-weird".into())
+            .await
+            .expect_err("unknown source rejected");
+        assert_eq!(err.kind(), "internal");
+        assert!(
+            err.message().contains("totally-made-up"),
+            "error message must echo the bad source: {err:?}"
+        );
+    }
+
+    /// Acceptance: a job_id that exists in neither the DB nor the
+    /// registry surfaces `NotFound` — the source-switch falls
+    /// through to the FSM branch on `None` source, which then
+    /// looks up the registry and returns `NotFound`. Equivalent in
+    /// shape to `cancel_unknown_job_id_returns_not_found` but
+    /// asserted explicitly under the WP-W5-05 path so a future
+    /// refactor doesn't drop the contract.
+    #[tokio::test]
+    async fn cancel_job_nonexistent_id_returns_not_found() {
+        let (app, _pool, _dir) = mock_app_with_pool().await;
+        let registry = Arc::new(JobRegistry::new());
+        app.manage(registry);
+
+        let err = swarm_cancel_job(
+            app.handle().clone(),
+            "j-does-not-exist".into(),
+        )
+        .await
+        .expect_err("nonexistent rejected");
+        assert_eq!(err.kind(), "not_found");
     }
 
     // ---------------------------------------------------------------- //
