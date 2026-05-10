@@ -196,9 +196,25 @@ pub struct Job {
     /// error, so on this branch `last_error` stays `None`.
     #[serde(default)]
     pub last_verdict: Option<Verdict>,
+    /// W5-04: which executor produced this job — `"fsm"` for the
+    /// W3 deterministic state-machine path (`swarm:run_job`),
+    /// `"brain"` for the W5-03 mailbox-driven CoordinatorBrain
+    /// path (`swarm:run_job_v2`). Defaults to `"fsm"` on
+    /// deserialise so older persisted JSON without the key
+    /// (W3 vintage) round-trips unchanged.
+    #[serde(default = "Job::default_source")]
+    pub source: String,
 }
 
 impl Job {
+    /// Default `source` value for backwards-compat deserialisation
+    /// (W5-04). Older persisted JSON written before W5-04 lacks the
+    /// `source` key; serde substitutes this default so the whole
+    /// `Job` parses cleanly without a migration step on every read.
+    pub fn default_source() -> String {
+        "fsm".into()
+    }
+
     /// Walk `stages` newest-first looking for the most recent
     /// Review/Test entry whose `verdict` came back rejected. Used by
     /// the W3-12e retry loop to label the prior gate ("Reviewer" /
@@ -269,6 +285,13 @@ pub struct JobSummary {
     pub stage_count: u32,
     pub total_cost_usd: f64,
     pub last_error: Option<String>,
+    /// W5-04: which executor produced this job — `"fsm"` for the
+    /// W3 FSM path, `"brain"` for the W5-03 brain-driven path.
+    /// Read from `swarm_jobs.source` (see migration 0011).
+    /// `serde(default)` lets older persisted JSON without the key
+    /// round-trip cleanly.
+    #[serde(default = "Job::default_source")]
+    pub source: String,
 }
 
 /// Full job-detail wire-shape returned by `swarm:get_job` (WP-W3-12b §4).
@@ -297,6 +320,13 @@ pub struct JobDetail {
     /// because a Reviewer or Tester verdict came back rejected.
     #[serde(default)]
     pub last_verdict: Option<Verdict>,
+    /// W5-04: which executor produced this job — `"fsm"` for the
+    /// W3 FSM path, `"brain"` for the W5-03 brain-driven path.
+    /// Read from `swarm_jobs.source` (see migration 0011).
+    /// `serde(default)` lets older persisted JSON without the key
+    /// round-trip cleanly.
+    #[serde(default = "Job::default_source")]
+    pub source: String,
 }
 
 impl JobDetail {
@@ -328,6 +358,7 @@ impl JobDetail {
             total_cost_usd,
             total_duration_ms,
             last_verdict: job.last_verdict,
+            source: job.source,
         }
     }
 }
@@ -926,6 +957,7 @@ mod tests {
             stages: Vec::new(),
             last_error: None,
             last_verdict: None,
+            source: Job::default_source(),
         }
     }
 

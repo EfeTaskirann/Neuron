@@ -614,6 +614,7 @@ impl<T: Transport> CoordinatorFsm<T> {
             stages: Vec::new(),
             last_error: None,
             last_verdict: None,
+            source: Job::default_source(),
         };
         self.registry
             .try_acquire_workspace(&workspace_id, job)
@@ -4970,6 +4971,7 @@ mod tests {
             stages: Vec::new(),
             last_error: None,
             last_verdict: None,
+            source: Job::default_source(),
         };
         registry
             .try_acquire_workspace("ws-restart", job)

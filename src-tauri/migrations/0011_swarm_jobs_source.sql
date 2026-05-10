@@ -1,0 +1,22 @@
+-- 0011 — swarm_jobs source discriminator (WP-W5-04).
+--
+-- Adds one column to distinguish FSM-driven jobs (W3 path,
+-- `swarm:run_job`) from brain-driven jobs (W5-03 path,
+-- `swarm:run_job_v2`):
+--
+--   * `source` — 'fsm' for jobs run via the W3 FSM, 'brain' for
+--     jobs run via the W5-03 mailbox-driven CoordinatorBrain.
+--     Backfill is 'fsm' for every existing row (the migration runs
+--     on databases that pre-date W5-04).
+--
+-- Wire / read paths: `Job.source` is added with `#[serde(default =
+-- "Job::default_source")]` so older persisted JSON without the key
+-- still deserialises (default = "fsm"). The W5-04 `JobProjector`
+-- writes 'brain' on every brain-driven INSERT; the FSM continues
+-- writing the default 'fsm'.
+--
+-- ALTER TABLE on SQLite is restricted; ADD COLUMN with a default
+-- backfills cleanly (mirrors migrations 0007 / 0008 / 0010 — same
+-- pattern).
+
+ALTER TABLE swarm_jobs ADD COLUMN source TEXT NOT NULL DEFAULT 'fsm';
