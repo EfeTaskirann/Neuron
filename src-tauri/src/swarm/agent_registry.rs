@@ -179,6 +179,18 @@ pub struct SwarmAgentRegistry {
     sessions: RwLock<HashMap<(String, String), Arc<Mutex<AgentSlot>>>>,
     profiles: Arc<ProfileRegistry>,
     turn_cap: u32,
+    /// W5-02 — per-(workspace, agent) `MailboxAgentDispatcher`s.
+    /// Spawned lazily by `ensure_dispatcher` on first dispatch
+    /// targeting the agent (or eagerly by tests / IPC). On
+    /// `shutdown_all` these are drained BEFORE sessions die so
+    /// in-flight invokes can complete via cancel rather than
+    /// being torn out from under the dispatcher.
+    dispatchers: RwLock<
+        HashMap<
+            (String, String),
+            crate::swarm::agent_dispatcher::MailboxAgentDispatcher,
+        >,
+    >,
 }
 
 impl SwarmAgentRegistry {
@@ -192,6 +204,7 @@ impl SwarmAgentRegistry {
             sessions: RwLock::new(HashMap::new()),
             profiles,
             turn_cap,
+            dispatchers: RwLock::new(HashMap::new()),
         }
     }
 
@@ -206,6 +219,7 @@ impl SwarmAgentRegistry {
             sessions: RwLock::new(HashMap::new()),
             profiles,
             turn_cap,
+            dispatchers: RwLock::new(HashMap::new()),
         }
     }
 
@@ -726,7 +740,28 @@ impl SwarmAgentRegistry {
 
     /// Eager shutdown of every workspace's every session.
     /// Called from `lib.rs` on `WindowEvent::CloseRequested`.
+    ///
+    /// W5-02 — drains every `MailboxAgentDispatcher` BEFORE
+    /// tearing down the session map. The order matters: a
+    /// dispatcher with an in-flight invoke holds an `Arc` to the
+    /// invoker which holds the registry; shutting sessions first
+    /// would yank `PersistentSession`s out from under the
+    /// dispatcher's invoke task. Shutting dispatchers first lets
+    /// each invoke finish via cancel signal cleanly.
     pub async fn shutdown_all(&self) -> Result<(), AppError> {
+        // 1. Drain dispatchers first.
+        let dispatchers: Vec<(
+            (String, String),
+            crate::swarm::agent_dispatcher::MailboxAgentDispatcher,
+        )> = {
+            let mut write = self.dispatchers.write().await;
+            write.drain().collect()
+        };
+        for (_, dispatcher) in dispatchers {
+            dispatcher.shutdown().await;
+        }
+
+        // 2. Now tear down sessions.
         let workspace_ids: Vec<String> = {
             let read = self.sessions.read().await;
             let mut ids: Vec<String> = read
@@ -746,11 +781,82 @@ impl SwarmAgentRegistry {
         Ok(())
     }
 
+    /// W5-02 — idempotent lazy spawn of a `MailboxAgentDispatcher`
+    /// for `(workspace_id, agent_id)`. Second + subsequent calls
+    /// no-op. The returned dispatcher is stored on the registry;
+    /// callers do not own it (its lifecycle ends on
+    /// `shutdown_all`).
+    ///
+    /// The dispatcher subscribes to the workspace's `MailboxBus`
+    /// channel and routes `agent:<agent_id>`-targeted
+    /// `task_dispatch` events to
+    /// `acquire_and_invoke_turn` (no help loop — that's W5-03
+    /// scope). Per the WP this is *lazy*: callers may invoke this
+    /// at app boot for a known set of agents, OR at first dispatch
+    /// (the IPC `swarm:agents:dispatch_to_agent` calls it
+    /// inline before emitting).
+    ///
+    /// Validation: empty `workspace_id` / `agent_id` are rejected
+    /// at the IPC boundary; this method silently no-ops on empty
+    /// inputs since the registry's hot path doesn't validate
+    /// either (defense-in-depth — the IPC ALWAYS validates first).
+    pub async fn ensure_dispatcher<R: Runtime>(
+        self: &Arc<Self>,
+        app: &AppHandle<R>,
+        workspace_id: &str,
+        agent_id: &str,
+        bus: &Arc<crate::swarm::mailbox_bus::MailboxBus>,
+    ) {
+        if workspace_id.trim().is_empty() || agent_id.trim().is_empty() {
+            return;
+        }
+        let key = (workspace_id.to_string(), agent_id.to_string());
+
+        // Fast path: if the dispatcher already exists, return.
+        {
+            let read = self.dispatchers.read().await;
+            if read.contains_key(&key) {
+                return;
+            }
+        }
+
+        // Slow path: take the write lock and re-check (handles the
+        // read-then-write race between two concurrent ensures).
+        let mut write = self.dispatchers.write().await;
+        if write.contains_key(&key) {
+            return;
+        }
+
+        let invoker = Arc::new(
+            crate::swarm::agent_dispatcher::SwarmAgentRegistryInvoker::new(
+                app.clone(),
+                Arc::clone(self),
+            ),
+        );
+        let dispatcher =
+            crate::swarm::agent_dispatcher::MailboxAgentDispatcher::spawn(
+                app.clone(),
+                workspace_id.to_string(),
+                agent_id.to_string(),
+                invoker,
+                Arc::clone(bus),
+            )
+            .await;
+        write.insert(key, dispatcher);
+    }
+
     /// Diagnostics: how many slots does the registry hold across all
     /// workspaces? Used by tests + a future telemetry surface.
     #[cfg(test)]
     pub(crate) async fn slot_count(&self) -> usize {
         self.sessions.read().await.len()
+    }
+
+    /// Diagnostics: how many dispatchers are registered. Used by the
+    /// `registry_ensure_dispatcher_is_idempotent` test.
+    #[cfg(test)]
+    pub(crate) async fn dispatcher_count(&self) -> usize {
+        self.dispatchers.read().await.len()
     }
 
     /// Diagnostics: the configured turn cap for this registry.
@@ -1112,6 +1218,53 @@ mod tests {
             .await
             .expect_err("empty rejected");
         assert_eq!(err.kind(), "invalid_input");
+    }
+
+    // ---------------------------------------------------------------- //
+    // WP-W5-02 — ensure_dispatcher idempotence                          //
+    // ---------------------------------------------------------------- //
+
+    /// Calling `ensure_dispatcher` twice for the same
+    /// (workspace, agent) pair leaves exactly one dispatcher
+    /// registered. Different (workspace, agent) keys land
+    /// independent dispatchers. Empty inputs no-op silently.
+    #[tokio::test]
+    async fn registry_ensure_dispatcher_is_idempotent() {
+        let reg = fresh_registry();
+        let (app, pool, _dir) = mock_app_with_pool().await;
+        let bus = Arc::new(crate::swarm::MailboxBus::new(pool));
+
+        assert_eq!(reg.dispatcher_count().await, 0);
+
+        // Empty inputs are silent no-ops.
+        reg.ensure_dispatcher(app.handle(), "", "scout", &bus).await;
+        reg.ensure_dispatcher(app.handle(), "default", "", &bus).await;
+        reg.ensure_dispatcher(app.handle(), "   ", "scout", &bus).await;
+        assert_eq!(reg.dispatcher_count().await, 0);
+
+        // First call lands a dispatcher.
+        reg.ensure_dispatcher(app.handle(), "default", "planner", &bus)
+            .await;
+        assert_eq!(reg.dispatcher_count().await, 1);
+
+        // Second call for same key is a no-op.
+        reg.ensure_dispatcher(app.handle(), "default", "planner", &bus)
+            .await;
+        assert_eq!(reg.dispatcher_count().await, 1);
+
+        // Different agent in same workspace — separate slot.
+        reg.ensure_dispatcher(app.handle(), "default", "scout", &bus)
+            .await;
+        assert_eq!(reg.dispatcher_count().await, 2);
+
+        // Different workspace, same agent — separate slot.
+        reg.ensure_dispatcher(app.handle(), "other", "planner", &bus)
+            .await;
+        assert_eq!(reg.dispatcher_count().await, 3);
+
+        // shutdown_all drains all dispatchers.
+        reg.shutdown_all().await.expect("shutdown_all ok");
+        assert_eq!(reg.dispatcher_count().await, 0);
     }
 
     /// Acquire with unknown agentId rejected as `not_found` (the
