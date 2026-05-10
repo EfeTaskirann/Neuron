@@ -4,6 +4,55 @@ Running journal of agent-driven changes. Newest entry on top. See `AGENTS.md` §
 
 ---
 
+## 2026-05-10 WP-W5-01 VERIFIED — gates green on user dev shell after toolchain bringup
+
+Follow-up to the 2026-05-09 deferred-verify entry below. After
+~3h of toolchain bringup pain (Win 11 Pro build 26200 vs VS Build
+Tools 17.14 manifest mismatch — every `--add VCTools` install
+produced 1.3 GB of LLVM/MSBuild bits but no MSVC compiler), the
+Apr 2026 manifest (17.14.31) finally provided MSVC v143 14.44.35207
++ Win 11 SDK 10.0.26100.7705 cleanly via the Modify-from-GUI path.
+
+Verification result on `wp-w5-01-mailbox-eventbus-substrate`
+branch:
+- `cargo build --lib`: exit 0 (18s incremental after first compile
+  of ~480 dep crates)
+- `cargo test --lib`: **451 / 0 / 14 ignored** (was 435 baseline +
+  16 new; matches the WP-W5-01 acceptance gate's "≥ 12 new tests"
+  threshold)
+- `cargo check --all-targets`: exit 0
+- `pnpm gen:bindings`: regenerated `app/src/lib/bindings.ts` (+140
+  lines: `MailboxEvent` 8-variant tagged union + `MailboxEnvelope`
+  + 2 commands)
+- `pnpm gen:bindings:check`: exit 0 post-commit
+- `pnpm typecheck`: exit 0
+- `pnpm lint`: exit 0
+- `pnpm test --run`: 64 passed / 1 failed. The failing test
+  (`App.test.tsx > RunInspector > renders span timeline from
+  useRun` looking for `/3,824 tokens/`) is a **pre-existing
+  locale-dependent flake** — verified by stashing W5-01 changes,
+  checking out `main`, running tests: same 1/65 fails. tr-TR
+  `Intl.NumberFormat` emits "3.824" with period; test expects
+  "3,824" with comma. Not introduced by W5-01; pre-existing on
+  every commit since the test was written. Tracked as a separate
+  follow-up (US-locale assumption in test code).
+
+Two follow-up commits landed in the same verification session:
+- `0c43e97` — `fix(WP-W5-01): post-verification fixes` —
+  `serde_json::Value` → `String` for `MailboxEvent::CoordinatorHelpOutcome.outcome_json`
+  (specta::Type doesn't impl Value); hand-written test fixtures
+  switched from camelCase to snake_case keys (serde
+  `rename_all="snake_case"` does NOT cascade to variant fields);
+  unused `Arc` import removed.
+- bindings.ts regenerated and committed in same `0c43e97` commit.
+
+Branch ready for ff-merge to main. Per Charter §"Cleanup at end of
+Week 2"-style discipline, the orchestrator will:
+1. ff-merge `wp-w5-01-mailbox-eventbus-substrate` → `main`
+2. push to `origin/main`
+3. Move to W5-02 sub-agent dispatch (contract already authored
+   in `42a247d`).
+
 ## 2026-05-09 WP-W5-01 implemented (VERIFICATION DEFERRED — toolchain unavailable in author session)
 
 - branch: `wp-w5-01-mailbox-eventbus-substrate` (NOT yet merged to `main`)
