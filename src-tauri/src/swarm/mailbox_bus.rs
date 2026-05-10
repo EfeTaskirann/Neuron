@@ -342,12 +342,17 @@ impl MailboxBus {
 
     /// Persist + broadcast + Tauri-emit one event. Atomic to the
     /// extent SQLite + Tauri allow:
-    /// 1. INSERT row (autoincrement id).
-    /// 2. Build envelope from row + event.
-    /// 3. `broadcast::Sender::send` to in-process subscribers.
+    /// 1. WP-W5-05: if `event` is `JobStarted`, refuse with
+    ///    `AppError::WorkspaceBusy` when another brain-driven,
+    ///    non-terminal job already exists for the same workspace.
+    ///    Other variants skip the guard — only the job-lifecycle
+    ///    bookend gates workspace exclusivity.
+    /// 2. INSERT row (autoincrement id).
+    /// 3. Build envelope from row + event.
+    /// 4. `broadcast::Sender::send` to in-process subscribers.
     ///    Send error (no receivers) is silently swallowed — agents
     ///    may not be subscribed yet.
-    /// 4. `app.emit("mailbox:new", legacy_form)` for back-compat.
+    /// 5. `app.emit("mailbox:new", legacy_form)` for back-compat.
     ///
     /// Any SQL failure short-circuits the rest. Caller-supplied
     /// `from_pane` / `to_pane` use the W4-07 namespacing convention
@@ -377,6 +382,47 @@ impl MailboxBus {
         }
         if to_pane.trim().is_empty() {
             return Err(AppError::InvalidInput("to must not be empty".into()));
+        }
+
+        // WP-W5-05 — workspace-busy guard for brain-driven JobStarted.
+        // The W3 FSM enforces "one job per workspace" via the
+        // `swarm_workspace_locks` table + `try_acquire_workspace`;
+        // for the W5 brain path that lock is short-circuited (the
+        // brain runs inline of the IPC, not through the FSM), so the
+        // mailbox bus becomes the canonical chokepoint. A non-empty
+        // count of brain-driven, non-terminal `swarm_jobs` rows for
+        // the target workspace — *excluding the JobStarted's own
+        // job_id* — means another brain job is already in-flight;
+        // refuse the JobStarted before the row lands so the
+        // projector never sees two concurrent JobStarted rows for
+        // the same workspace. The current job is excluded because
+        // the W5-03 v2 IPC writes its `swarm_jobs` row up-front via
+        // `JobRegistry::try_acquire_workspace` *before* emitting
+        // JobStarted; without the exclusion the guard would always
+        // trip on the just-acquired job. The query targets `source
+        // = 'brain'` so the FSM (`source = 'fsm'`) and the brain
+        // coexist peacefully until W5-06 deletes the FSM. Other
+        // event kinds (TaskDispatch / AgentResult / …) skip the
+        // guard — only the job-lifecycle bookend gates workspace
+        // exclusivity.
+        if let MailboxEvent::JobStarted { job_id: own_job_id, .. } = &event {
+            let in_flight: Option<String> = sqlx::query_scalar(
+                "SELECT id FROM swarm_jobs \
+                 WHERE workspace_id = ? AND source = 'brain' \
+                   AND id != ? \
+                   AND state NOT IN ('done', 'failed') \
+                 ORDER BY created_at_ms DESC LIMIT 1",
+            )
+            .bind(workspace_id)
+            .bind(own_job_id)
+            .fetch_optional(&self.pool)
+            .await?;
+            if let Some(in_flight_job_id) = in_flight {
+                return Err(AppError::WorkspaceBusy {
+                    workspace_id: workspace_id.to_string(),
+                    in_flight_job_id,
+                });
+            }
         }
 
         let kind = event.kind_str();
@@ -1095,4 +1141,182 @@ mod tests {
         assert_eq!(after_first.len(), 1);
         assert_eq!(after_first[0].summary, "2");
     }
+
+    // -----------------------------------------------------------------
+    // 6. WP-W5-05 — workspace-busy guard for JobStarted
+    // -----------------------------------------------------------------
+
+    /// Test helper: seed one `swarm_jobs` row with the supplied
+    /// shape. Mirrors `swarm::projector::persist_job_init` minus
+    /// the duplicate-detect branch — tests want a deterministic
+    /// fixture, not idempotent insert behavior.
+    async fn seed_swarm_job(
+        pool: &DbPool,
+        id: &str,
+        workspace_id: &str,
+        state: &str,
+        source: &str,
+    ) {
+        sqlx::query(
+            "INSERT INTO swarm_jobs \
+             (id, workspace_id, goal, created_at_ms, state, retry_count, last_error, finished_at_ms, last_verdict_json, source) \
+             VALUES (?, ?, 'g', 0, ?, 0, NULL, NULL, NULL, ?)",
+        )
+        .bind(id)
+        .bind(workspace_id)
+        .bind(state)
+        .bind(source)
+        .execute(pool)
+        .await
+        .expect("seed swarm_jobs row");
+    }
+
+    /// Acceptance: `emit_typed(JobStarted)` against a workspace that
+    /// already has a brain-driven, non-terminal `swarm_jobs` row
+    /// surfaces `WorkspaceBusy` with the in-flight job's id —
+    /// without inserting a mailbox row.
+    #[tokio::test]
+    async fn emit_typed_rejects_concurrent_job_started_for_same_workspace() {
+        let (app, pool, _dir) = mock_app_with_pool().await;
+        seed_swarm_job(&pool, "j-existing", "ws-1", "scout", "brain").await;
+        let bus = MailboxBus::new(pool.clone());
+
+        let err = bus
+            .emit_typed(
+                app.handle(),
+                "ws-1",
+                "agent:user",
+                "agent:coordinator",
+                "second job",
+                None,
+                MailboxEvent::JobStarted {
+                    job_id: "j-second".into(),
+                    workspace_id: "ws-1".into(),
+                    goal: "g2".into(),
+                },
+            )
+            .await
+            .expect_err("rejected");
+        assert_eq!(err.kind(), "workspace_busy");
+        match err {
+            AppError::WorkspaceBusy {
+                workspace_id,
+                in_flight_job_id,
+            } => {
+                assert_eq!(workspace_id, "ws-1");
+                assert_eq!(in_flight_job_id, "j-existing");
+            }
+            other => panic!("expected WorkspaceBusy; got {other:?}"),
+        }
+
+        // No mailbox row landed for the rejected JobStarted.
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM mailbox WHERE kind = 'job_started'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    /// Acceptance: once the previous brain job is terminal
+    /// (`done` / `failed`), the bus accepts a fresh JobStarted for
+    /// the same workspace.
+    #[tokio::test]
+    async fn emit_typed_allows_job_started_after_previous_finished() {
+        let (app, pool, _dir) = mock_app_with_pool().await;
+        // Two prior jobs in the same workspace; both terminal.
+        seed_swarm_job(&pool, "j-done", "ws-1", "done", "brain").await;
+        seed_swarm_job(&pool, "j-failed", "ws-1", "failed", "brain").await;
+        let bus = MailboxBus::new(pool);
+
+        bus.emit_typed(
+            app.handle(),
+            "ws-1",
+            "agent:user",
+            "agent:coordinator",
+            "fresh job",
+            None,
+            MailboxEvent::JobStarted {
+                job_id: "j-fresh".into(),
+                workspace_id: "ws-1".into(),
+                goal: "g".into(),
+            },
+        )
+        .await
+        .expect("JobStarted accepted after previous finished");
+    }
+
+    /// Acceptance: brain jobs in different workspaces run in
+    /// parallel — the guard scopes per workspace_id.
+    #[tokio::test]
+    async fn emit_typed_allows_concurrent_job_started_for_different_workspaces() {
+        let (app, pool, _dir) = mock_app_with_pool().await;
+        seed_swarm_job(&pool, "j-ws-a", "ws-a", "build", "brain").await;
+        let bus = MailboxBus::new(pool);
+
+        // Different workspace must be accepted even though ws-a is
+        // busy.
+        bus.emit_typed(
+            app.handle(),
+            "ws-b",
+            "agent:user",
+            "agent:coordinator",
+            "ws-b job",
+            None,
+            MailboxEvent::JobStarted {
+                job_id: "j-ws-b".into(),
+                workspace_id: "ws-b".into(),
+                goal: "g".into(),
+            },
+        )
+        .await
+        .expect("ws-b JobStarted accepted while ws-a is busy");
+
+        // Sanity: ws-a is still busy.
+        let err = bus
+            .emit_typed(
+                app.handle(),
+                "ws-a",
+                "agent:user",
+                "agent:coordinator",
+                "ws-a second",
+                None,
+                MailboxEvent::JobStarted {
+                    job_id: "j-ws-a-2".into(),
+                    workspace_id: "ws-a".into(),
+                    goal: "g".into(),
+                },
+            )
+            .await
+            .expect_err("ws-a still busy");
+        assert_eq!(err.kind(), "workspace_busy");
+    }
+
+    /// Acceptance: an `fsm`-source row in flight does NOT block a
+    /// brain JobStarted for the same workspace. The two paths
+    /// coexist until W5-06 deletes the FSM; the bus only gates on
+    /// brain jobs (W5-06 collapses both into the brain path).
+    #[tokio::test]
+    async fn emit_typed_ignores_fsm_source_jobs_for_busy_check() {
+        let (app, pool, _dir) = mock_app_with_pool().await;
+        seed_swarm_job(&pool, "j-fsm", "ws-1", "scout", "fsm").await;
+        let bus = MailboxBus::new(pool);
+
+        bus.emit_typed(
+            app.handle(),
+            "ws-1",
+            "agent:user",
+            "agent:coordinator",
+            "brain job sharing workspace with fsm job",
+            None,
+            MailboxEvent::JobStarted {
+                job_id: "j-brain".into(),
+                workspace_id: "ws-1".into(),
+                goal: "g".into(),
+            },
+        )
+        .await
+        .expect("brain JobStarted accepted while fsm job in flight");
+    }
+
 }
