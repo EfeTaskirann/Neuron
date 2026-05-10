@@ -120,6 +120,7 @@ pub fn specta_builder_for_export() -> tauri_specta::Builder<tauri::Wry> {
             commands::swarm::swarm_agents_list_status::<tauri::Wry>,
             commands::swarm::swarm_agents_shutdown_workspace::<tauri::Wry>,
             commands::swarm::swarm_agents_dispatch_to_agent::<tauri::Wry>,
+            commands::swarm::swarm_run_job_v2::<tauri::Wry>,
         ])
         // Register the AppError once on the builder so the type lands
         // in `bindings.ts` as a referenceable shape rather than being
@@ -155,6 +156,16 @@ pub fn specta_builder_for_export() -> tauri_specta::Builder<tauri::Wry> {
         // (specta walks reachable types only).
         .typ::<crate::swarm::MailboxEvent>()
         .typ::<crate::swarm::MailboxEnvelope>()
+        // WP-W5-03 — `BrainAction` is the discriminated-union the
+        // Coordinator persona emits per turn (dispatch / finish /
+        // ask_user / help_outcome). It's not a command surface; it
+        // appears in tests and serializes to mailbox `payload_json`
+        // through the W5-02 dispatcher's help-loop branch.
+        // Registering it on the specta builder lands the type in
+        // bindings.ts so a future frontend that wants to display
+        // "Coordinator emitted: dispatch agent:scout" can match on
+        // the discriminator.
+        .typ::<crate::swarm::BrainAction>()
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]

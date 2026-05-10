@@ -773,6 +773,340 @@ pub async fn swarm_agents_dispatch_to_agent<R: Runtime>(
     Ok(env.id)
 }
 
+// --------------------------------------------------------------------- //
+// W5-03 — Coordinator brain dispatch loop                                //
+// --------------------------------------------------------------------- //
+
+/// IDs of the specialist agents the brain may dispatch to. These get
+/// `ensure_dispatcher` called on them up front so the bus picks up
+/// every dispatch the brain emits without a per-target spawn race.
+/// `coordinator` is intentionally absent — the brain talks to its
+/// own session through `CoordinatorInvoker`, not through a
+/// dispatcher.
+const SPECIALIST_AGENT_IDS: &[&str] = &[
+    "scout",
+    "planner",
+    "backend-builder",
+    "backend-reviewer",
+    "frontend-builder",
+    "frontend-reviewer",
+    "integration-tester",
+];
+
+/// Drive the W5-03 Coordinator brain dispatch loop to completion.
+/// Parallel to `swarm:run_job` (the FSM-driven path stays alive for
+/// regression smokes; W5-06 deletes it).
+///
+/// Lifecycle:
+/// 1. Mint a `j-<ULID>` if not preset; acquire the workspace lock
+///    via the existing `JobRegistry::try_acquire_workspace`.
+/// 2. Ensure a `MailboxAgentDispatcher` exists for every specialist
+///    agent so dispatches the brain emits land on a real receiver
+///    immediately.
+/// 3. Spawn the brain on `CoordinatorBrain::run` with the workspace's
+///    `MailboxBus` and the production `CoordinatorInvoker`.
+/// 4. Await the brain's `BrainRunResult` and build a stub
+///    `JobOutcome`. The full job-state derivation from mailbox
+///    events is W5-04's scope; for W5-03 we surface a minimal shape
+///    so callers (manual smokes) get a structured result without
+///    a frontend reducer.
+/// 5. Release the workspace lock.
+///
+/// Returns the stub `JobOutcome` on success / failure paths.
+/// `final_state` maps from brain outcome:
+///   - `"done"` → `JobState::Done`
+///   - everything else (`"failed" | "ask_user"`) → `JobState::Failed`
+#[tauri::command(rename_all = "camelCase")]
+#[specta::specta]
+pub async fn swarm_run_job_v2<R: Runtime>(
+    app: AppHandle<R>,
+    workspace_id: String,
+    goal: String,
+) -> Result<JobOutcome, AppError> {
+    if workspace_id.trim().is_empty() {
+        return Err(AppError::InvalidInput(
+            "workspaceId must not be empty".into(),
+        ));
+    }
+    if goal.trim().is_empty() {
+        return Err(AppError::InvalidInput(
+            "goal must not be empty".into(),
+        ));
+    }
+
+    let job_registry = app
+        .try_state::<Arc<crate::swarm::JobRegistry>>()
+        .ok_or_else(|| {
+            AppError::Internal(
+                "swarm JobRegistry missing from app state — \
+                 lib.rs::setup did not call app.manage()"
+                    .into(),
+            )
+        })?
+        .inner()
+        .clone();
+    let agent_registry = app
+        .try_state::<Arc<SwarmAgentRegistry>>()
+        .ok_or_else(|| {
+            AppError::Internal(
+                "SwarmAgentRegistry missing from app state — \
+                 lib.rs::setup did not call app.manage()"
+                    .into(),
+            )
+        })?
+        .inner()
+        .clone();
+    let bus = app
+        .try_state::<Arc<MailboxBus>>()
+        .ok_or_else(|| {
+            AppError::Internal(
+                "MailboxBus missing from app state — \
+                 lib.rs::setup did not call app.manage()"
+                    .into(),
+            )
+        })?
+        .inner()
+        .clone();
+
+    // Mint job + acquire workspace lock. Reuse the existing
+    // `try_acquire_workspace` for compatibility (W5-05 migrates
+    // this off the registry).
+    let job_id = format!("j-{}", ulid::Ulid::new());
+    let now_ms = crate::time::now_millis();
+    let started_at_ms = now_ms;
+    let job = crate::swarm::Job {
+        id: job_id.clone(),
+        goal: goal.clone(),
+        created_at_ms: now_ms,
+        state: crate::swarm::JobState::Init,
+        retry_count: 0,
+        stages: Vec::new(),
+        last_error: None,
+        last_verdict: None,
+    };
+    job_registry
+        .try_acquire_workspace(&workspace_id, job)
+        .await?;
+
+    // Ensure a MailboxAgentDispatcher is wired up for each specialist
+    // so the brain's dispatches don't race against late-spawning
+    // dispatchers. Idempotent — second call is a no-op.
+    for agent_id in SPECIALIST_AGENT_IDS {
+        agent_registry
+            .ensure_dispatcher(&app, &workspace_id, agent_id, &bus)
+            .await;
+    }
+
+    // Build the production CoordinatorInvoker and run the brain
+    // inline (not on a spawned task — the IPC call is the await
+    // boundary; cancellation comes through the workspace's mailbox
+    // event-bus and signal_cancel, both of which are independent of
+    // this task's join handle).
+    let invoker = std::sync::Arc::new(
+        crate::swarm::SwarmRegistryCoordinatorInvoker::new(
+            app.clone(),
+            std::sync::Arc::clone(&agent_registry),
+        ),
+    );
+    let cancel = std::sync::Arc::new(tokio::sync::Notify::new());
+    // Best-effort: register the cancel notify so `swarm:cancel_job`
+    // can target the v2 path too. The W5-05 cancel migration makes
+    // this canonical.
+    let _ = job_registry.register_cancel(&job_id, std::sync::Arc::clone(&cancel));
+
+    let brain_result = crate::swarm::CoordinatorBrain::run(
+        app.clone(),
+        workspace_id.clone(),
+        job_id.clone(),
+        goal.clone(),
+        invoker,
+        std::sync::Arc::clone(&bus),
+        cancel,
+    )
+    .await;
+    finalise_run_job_v2(
+        &job_registry,
+        &workspace_id,
+        &job_id,
+        started_at_ms,
+        brain_result,
+    )
+    .await
+}
+
+/// Internal: shared finalisation logic between `swarm_run_job_v2`
+/// and the test-only entry point. Releases the workspace lock,
+/// unregisters the cancel notify, updates the in-memory job state,
+/// and builds the stub `JobOutcome`.
+async fn finalise_run_job_v2(
+    job_registry: &crate::swarm::JobRegistry,
+    workspace_id: &str,
+    job_id: &str,
+    started_at_ms: i64,
+    brain_result: Result<crate::swarm::BrainRunResult, AppError>,
+) -> Result<JobOutcome, AppError> {
+    job_registry.unregister_cancel(job_id);
+    job_registry
+        .release_workspace(workspace_id, job_id)
+        .await;
+    match brain_result {
+        Ok(result) => {
+            let final_state = if result.outcome == "done" {
+                crate::swarm::JobState::Done
+            } else {
+                crate::swarm::JobState::Failed
+            };
+            let last_error = if final_state == crate::swarm::JobState::Failed
+            {
+                Some(result.summary.clone())
+            } else {
+                None
+            };
+            let total_duration_ms =
+                (crate::time::now_millis() - started_at_ms).max(0) as u64;
+            let _ = job_registry
+                .update(job_id, |job| {
+                    job.state = final_state;
+                    job.last_error = last_error.clone();
+                })
+                .await;
+            Ok(JobOutcome {
+                job_id: result.job_id,
+                final_state,
+                stages: Vec::new(),
+                last_error,
+                total_cost_usd: 0.0,
+                total_duration_ms,
+                last_verdict: None,
+            })
+        }
+        Err(err) => {
+            let _ = job_registry
+                .update(job_id, |job| {
+                    job.state = crate::swarm::JobState::Failed;
+                    job.last_error = Some(err.message().to_string());
+                })
+                .await;
+            Err(err)
+        }
+    }
+}
+
+/// Test-only entry point: run the brain with a caller-provided
+/// invoker (typically a mock that returns canned action sequences).
+/// Mirrors `swarm_run_job_v2`'s lifecycle so the tests can exercise
+/// the same lock + finalisation path the IPC takes — they only swap
+/// out the LLM-spawning piece.
+///
+/// `spawn_dispatchers` toggles whether the real
+/// `MailboxAgentDispatcher`s are wired up. Tests that mock the
+/// brain inline (and emit AgentResults from a helper task) pass
+/// `false` so the real dispatchers don't race the helper to invoke
+/// `claude`.
+#[cfg(test)]
+pub(crate) async fn swarm_run_job_v2_with_invoker<R, I>(
+    app: AppHandle<R>,
+    workspace_id: String,
+    goal: String,
+    invoker: std::sync::Arc<I>,
+    max_dispatches: u32,
+    spawn_dispatchers: bool,
+) -> Result<JobOutcome, AppError>
+where
+    R: Runtime,
+    I: crate::swarm::CoordinatorInvoker,
+{
+    if workspace_id.trim().is_empty() {
+        return Err(AppError::InvalidInput(
+            "workspaceId must not be empty".into(),
+        ));
+    }
+    if goal.trim().is_empty() {
+        return Err(AppError::InvalidInput(
+            "goal must not be empty".into(),
+        ));
+    }
+    let job_registry = app
+        .try_state::<Arc<crate::swarm::JobRegistry>>()
+        .ok_or_else(|| {
+            AppError::Internal(
+                "swarm JobRegistry missing from app state — \
+                 lib.rs::setup did not call app.manage()"
+                    .into(),
+            )
+        })?
+        .inner()
+        .clone();
+    let agent_registry = app
+        .try_state::<Arc<SwarmAgentRegistry>>()
+        .ok_or_else(|| {
+            AppError::Internal(
+                "SwarmAgentRegistry missing from app state — \
+                 lib.rs::setup did not call app.manage()"
+                    .into(),
+            )
+        })?
+        .inner()
+        .clone();
+    let bus = app
+        .try_state::<Arc<MailboxBus>>()
+        .ok_or_else(|| {
+            AppError::Internal(
+                "MailboxBus missing from app state — \
+                 lib.rs::setup did not call app.manage()"
+                    .into(),
+            )
+        })?
+        .inner()
+        .clone();
+
+    let job_id = format!("j-{}", ulid::Ulid::new());
+    let now_ms = crate::time::now_millis();
+    let started_at_ms = now_ms;
+    let job = crate::swarm::Job {
+        id: job_id.clone(),
+        goal: goal.clone(),
+        created_at_ms: now_ms,
+        state: crate::swarm::JobState::Init,
+        retry_count: 0,
+        stages: Vec::new(),
+        last_error: None,
+        last_verdict: None,
+    };
+    job_registry
+        .try_acquire_workspace(&workspace_id, job)
+        .await?;
+    if spawn_dispatchers {
+        for agent_id in SPECIALIST_AGENT_IDS {
+            agent_registry
+                .ensure_dispatcher(&app, &workspace_id, agent_id, &bus)
+                .await;
+        }
+    }
+    let cancel = std::sync::Arc::new(tokio::sync::Notify::new());
+    let _ = job_registry
+        .register_cancel(&job_id, std::sync::Arc::clone(&cancel));
+    let brain_result = crate::swarm::CoordinatorBrain::run_with_max(
+        app.clone(),
+        workspace_id.clone(),
+        job_id.clone(),
+        goal,
+        invoker,
+        std::sync::Arc::clone(&bus),
+        cancel,
+        max_dispatches,
+    )
+    .await;
+    finalise_run_job_v2(
+        &job_registry,
+        &workspace_id,
+        &job_id,
+        started_at_ms,
+        brain_result,
+    )
+    .await
+}
+
 /// Truncate a prompt for the `summary` column of the dispatch row.
 /// 80 chars with ellipsis is enough for the existing mailbox UI to
 /// render a recognisable line without overflowing.
@@ -1883,5 +2217,312 @@ mod tests {
         // Cleanup — drain the dispatcher so the test exits without
         // leaving its background task in flight.
         registry.shutdown_all().await.expect("shutdown ok");
+    }
+
+    // ---------------------------------------------------------------- //
+    // WP-W5-03 — swarm:run_job_v2                                       //
+    // ---------------------------------------------------------------- //
+
+    /// Build a mock app wiring `JobRegistry`, `MailboxBus`, and
+    /// `SwarmAgentRegistry` so the v2 IPC tests don't repeat the
+    /// boilerplate. The job registry is in-memory only (`new()`) so
+    /// state mutations don't write through to SQLite — the tests
+    /// only care about the in-memory shape.
+    async fn mock_app_with_v2_state() -> (
+        tauri::App<tauri::test::MockRuntime>,
+        std::sync::Arc<crate::swarm::JobRegistry>,
+        std::sync::Arc<crate::swarm::MailboxBus>,
+        std::sync::Arc<SwarmAgentRegistry>,
+        tempfile::TempDir,
+    ) {
+        let (pool, dir) = crate::test_support::fresh_pool().await;
+        let job_registry = std::sync::Arc::new(
+            crate::swarm::JobRegistry::with_pool(pool.clone()),
+        );
+        let bus = std::sync::Arc::new(
+            crate::swarm::MailboxBus::new(pool.clone()),
+        );
+        let agent_registry = std::sync::Arc::new(SwarmAgentRegistry::new(
+            std::sync::Arc::new(
+                ProfileRegistry::load_from(None).expect("load"),
+            ),
+        ));
+        let app = tauri::test::mock_builder()
+            .manage(pool)
+            .manage(job_registry.clone())
+            .manage(bus.clone())
+            .manage(agent_registry.clone())
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .expect("mock app");
+        (app, job_registry, bus, agent_registry, dir)
+    }
+
+    /// Mock CoordinatorInvoker for v2 tests — same shape as the
+    /// brain's ScriptedCoordinatorInvoker but lives here so the
+    /// IPC test path doesn't depend on `#[cfg(test)]` items inside
+    /// `swarm::brain`.
+    struct V2ScriptedInvoker {
+        replies: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl V2ScriptedInvoker {
+        fn new(replies: Vec<&str>) -> Self {
+            Self {
+                replies: std::sync::Arc::new(std::sync::Mutex::new(
+                    replies.into_iter().map(String::from).collect(),
+                )),
+            }
+        }
+    }
+
+    impl crate::swarm::CoordinatorInvoker for V2ScriptedInvoker {
+        fn invoke_coordinator_turn(
+            &self,
+            _workspace_id: &str,
+            _user_message: &str,
+            _timeout: std::time::Duration,
+            _cancel: std::sync::Arc<tokio::sync::Notify>,
+        ) -> impl std::future::Future<
+            Output = Result<crate::swarm::InvokeResult, AppError>,
+        > + Send {
+            let replies = std::sync::Arc::clone(&self.replies);
+            async move {
+                let mut replies = replies.lock().unwrap();
+                if replies.is_empty() {
+                    return Err(AppError::Internal(
+                        "scripted invoker exhausted".into(),
+                    ));
+                }
+                let text = replies.remove(0);
+                Ok(crate::swarm::InvokeResult {
+                    session_id: "mock".into(),
+                    assistant_text: text,
+                    total_cost_usd: 0.01,
+                    turn_count: 1,
+                })
+            }
+        }
+    }
+
+    /// Acceptance: empty inputs surface `InvalidInput` before any
+    /// state mutation.
+    #[tokio::test]
+    async fn run_job_v2_validates_inputs() {
+        let (app, _jr, _bus, _ar, _dir) = mock_app_with_v2_state().await;
+
+        let err = swarm_run_job_v2(
+            app.handle().clone(),
+            "".into(),
+            "do something".into(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.kind(), "invalid_input");
+
+        let err = swarm_run_job_v2(
+            app.handle().clone(),
+            "default".into(),
+            "".into(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.kind(), "invalid_input");
+
+        // Whitespace-only.
+        let err = swarm_run_job_v2(
+            app.handle().clone(),
+            "default".into(),
+            "   ".into(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.kind(), "invalid_input");
+    }
+
+    /// Acceptance: a second call against the same workspace while
+    /// the first is in flight surfaces `WorkspaceBusy`. We exercise
+    /// this by holding the workspace via a hand-acquired lock —
+    /// the IPC's `try_acquire_workspace` short-circuits on the
+    /// second call.
+    #[tokio::test]
+    async fn run_job_v2_workspace_busy_when_concurrent() {
+        let (app, jr, _bus, _ar, _dir) = mock_app_with_v2_state().await;
+
+        // Manually acquire the workspace lock (simulates an
+        // in-flight job).
+        let dummy_job = crate::swarm::Job {
+            id: "j-existing".into(),
+            goal: "dummy".into(),
+            created_at_ms: 0,
+            state: crate::swarm::JobState::Init,
+            retry_count: 0,
+            stages: Vec::new(),
+            last_error: None,
+            last_verdict: None,
+        };
+        jr.try_acquire_workspace("default", dummy_job)
+            .await
+            .expect("acquire");
+
+        // Now the v2 IPC call collides.
+        let err = swarm_run_job_v2(
+            app.handle().clone(),
+            "default".into(),
+            "do something".into(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.kind(), "workspace_busy");
+
+        // Cleanup so the dispatcher tasks (if any spawned) drain.
+        jr.release_workspace("default", "j-existing").await;
+    }
+
+    /// Acceptance: a happy-path mock invoker drives the brain
+    /// through Dispatch → AgentResult → Finish and returns a
+    /// `JobOutcome` with `final_state == Done`. We use a faux
+    /// scout-results emitter that watches for the dispatch and
+    /// emits the AgentResult so the brain can take its second turn.
+    #[tokio::test]
+    async fn run_job_v2_runs_full_chain_via_mock_brain() {
+        let (app, _jr, bus, _ar, _dir) = mock_app_with_v2_state().await;
+
+        let invoker = std::sync::Arc::new(V2ScriptedInvoker::new(vec![
+            r#"{"action":"dispatch","target":"agent:scout","prompt":"investigate"}"#,
+            r#"{"action":"finish","outcome":"done","summary":"done"}"#,
+        ]));
+
+        // Helper: emit AgentResult once a dispatch lands. Runs in
+        // parallel with the IPC call. Uses a clone of the same app
+        // handle so the bus's legacy `mailbox:new` Tauri event lands
+        // on the same listener set.
+        let bus_for_helper = std::sync::Arc::clone(&bus);
+        let app_for_helper = app.handle().clone();
+        let helper = tokio::spawn(async move {
+            // Poll the bus for the first task_dispatch row.
+            let deadline = std::time::Instant::now()
+                + std::time::Duration::from_secs(10);
+            loop {
+                let rows = bus_for_helper
+                    .list_typed(Some("task_dispatch"), None, Some(10))
+                    .await
+                    .expect("list");
+                if let Some(row) = rows.into_iter().next() {
+                    if let crate::swarm::MailboxEvent::TaskDispatch {
+                        job_id, ..
+                    } = &row.event
+                    {
+                        bus_for_helper
+                            .emit_typed(
+                                &app_for_helper,
+                                "default",
+                                "agent:scout",
+                                "agent:coordinator",
+                                "result",
+                                Some(row.id),
+                                crate::swarm::MailboxEvent::AgentResult {
+                                    job_id: job_id.clone(),
+                                    agent_id: "scout".into(),
+                                    assistant_text: "found".into(),
+                                    total_cost_usd: 0.01,
+                                    turn_count: 1,
+                                },
+                            )
+                            .await
+                            .expect("emit");
+                        break;
+                    }
+                }
+                if std::time::Instant::now() > deadline {
+                    panic!("never saw dispatch");
+                }
+                tokio::time::sleep(
+                    std::time::Duration::from_millis(20),
+                )
+                .await;
+            }
+        });
+
+        let outcome = swarm_run_job_v2_with_invoker(
+            app.handle().clone(),
+            "default".to_string(),
+            "do something".to_string(),
+            invoker,
+            30,
+            // spawn_dispatchers=false — the test's helper is the
+            // simulated dispatcher, so we don't want the real one
+            // racing it (and trying to spawn `claude`).
+            false,
+        )
+        .await
+        .expect("ok");
+
+        let _ = helper.await;
+        assert_eq!(outcome.final_state, crate::swarm::JobState::Done);
+        assert!(outcome.last_error.is_none());
+        assert!(outcome.job_id.starts_with("j-"));
+    }
+
+    /// Acceptance: the returned `JobOutcome` shape carries the
+    /// expected fields. Even on a parse-failure path (brain bails
+    /// after the first invoke returns garbage) we get a stub
+    /// outcome with `final_state == Failed` and `last_error`
+    /// populated. No `claude` spawn needed for this test.
+    #[tokio::test]
+    async fn run_job_v2_returns_job_outcome_with_correct_shape() {
+        let (app, _jr, _bus, _ar, _dir) = mock_app_with_v2_state().await;
+        let invoker = std::sync::Arc::new(V2ScriptedInvoker::new(vec![
+            "Just garbage no JSON.",
+        ]));
+
+        let outcome = swarm_run_job_v2_with_invoker(
+            app.handle().clone(),
+            "default".to_string(),
+            "trivial".to_string(),
+            invoker,
+            30,
+            // spawn_dispatchers=false — no dispatch flows so the
+            // real dispatchers wouldn't fire anyway, but disable
+            // for symmetry with the other invoker tests.
+            false,
+        )
+        .await
+        .expect("ok");
+
+        // Stub shape: empty stages, zero cost, populated last_error.
+        assert_eq!(outcome.final_state, crate::swarm::JobState::Failed);
+        assert!(outcome.last_error.is_some());
+        assert_eq!(outcome.stages.len(), 0);
+        assert_eq!(outcome.total_cost_usd, 0.0);
+        assert!(outcome.job_id.starts_with("j-"));
+    }
+
+    /// Real-claude integration smoke (`#[ignore]`'d) — drives a
+    /// small doc-edit goal end-to-end through the v2 brain dispatch
+    /// loop and asserts `final_state == Done`. Wall-clock budget
+    /// 600s; env override `NEURON_BRAIN_MAX_DISPATCHES=15` keeps
+    /// the LLM honest.
+    ///
+    /// Time budget: typical 3-8 minutes (multiple cold-starts).
+    /// Run with: `$env:NEURON_BRAIN_MAX_DISPATCHES="15"; cargo test \
+    /// --lib integration_run_job_v2_real_claude -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore = "requires real `claude` binary + Pro/Max subscription"]
+    async fn integration_run_job_v2_real_claude() {
+        let (app, _jr, _bus, _ar, _dir) = mock_app_with_v2_state().await;
+        let outcome = swarm_run_job_v2(
+            app.handle().clone(),
+            "default".to_string(),
+            "Reply with a single 'finish' action with outcome=\"done\" \
+             and summary=\"smoke\". No dispatches needed."
+                .to_string(),
+        )
+        .await
+        .expect("smoke ok");
+        assert_eq!(
+            outcome.final_state,
+            crate::swarm::JobState::Done,
+            "smoke should produce Done outcome"
+        );
     }
 }
