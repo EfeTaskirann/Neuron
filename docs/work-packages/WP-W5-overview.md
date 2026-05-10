@@ -65,7 +65,7 @@ matching WP file is authored.
 | ID | Title | Owner | Status | Blocked by | Size |
 |---|---|---|---|---|---|
 | WP-W5-01 | Mailbox event-bus substrate (kind / parent_id / payload_json columns + workspace broadcast channel) | orchestrator-direct | **implemented 2026-05-09 (`1b92c63`); cargo/pnpm verification DEFERRED to user dev shell** | — | M |
-| WP-W5-02 | Agent mailbox subscription + auto-emit (`MailboxAgentDispatcher` per agent) | TBD | contract authored (`42a247d`); not started | WP-W5-01 (verified) | M |
+| WP-W5-02 | Agent mailbox subscription + auto-emit (`MailboxAgentDispatcher` per agent) | sub-agent (general-purpose) | **shipped 2026-05-10 (`8cca3ba` + `2432440` + `14a50b3` + `739e836`); cargo 465/0/14 verified** | WP-W5-01 ✅ | M |
 | WP-W5-03 | Coordinator brain protocol — broadcast dispatch (`CoordinatorBrain` + `BrainAction` parser + `swarm:run_job_v2`) | TBD | contract authored (`42a247d`); not started | WP-W5-02 | L |
 | WP-W5-04 | Job state derived from mailbox + UI plumbing (`JobProjector` synthesises `SwarmJobEvent` stream) | TBD | contract authored (`42a247d`); not started | WP-W5-03 | M |
 | WP-W5-05 | Cancel + workspace serialization under message-bus (`JobCancel` event + `JobStarted` workspace-busy guard) | TBD | contract authored (`42a247d`); not started | WP-W5-03 | S |
