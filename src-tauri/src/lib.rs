@@ -119,6 +119,7 @@ pub fn specta_builder_for_export() -> tauri_specta::Builder<tauri::Wry> {
             commands::swarm::swarm_get_job::<tauri::Wry>,
             commands::swarm::swarm_agents_list_status::<tauri::Wry>,
             commands::swarm::swarm_agents_shutdown_workspace::<tauri::Wry>,
+            commands::swarm::swarm_agents_dispatch_to_agent::<tauri::Wry>,
         ])
         // Register the AppError once on the builder so the type lands
         // in `bindings.ts` as a referenceable shape rather than being
