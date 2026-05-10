@@ -412,6 +412,30 @@ pub fn run() {
                         });
                     }
                 }
+                // WP-W5-05 — fan-out JobCancel to every in-flight
+                // brain-driven job before tearing the agent
+                // registry down. The brain's loop + each
+                // dispatcher's invoke notify pick the JobCancel up
+                // and unwind cleanly; doing this BEFORE
+                // `agent_registry.shutdown_all()` gives the
+                // dispatchers a chance to break out of their
+                // `tokio::select!`'s and finish in-flight `claude`
+                // turns instead of getting SIGKILL'd mid-stream.
+                // Idempotent — an empty `swarm_jobs` query is a
+                // no-op. The fan-out body lives on `MailboxBus` so
+                // the unit tests can exercise it without booting
+                // the runtime closure.
+                if let Some(bus) = app
+                    .try_state::<std::sync::Arc<crate::swarm::MailboxBus>>()
+                {
+                    let bus = bus.inner().clone();
+                    let app_handle = app.clone();
+                    tauri::async_runtime::block_on(async move {
+                        let _ = bus
+                            .cancel_in_flight_brain_jobs(&app_handle)
+                            .await;
+                    });
+                }
                 // WP-W4-02 — kill every persistent agent session
                 // before the runtime exits. Same kill_on_drop seatbelt
                 // as the rest of the supervisors, but explicit

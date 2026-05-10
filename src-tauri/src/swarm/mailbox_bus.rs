@@ -575,6 +575,53 @@ impl MailboxBus {
             .collect()
     }
 
+    /// WP-W5-05 — emit `JobCancel` for every brain-driven,
+    /// non-terminal `swarm_jobs` row. Used by the
+    /// `RunEvent::ExitRequested` shutdown hook so the brain + each
+    /// dispatcher can unwind cleanly before the agent registry tears
+    /// the underlying `claude` sessions down.
+    ///
+    /// Returns the number of cancels that emitted successfully —
+    /// failed emits are swallowed (logged via the SQL row's INSERT
+    /// failure path) so a single broken row does not block the rest
+    /// of the shutdown chain. The test suite uses the return value
+    /// to assert exact fan-out counts.
+    pub async fn cancel_in_flight_brain_jobs<R: Runtime>(
+        &self,
+        app: &AppHandle<R>,
+    ) -> usize {
+        let rows: Vec<(String, String)> = match sqlx::query_as(
+            "SELECT id, workspace_id FROM swarm_jobs \
+             WHERE source = 'brain' \
+               AND state NOT IN ('done', 'failed')",
+        )
+        .fetch_all(&self.pool)
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => return 0,
+        };
+        let mut emitted = 0_usize;
+        for (job_id, ws) in rows {
+            if self
+                .emit_typed(
+                    app,
+                    &ws,
+                    "agent:user",
+                    "agent:coordinator",
+                    &format!("shutdown cancel: {job_id}"),
+                    None,
+                    MailboxEvent::JobCancel { job_id },
+                )
+                .await
+                .is_ok()
+            {
+                emitted += 1;
+            }
+        }
+        emitted
+    }
+
     /// Test helper: returns the number of workspace channels
     /// currently held in the bus. Used by the
     /// `mailbox_bus_subscribe_creates_channel_on_first_call` test.
@@ -1319,4 +1366,93 @@ mod tests {
         .expect("brain JobStarted accepted while fsm job in flight");
     }
 
+    // -----------------------------------------------------------------
+    // 7. WP-W5-05 — shutdown cancel fan-out
+    // -----------------------------------------------------------------
+
+    /// Acceptance: `cancel_in_flight_brain_jobs` emits one
+    /// `MailboxEvent::JobCancel` for every brain-driven, non-terminal
+    /// `swarm_jobs` row — and skips terminal jobs and FSM-source
+    /// jobs. Mirrors the body of the `RunEvent::ExitRequested`
+    /// shutdown hook in `lib.rs::run` so the WP-W5-05 step-3
+    /// invariant is unit-testable without booting the runtime
+    /// closure.
+    #[tokio::test]
+    async fn shutdown_emits_job_cancel_for_each_in_flight_brain_job() {
+        let (app, pool, _dir) = mock_app_with_pool().await;
+
+        // Two in-flight brain jobs across two workspaces…
+        seed_swarm_job(&pool, "j-brain-a", "ws-a", "scout", "brain").await;
+        seed_swarm_job(&pool, "j-brain-b", "ws-b", "build", "brain").await;
+        // …one terminal brain job (must be skipped)…
+        seed_swarm_job(&pool, "j-brain-done", "ws-a", "done", "brain").await;
+        // …one in-flight FSM-source job (must be skipped — the
+        // brain path doesn't drive the FSM's cancel notify).
+        seed_swarm_job(&pool, "j-fsm-live", "ws-c", "scout", "fsm").await;
+
+        let bus = MailboxBus::new(pool.clone());
+
+        // Subscribe to each workspace BEFORE the fan-out so the
+        // broadcast lands on a live receiver (not strictly required
+        // — the SQL log is the source of truth — but it lets us
+        // assert per-workspace routing too).
+        let mut rx_a = bus.subscribe("ws-a").await;
+        let mut rx_b = bus.subscribe("ws-b").await;
+        let mut rx_c = bus.subscribe("ws-c").await;
+
+        let emitted =
+            bus.cancel_in_flight_brain_jobs(app.handle()).await;
+        assert_eq!(emitted, 2, "exactly two in-flight brain jobs cancel");
+
+        // ws-a must receive a JobCancel for j-brain-a.
+        let env_a = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            rx_a.recv(),
+        )
+        .await
+        .expect("ws-a recv within 1s")
+        .expect("ws-a envelope");
+        match env_a.event {
+            MailboxEvent::JobCancel { job_id } => {
+                assert_eq!(job_id, "j-brain-a");
+            }
+            other => panic!("ws-a expected JobCancel; got {other:?}"),
+        }
+
+        // ws-b must receive a JobCancel for j-brain-b.
+        let env_b = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            rx_b.recv(),
+        )
+        .await
+        .expect("ws-b recv within 1s")
+        .expect("ws-b envelope");
+        match env_b.event {
+            MailboxEvent::JobCancel { job_id } => {
+                assert_eq!(job_id, "j-brain-b");
+            }
+            other => panic!("ws-b expected JobCancel; got {other:?}"),
+        }
+
+        // ws-c must NOT receive any cancel (FSM-source job skipped).
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            rx_c.recv(),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "ws-c (FSM-source) must not receive a JobCancel; got: {result:?}"
+        );
+
+        // Persisted rows: exactly two `kind='job_cancel'` rows in
+        // mailbox.
+        let cancel_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM mailbox WHERE kind = 'job_cancel'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(cancel_count, 2);
+    }
 }
