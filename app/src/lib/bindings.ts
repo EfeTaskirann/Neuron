@@ -179,14 +179,33 @@ export const commands = {
 	 */
 	swarmTestInvoke: (profileId: string, userMessage: string) => typedError<InvokeResult, AppErrorWire>(__TAURI_INVOKE("swarm_test_invoke", { profileId, userMessage })),
 	/**
-	 *  Drive a 3-stage swarm job to completion (WP-W3-12a §4).
+	 *  Drive the Coordinator brain dispatch loop to completion (WP-W5-06,
+	 *  previously `swarm:run_job_v2` from W5-03).
 	 * 
-	 *  Walks `scout` → `planner` → `backend-builder` against the
-	 *  substrate from W3-11, returning the aggregated `JobOutcome`. The
-	 *  IPC blocks until the FSM finishes (Done / Failed). Two calls with
-	 *  the same `workspace_id` serialize — the second returns
-	 *  `AppError::WorkspaceBusy`. Two calls with different `workspace_id`s
-	 *  run in parallel.
+	 *  Lifecycle:
+	 *  1. Mint a `j-<ULID>` if not preset; acquire the workspace lock
+	 *     via the existing `JobRegistry::try_acquire_workspace`.
+	 *  2. Ensure a `MailboxAgentDispatcher` exists for every specialist
+	 *     agent so dispatches the brain emits land on a real receiver
+	 *     immediately.
+	 *  3. Spawn the brain on `CoordinatorBrain::run` with the workspace's
+	 *     `MailboxBus` and the production `CoordinatorInvoker`.
+	 *  4. Await the brain's `BrainRunResult` and build a `JobOutcome`
+	 *     from the W5-04 projector's `swarm_jobs` / `swarm_stages`
+	 *     rows.
+	 *  5. Release the workspace lock.
+	 * 
+	 *  Returns the projector-built `JobOutcome` on success / failure
+	 *  paths. `final_state` maps from brain outcome via the projector:
+	 *    - terminal `JobFinished` event with `outcome="done"` →
+	 *      `JobState::Done`
+	 *    - terminal `JobFinished` with anything else → `JobState::Failed`
+	 *    - terminal `JobCancel` → `JobState::Failed` with `last_error =
+	 *      "cancelled by user"`.
+	 * 
+	 *  W5-06 — frontend signature unchanged from the legacy FSM IPC:
+	 *  `(workspaceId, goal) -> JobOutcome`. Callers
+	 *  (`useRunSwarmJob`) keep working without code change.
 	 */
 	swarmRunJob: (workspaceId: string, goal: string) => typedError<JobOutcome, AppErrorWire>(__TAURI_INVOKE("swarm_run_job", { workspaceId, goal })),
 	/**
@@ -372,32 +391,6 @@ export const commands = {
 	 *  consumers (W5-03 brain) can still read user intent.
 	 */
 	swarmAgentsDispatchToAgent: (workspaceId: string, agentId: string, prompt: string, jobId: string | null, withHelpLoop: boolean | null) => typedError<number, AppErrorWire>(__TAURI_INVOKE("swarm_agents_dispatch_to_agent", { workspaceId, agentId, prompt, jobId, withHelpLoop })),
-	/**
-	 *  Drive the W5-03 Coordinator brain dispatch loop to completion.
-	 *  Parallel to `swarm:run_job` (the FSM-driven path stays alive for
-	 *  regression smokes; W5-06 deletes it).
-	 * 
-	 *  Lifecycle:
-	 *  1. Mint a `j-<ULID>` if not preset; acquire the workspace lock
-	 *     via the existing `JobRegistry::try_acquire_workspace`.
-	 *  2. Ensure a `MailboxAgentDispatcher` exists for every specialist
-	 *     agent so dispatches the brain emits land on a real receiver
-	 *     immediately.
-	 *  3. Spawn the brain on `CoordinatorBrain::run` with the workspace's
-	 *     `MailboxBus` and the production `CoordinatorInvoker`.
-	 *  4. Await the brain's `BrainRunResult` and build a stub
-	 *     `JobOutcome`. The full job-state derivation from mailbox
-	 *     events is W5-04's scope; for W5-03 we surface a minimal shape
-	 *     so callers (manual smokes) get a structured result without
-	 *     a frontend reducer.
-	 *  5. Release the workspace lock.
-	 * 
-	 *  Returns the stub `JobOutcome` on success / failure paths.
-	 *  `final_state` maps from brain outcome:
-	 *    - `"done"` → `JobState::Done`
-	 *    - everything else (`"failed" | "ask_user"`) → `JobState::Failed`
-	 */
-	swarmRunJobV2: (workspaceId: string, goal: string) => typedError<JobOutcome, AppErrorWire>(__TAURI_INVOKE("swarm_run_job_v2", { workspaceId, goal })),
 };
 
 /* Types */
