@@ -4,6 +4,65 @@ Running journal of agent-driven changes. Newest entry on top. See `AGENTS.md` §
 
 ---
 
+## 2026-05-10 WP-W5-05 completed
+
+- sub-agent: general-purpose (Claude Opus 4.7 1M)
+- branch: `wp-w5-05-cancel-workspace-lock` (off `main` at `495c932`)
+- commits: `659d1dc` MailboxBus workspace-busy guard for JobStarted,
+  `5b59976` swarm_cancel_job source-switching for brain jobs,
+  `1703faa` RunEvent::ExitRequested emits JobCancel for in-flight
+  brain jobs, + (this commit) bindings regen + AGENT_LOG /
+  WP status flip
+- files changed: 5 (0 new, 5 modified) —
+  `swarm/mailbox_bus.rs` (workspace-busy guard +
+  `cancel_in_flight_brain_jobs` shutdown helper),
+  `commands/swarm.rs` (swarm_cancel_job source-switch),
+  `lib.rs` (RunEvent::ExitRequested cancel fan-out),
+  `app/src/lib/bindings.ts` (regen — only docstring updates,
+  no public type drift),
+  `docs/work-packages/WP-W5-05-cancel-workspace-lock.md`
+- tests: 516 → **525** (+9 new); 0 failed; 15 ignored. The
+  contract called for ≥ 8 new tests; we landed 9 — 8
+  contract-listed plus 1 sister
+  (`emit_typed_ignores_fsm_source_jobs_for_busy_check`)
+  pinning the FSM/brain coexistence path called out in
+  the WP §"Notes / risks".
+- acceptance: ✅ all gates green
+  - `cargo build --lib` 0
+  - `cargo test --lib` **525 / 0 / 15** (target ≥ 524)
+  - `cargo check --all-targets` 0
+  - `pnpm gen:bindings:check` 0 (post-commit)
+  - `pnpm typecheck` 0
+  - `pnpm lint` 0
+  - `pnpm test --run` 64 passed / 1 pre-existing locale flake
+    (matches W5-04 baseline)
+- design notes:
+  - **WP example SQL needed adjustment**: the contract's
+    `SELECT COUNT(*) FROM swarm_jobs WHERE workspace_id = ? AND
+    source = 'brain' AND state NOT IN ('done','failed')`
+    implicitly assumed the projector inserts the swarm_jobs row
+    AFTER `emit_typed`. The current code path's
+    `try_acquire_workspace` writes the row up-front, so the
+    guard would self-trip on the just-acquired job. The
+    implementation excludes the JobStarted's own job_id (`AND
+    id != ?`) and switched to `SELECT id ... LIMIT 1` so the
+    same query feeds `AppError::WorkspaceBusy { workspace_id,
+    in_flight_job_id }` directly.
+  - **Shutdown fan-out body lives on MailboxBus** as
+    `cancel_in_flight_brain_jobs(&AppHandle) -> usize`. This
+    keeps the `RunEvent::ExitRequested` closure thin and lets
+    `shutdown_emits_job_cancel_for_each_in_flight_brain_job`
+    exercise the invariant without spinning the runtime.
+- caveats:
+  - `AppError::WorkspaceBusy` is a struct variant
+    (`{ workspace_id, in_flight_job_id }`) — the WP example
+    uses a unit-form `AppError::WorkspaceBusy`. Honored the
+    existing struct shape verbatim per gotcha #6.
+- next: orchestrator should ff-merge wp-w5-05-cancel-workspace-lock
+  → main and dispatch W5-06.
+
+---
+
 ## 2026-05-10 WP-W5-04 completed
 
 - sub-agent: general-purpose (Claude Opus 4.7 1M)

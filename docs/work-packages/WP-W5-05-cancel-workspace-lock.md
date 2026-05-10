@@ -1,11 +1,68 @@
 ---
 id: WP-W5-05
 title: Cancel + workspace serialization under the message-bus
-owner: TBD
-status: not-started
+owner: Claude Opus 4.7 (1M context)
+status: implemented
 depends-on: [WP-W5-03]
 acceptance-gate: "`swarm:cancel_job` IPC migrated to emit `MailboxEvent::JobCancel` (instead of signaling the FSM's per-job `Notify` directly). `MailboxBus::emit_typed` gains a workspace-busy guard for `JobStarted` events that returns `AppError::WorkspaceBusy` when another brain-driven job is in-flight for the same workspace. `RunEvent::ExitRequested` shutdown hook emits `JobCancel` for every in-flight brain-driven job. The W3 FSM cancel path stays untouched for v1 jobs. `cargo test --lib` ≥ 8 new unit tests; `pnpm typecheck` / `lint` / `gen:bindings:check` green."
 ---
+
+## Result
+
+Branch: `wp-w5-05-cancel-workspace-lock`. Implementation per the contract:
+
+- `MailboxBus::emit_typed` body grew a workspace-busy guard at
+  the top of the function: when the inbound event is
+  `MailboxEvent::JobStarted`, the bus refuses with
+  `AppError::WorkspaceBusy` if another brain-driven, non-terminal
+  `swarm_jobs` row exists for the same workspace. The current
+  job's id is excluded so the v2 IPC's up-front
+  `try_acquire_workspace` write does not self-trip. FSM-source
+  rows are ignored.
+- `swarm:cancel_job` IPC discriminates on `swarm_jobs.source`:
+  brain → emit `MailboxEvent::JobCancel`; fsm or no DB row →
+  legacy `JobRegistry::signal_cancel` (W3-12c semantics
+  preserved verbatim); unknown string → `AppError::Internal`.
+  IPC signature unchanged — the bus + pool come from
+  `app.state` lookups inside the function body.
+- `RunEvent::ExitRequested` hook calls
+  `MailboxBus::cancel_in_flight_brain_jobs` BEFORE
+  `agent_registry.shutdown_all()` so dispatchers can break out
+  of their `tokio::select!`'s and finish in-flight `claude`
+  turns instead of getting SIGKILL'd mid-stream. The fan-out
+  body lives on `MailboxBus` so the shutdown invariant is
+  unit-testable without booting the runtime closure.
+- Test gates green:
+  - `cargo build --lib` exit 0
+  - `cargo test --lib` **525 passed / 0 failed / 15 ignored**
+    (baseline 516 + 9 new — 8 contract-listed + 1 sister
+    `emit_typed_ignores_fsm_source_jobs_for_busy_check` pinning
+    the FSM/brain coexistence path called out in §"Notes / risks")
+  - `cargo check --all-targets` exit 0
+  - `pnpm gen:bindings` regen — only docstring updates land in
+    `app/src/lib/bindings.ts` (no public type changes)
+  - `pnpm gen:bindings:check` exit 0 (post-commit)
+  - `pnpm typecheck` / `pnpm lint` exit 0
+  - `pnpm test --run` 64 passed / 1 pre-existing locale flake
+    (matches W5-04 baseline)
+
+### Caveats
+
+- The WP example SQL (`SELECT COUNT(*) FROM swarm_jobs WHERE
+  workspace_id = ? AND source = 'brain' AND state NOT IN ('done',
+  'failed')`) implicitly assumed the projector inserts the
+  swarm_jobs row AFTER `emit_typed`. In the current code path the
+  v2 IPC's `try_acquire_workspace` writes the row up-front, so
+  the guard would self-trip. The implementation excludes the
+  JobStarted's own job_id (`AND id != ?`) and switched
+  `COUNT(*)` to a one-row `SELECT id ... LIMIT 1` so the same
+  query returns the in-flight job_id for the
+  `AppError::WorkspaceBusy { workspace_id, in_flight_job_id }`
+  variant the existing `AppError` enum requires.
+- `RunEvent::ExitRequested` already runs inside a
+  `block_on` chain. Adding the bus cancel fan-out at the head
+  of the swarm cleanup order matches the WP's
+  "BEFORE agent_registry.shutdown_all()" directive verbatim.
 
 ## Goal
 

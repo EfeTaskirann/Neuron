@@ -266,25 +266,46 @@ export const commands = {
 	 */
 	swarmOrchestratorLogJob: (workspaceId: string, jobId: string, goal: string) => typedError<null, AppErrorWire>(__TAURI_INVOKE("swarm_orchestrator_log_job", { workspaceId, jobId, goal })),
 	/**
-	 *  Signal cancellation for an in-flight swarm job (WP-W3-12c §4).
+	 *  Signal cancellation for an in-flight swarm job (WP-W3-12c §4,
+	 *  WP-W5-05 source-switching).
 	 * 
-	 *  Looks up `job_id` in the `JobRegistry`. Returns:
+	 *  Discriminates on `swarm_jobs.source` (`'brain'` vs `'fsm'`):
 	 * 
-	 *  - `Ok(())` if the job was in-flight and the cancel signal was
-	 *    delivered. The FSM observes the signal at the next `select!`
-	 *    point, emits `Cancelled` then `Finished`, and finalizes the
-	 *    job as `Failed` with `last_error = "cancelled by user"`.
-	 *  - `Err(AppError::NotFound)` if no job with the given id exists
-	 *    in the registry.
-	 *  - `Err(AppError::Conflict)` if the job is already terminal
-	 *    (`Done`/`Failed`) — including a previous cancel that has
-	 *    already finalized.
+	 *  - **`source='brain'`** (W5-03 brain-driven jobs): emits
+	 *    `MailboxEvent::JobCancel` on the workspace's mailbox bus.
+	 *    The brain's dispatch-loop `select!` and every dispatcher's
+	 *    in-flight invoke notify pick it up and unwind. Returns
+	 *    `Ok(())` immediately — the IPC does not block on the
+	 *    cancel actually propagating (≤ 100ms in practice; same
+	 *    async semantics as the FSM cancel below).
+	 *  - **`source='fsm'` or no DB row** (legacy / W3 path): keeps
+	 *    the in-memory `JobRegistry::signal_cancel` flow. Returns:
+	 *      - `Ok(())` if the cancel signal landed on the FSM's per-
+	 *        job `Notify`. The FSM observes the signal at its next
+	 *        `select!` point, emits `Cancelled` then `Finished`,
+	 *        and finalizes the job as `Failed` with `last_error =
+	 *        "cancelled by user"`.
+	 *      - `Err(AppError::NotFound)` if no job with the given id
+	 *        exists in the registry.
+	 *      - `Err(AppError::Conflict)` if the job is already
+	 *        terminal (`Done`/`Failed`) — including a previous
+	 *        cancel that has already finalized.
+	 *  - **unknown source string**: returns
+	 *    `AppError::Internal(...)`. Defensive — only `'brain'` and
+	 *    `'fsm'` are written in production; any other value implies
+	 *    schema drift.
 	 * 
-	 *  Idempotency: a second cancel against the same in-flight job
-	 *  either returns `Ok(())` (signal sent again, FSM ignores it
-	 *  once finalized) or `Err(Conflict)` if the FSM has already
-	 *  removed the cancel notify on its tail. The race is benign;
-	 *  callers should treat both as "cancel acknowledged".
+	 *  Idempotency (FSM path): a second cancel against the same
+	 *  in-flight job either returns `Ok(())` (signal sent again, FSM
+	 *  ignores it once finalized) or `Err(Conflict)` if the FSM has
+	 *  already removed the cancel notify on its tail. The race is
+	 *  benign; callers should treat both as "cancel acknowledged".
+	 * 
+	 *  Idempotency (brain path): the bus has no dedupe — a second
+	 *  cancel emits a second `JobCancel` row. The brain + dispatchers
+	 *  both treat the second as a no-op (the loop has already
+	 *  terminated). The mailbox row is informational; the SQL log
+	 *  remains the source of truth.
 	 */
 	swarmCancelJob: (jobId: string) => typedError<null, AppErrorWire>(__TAURI_INVOKE("swarm_cancel_job", { jobId })),
 	/**
