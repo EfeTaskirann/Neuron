@@ -68,7 +68,7 @@ matching WP file is authored.
 | WP-W5-02 | Agent mailbox subscription + auto-emit (`MailboxAgentDispatcher` per agent) | sub-agent (general-purpose) | **shipped 2026-05-10 (`8cca3ba` + `2432440` + `14a50b3` + `739e836`); cargo 465/0/14 verified** | WP-W5-01 ✅ | M |
 | WP-W5-03 | Coordinator brain protocol — broadcast dispatch (`CoordinatorBrain` + `BrainAction` parser + `swarm:run_job_v2`) | sub-agent (general-purpose) | **shipped 2026-05-10 (`07ad3c4` + `49641bb` + `3546b36` + `407581f`); cargo 499/0/15 verified, integration smoke compile-only deferred** | WP-W5-02 ✅ | L |
 | WP-W5-04 | Job state derived from mailbox + UI plumbing (`JobProjector` synthesises `SwarmJobEvent` stream) | sub-agent (general-purpose) | **shipped 2026-05-10 (`f73a297` + `b1dc2ca` + `6cdf795` + `b3b95df`); cargo 516/0/15 verified** | WP-W5-03 ✅ | M |
-| WP-W5-05 | Cancel + workspace serialization under message-bus (`JobCancel` event + `JobStarted` workspace-busy guard) | TBD | contract authored (`42a247d`); not started | WP-W5-03 | S |
+| WP-W5-05 | Cancel + workspace serialization under message-bus (`JobCancel` event + `JobStarted` workspace-busy guard) | sub-agent (general-purpose) | **shipped 2026-05-10 (`659d1dc` + `5b59976` + `1703faa` + `f1846c1`); cargo 525/0/15 verified** | WP-W5-03 ✅ | S |
 | WP-W5-06 | FSM deprecation + 435-test migration + final integration smoke (replace `swarm:run_job` with the brain dispatcher; remove `coordinator::fsm`) | TBD | contract authored (`42a247d`); not started | WP-W5-04, WP-W5-05 | L |
 
 Sizes (rough, in sub-agent days): S = 0.5–1 day, M = 1–2 days,
