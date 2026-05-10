@@ -883,10 +883,41 @@ pub async fn swarm_run_job_v2<R: Runtime>(
         stages: Vec::new(),
         last_error: None,
         last_verdict: None,
+        // W5-04: brain-driven jobs land with `source='brain'` so
+        // the projector's row writes (and any subsequent reads via
+        // `swarm:get_job` / `swarm:list_jobs`) carry the right
+        // discriminator. The FSM path (`swarm:run_job`) keeps the
+        // default `'fsm'` value.
+        source: "brain".into(),
     };
     job_registry
         .try_acquire_workspace(&workspace_id, job)
         .await?;
+
+    // WP-W5-04 — ensure the workspace's `JobProjector` is up.
+    // Idempotent; the registry's RwLock fast path returns
+    // immediately when the projector already exists. Spawning the
+    // projector BEFORE wiring the dispatchers (and therefore
+    // before any brain emit) keeps the broadcast subscriber
+    // ordering: projector subscribed first, then dispatchers,
+    // then the brain emits JobStarted.
+    if let Some(projector_registry) = app
+        .try_state::<Arc<crate::swarm::JobProjectorRegistry>>()
+    {
+        let projector_registry = projector_registry.inner().clone();
+        let pool_for_projector = app
+            .state::<crate::db::DbPool>()
+            .inner()
+            .clone();
+        projector_registry
+            .ensure_for_workspace(
+                &app,
+                &workspace_id,
+                std::sync::Arc::clone(&bus),
+                pool_for_projector,
+            )
+            .await;
+    }
 
     // Ensure a MailboxAgentDispatcher is wired up for each specialist
     // so the brain's dispatches don't race against late-spawning
@@ -925,6 +956,7 @@ pub async fn swarm_run_job_v2<R: Runtime>(
     )
     .await;
     finalise_run_job_v2(
+        &app,
         &job_registry,
         &workspace_id,
         &job_id,
@@ -937,12 +969,20 @@ pub async fn swarm_run_job_v2<R: Runtime>(
 /// Internal: shared finalisation logic between `swarm_run_job_v2`
 /// and the test-only entry point. Releases the workspace lock,
 /// unregisters the cancel notify, updates the in-memory job state,
-/// and builds the stub `JobOutcome`.
-async fn finalise_run_job_v2(
+/// and asks the [`JobProjector`] to build the canonical
+/// [`JobOutcome`] from the persisted event log.
+///
+/// W5-04: previously this function returned a STUB outcome (empty
+/// stages, zero cost). It now defers to `JobProjector::build_outcome`
+/// which walks the bus's SQL-persisted event log and returns the
+/// fully-shaped outcome — same contract as the FSM's
+/// `swarm:run_job` IPC.
+async fn finalise_run_job_v2<R: Runtime>(
+    app: &AppHandle<R>,
     job_registry: &crate::swarm::JobRegistry,
     workspace_id: &str,
     job_id: &str,
-    started_at_ms: i64,
+    _started_at_ms: i64,
     brain_result: Result<crate::swarm::BrainRunResult, AppError>,
 ) -> Result<JobOutcome, AppError> {
     job_registry.unregister_cancel(job_id);
@@ -950,35 +990,47 @@ async fn finalise_run_job_v2(
         .release_workspace(workspace_id, job_id)
         .await;
     match brain_result {
-        Ok(result) => {
-            let final_state = if result.outcome == "done" {
-                crate::swarm::JobState::Done
-            } else {
-                crate::swarm::JobState::Failed
+        Ok(_result) => {
+            // Pull the bus from app state so `build_outcome` can
+            // walk the event log. Fall back to a stub outcome only
+            // if the bus is missing (defensive — `lib.rs::setup`
+            // always installs it).
+            let bus_state = app
+                .try_state::<Arc<crate::swarm::MailboxBus>>();
+            let pool_state = app.try_state::<crate::db::DbPool>();
+            let outcome = match (bus_state, pool_state) {
+                (Some(bus), Some(pool)) => {
+                    let bus = bus.inner().clone();
+                    let pool = pool.inner().clone();
+                    crate::swarm::JobProjector::build_outcome(
+                        &bus, &pool, job_id,
+                    )
+                    .await?
+                }
+                _ => {
+                    // Defensive — should never happen in production
+                    // (lib.rs::setup wires both). Surface a tame
+                    // error so the caller sees a typed failure.
+                    return Err(AppError::Internal(
+                        "swarm:run_job_v2: MailboxBus or DbPool missing \
+                         from app state — cannot build JobOutcome"
+                            .into(),
+                    ));
+                }
             };
-            let last_error = if final_state == crate::swarm::JobState::Failed
-            {
-                Some(result.summary.clone())
-            } else {
-                None
-            };
-            let total_duration_ms =
-                (crate::time::now_millis() - started_at_ms).max(0) as u64;
+            // Mirror the projector's terminal state into the
+            // in-memory JobRegistry so `swarm:cancel_job` / future
+            // status queries through the registry see the latest
+            // shape.
+            let final_state = outcome.final_state;
+            let last_error_clone = outcome.last_error.clone();
             let _ = job_registry
                 .update(job_id, |job| {
                     job.state = final_state;
-                    job.last_error = last_error.clone();
+                    job.last_error = last_error_clone.clone();
                 })
                 .await;
-            Ok(JobOutcome {
-                job_id: result.job_id,
-                final_state,
-                stages: Vec::new(),
-                last_error,
-                total_cost_usd: 0.0,
-                total_duration_ms,
-                last_verdict: None,
-            })
+            Ok(outcome)
         }
         Err(err) => {
             let _ = job_registry
@@ -1072,6 +1124,8 @@ where
         stages: Vec::new(),
         last_error: None,
         last_verdict: None,
+        // W5-04 — brain-driven path, see swarm_run_job_v2 above.
+        source: "brain".into(),
     };
     job_registry
         .try_acquire_workspace(&workspace_id, job)
@@ -1098,6 +1152,7 @@ where
     )
     .await;
     finalise_run_job_v2(
+        &app,
         &job_registry,
         &workspace_id,
         &job_id,
@@ -1340,7 +1395,8 @@ mod tests {
             retry_count: 0,
             stages: Vec::new(),
             last_error: None,
-        last_verdict: None,
+            last_verdict: None,
+            source: Job::default_source(),
         };
         registry
             .try_acquire_workspace("ws-done", job)
@@ -1369,7 +1425,8 @@ mod tests {
             retry_count: 0,
             stages: Vec::new(),
             last_error: Some("boom".into()),
-        last_verdict: None,
+            last_verdict: None,
+            source: Job::default_source(),
         };
         registry
             .try_acquire_workspace("ws-failed", job)
@@ -1401,7 +1458,8 @@ mod tests {
             retry_count: 0,
             stages: Vec::new(),
             last_error: None,
-        last_verdict: None,
+            last_verdict: None,
+            source: Job::default_source(),
         };
         registry
             .try_acquire_workspace("ws-mid", job)
@@ -1432,7 +1490,8 @@ mod tests {
             retry_count: 0,
             stages: Vec::new(),
             last_error: None,
-        last_verdict: None,
+            last_verdict: None,
+            source: Job::default_source(),
         };
         registry
             .try_acquire_workspace("ws-live", job)
@@ -1480,7 +1539,8 @@ mod tests {
             retry_count: 0,
             stages: Vec::new(),
             last_error: None,
-        last_verdict: None,
+            last_verdict: None,
+            source: Job::default_source(),
         };
         registry
             .try_acquire_workspace("ws-double", job)
@@ -1557,7 +1617,8 @@ mod tests {
                 retry_count: 0,
                 stages: Vec::new(),
                 last_error: None,
-            last_verdict: None,
+                last_verdict: None,
+                source: Job::default_source(),
             };
             registry
                 .try_acquire_workspace("ws-list", job)
@@ -1624,7 +1685,8 @@ mod tests {
             retry_count: 0,
             stages: Vec::new(),
             last_error: None,
-        last_verdict: None,
+            last_verdict: None,
+            source: Job::default_source(),
         };
         registry
             .try_acquire_workspace("ws-detail", job)
@@ -2247,11 +2309,21 @@ mod tests {
                 ProfileRegistry::load_from(None).expect("load"),
             ),
         ));
+        // WP-W5-04 — install the projector registry so v2 tests
+        // exercise the same `ensure_for_workspace` path the IPC
+        // takes in production. Without it, `swarm_run_job_v2`
+        // skips the projector spawn and `build_outcome` walks the
+        // bus directly (still works, but bypasses the live
+        // SwarmJobEvent emit chain).
+        let projector_registry = std::sync::Arc::new(
+            crate::swarm::JobProjectorRegistry::new(),
+        );
         let app = tauri::test::mock_builder()
             .manage(pool)
             .manage(job_registry.clone())
             .manage(bus.clone())
             .manage(agent_registry.clone())
+            .manage(projector_registry)
             .build(tauri::test::mock_context(tauri::test::noop_assets()))
             .expect("mock app");
         (app, job_registry, bus, agent_registry, dir)
@@ -2359,6 +2431,7 @@ mod tests {
             stages: Vec::new(),
             last_error: None,
             last_verdict: None,
+            source: crate::swarm::Job::default_source(),
         };
         jr.try_acquire_workspace("default", dummy_job)
             .await

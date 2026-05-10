@@ -314,6 +314,21 @@ pub fn run() {
             );
             app.manage(mailbox_bus);
 
+            // WP-W5-04 — install the per-workspace `JobProjector`
+            // registry. Lazy-spawned: the registry holds zero
+            // projectors at startup; `swarm:run_job_v2` calls
+            // `ensure_for_workspace` on its workspace before the
+            // brain emits the first JobStarted, so the projector
+            // is subscribed to the bus before any brain-driven
+            // event lands. Per WP-W5-04 §"Notes / risks" the
+            // bus's broadcast channel is FIFO per subscriber, so
+            // this subscribe-before-emit ordering keeps the event
+            // stream ordered from the projector's perspective.
+            let projector_registry = std::sync::Arc::new(
+                crate::swarm::JobProjectorRegistry::new(),
+            );
+            app.manage(projector_registry);
+
             // WP-W2-06 — install an empty terminal PTY registry. Each
             // `terminal:spawn` adds a pane to it; the shutdown hook
             // below tears them all down on app exit so no shell
@@ -408,6 +423,17 @@ pub fn run() {
                     let cloned = agent_registry.inner().clone();
                     tauri::async_runtime::block_on(async move {
                         let _ = cloned.shutdown_all().await;
+                    });
+                }
+                // WP-W5-04 — drain every projector before exit so
+                // the broadcast subscribers don't outlive the
+                // runtime. Idempotent — empty registry is a no-op.
+                if let Some(projector_registry) = app
+                    .try_state::<std::sync::Arc<crate::swarm::JobProjectorRegistry>>()
+                {
+                    let cloned = projector_registry.inner().clone();
+                    tauri::async_runtime::block_on(async move {
+                        cloned.shutdown_all().await;
                     });
                 }
             }
