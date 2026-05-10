@@ -35,6 +35,7 @@ pub mod help_request;
 pub mod mailbox_bus;
 pub mod persistent_session;
 pub mod profile;
+pub mod projector;
 pub mod transport;
 
 // Re-export the public surface used by `commands/swarm.rs` so callers
@@ -47,6 +48,10 @@ pub use binding::{
 pub use coordinator::{
     CoordinatorFsm, Job, JobOutcome, JobRegistry, JobState, StageResult,
     SwarmJobEvent, MAX_RETRIES,
+};
+pub use projector::{
+    get_brain_job_detail, JobProjector, JobProjectorRegistry,
+    ProjectorHandle,
 };
 pub use agent_dispatcher::{
     parse_agent_target, AgentInvoker, MailboxAgentDispatcher,

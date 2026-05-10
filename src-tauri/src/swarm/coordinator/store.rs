@@ -58,10 +58,15 @@ pub(super) async fn insert_job_and_lock(
 ) -> Result<(), AppError> {
     let mut tx = pool.begin().await?;
     let last_verdict_json = serialize_verdict(job.last_verdict.as_ref())?;
+    // WP-W5-04 — `source` discriminates FSM-driven (`'fsm'`) from
+    // brain-driven (`'brain'`) job rows. Migration 0011 added the
+    // column with default `'fsm'`; this INSERT carries `Job.source`
+    // through verbatim so the projector's `'brain'` writes land
+    // correctly.
     sqlx::query(
         "INSERT INTO swarm_jobs \
-         (id, workspace_id, goal, created_at_ms, state, retry_count, last_error, finished_at_ms, last_verdict_json) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         (id, workspace_id, goal, created_at_ms, state, retry_count, last_error, finished_at_ms, last_verdict_json, source) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&job.id)
     .bind(workspace_id)
@@ -72,6 +77,7 @@ pub(super) async fn insert_job_and_lock(
     .bind(job.last_error.as_deref())
     .bind(Option::<i64>::None)
     .bind(last_verdict_json)
+    .bind(&job.source)
     .execute(&mut *tx)
     .await?;
     sqlx::query(
@@ -181,7 +187,7 @@ pub(super) async fn list_jobs(
     let rows = if let Some(workspace_id) = workspace_id_opt {
         sqlx::query(
             "SELECT j.id, j.workspace_id, j.goal, j.created_at_ms, j.finished_at_ms, \
-                    j.state, j.last_error, \
+                    j.state, j.last_error, j.source, \
                     COALESCE((SELECT COUNT(*) FROM swarm_stages s WHERE s.job_id = j.id), 0) AS stage_count, \
                     COALESCE((SELECT SUM(s.total_cost_usd) FROM swarm_stages s WHERE s.job_id = j.id), 0.0) AS total_cost_usd \
              FROM swarm_jobs j \
@@ -196,7 +202,7 @@ pub(super) async fn list_jobs(
     } else {
         sqlx::query(
             "SELECT j.id, j.workspace_id, j.goal, j.created_at_ms, j.finished_at_ms, \
-                    j.state, j.last_error, \
+                    j.state, j.last_error, j.source, \
                     COALESCE((SELECT COUNT(*) FROM swarm_stages s WHERE s.job_id = j.id), 0) AS stage_count, \
                     COALESCE((SELECT SUM(s.total_cost_usd) FROM swarm_stages s WHERE s.job_id = j.id), 0.0) AS total_cost_usd \
              FROM swarm_jobs j \
@@ -218,6 +224,7 @@ pub(super) async fn list_jobs(
             row.try_get("finished_at_ms")?;
         let state_str: String = row.try_get("state")?;
         let last_error: Option<String> = row.try_get("last_error")?;
+        let source: String = row.try_get("source")?;
         let stage_count_i: i64 = row.try_get("stage_count")?;
         let total_cost_usd: f64 = row.try_get("total_cost_usd")?;
 
@@ -232,6 +239,7 @@ pub(super) async fn list_jobs(
             stage_count: stage_count_i.max(0) as u32,
             total_cost_usd,
             last_error,
+            source,
         });
     }
     Ok(out)
@@ -246,7 +254,7 @@ pub(super) async fn get_job_detail(
 ) -> Result<Option<JobDetail>, AppError> {
     let job_row_opt = sqlx::query(
         "SELECT id, workspace_id, goal, created_at_ms, finished_at_ms, \
-                state, retry_count, last_error, last_verdict_json \
+                state, retry_count, last_error, last_verdict_json, source \
          FROM swarm_jobs \
          WHERE id = ?",
     )
@@ -268,6 +276,7 @@ pub(super) async fn get_job_detail(
     let last_error: Option<String> = row.try_get("last_error")?;
     let last_verdict_json: Option<String> =
         row.try_get("last_verdict_json")?;
+    let source: String = row.try_get("source")?;
     let state = JobState::from_db_str(&state_str)?;
     let last_verdict = deserialize_verdict(last_verdict_json.as_deref())?;
 
@@ -289,6 +298,7 @@ pub(super) async fn get_job_detail(
         total_cost_usd,
         total_duration_ms,
         last_verdict,
+        source,
     }))
 }
 
@@ -440,6 +450,7 @@ fn detail_to_job(detail: JobDetail) -> Job {
         stages: detail.stages,
         last_error: detail.last_error,
         last_verdict: detail.last_verdict,
+        source: detail.source,
     }
 }
 
@@ -545,6 +556,7 @@ mod tests {
             stages: Vec::new(),
             last_error: None,
             last_verdict: None,
+            source: Job::default_source(),
         }
     }
 
