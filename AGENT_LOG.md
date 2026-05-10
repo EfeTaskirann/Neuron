@@ -4,6 +4,122 @@ Running journal of agent-driven changes. Newest entry on top. See `AGENTS.md` §
 
 ---
 
+## 2026-05-10 WP-W5-06 completed (FSM deleted; autonomous swarm ships)
+
+- sub-agent: general-purpose (Claude Opus 4.7 1M)
+- branch: `wp-w5-06-fsm-deprecation` (off `main` at `5b99169`)
+- commits:
+  - `b484065` chore(WP-W5-06): delete coordinator::fsm + RegistryTransport
+  - `869e037` feat(WP-W5-06): regen bindings.ts after FSM IPC removal
+  - `2bff4e5` docs(WP-W5-06): final CoordinatorFsm reference removed
+  - (this commit) docs(WP-W5-06): retrospective with FSM-vs-brain
+    comparison
+- files changed: 11 modified + 1 deleted —
+  `src-tauri/src/swarm/coordinator/fsm.rs` (deleted, 7322 lines),
+  `src-tauri/src/swarm/coordinator/{mod.rs,job.rs}` (FSM re-exports
+  out, doc-comment cleanup),
+  `src-tauri/src/swarm/{mod.rs,agent_registry.rs,help_request.rs,transport.rs,agent_dispatcher.rs}`
+  (RegistryTransport + process_help_request + acquire_and_invoke_turn_with_help
+  + mock_transport + emit_help_mailbox + mark_waiting_on_coordinator deletions),
+  `src-tauri/src/commands/swarm.rs` (old swarm_run_job body
+  deleted; v2 renamed to v1; 5 new ignored brain smokes added),
+  `src-tauri/src/lib.rs` (collect_commands! trim — v2 entry gone),
+  `app/src/lib/bindings.ts` (regen),
+  `docs/work-packages/WP-W5-06-fsm-deprecation.md` (Result section)
+- tests: 525 → **446** (`-79` net); 0 failed; 13 ignored. Down
+  from 525 because ~80 FSM-internal tests were deleted alongside
+  the module; 5 ignored brain smokes were added (replacing 7
+  deleted FSM smokes — net `-2` ignored). Frontend 64/1
+  pre-existing flake matches W5-04/W5-05 baseline.
+- acceptance:
+  - `cargo build --lib` 0
+  - `cargo test --lib` **446 / 0 / 13** (target ≥ 350)
+  - `cargo check --all-targets` 0
+  - `pnpm gen:bindings` regen committed
+  - `pnpm gen:bindings:check` 0
+  - `pnpm typecheck` 0
+  - `pnpm lint` 0
+  - `pnpm test --run` 64 passed / 1 pre-existing locale flake
+  - `Test-Path "src-tauri/src/swarm/coordinator/fsm.rs"` False
+  - `grep "CoordinatorFsm" src-tauri/src/` returns 0 matches
+- design notes:
+  - **Lifecycle coverage was already in place** from W5-03's
+    `brain.rs::tests` (16 tests) + W5-04's `projector.rs::tests`
+    (17 tests) + W5-05's `mailbox_bus.rs` cancel/busy tests +
+    `commands/swarm.rs::tests` brain IPC tests. Deleting fsm.rs
+    didn't reduce assertion coverage of the lifecycle invariants
+    — only the FSM's internal state-table walks lost their
+    tests, which is intended.
+  - **Real-claude smokes** were rewritten as brain-driven 1:1
+    where a brain analog exists (research-only, full-chain,
+    fullstack, persistence, cancel) and dropped where they were
+    FSM-specific (`integration_fsm_drives_real_claude_chain`,
+    the FSM-vs-pool variant). Smokes stayed `#[ignore]` per the
+    contract; the owner runs them post-merge.
+  - **`swarm_run_job_v2` rename** is straightforward — frontend
+    hooks already called `commands.swarmRunJob`; the v2 binding
+    disappears and the v1 binding's signature is unchanged.
+  - **Single-commit delete** chosen over the split escape hatch
+    because (a) lifecycle coverage was already in place from
+    W5-03/04/05, (b) the `cargo build` graph stayed green at
+    every step (mod-level cleanup + delete + IPC rename are a
+    single atomic refactor), (c) the `~80 deletions + ~120
+    rewrites` math from the WP simplified to `delete fsm.rs +
+    add 5 brain smokes` once the brain coverage was confirmed
+    pre-existing.
+- comparison table (synthetic, from unit tests — wall-clock
+  measured by owner post-merge):
+
+  | Goal | FSM stages | Brain dispatches | Final state |
+  |---|---:|---:|---|
+  | ResearchOnly happy path | 2 | 1-2 | Done |
+  | Backend full-chain | 6 | 5-7 | Done |
+  | Fullstack | 8 (parallel pairs) | 6-9 | Done |
+  | Cancel mid-chain | FSM: signal_cancel | Brain: JobCancel | Failed |
+- caveats:
+  - **Real-claude smokes not executed** in the sub-agent run.
+    Skipped per the WP's "passes within 3 retries" gate which
+    can't be exercised inside the sandbox. The smokes are
+    landed `#[ignore]`'d at the right shape; owner runs them
+    with the env-overrides shown in the WP `## Verification
+    commands` block. If they consistently miss `Done`, the
+    persona body or `NEURON_BRAIN_MAX_DISPATCHES` cap is the
+    tuning surface.
+  - **`JobRegistry` was trimmed in place** rather than deleted
+    outright. WP §"Notes / risks" default was "trim"; the
+    brain IPC still uses `try_acquire_workspace` /
+    `release_workspace` for in-memory bookkeeping, with
+    W5-05's bus-level guard running alongside.
+  - **`signal_cancel` legacy path** stayed in `swarm_cancel_job`
+    for `source='fsm' | None`. No production writer emits
+    `'fsm'` post-W5-06 (the brain IPC always writes `'brain'`),
+    but old W3-12-era persisted rows still have it; the legacy
+    path keeps cancelling them gracefully.
+  - **`prompts.rs` was NOT created.** None of the FSM's prompt
+    templates have a brain consumer (the persona body owns
+    the dispatch contract now), so they were deleted with
+    fsm.rs rather than parked in a vestigial module.
+  - **`last_rejecting_gate` helper on `Job` was kept** even
+    though only the FSM consumed it. Pure helper, no SQL,
+    its unit tests still pin the semantics — keeps the field
+    surface symmetrical with `last_verdict` for future post-
+    W5 retry UX.
+- followups (none of these block W5):
+  - Owner runs the 5 real-claude brain smokes post-merge to
+    confirm the brain's wall-clock + Done-rate against the
+    FSM baseline. Document outcomes in a follow-up entry.
+  - If `JobRegistry`'s in-memory workspace-lock turns out
+    fully redundant after W5-05's bus guard logs zero "double
+    catch" telemetry over a week of usage, a future WP can
+    delete the in-memory map.
+  - The `WaitingOnCoordinator` `AgentStatus` variant is now
+    unreachable (only `mark_waiting_on_coordinator` set it,
+    and that helper was deleted). Variant left in place
+    because removing it touches the bindings-typed
+    `SwarmAgentEvent` contract; defer to a future cleanup WP.
+
+---
+
 ## 2026-05-10 WP-W5-05 completed
 
 - sub-agent: general-purpose (Claude Opus 4.7 1M)
