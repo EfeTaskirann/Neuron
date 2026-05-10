@@ -54,7 +54,6 @@
 //! - FSM teardown (W5-06).
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use specta::Type;
@@ -133,16 +132,18 @@ pub enum MailboxEvent {
         question: String,
     },
     /// W5-03: Coordinator's response to a help request. The
-    /// `outcome` payload is the serialized
+    /// `outcome_json` payload is a JSON-serialised
     /// `swarm::help_request::CoordinatorHelpOutcome` (action +
     /// answer / followup / user_question fields, depending on
-    /// variant). Stored as `serde_json::Value` here so the bus
-    /// stays decoupled from `swarm::help_request` (which depends
-    /// on `swarm::agent_registry` — would create a cycle).
+    /// variant). Stored as `String` here so the bus stays
+    /// decoupled from `swarm::help_request` (which depends on
+    /// `swarm::agent_registry` — would create a cycle), and so
+    /// the type implements `specta::Type` cleanly. Consumers
+    /// parse via `serde_json::from_str`.
     CoordinatorHelpOutcome {
         job_id: String,
         target_agent_id: String,
-        outcome: serde_json::Value,
+        outcome_json: String,
     },
     /// W5-03: job lifecycle start. Emitted once per job by the
     /// `swarm:run_job_v2` IPC; CoordinatorBrain subscribes and
@@ -277,7 +278,10 @@ pub struct MailboxEnvelope {
     /// row's autoincrement `id`. `None` for top-level events.
     pub parent_id: Option<i64>,
     /// Typed event payload. Tagged on `kind` so the wire form is
-    /// `{"kind":"task_dispatch","jobId":"...","target":"...","prompt":"...","withHelpLoop":true}`.
+    /// `{"kind":"task_dispatch","job_id":"...","target":"...","prompt":"...","with_help_loop":true}`.
+    /// Field names stay snake_case inside the variant body
+    /// (matches the enum's `rename_all = "snake_case"`); only the
+    /// outer envelope renames to camelCase.
     pub event: MailboxEvent,
 }
 
@@ -582,7 +586,7 @@ mod tests {
             "INSERT INTO mailbox \
                (ts, from_pane, to_pane, type, summary, kind, parent_id, payload_json) \
              VALUES (200, 'agent:scout', 'agent:planner', 'task_dispatch', \
-                     'dispatched', 'task_dispatch', 1, '{\"kind\":\"task_dispatch\",\"jobId\":\"j-1\",\"target\":\"agent:scout\",\"prompt\":\"go\",\"withHelpLoop\":true}')",
+                     'dispatched', 'task_dispatch', 1, '{\"kind\":\"task_dispatch\",\"job_id\":\"j-1\",\"target\":\"agent:scout\",\"prompt\":\"go\",\"with_help_loop\":true}')",
         )
         .execute(&pool)
         .await
@@ -597,7 +601,7 @@ mod tests {
             .unwrap();
         assert_eq!(kind2, "task_dispatch");
         assert_eq!(parent2, Some(1));
-        assert!(payload2.contains("\"jobId\":\"j-1\""));
+        assert!(payload2.contains("\"job_id\":\"j-1\""));
     }
 
     // -----------------------------------------------------------------
@@ -628,7 +632,7 @@ mod tests {
             MailboxEvent::CoordinatorHelpOutcome {
                 job_id: "j-1".into(),
                 target_agent_id: "backend-builder".into(),
-                outcome: serde_json::json!({"action":"direct_answer","answer":"User.id"}),
+                outcome_json: r#"{"action":"direct_answer","answer":"User.id"}"#.into(),
             },
             MailboxEvent::JobStarted {
                 job_id: "j-1".into(),
@@ -667,37 +671,37 @@ mod tests {
         let cases: &[(&str, &str, fn(&MailboxEvent) -> bool)] = &[
             (
                 "task_dispatch",
-                r#"{"kind":"task_dispatch","jobId":"j-1","target":"agent:scout","prompt":"go","withHelpLoop":false}"#,
+                r#"{"kind":"task_dispatch","job_id":"j-1","target":"agent:scout","prompt":"go","with_help_loop":false}"#,
                 |e| matches!(e, MailboxEvent::TaskDispatch { with_help_loop: false, .. }),
             ),
             (
                 "agent_result",
-                r#"{"kind":"agent_result","jobId":"j-1","agentId":"scout","assistantText":"done","totalCostUsd":0.5,"turnCount":2}"#,
+                r#"{"kind":"agent_result","job_id":"j-1","agent_id":"scout","assistant_text":"done","total_cost_usd":0.5,"turn_count":2}"#,
                 |e| matches!(e, MailboxEvent::AgentResult { turn_count: 2, .. }),
             ),
             (
                 "agent_help_request",
-                r#"{"kind":"agent_help_request","jobId":"j-1","agentId":"x","reason":"r","question":"q"}"#,
+                r#"{"kind":"agent_help_request","job_id":"j-1","agent_id":"x","reason":"r","question":"q"}"#,
                 |e| matches!(e, MailboxEvent::AgentHelpRequest { .. }),
             ),
             (
                 "coordinator_help_outcome",
-                r#"{"kind":"coordinator_help_outcome","jobId":"j-1","targetAgentId":"x","outcome":{"action":"direct_answer","answer":"a"}}"#,
+                r#"{"kind":"coordinator_help_outcome","job_id":"j-1","target_agent_id":"x","outcome_json":"{\"action\":\"direct_answer\",\"answer\":\"a\"}"}"#,
                 |e| matches!(e, MailboxEvent::CoordinatorHelpOutcome { .. }),
             ),
             (
                 "job_started",
-                r#"{"kind":"job_started","jobId":"j-1","workspaceId":"default","goal":"g"}"#,
+                r#"{"kind":"job_started","job_id":"j-1","workspace_id":"default","goal":"g"}"#,
                 |e| matches!(e, MailboxEvent::JobStarted { .. }),
             ),
             (
                 "job_finished",
-                r#"{"kind":"job_finished","jobId":"j-1","outcome":"done","summary":"s"}"#,
+                r#"{"kind":"job_finished","job_id":"j-1","outcome":"done","summary":"s"}"#,
                 |e| matches!(e, MailboxEvent::JobFinished { .. }),
             ),
             (
                 "job_cancel",
-                r#"{"kind":"job_cancel","jobId":"j-1"}"#,
+                r#"{"kind":"job_cancel","job_id":"j-1"}"#,
                 |e| matches!(e, MailboxEvent::JobCancel { .. }),
             ),
             ("note", r#"{}"#, |e| matches!(e, MailboxEvent::Note)),

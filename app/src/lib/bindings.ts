@@ -110,6 +110,30 @@ export const commands = {
 	 */
 	mailboxEmit: (entry: MailboxEntryInput) => typedError<MailboxEntry, AppErrorWire>(__TAURI_INVOKE("mailbox_emit", { entry })),
 	/**
+	 *  W5-01 — typed emit for the mailbox event-bus. Persists +
+	 *  broadcasts (in-process) + fires the legacy `mailbox:new` Tauri
+	 *  event for back-compat. Use this from the W5-02 agent dispatcher,
+	 *  W5-03 Coordinator brain, and W5-05 cancel path.
+	 * 
+	 *  `event` is a tagged `MailboxEvent` discriminated by `kind`; the
+	 *  SQL row's `kind` column mirrors the same string for indexed
+	 *  filtering. `summary` is the human-readable line that surfaces
+	 *  in the existing mailbox UI.
+	 */
+	mailboxEmitTyped: (workspaceId: string, fromPane: string, toPane: string, summary: string, parentId: number | null, event: MailboxEvent) => typedError<MailboxEnvelope, AppErrorWire>(__TAURI_INVOKE("mailbox_emit_typed", { workspaceId, fromPane, toPane, summary, parentId, event })),
+	/**
+	 *  W5-01 — typed list with kind filter + since-id cursor. Used by
+	 *  the W5-04 projector to replay events on mount and by the future
+	 *  "Swarm comms" tab UI.
+	 * 
+	 *  Returns oldest-first so consumers can replay events in event-log
+	 *  order. `since_id` is exclusive (rows with `id > since_id`).
+	 *  `kind` matches against the SQL `kind` column verbatim — pass
+	 *  e.g. `"task_dispatch"` to get only dispatch events. `limit`
+	 *  defaults to 100, capped at 500.
+	 */
+	mailboxListTyped: (kind: string | null, sinceId: number | null, limit: number | null) => typedError<MailboxEnvelope[], AppErrorWire>(__TAURI_INVOKE("mailbox_list_typed", { kind, sinceId, limit })),
+	/**
 	 *  Write a secret to the OS keychain. Empty `value` is rejected so
 	 *  the keychain never holds a sentinel "" that `has_secret` would
 	 *  then have to second-guess.
@@ -712,6 +736,122 @@ export type MailboxEntryInput = {
 	type: string,
 	summary: string,
 };
+
+/**
+ *  One persisted row decorated with the typed event. Returned by
+ *  `MailboxBus::emit_typed` and `MailboxBus::list_typed`. The `id`,
+ *  `ts`, `from`, `to`, `summary` mirror `MailboxEntry`'s wire shape
+ *  so the frontend can render either type with the same code path.
+ * 
+ *  `parent_id` is `None` for top-level events (`JobStarted`,
+ *  `Note`); `Some(rowid)` for chained events (`AgentResult` whose
+ *  parent is a `TaskDispatch`).
+ */
+export type MailboxEnvelope = {
+	id: number,
+	/**
+	 *  Unix epoch seconds (matches the existing `mailbox.ts`
+	 *  column; Charter §8 invariant).
+	 */
+	ts: number,
+	/**
+	 *  `agent:<id>` for swarm-driven rows, `pane:<uuid>` for
+	 *  terminal-pane rows. The bus does not enforce a format;
+	 *  convention is documented in the WP.
+	 */
+	from: string,
+	to: string,
+	/**
+	 *  Human-readable line; mirrors the existing `mailbox.summary`
+	 *  column. Frontend renders this on the Recent activity list.
+	 */
+	summary: string,
+	/**
+	 *  Reply-to / correlation reference. Points at another mailbox
+	 *  row's autoincrement `id`. `None` for top-level events.
+	 */
+	parentId: number | null,
+	/**
+	 *  Typed event payload. Tagged on `kind` so the wire form is
+	 *  `{"kind":"task_dispatch","job_id":"...","target":"...","prompt":"...","with_help_loop":true}`.
+	 *  Field names stay snake_case inside the variant body
+	 *  (matches the enum's `rename_all = "snake_case"`); only the
+	 *  outer envelope renames to camelCase.
+	 */
+	event: MailboxEvent,
+};
+
+/**
+ *  Structured event-bus payload. Discriminated by `kind` field on
+ *  the wire (snake_case). The variant body carries the typed
+ *  payload; the SQL row's `payload_json` column persists the same
+ *  JSON verbatim so a process restart can rebuild events from
+ *  SQLite without losing fidelity.
+ * 
+ *  Matches the W5-overview event table:
+ *  `task_dispatch / agent_result / agent_help_request /
+ *  coordinator_help_outcome / job_started / job_finished /
+ *  job_cancel / note`.
+ */
+export type MailboxEvent = 
+/**
+ *  W5-03: Coordinator brain dispatches a task to a specific
+ *  agent. `target` is `agent:<id>` per the W4-07 namespacing.
+ *  `prompt` is the user-message fed into the agent's session.
+ *  `with_help_loop` toggles the W4-05 help-loop on the dispatch;
+ *  defaults to true for builders/scout/planner, false for
+ *  reviewers/tester whose persona contracts forbid help blocks.
+ */
+{ kind: "task_dispatch"; job_id: string; target: string; prompt: string; with_help_loop: boolean } | 
+/**
+ *  W5-02: agent emitted a result for a dispatch. The
+ *  originating `TaskDispatch` row's `id` is carried in the
+ *  envelope's `parent_id` (NOT the variant body) so a single
+ *  reply-to chain stays uniform across all variants.
+ */
+{ kind: "agent_result"; job_id: string; agent_id: string; assistant_text: string; total_cost_usd: number; turn_count: number } | 
+/**
+ *  W5-02: agent emitted a `neuron_help` block via W4-05's
+ *  parser. The W5-03 brain reads this and replies with a
+ *  `CoordinatorHelpOutcome`.
+ */
+{ kind: "agent_help_request"; job_id: string; agent_id: string; reason: string; question: string } | 
+/**
+ *  W5-03: Coordinator's response to a help request. The
+ *  `outcome_json` payload is a JSON-serialised
+ *  `swarm::help_request::CoordinatorHelpOutcome` (action +
+ *  answer / followup / user_question fields, depending on
+ *  variant). Stored as `String` here so the bus stays
+ *  decoupled from `swarm::help_request` (which depends on
+ *  `swarm::agent_registry` — would create a cycle), and so
+ *  the type implements `specta::Type` cleanly. Consumers
+ *  parse via `serde_json::from_str`.
+ */
+{ kind: "coordinator_help_outcome"; job_id: string; target_agent_id: string; outcome_json: string } | 
+/**
+ *  W5-03: job lifecycle start. Emitted once per job by the
+ *  `swarm:run_job_v2` IPC; CoordinatorBrain subscribes and
+ *  drives the dispatch loop.
+ */
+{ kind: "job_started"; job_id: string; workspace_id: string; goal: string } | 
+/**
+ *  W5-03: job lifecycle finish. Emitted by CoordinatorBrain
+ *  when the brain returns a `finish` action. `outcome` is
+ *  `"done" | "failed"`.
+ */
+{ kind: "job_finished"; job_id: string; outcome: string; summary: string } | 
+/**
+ *  W5-05: cancel signal. CoordinatorBrain + agent dispatchers
+ *  subscribe; in-flight turns truncate.
+ */
+{ kind: "job_cancel"; job_id: string } | 
+/**
+ *  Legacy free-form note. The default kind for back-compat
+ *  emitters (`mailbox::emit_internal` / `mailbox_emit` IPCs
+ *  keep emitting `kind='note'` implicitly via the migration
+ *  0010 column default).
+ */
+{ kind: "note" };
 
 /**
  *  Composite shape returned by `me:get`. Combines `data.user` and
