@@ -46,8 +46,8 @@ pub use binding::{
     ClaudeBinary,
 };
 pub use coordinator::{
-    CoordinatorFsm, Job, JobOutcome, JobRegistry, JobState, StageResult,
-    SwarmJobEvent, MAX_RETRIES,
+    Job, JobOutcome, JobRegistry, JobState, StageResult,
+    SwarmJobEvent,
 };
 pub use projector::{
     get_brain_job_detail, JobProjector, JobProjectorRegistry,
@@ -63,12 +63,12 @@ pub use brain::{
     SwarmRegistryCoordinatorInvoker, DEFAULT_MAX_DISPATCHES,
 };
 pub use agent_registry::{
-    agent_event_channel, AgentStatus, AgentStatusRow, RegistryTransport,
+    agent_event_channel, AgentStatus, AgentStatusRow,
     SwarmAgentEvent, SwarmAgentRegistry,
 };
 pub use help_request::{
     parse_coordinator_help_outcome, parse_help_request,
-    process_help_request, CoordinatorHelpOutcome, HelpRequest,
+    CoordinatorHelpOutcome, HelpRequest,
 };
 pub use mailbox_bus::{MailboxBus, MailboxEnvelope, MailboxEvent};
 pub use persistent_session::PersistentSession;

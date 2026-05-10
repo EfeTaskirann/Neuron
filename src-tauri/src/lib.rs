@@ -120,7 +120,6 @@ pub fn specta_builder_for_export() -> tauri_specta::Builder<tauri::Wry> {
             commands::swarm::swarm_agents_list_status::<tauri::Wry>,
             commands::swarm::swarm_agents_shutdown_workspace::<tauri::Wry>,
             commands::swarm::swarm_agents_dispatch_to_agent::<tauri::Wry>,
-            commands::swarm::swarm_run_job_v2::<tauri::Wry>,
         ])
         // Register the AppError once on the builder so the type lands
         // in `bindings.ts` as a referenceable shape rather than being
@@ -223,10 +222,10 @@ pub fn run() {
                 }
             }
 
-            // WP-W3-12a / W3-12b — install the SQLite-backed swarm
-            // `JobRegistry`. `swarm:run_job` serializes per-workspace
-            // calls through it; `Arc` so multiple concurrent commands
-            // share the same lock state. The pool comes from the
+            // WP-W3-12a / W3-12b / W5-06 — install the SQLite-backed
+            // swarm `JobRegistry`. `swarm:run_job` (now brain-driven
+            // post-W5-06) serializes per-workspace calls through
+            // `try_acquire_workspace`. The pool comes from the
             // already-managed `DbPool` so every state transition
             // writes through to `swarm_jobs` / `swarm_stages` /
             // `swarm_workspace_locks`.
@@ -238,9 +237,11 @@ pub fn run() {
             // recovered set is hydrated into the registry's in-memory
             // cache, capped at 100 rows.
             //
-            // Placed BEFORE the TerminalRegistry per WP-W3-12b so any
-            // future code path that constructs `CoordinatorFsm` during
-            // startup finds the registry in app state.
+            // Placed BEFORE the TerminalRegistry per WP-W3-12b. The
+            // FSM was deleted in W5-06, but the registry stays
+            // because the brain-driven `swarm:run_job` still relies
+            // on `try_acquire_workspace` + the projector reads
+            // through it for `swarm:list_jobs` / `swarm:get_job`.
             let pool_for_registry = app
                 .state::<db::DbPool>()
                 .inner()

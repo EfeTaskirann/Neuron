@@ -1,7 +1,7 @@
-//! `neuron_help` request + response substrate (WP-W4-05).
+//! `neuron_help` request + response parsers (WP-W4-05).
 //!
-//! Two parsers + one routing helper. Used by the FSM (W4-06) to
-//! handle specialist→Coordinator escalation:
+//! Two parsers shared by the FSM (W4-06, deleted in W5-06) and the
+//! brain (W5-03) for the specialist→Coordinator escalation contract:
 //!
 //! 1. **Specialist** emits a `{"neuron_help": {...}}` JSON block in
 //!    its assistant_text when blocked. `parse_help_request` extracts
@@ -12,26 +12,18 @@
 //!    `{"action": "direct_answer" | "ask_back" | "escalate", ...}`
 //!    JSON block. `parse_coordinator_help_outcome` extracts it via
 //!    the same 4-step parser.
-//! 3. `process_help_request` is the registry-level orchestrator that
-//!    sends the formatted help message to the Coordinator session
-//!    and returns the parsed outcome. The FSM (W4-06) wires this
-//!    into the specialist invoke loop.
 //!
-//! Out of scope (per WP §"Out of scope"): FSM integration (W4-06),
-//! mailbox swarm tab (W4-07), AskBack→specialist follow-up turn
-//! (W4-06 owns the loop).
-
-use std::sync::Arc;
-use std::time::Duration;
+//! WP-W5-06 — the registry-level `process_help_request` +
+//! `format_help_message` helpers were deleted with the FSM. The brain
+//! routes help via the mailbox bus (`agent_dispatcher`'s help-loop
+//! branch), which constructs its own prompt body. The pure parsers
+//! here stay; both runtimes share the JSON contract.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use specta::Type;
-use tauri::{AppHandle, Runtime};
-use tokio::sync::Notify;
 
 use crate::error::AppError;
-use crate::swarm::agent_registry::SwarmAgentRegistry;
 
 /// Specialist's structured "I'm blocked" payload. Mirrors the JSON
 /// the persona emits — `reason` is a one-liner explanation,
@@ -220,75 +212,14 @@ fn first_balanced_object(s: &str) -> Option<&str> {
     None
 }
 
-/// Send a `help_request` to the Coordinator session and parse the
-/// outcome. Used by the FSM (W4-06) when a specialist's turn ends
-/// with a `neuron_help` block.
-///
-/// The message format is fixed (Turkish per the Coordinator
-/// persona's working language): "<specialist_id> bir blocker'a
-/// takıldı. Reason: <r>. Question: <q>. action: direct_answer |
-/// ask_back | escalate olarak yanıtla."
-///
-/// Timeout + cancel: the Coordinator's response is just another
-/// turn against its persistent session, so the W4-01 cancel +
-/// timeout semantics apply unchanged.
-pub async fn process_help_request<R: Runtime>(
-    registry: &Arc<SwarmAgentRegistry>,
-    app: &AppHandle<R>,
-    workspace_id: &str,
-    specialist_id: &str,
-    help_request: &HelpRequest,
-    timeout: Duration,
-    cancel: Arc<Notify>,
-) -> Result<CoordinatorHelpOutcome, AppError> {
-    let prompt = format_help_message(specialist_id, help_request);
-    let result = registry
-        .acquire_and_invoke_turn(
-            app,
-            workspace_id,
-            "coordinator",
-            &prompt,
-            timeout,
-            cancel,
-        )
-        .await?;
-    parse_coordinator_help_outcome(&result.assistant_text)
-}
-
-/// Format the prompt sent to the Coordinator when a specialist
-/// emits `neuron_help`. Public for testing — the exact wording
-/// affects LLM behavior so a unit test pins it.
-pub fn format_help_message(
-    specialist_id: &str,
-    help_request: &HelpRequest,
-) -> String {
-    format!(
-        "Specialist `{specialist_id}` bir blocker'a takıldı ve yardım istiyor.\n\n\
-         REASON: {reason}\n\
-         QUESTION: {question}\n\n\
-         Lütfen şu üç action'dan birini ver:\n\
-         - `direct_answer` — sorunun cevabını biliyorsan, specialist'e gönderilecek\n\
-           özet bir cevap yaz.\n\
-         - `ask_back` — sorunu çözmek için specialist'ten daha fazla bilgi gerekiyorsa,\n\
-           specialist'e iletecek bir followup_question yaz.\n\
-         - `escalate` — kullanıcıya sorulması gereken bir konu varsa, kullanıcıya\n\
-           gidecek user_question yaz.\n\n\
-         OUTPUT CONTRACT — yalnızca tek bir JSON object çıkar, başka hiçbir text yazma:\n\
-         ```json\n\
-         {{\"action\": \"direct_answer\", \"answer\": \"...\"}}\n\
-         ```\n\
-         veya\n\
-         ```json\n\
-         {{\"action\": \"ask_back\", \"followup_question\": \"...\"}}\n\
-         ```\n\
-         veya\n\
-         ```json\n\
-         {{\"action\": \"escalate\", \"user_question\": \"...\"}}\n\
-         ```",
-        reason = help_request.reason,
-        question = help_request.question,
-    )
-}
+// WP-W5-06 — `process_help_request` and `format_help_message`
+// were the registry-level helpers the FSM (`RegistryTransport`)
+// invoked when a specialist emitted `neuron_help`. With the FSM
+// gone, the brain (W5-03) routes help via the mailbox bus
+// + `agent_dispatcher::handle_help_request_via_mailbox`. The
+// parsers above (`parse_help_request`,
+// `parse_coordinator_help_outcome`) stay — both runtimes share
+// the same JSON contract.
 
 // --------------------------------------------------------------------- //
 // Tests                                                                  //
@@ -407,24 +338,6 @@ mod tests {
         let err = parse_coordinator_help_outcome(text)
             .expect_err("unknown action rejected");
         assert_eq!(err.kind(), "swarm_invoke");
-    }
-
-    // -- format_help_message --
-
-    #[test]
-    fn format_help_message_includes_specialist_id_and_reason_question() {
-        let req = HelpRequest {
-            reason: "REASON-MARKER".into(),
-            question: "QUESTION-MARKER".into(),
-        };
-        let msg = format_help_message("scout", &req);
-        assert!(msg.contains("scout"));
-        assert!(msg.contains("REASON-MARKER"));
-        assert!(msg.contains("QUESTION-MARKER"));
-        // Output contract sentinels for the LLM.
-        assert!(msg.contains("direct_answer"));
-        assert!(msg.contains("ask_back"));
-        assert!(msg.contains("escalate"));
     }
 
     // -- helpers --

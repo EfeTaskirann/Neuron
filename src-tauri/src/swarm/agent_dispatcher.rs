@@ -20,8 +20,8 @@
 //!    `MailboxEvent::CoordinatorHelpOutcome` (filter by
 //!    `target_agent_id`), and feeds the outcome back to the same
 //!    specialist session as the next turn's user message. The
-//!    loop is bounded by `MAX_HELP_ROUNDS` (3, matching
-//!    `RegistryTransport::DEFAULT_HELP_ROUNDS`).
+//!    loop is bounded by `MAX_HELP_ROUNDS` (3, the same cap the
+//!    deleted `RegistryTransport` used in W4-06).
 //! 3. **Emit** — on every result (success OR failure) the dispatcher
 //!    writes back a `MailboxEvent::AgentResult` whose envelope's
 //!    `parent_id` points at the dispatch row's autoincrement `id`.
@@ -86,13 +86,13 @@ use crate::swarm::transport::InvokeResult;
 const DEFAULT_DISPATCH_TIMEOUT_SECS: u64 = 60;
 const STAGE_TIMEOUT_ENV: &str = "NEURON_SWARM_STAGE_TIMEOUT_SEC";
 
-/// Cap on help-loop rounds when `with_help_loop: true`. Matches
-/// `RegistryTransport::DEFAULT_HELP_ROUNDS` so the W5-03 path
-/// behaves identically to the W4-05 / FSM path on iteration count.
-/// Past the cap the dispatcher gives up and emits the most recent
-/// `assistant_text` (still containing the unanswered `neuron_help`
-/// block) as the AgentResult — the brain can decide whether to
-/// retry, escalate, or finish:failed.
+/// Cap on help-loop rounds when `with_help_loop: true`. Same cap
+/// the deleted `RegistryTransport` used in W4-06; the dispatcher
+/// is now the single owner of the help-loop. Past the cap the
+/// dispatcher gives up and emits the most recent `assistant_text`
+/// (still containing the unanswered `neuron_help` block) as the
+/// AgentResult — the brain can decide whether to retry, escalate,
+/// or finish:failed.
 const MAX_HELP_ROUNDS: u32 = 3;
 
 /// Soft timeout for awaiting a `CoordinatorHelpOutcome` after

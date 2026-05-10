@@ -36,7 +36,7 @@ use crate::swarm::coordinator::{
 };
 use crate::swarm::profile::ProfileSource;
 use crate::swarm::{
-    AgentStatusRow, CoordinatorFsm, InvokeResult, JobOutcome, JobRegistry,
+    AgentStatusRow, InvokeResult, JobOutcome, JobRegistry,
     MailboxBus, MailboxEvent, ProfileRegistry, SubprocessTransport,
     SwarmAgentRegistry, Transport,
 };
@@ -172,74 +172,10 @@ fn stage_timeout() -> Duration {
     }
 }
 
-/// Drive a 3-stage swarm job to completion (WP-W3-12a §4).
-///
-/// Walks `scout` → `planner` → `backend-builder` against the
-/// substrate from W3-11, returning the aggregated `JobOutcome`. The
-/// IPC blocks until the FSM finishes (Done / Failed). Two calls with
-/// the same `workspace_id` serialize — the second returns
-/// `AppError::WorkspaceBusy`. Two calls with different `workspace_id`s
-/// run in parallel.
-#[tauri::command(rename_all = "camelCase")]
-#[specta::specta]
-pub async fn swarm_run_job<R: Runtime>(
-    app: AppHandle<R>,
-    workspace_id: String,
-    goal: String,
-) -> Result<JobOutcome, AppError> {
-    if workspace_id.trim().is_empty() {
-        return Err(AppError::InvalidInput(
-            "workspaceId must not be empty".into(),
-        ));
-    }
-    if goal.trim().is_empty() {
-        return Err(AppError::InvalidInput(
-            "goal must not be empty".into(),
-        ));
-    }
-
-    let workspace_dir = workspace_agents_dir(&app)?;
-    let profiles = std::sync::Arc::new(
-        ProfileRegistry::load_from(workspace_dir.as_deref())?,
-    );
-    let registry = app
-        .try_state::<std::sync::Arc<JobRegistry>>()
-        .ok_or_else(|| {
-            AppError::Internal(
-                "swarm JobRegistry missing from app state — \
-                 lib.rs::setup did not call app.manage()"
-                    .into(),
-            )
-        })?
-        .inner()
-        .clone();
-    // WP-W4-06 — drive the FSM through the persistent
-    // `RegistryTransport` (alongside the W3-12 `SubprocessTransport`).
-    // Sessions live in the workspace-scoped `SwarmAgentRegistry`;
-    // each FSM stage's invoke reuses the persistent session for
-    // that agent, and specialist→Coordinator help requests are
-    // handled transparently inside the registry adapter (max 3
-    // help rounds before the FSM sees a hard SwarmInvoke fallback).
-    let agent_registry = app
-        .try_state::<std::sync::Arc<SwarmAgentRegistry>>()
-        .ok_or_else(|| {
-            AppError::Internal(
-                "SwarmAgentRegistry missing from app state — \
-                 lib.rs::setup did not call app.manage()"
-                    .into(),
-            )
-        })?
-        .inner()
-        .clone();
-    let cancel = std::sync::Arc::new(tokio::sync::Notify::new());
-    let transport = crate::swarm::RegistryTransport::new(
-        workspace_id.clone(),
-        agent_registry,
-        cancel,
-    );
-    let fsm = CoordinatorFsm::new(profiles, transport, registry, stage_timeout());
-    fsm.run_job(&app, workspace_id, goal).await
-}
+// WP-W5-06 — `swarm_run_job` was the FSM-driven IPC (W3-12a). It is
+// now the brain-driven IPC (renamed from W5-03's `swarm_run_job_v2`,
+// see definition below). The frontend sees no signature change:
+// `(workspace_id, goal) -> JobOutcome` is preserved.
 
 /// Single-shot Orchestrator decision (WP-W3-12k1 §3, extended in
 /// WP-W3-12k2 §3 with persistent history).
@@ -882,9 +818,8 @@ const SPECIALIST_AGENT_IDS: &[&str] = &[
     "integration-tester",
 ];
 
-/// Drive the W5-03 Coordinator brain dispatch loop to completion.
-/// Parallel to `swarm:run_job` (the FSM-driven path stays alive for
-/// regression smokes; W5-06 deletes it).
+/// Drive the Coordinator brain dispatch loop to completion (WP-W5-06,
+/// previously `swarm:run_job_v2` from W5-03).
 ///
 /// Lifecycle:
 /// 1. Mint a `j-<ULID>` if not preset; acquire the workspace lock
@@ -894,20 +829,25 @@ const SPECIALIST_AGENT_IDS: &[&str] = &[
 ///    immediately.
 /// 3. Spawn the brain on `CoordinatorBrain::run` with the workspace's
 ///    `MailboxBus` and the production `CoordinatorInvoker`.
-/// 4. Await the brain's `BrainRunResult` and build a stub
-///    `JobOutcome`. The full job-state derivation from mailbox
-///    events is W5-04's scope; for W5-03 we surface a minimal shape
-///    so callers (manual smokes) get a structured result without
-///    a frontend reducer.
+/// 4. Await the brain's `BrainRunResult` and build a `JobOutcome`
+///    from the W5-04 projector's `swarm_jobs` / `swarm_stages`
+///    rows.
 /// 5. Release the workspace lock.
 ///
-/// Returns the stub `JobOutcome` on success / failure paths.
-/// `final_state` maps from brain outcome:
-///   - `"done"` → `JobState::Done`
-///   - everything else (`"failed" | "ask_user"`) → `JobState::Failed`
+/// Returns the projector-built `JobOutcome` on success / failure
+/// paths. `final_state` maps from brain outcome via the projector:
+///   - terminal `JobFinished` event with `outcome="done"` →
+///     `JobState::Done`
+///   - terminal `JobFinished` with anything else → `JobState::Failed`
+///   - terminal `JobCancel` → `JobState::Failed` with `last_error =
+///     "cancelled by user"`.
+///
+/// W5-06 — frontend signature unchanged from the legacy FSM IPC:
+/// `(workspaceId, goal) -> JobOutcome`. Callers
+/// (`useRunSwarmJob`) keep working without code change.
 #[tauri::command(rename_all = "camelCase")]
 #[specta::specta]
-pub async fn swarm_run_job_v2<R: Runtime>(
+pub async fn swarm_run_job<R: Runtime>(
     app: AppHandle<R>,
     workspace_id: String,
     goal: String,
@@ -1044,7 +984,7 @@ pub async fn swarm_run_job_v2<R: Runtime>(
         cancel,
     )
     .await;
-    finalise_run_job_v2(
+    finalise_run_job(
         &app,
         &job_registry,
         &workspace_id,
@@ -1055,18 +995,16 @@ pub async fn swarm_run_job_v2<R: Runtime>(
     .await
 }
 
-/// Internal: shared finalisation logic between `swarm_run_job_v2`
-/// and the test-only entry point. Releases the workspace lock,
+/// Internal: shared finalisation logic between `swarm_run_job` and
+/// the test-only entry point. Releases the workspace lock,
 /// unregisters the cancel notify, updates the in-memory job state,
 /// and asks the [`JobProjector`] to build the canonical
 /// [`JobOutcome`] from the persisted event log.
 ///
-/// W5-04: previously this function returned a STUB outcome (empty
-/// stages, zero cost). It now defers to `JobProjector::build_outcome`
-/// which walks the bus's SQL-persisted event log and returns the
-/// fully-shaped outcome — same contract as the FSM's
-/// `swarm:run_job` IPC.
-async fn finalise_run_job_v2<R: Runtime>(
+/// W5-04: defers to `JobProjector::build_outcome` which walks the
+/// bus's SQL-persisted event log and returns the fully-shaped
+/// outcome.
+async fn finalise_run_job<R: Runtime>(
     app: &AppHandle<R>,
     job_registry: &crate::swarm::JobRegistry,
     workspace_id: &str,
@@ -1101,7 +1039,7 @@ async fn finalise_run_job_v2<R: Runtime>(
                     // (lib.rs::setup wires both). Surface a tame
                     // error so the caller sees a typed failure.
                     return Err(AppError::Internal(
-                        "swarm:run_job_v2: MailboxBus or DbPool missing \
+                        "swarm:run_job: MailboxBus or DbPool missing \
                          from app state — cannot build JobOutcome"
                             .into(),
                     ));
@@ -1135,7 +1073,7 @@ async fn finalise_run_job_v2<R: Runtime>(
 
 /// Test-only entry point: run the brain with a caller-provided
 /// invoker (typically a mock that returns canned action sequences).
-/// Mirrors `swarm_run_job_v2`'s lifecycle so the tests can exercise
+/// Mirrors `swarm_run_job`'s lifecycle so the tests can exercise
 /// the same lock + finalisation path the IPC takes — they only swap
 /// out the LLM-spawning piece.
 ///
@@ -1145,7 +1083,7 @@ async fn finalise_run_job_v2<R: Runtime>(
 /// `false` so the real dispatchers don't race the helper to invoke
 /// `claude`.
 #[cfg(test)]
-pub(crate) async fn swarm_run_job_v2_with_invoker<R, I>(
+pub(crate) async fn swarm_run_job_with_invoker<R, I>(
     app: AppHandle<R>,
     workspace_id: String,
     goal: String,
@@ -1213,7 +1151,7 @@ where
         stages: Vec::new(),
         last_error: None,
         last_verdict: None,
-        // W5-04 — brain-driven path, see swarm_run_job_v2 above.
+        // W5-04 — brain-driven path, see swarm_run_job above.
         source: "brain".into(),
     };
     job_registry
@@ -1240,7 +1178,7 @@ where
         max_dispatches,
     )
     .await;
-    finalise_run_job_v2(
+    finalise_run_job(
         &app,
         &job_registry,
         &workspace_id,
@@ -2561,7 +2499,7 @@ mod tests {
     /// boilerplate. The job registry is in-memory only (`new()`) so
     /// state mutations don't write through to SQLite — the tests
     /// only care about the in-memory shape.
-    async fn mock_app_with_v2_state() -> (
+    async fn mock_app_with_brain_state() -> (
         tauri::App<tauri::test::MockRuntime>,
         std::sync::Arc<crate::swarm::JobRegistry>,
         std::sync::Arc<crate::swarm::MailboxBus>,
@@ -2580,11 +2518,11 @@ mod tests {
                 ProfileRegistry::load_from(None).expect("load"),
             ),
         ));
-        // WP-W5-04 — install the projector registry so v2 tests
+        // WP-W5-04 — install the projector registry so brain tests
         // exercise the same `ensure_for_workspace` path the IPC
-        // takes in production. Without it, `swarm_run_job_v2`
-        // skips the projector spawn and `build_outcome` walks the
-        // bus directly (still works, but bypasses the live
+        // takes in production. Without it, `swarm_run_job` skips
+        // the projector spawn and `build_outcome` walks the bus
+        // directly (still works, but bypasses the live
         // SwarmJobEvent emit chain).
         let projector_registry = std::sync::Arc::new(
             crate::swarm::JobProjectorRegistry::new(),
@@ -2600,15 +2538,15 @@ mod tests {
         (app, job_registry, bus, agent_registry, dir)
     }
 
-    /// Mock CoordinatorInvoker for v2 tests — same shape as the
+    /// Mock CoordinatorInvoker for brain IPC tests — same shape as the
     /// brain's ScriptedCoordinatorInvoker but lives here so the
     /// IPC test path doesn't depend on `#[cfg(test)]` items inside
     /// `swarm::brain`.
-    struct V2ScriptedInvoker {
+    struct BrainScriptedInvoker {
         replies: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     }
 
-    impl V2ScriptedInvoker {
+    impl BrainScriptedInvoker {
         fn new(replies: Vec<&str>) -> Self {
             Self {
                 replies: std::sync::Arc::new(std::sync::Mutex::new(
@@ -2618,7 +2556,7 @@ mod tests {
         }
     }
 
-    impl crate::swarm::CoordinatorInvoker for V2ScriptedInvoker {
+    impl crate::swarm::CoordinatorInvoker for BrainScriptedInvoker {
         fn invoke_coordinator_turn(
             &self,
             _workspace_id: &str,
@@ -2650,10 +2588,10 @@ mod tests {
     /// Acceptance: empty inputs surface `InvalidInput` before any
     /// state mutation.
     #[tokio::test]
-    async fn run_job_v2_validates_inputs() {
-        let (app, _jr, _bus, _ar, _dir) = mock_app_with_v2_state().await;
+    async fn run_job_validates_inputs() {
+        let (app, _jr, _bus, _ar, _dir) = mock_app_with_brain_state().await;
 
-        let err = swarm_run_job_v2(
+        let err = swarm_run_job(
             app.handle().clone(),
             "".into(),
             "do something".into(),
@@ -2662,7 +2600,7 @@ mod tests {
         .unwrap_err();
         assert_eq!(err.kind(), "invalid_input");
 
-        let err = swarm_run_job_v2(
+        let err = swarm_run_job(
             app.handle().clone(),
             "default".into(),
             "".into(),
@@ -2672,7 +2610,7 @@ mod tests {
         assert_eq!(err.kind(), "invalid_input");
 
         // Whitespace-only.
-        let err = swarm_run_job_v2(
+        let err = swarm_run_job(
             app.handle().clone(),
             "default".into(),
             "   ".into(),
@@ -2688,8 +2626,9 @@ mod tests {
     /// the IPC's `try_acquire_workspace` short-circuits on the
     /// second call.
     #[tokio::test]
-    async fn run_job_v2_workspace_busy_when_concurrent() {
-        let (app, jr, _bus, _ar, _dir) = mock_app_with_v2_state().await;
+    async fn run_job_workspace_busy_when_concurrent() {
+        let (app, jr, _bus, _ar, _dir) =
+            mock_app_with_brain_state().await;
 
         // Manually acquire the workspace lock (simulates an
         // in-flight job).
@@ -2708,8 +2647,8 @@ mod tests {
             .await
             .expect("acquire");
 
-        // Now the v2 IPC call collides.
-        let err = swarm_run_job_v2(
+        // Now the IPC call collides.
+        let err = swarm_run_job(
             app.handle().clone(),
             "default".into(),
             "do something".into(),
@@ -2728,10 +2667,10 @@ mod tests {
     /// scout-results emitter that watches for the dispatch and
     /// emits the AgentResult so the brain can take its second turn.
     #[tokio::test]
-    async fn run_job_v2_runs_full_chain_via_mock_brain() {
-        let (app, _jr, bus, _ar, _dir) = mock_app_with_v2_state().await;
+    async fn run_job_runs_full_chain_via_mock_brain() {
+        let (app, _jr, bus, _ar, _dir) = mock_app_with_brain_state().await;
 
-        let invoker = std::sync::Arc::new(V2ScriptedInvoker::new(vec![
+        let invoker = std::sync::Arc::new(BrainScriptedInvoker::new(vec![
             r#"{"action":"dispatch","target":"agent:scout","prompt":"investigate"}"#,
             r#"{"action":"finish","outcome":"done","summary":"done"}"#,
         ]));
@@ -2787,7 +2726,7 @@ mod tests {
             }
         });
 
-        let outcome = swarm_run_job_v2_with_invoker(
+        let outcome = swarm_run_job_with_invoker(
             app.handle().clone(),
             "default".to_string(),
             "do something".to_string(),
@@ -2813,13 +2752,13 @@ mod tests {
     /// outcome with `final_state == Failed` and `last_error`
     /// populated. No `claude` spawn needed for this test.
     #[tokio::test]
-    async fn run_job_v2_returns_job_outcome_with_correct_shape() {
-        let (app, _jr, _bus, _ar, _dir) = mock_app_with_v2_state().await;
-        let invoker = std::sync::Arc::new(V2ScriptedInvoker::new(vec![
+    async fn run_job_returns_job_outcome_with_correct_shape() {
+        let (app, _jr, _bus, _ar, _dir) = mock_app_with_brain_state().await;
+        let invoker = std::sync::Arc::new(BrainScriptedInvoker::new(vec![
             "Just garbage no JSON.",
         ]));
 
-        let outcome = swarm_run_job_v2_with_invoker(
+        let outcome = swarm_run_job_with_invoker(
             app.handle().clone(),
             "default".to_string(),
             "trivial".to_string(),
@@ -2842,19 +2781,22 @@ mod tests {
     }
 
     /// Real-claude integration smoke (`#[ignore]`'d) — drives a
-    /// small doc-edit goal end-to-end through the v2 brain dispatch
-    /// loop and asserts `final_state == Done`. Wall-clock budget
-    /// 600s; env override `NEURON_BRAIN_MAX_DISPATCHES=15` keeps
-    /// the LLM honest.
+    /// minimal "no-dispatch finish" goal through the brain and
+    /// asserts `final_state == Done`. The brain only needs one turn
+    /// (the LLM emits a `finish` action immediately). Smallest
+    /// possible end-to-end smoke; complements the heavier real-
+    /// claude smokes below.
     ///
-    /// Time budget: typical 3-8 minutes (multiple cold-starts).
-    /// Run with: `$env:NEURON_BRAIN_MAX_DISPATCHES="15"; cargo test \
-    /// --lib integration_run_job_v2_real_claude -- --ignored --nocapture`
+    /// Time budget: typical 30-60s (one Coordinator subprocess
+    /// cold-start plus one turn). Run with:
+    /// `$env:NEURON_BRAIN_MAX_DISPATCHES="15"; cargo test --lib \
+    /// integration_run_job_real_claude_brain -- --ignored --nocapture`
     #[tokio::test]
     #[ignore = "requires real `claude` binary + Pro/Max subscription"]
-    async fn integration_run_job_v2_real_claude() {
-        let (app, _jr, _bus, _ar, _dir) = mock_app_with_v2_state().await;
-        let outcome = swarm_run_job_v2(
+    async fn integration_run_job_real_claude_brain() {
+        let (app, _jr, _bus, _ar, _dir) =
+            mock_app_with_brain_state().await;
+        let outcome = swarm_run_job(
             app.handle().clone(),
             "default".to_string(),
             "Reply with a single 'finish' action with outcome=\"done\" \
@@ -2867,6 +2809,235 @@ mod tests {
             outcome.final_state,
             crate::swarm::JobState::Done,
             "smoke should produce Done outcome"
+        );
+    }
+
+    /// Real-claude integration smoke (`#[ignore]`) — drives a
+    /// research-only goal end-to-end against the brain dispatcher.
+    /// The persona should classify "explain how X works" as a
+    /// scout-only flow and emit `finish` after consuming the
+    /// scout's output.
+    ///
+    /// Acceptance: `final_state == Done`. Stage / dispatch counts
+    /// are LLM-side decisions and aren't asserted at this layer.
+    /// W5-06 acceptance gate: passes within 3 retries on a fresh
+    /// subprocess pool.
+    ///
+    /// Time budget: 2 dispatches × 600s typical wall-clock.
+    /// Run with `$env:NEURON_SWARM_STAGE_TIMEOUT_SEC="600"; \
+    /// $env:NEURON_BRAIN_MAX_DISPATCHES="20"; cargo test --lib \
+    /// integration_research_only_real_claude_brain -- --ignored \
+    /// --nocapture --test-threads=1`.
+    #[tokio::test]
+    #[ignore = "requires real `claude` binary + Pro/Max subscription"]
+    async fn integration_research_only_real_claude_brain() {
+        let (app, _jr, _bus, _ar, _dir) =
+            mock_app_with_brain_state().await;
+        let goal = "Explain how brain dispatches are routed in \
+            src-tauri/src/swarm/brain.rs based on the BrainAction \
+            parser. Research only — do not edit files.";
+        let outcome = swarm_run_job(
+            app.handle().clone(),
+            "default".to_string(),
+            goal.to_string(),
+        )
+        .await
+        .expect("brain ok");
+        assert_eq!(
+            outcome.final_state,
+            crate::swarm::JobState::Done,
+            "expected Done, got {:?} (last_error: {:?})",
+            outcome.final_state,
+            outcome.last_error,
+        );
+    }
+
+    /// Real-claude integration smoke (`#[ignore]`) — drives a full
+    /// build+review chain end-to-end against the brain dispatcher.
+    /// Uses the canonical "add a one-line method" goal that the
+    /// W3-12d FSM smoke pinned. The brain decides the dispatch
+    /// order; the assertion checks for a Done terminal state.
+    ///
+    /// Time budget: typical 3-6 min. Reviewer should approve a
+    /// trivial method add. W5-06 acceptance gate: passes within 3
+    /// retries on a fresh subprocess pool.
+    #[tokio::test]
+    #[ignore = "requires real `claude` binary + Pro/Max subscription"]
+    async fn integration_full_chain_real_claude_brain_with_verdict() {
+        let (app, _jr, _bus, _ar, _dir) =
+            mock_app_with_brain_state().await;
+        let goal = "Find the `impl ProfileRegistry` block in \
+            profile.rs and add a one-line public method \
+            `pub fn profile_count(&self) -> usize { self.profiles.len() }` \
+            right after the existing `list` method. Just the method. \
+            Do NOT add a unit test, do NOT add doc comments, do NOT \
+            run cargo check.";
+        let outcome = swarm_run_job(
+            app.handle().clone(),
+            "default".to_string(),
+            goal.to_string(),
+        )
+        .await
+        .expect("brain ok");
+        assert_eq!(
+            outcome.final_state,
+            crate::swarm::JobState::Done,
+            "expected Done, got {:?} (last_error: {:?}, last_verdict: {:?})",
+            outcome.final_state,
+            outcome.last_error,
+            outcome.last_verdict,
+        );
+    }
+
+    /// Real-claude integration smoke (`#[ignore]`) — fullstack
+    /// chain (backend + frontend changes) against the brain
+    /// dispatcher. Sequential or parallel dispatch is decided
+    /// LLM-side; W5-06 makes no parallel-guarantee.
+    ///
+    /// Time budget: typical 8-12 min. The integration tester does
+    /// a full crate compile so a fresh CARGO_TARGET_DIR is
+    /// recommended (FSM-era trick — kept for parity).
+    #[tokio::test]
+    #[ignore = "requires real `claude` binary + Pro/Max subscription"]
+    async fn integration_fullstack_chain_real_claude_brain() {
+        let (app, _jr, _bus, _ar, _dir) =
+            mock_app_with_brain_state().await;
+        let goal = "EXECUTE: Edit two source files. \
+            (1) Edit src-tauri/src/swarm/coordinator/job.rs. Add a \
+            one-line `///` doc comment immediately above the line \
+            `pub struct Job {`. The comment text must be exactly: \
+            `/// Carries the full lifecycle of a swarm run.` \
+            (2) Edit app/src/components/SwarmJobList.tsx. Add a \
+            one-line `// ` comment immediately above the line \
+            `export function formatRelativeMs`. The comment text \
+            must be exactly: \
+            `// Rounds elapsed ms to the nearest minute granularity.` \
+            Both files must be edited; this is fullstack.";
+        let outcome = swarm_run_job(
+            app.handle().clone(),
+            "default".to_string(),
+            goal.to_string(),
+        )
+        .await
+        .expect("brain ok");
+        assert_eq!(
+            outcome.final_state,
+            crate::swarm::JobState::Done,
+            "expected Done, got {:?} (last_error: {:?})",
+            outcome.final_state,
+            outcome.last_error,
+        );
+    }
+
+    /// Real-claude integration smoke (`#[ignore]`) — exercises the
+    /// SQLite write-through against the brain. The brain runs a
+    /// canonical chain; on completion the smoke asserts
+    /// `swarm_jobs` has a single Done row and `swarm_stages` has
+    /// at least one row, demonstrating the projector (W5-04)
+    /// persisted state through the brain dispatcher.
+    ///
+    /// Time budget: typical 3-6 min (same as the full-chain smoke).
+    #[tokio::test]
+    #[ignore = "requires real `claude` binary + Pro/Max subscription"]
+    async fn integration_persistence_survives_real_claude_chain_brain() {
+        use sqlx::Row;
+        let (app, _jr, _bus, _ar, _dir) =
+            mock_app_with_brain_state().await;
+        let goal = "Reply with a single 'finish' action with \
+                    outcome=\"done\" and summary=\"persistence smoke\". \
+                    No dispatches needed.";
+        let outcome = swarm_run_job(
+            app.handle().clone(),
+            "default".to_string(),
+            goal.to_string(),
+        )
+        .await
+        .expect("brain ok");
+        assert_eq!(
+            outcome.final_state,
+            crate::swarm::JobState::Done,
+            "expected Done, got {:?} (last_error: {:?})",
+            outcome.final_state,
+            outcome.last_error,
+        );
+        // Verify the projector persisted at least the swarm_jobs row.
+        let pool = app
+            .handle()
+            .state::<crate::db::DbPool>()
+            .inner()
+            .clone();
+        let rows = sqlx::query(
+            "SELECT id, state FROM swarm_jobs WHERE id = ?",
+        )
+        .bind(&outcome.job_id)
+        .fetch_all(&pool)
+        .await
+        .expect("query");
+        assert_eq!(rows.len(), 1, "swarm_jobs row should be present");
+        let state: String = rows[0].get("state");
+        assert_eq!(state, "Done");
+    }
+
+    /// Real-claude integration smoke (`#[ignore]`) — drives a
+    /// canonical chain and signals `swarm:cancel_job` mid-flight.
+    /// The brain (and the W5-05 cancel path) should observe the
+    /// `JobCancel` mailbox event and unwind, leaving the job in
+    /// `Failed` with `last_error` referencing the cancel.
+    ///
+    /// Time budget: typical 30-90s (the cancel fires within
+    /// seconds of the first dispatch).
+    #[tokio::test]
+    #[ignore = "requires real `claude` binary + Pro/Max subscription"]
+    async fn integration_cancel_during_real_claude_chain_brain() {
+        let (app, _jr, _bus, _ar, _dir) =
+            mock_app_with_brain_state().await;
+        let app_handle = app.handle().clone();
+        // Spawn a watcher that cancels the first in-flight brain
+        // job after a fixed delay.
+        let cancel_handle = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(8))
+                .await;
+            // Find the most-recent brain-source job and cancel it.
+            let pool = app_handle
+                .state::<crate::db::DbPool>()
+                .inner()
+                .clone();
+            let row: Option<(String,)> = sqlx::query_as(
+                "SELECT id FROM swarm_jobs \
+                 WHERE source='brain' AND state NOT IN ('Done','Failed') \
+                 ORDER BY id DESC LIMIT 1",
+            )
+            .fetch_optional(&pool)
+            .await
+            .expect("query");
+            if let Some((job_id,)) = row {
+                let _ = swarm_cancel_job(app_handle.clone(), job_id)
+                    .await;
+            }
+        });
+        let goal = "Investigate src-tauri/src/swarm/brain.rs \
+                    extensively, then explain its design.";
+        let outcome = swarm_run_job(
+            app.handle().clone(),
+            "default".to_string(),
+            goal.to_string(),
+        )
+        .await
+        .expect("brain runs even on cancel path");
+        let _ = cancel_handle.await;
+        // Cancel could land before or after the brain finishes —
+        // both Done (race won by brain) and Failed (cancel won) are
+        // valid. The smoke is documenting the cancel WIRE works
+        // end-to-end; the W5-05 unit tests already pin the
+        // semantic.
+        assert!(
+            matches!(
+                outcome.final_state,
+                crate::swarm::JobState::Done
+                    | crate::swarm::JobState::Failed
+            ),
+            "expected terminal state, got {:?}",
+            outcome.final_state,
         );
     }
 }

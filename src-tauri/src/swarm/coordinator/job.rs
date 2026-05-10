@@ -196,12 +196,13 @@ pub struct Job {
     /// error, so on this branch `last_error` stays `None`.
     #[serde(default)]
     pub last_verdict: Option<Verdict>,
-    /// W5-04: which executor produced this job — `"fsm"` for the
-    /// W3 deterministic state-machine path (`swarm:run_job`),
-    /// `"brain"` for the W5-03 mailbox-driven CoordinatorBrain
-    /// path (`swarm:run_job_v2`). Defaults to `"fsm"` on
-    /// deserialise so older persisted JSON without the key
-    /// (W3 vintage) round-trips unchanged.
+    /// W5-04 / W5-06: which executor produced this job —
+    /// `"fsm"` is preserved for backwards-compat reads of older
+    /// W3-vintage rows; `"brain"` is the W5-03 mailbox-driven
+    /// `CoordinatorBrain` path that W5-06's `swarm:run_job`
+    /// always writes. Defaults to `"fsm"` on deserialise so
+    /// older persisted JSON without the key round-trips
+    /// unchanged.
     #[serde(default = "Job::default_source")]
     pub source: String,
 }
