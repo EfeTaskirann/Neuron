@@ -4,6 +4,49 @@ Running journal of agent-driven changes. Newest entry on top. See `AGENTS.md` §
 
 ---
 
+## 2026-05-10 WP-W5-04 completed
+
+- sub-agent: general-purpose (Claude Opus 4.7 1M)
+- branch: `wp-w5-04-job-state-projector` (off `main` at `3faec52`)
+- files changed: 11 (2 new, 9 modified) — `swarm/projector.rs`
+  (NEW), `migrations/0011_swarm_jobs_source.sql` (NEW),
+  `swarm/coordinator/job.rs` (Job/JobSummary/JobDetail.source),
+  `swarm/coordinator/store.rs` (read/write source column),
+  `swarm/coordinator/fsm.rs` (mechanical: 2× Job literal
+  source field — no logic change), `swarm/mod.rs` (re-exports),
+  `commands/swarm.rs` (swarm_run_job_v2 → build_outcome),
+  `lib.rs` (manage JobProjectorRegistry + ExitRequested drain),
+  `db.rs` (migration count 10 → 11), `app/src/lib/bindings.ts`
+  (regen), `docs/work-packages/WP-W5-04-job-state-projector.md`
+- tests: 499 → **516** (+17 new); 0 failed; 15 ignored. The
+  contract called for ≥ 15 new tests; we landed 17 — 15
+  contract-listed plus 2 sister helpers
+  (`is_retry_dispatch_counts_prior_targets`,
+  `build_outcome_surfaces_last_rejected_verdict_on_failed`)
+  pinning pure logic that the e2e tests exercise indirectly.
+- acceptance: ✅ all gates green
+  - `cargo build --lib` 0
+  - `cargo test --lib` **516 / 0 / 15** (target ≥ 514)
+  - `cargo check --all-targets` 0
+  - `pnpm gen:bindings:check` 0 (post-commit)
+  - `pnpm typecheck` 0
+  - `pnpm lint` 0
+  - `pnpm test --run` 64 passed / 1 pre-existing locale flake
+    (matches W5-03 baseline)
+- caveats:
+  - `SwarmJobEvent::RetryStarted` is reused verbatim where the
+    contract called the variant `RetryAttempt` — the existing
+    enum (W3-12e) defines `RetryStarted` and gotcha #9 forbids
+    drift, so the projector emits the existing variant.
+  - fsm.rs received the minimal mechanical update needed to
+    keep `Job` struct literals compiling (2× `source:
+    Job::default_source()` field append). No logic change;
+    flagged in the WP doc's caveats.
+- next: orchestrator should ff-merge wp-w5-04-job-state-projector
+  → main and dispatch W5-05.
+
+---
+
 ## 2026-05-10 WP-W5-03 completed
 
 - sub-agent: general-purpose (Claude Opus 4.7 1M)

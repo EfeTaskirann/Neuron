@@ -1,11 +1,60 @@
 ---
 id: WP-W5-04
 title: Job state derived from mailbox + UI plumbing (`JobProjector` synthesises `SwarmJobEvent` stream)
-owner: TBD
-status: not-started
+owner: Claude Opus 4.7 (1M context)
+status: implemented
 depends-on: [WP-W5-03]
 acceptance-gate: "New `JobProjector` service subscribes to the workspace `MailboxBus`, synthesises `SwarmJobEvent`s on the existing `swarm:job:{id}:event` Tauri channel, and persists job rows under a new `swarm_jobs.source='brain'` flag. `swarm:run_job_v2` returns a fully-shaped `JobOutcome` derived from the event log. Frontend hooks (`useSwarmJob`, `useSwarmJobs`, `useRunSwarmJob`) work unchanged against brain-driven jobs. `cargo test --lib` ≥ 15 new unit tests; `pnpm typecheck` / `lint` / `gen:bindings:check` green."
 ---
+
+## Result
+
+Branch: `wp-w5-04-job-state-projector`. Implementation per the contract:
+
+- Migration `0011_swarm_jobs_source.sql` adds `source TEXT NOT
+  NULL DEFAULT 'fsm'` to `swarm_jobs`. Migration count assertion
+  bumped 10 → 11.
+- `Job` / `JobSummary` / `JobDetail` gained `source: String`
+  (camelCase wire shape) with `#[serde(default = "Job::default_source")]`
+  for older persisted JSON.
+- `swarm/projector.rs` — new module hosting `JobProjector`
+  (per-workspace task), `JobProjectorRegistry`
+  (`ensure_for_workspace` lazy-spawn), and `build_outcome`
+  aggregator. Hardcoded `agent_id → JobState` mapping documented
+  inline (see `agent_id_to_job_state`).
+- `swarm:run_job_v2` builds the canonical `JobOutcome` via
+  `JobProjector::build_outcome` (replaces the W5-03 stub).
+- `lib.rs::run` setup hook installs `JobProjectorRegistry` next to
+  the bus / agent registry; `RunEvent::ExitRequested` drains every
+  projector before runtime exit.
+- Test gates green:
+  - `cargo build --lib` exit 0
+  - `cargo test --lib` 516 passed / 0 failed / 15 ignored
+    (baseline 499 + 17 new — 15 contract-listed + 2 sister
+    helpers `is_retry_dispatch_counts_prior_targets` and
+    `build_outcome_surfaces_last_rejected_verdict_on_failed`)
+  - `cargo check --all-targets` exit 0
+  - `pnpm gen:bindings` regen — `Job.source` / `JobSummary.source`
+    / `JobDetail.source` land in `app/src/lib/bindings.ts`
+  - `pnpm gen:bindings:check` exit 0 (post-commit)
+  - `pnpm typecheck` / `pnpm lint` exit 0
+  - `pnpm test --run` 64 passed / 1 pre-existing locale flake
+    (matches W5-03 baseline)
+
+### Caveats
+
+- The W5-04 contract calls the retry event `RetryAttempt`; the
+  existing `SwarmJobEvent` enum (W3-12e) defines the variant as
+  `RetryStarted`. Per gotcha #9 ("reuse it verbatim — frontend
+  hooks consume this exact shape") the projector emits
+  `SwarmJobEvent::RetryStarted` so the wire contract stays
+  identical to FSM-driven retries.
+- The contract said "MUST NOT touch fsm.rs" but adding the
+  required `source` field to the `Job` struct breaks fsm.rs
+  struct literals at compile time. fsm.rs received the minimal
+  mechanical update: `source: Job::default_source()` added to
+  two `Job { ... }` literals (one in `run_job_with_id_at`, one
+  in a `#[cfg(test)]` test). No FSM logic change.
 
 ## Goal
 

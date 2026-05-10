@@ -707,6 +707,14 @@ export type JobDetail = {
 	 *  because a Reviewer or Tester verdict came back rejected.
 	 */
 	lastVerdict?: Verdict | null,
+	/**
+	 *  W5-04: which executor produced this job — `"fsm"` for the
+	 *  W3 FSM path, `"brain"` for the W5-03 brain-driven path.
+	 *  Read from `swarm_jobs.source` (see migration 0011).
+	 *  `serde(default)` lets older persisted JSON without the key
+	 *  round-trip cleanly.
+	 */
+	source?: string,
 };
 
 /**
@@ -795,6 +803,14 @@ export type JobSummary = {
 	stageCount: number,
 	totalCostUsd: number,
 	lastError: string | null,
+	/**
+	 *  W5-04: which executor produced this job — `"fsm"` for the
+	 *  W3 FSM path, `"brain"` for the W5-03 brain-driven path.
+	 *  Read from `swarm_jobs.source` (see migration 0011).
+	 *  `serde(default)` lets older persisted JSON without the key
+	 *  round-trip cleanly.
+	 */
+	source?: string,
 };
 
 /**
