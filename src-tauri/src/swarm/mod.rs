@@ -29,6 +29,7 @@
 pub mod agent_dispatcher;
 pub mod agent_registry;
 pub mod binding;
+pub mod brain;
 pub mod coordinator;
 pub mod help_request;
 pub mod mailbox_bus;
@@ -50,6 +51,11 @@ pub use coordinator::{
 pub use agent_dispatcher::{
     parse_agent_target, AgentInvoker, MailboxAgentDispatcher,
     SwarmAgentRegistryInvoker,
+};
+pub use brain::{
+    parse_brain_action, resolve_max_dispatches, BrainAction,
+    BrainRunResult, CoordinatorBrain, CoordinatorInvoker,
+    SwarmRegistryCoordinatorInvoker, DEFAULT_MAX_DISPATCHES,
 };
 pub use agent_registry::{
     agent_event_channel, AgentStatus, AgentStatusRow, RegistryTransport,
