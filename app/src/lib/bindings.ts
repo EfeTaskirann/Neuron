@@ -324,6 +324,33 @@ export const commands = {
 	 *  Validation: `workspace_id.trim().is_empty()` → `InvalidInput`.
 	 */
 	swarmAgentsShutdownWorkspace: (workspaceId: string) => typedError<null, AppErrorWire>(__TAURI_INVOKE("swarm_agents_shutdown_workspace", { workspaceId })),
+	/**
+	 *  Dispatch a task to a named agent via the W5-01 mailbox event-bus
+	 *  (WP-W5-02). Spawns the agent's `MailboxAgentDispatcher` if it
+	 *  doesn't already exist, then emits a `MailboxEvent::TaskDispatch`
+	 *  with `target = "agent:<agent_id>"`. The dispatcher picks up the
+	 *  event from the broadcast channel, calls
+	 *  `acquire_and_invoke_turn` against the registry, and emits a
+	 *  `MailboxEvent::AgentResult` whose envelope `parent_id` points
+	 *  back at the dispatch row.
+	 * 
+	 *  Returns the dispatch row's `id` so callers (tests, manual
+	 *  dispatch UIs) can correlate the dispatch with its eventual
+	 *  result via the parent_id chain.
+	 * 
+	 *  Validation: empty workspace_id / agent_id / prompt are rejected
+	 *  as `InvalidInput`. Missing `MailboxBus` or `SwarmAgentRegistry`
+	 *  state surfaces as `Internal` (defensive; `lib.rs::setup` always
+	 *  installs both on production runs).
+	 * 
+	 *  `job_id` defaults to a fresh `j-<ULID>` when omitted; callers
+	 *  running standalone dispatches (no enclosing job) can let it
+	 *  auto-generate. `with_help_loop` defaults to `false` per WP
+	 *  §"Notes" — W5-02 dispatchers always call the non-help variant.
+	 *  The flag is preserved in the emitted event so downstream
+	 *  consumers (W5-03 brain) can still read user intent.
+	 */
+	swarmAgentsDispatchToAgent: (workspaceId: string, agentId: string, prompt: string, jobId: string | null, withHelpLoop: boolean | null) => typedError<number, AppErrorWire>(__TAURI_INVOKE("swarm_agents_dispatch_to_agent", { workspaceId, agentId, prompt, jobId, withHelpLoop })),
 };
 
 /* Types */

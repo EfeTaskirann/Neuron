@@ -4,6 +4,57 @@ Running journal of agent-driven changes. Newest entry on top. See `AGENTS.md` §
 
 ---
 
+## 2026-05-10 WP-W5-02 completed
+
+- sub-agent: general-purpose (Claude Opus 4.7 1M)
+- branch: `wp-w5-02-agent-mailbox-subscription` (off `main` at `00af0d3`)
+- commits: `8cca3ba` dispatcher module + parse_agent_target,
+  `2432440` registry dispatcher map + ensure_dispatcher,
+  `14a50b3` IPC + bindings regen
+- files changed: 6 (1 new, 5 modified) — `agent_dispatcher.rs` (NEW),
+  `agent_registry.rs`, `mod.rs`, `commands/swarm.rs`, `lib.rs`,
+  `app/src/lib/bindings.ts` (regen)
+- tests: 451 → **465** (+14 new); 0 failed; 14 ignored. New tests
+  cover `parse_agent_target` (3), dispatcher routing/cancel/lag/
+  shutdown (8), `registry.ensure_dispatcher` idempotence (1), and
+  the `swarm:agents:dispatch_to_agent` IPC (2).
+- acceptance: ✅ all gates green
+  - `cargo build --lib` 0
+  - `cargo test --lib` 465/0/14
+  - `cargo check --all-targets` 0
+  - `pnpm gen:bindings:check` 0
+  - `pnpm typecheck` 0
+  - `pnpm lint` 0
+  - `pnpm test --run` 64/65 — same pre-existing locale flake as
+    W5-01 baseline (`App.test.tsx > RunInspector > /3,824 tokens/`,
+    tr-TR `Intl.NumberFormat` issue, predates W5)
+- design notes:
+  - Dispatcher main loop spawns each invoke into a child task
+    (`tokio::spawn`) so `select!` can keep draining cancel events
+    while a turn is in flight. Inline-await deadlocked the cancel
+    test; child-task design tolerates concurrent dispatches per
+    WP §"Out of scope (multi-job-per-workspace)".
+  - `AgentInvoker` trait uses `impl Future` return (matches the
+    existing `Transport` trait pattern; no `async-trait` dep per
+    Charter §"no new deps").
+  - `shutdown_all` drains dispatchers BEFORE sessions: in-flight
+    invokes hold registry references, so reversing order would
+    yank `PersistentSession`s out from under live tasks.
+  - IPC test dispatches to an unbundled agent id so the
+    dispatcher's downstream `acquire_and_invoke_turn` returns
+    `NotFound` quickly and emits an `error:` AgentResult — proves
+    end-to-end without needing a real `claude` spawn.
+- caveats:
+  - Help-loop migration deferred to W5-03 (Coordinator brain WP).
+    Dispatcher unconditionally calls non-help variant; `neuron_help`
+    blocks surface as plain `assistant_text` so the W5-03 brain
+    parses client-side.
+  - End-to-end IPC-level cancel (`swarm:cancel_job` → emit
+    `JobCancel` on bus → dispatcher routes) is W5-05 scope. W5-02
+    only wires bus-level `JobCancel` → in-flight `Notify`.
+- next: orchestrator ff-merges `wp-w5-02-agent-mailbox-subscription`
+  → `main` and dispatches W5-03 (Coordinator brain).
+
 ## 2026-05-10 WP-W5-01 VERIFIED — gates green on user dev shell after toolchain bringup
 
 Follow-up to the 2026-05-09 deferred-verify entry below. After

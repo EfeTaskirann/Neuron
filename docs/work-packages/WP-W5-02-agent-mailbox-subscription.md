@@ -2,7 +2,7 @@
 id: WP-W5-02
 title: Agent mailbox subscription + auto-emit (MailboxAgentDispatcher per agent)
 owner: TBD
-status: not-started
+status: implemented
 depends-on: [WP-W5-01]
 acceptance-gate: "New `MailboxAgentDispatcher` per (workspace, agent) pair, spawned by `SwarmAgentRegistry` on first `task_dispatch` event whose `target` matches `agent:<id>`. Dispatcher subscribes to the workspace's `MailboxBus` channel; on `task_dispatch`, calls `acquire_and_invoke_turn` and auto-emits `MailboxEvent::AgentResult` with `parent_id` pointing at the dispatch row. On `job_cancel`, signals the in-flight invoke's `Notify` for graceful turn-truncate. New `swarm:agents:dispatch_to_agent` IPC for tests + manual dispatch. NO change to FSM, RegistryTransport, or W4-05 help-loop wiring (help-loop migration to mailbox events is deferred to W5-03). `cargo test --lib` ≥ 12 new unit tests; `pnpm typecheck` / `lint` / `gen:bindings:check` green."
 ---
@@ -445,4 +445,104 @@ prompt should include:
 
 ## Result
 
-(Filled in by the sub-agent on completion.)
+Branch: `wp-w5-02-agent-mailbox-subscription` (off `main` at `00af0d3`).
+
+### Commits
+
+1. `feat(WP-W5-02): MailboxAgentDispatcher module + parse_agent_target helper`
+2. `feat(WP-W5-02): SwarmAgentRegistry dispatcher map + ensure_dispatcher`
+3. `feat(WP-W5-02): swarm:agents:dispatch_to_agent IPC + bindings regen`
+
+### Files
+
+- **NEW** `src-tauri/src/swarm/agent_dispatcher.rs` — `MailboxAgentDispatcher`,
+  `AgentInvoker` trait, `SwarmAgentRegistryInvoker` production impl,
+  `parse_agent_target`, plus 11 unit tests.
+- **MODIFIED** `src-tauri/src/swarm/agent_registry.rs` — added
+  `dispatchers` field, `ensure_dispatcher`, dispatcher-first
+  `shutdown_all` ordering, `dispatcher_count` test helper, and
+  `registry_ensure_dispatcher_is_idempotent` test.
+- **MODIFIED** `src-tauri/src/swarm/mod.rs` — re-export
+  `MailboxAgentDispatcher`, `parse_agent_target`, `AgentInvoker`,
+  `SwarmAgentRegistryInvoker`.
+- **MODIFIED** `src-tauri/src/commands/swarm.rs` — added
+  `swarm_agents_dispatch_to_agent` IPC + 2 unit tests.
+- **MODIFIED** `src-tauri/src/lib.rs` — registered the new
+  command in `specta_builder_for_export`'s `collect_commands!`.
+- **REGENERATED** `app/src/lib/bindings.ts` — added
+  `swarmAgentsDispatchToAgent` typed wrapper (+27 lines).
+
+### Verification gates
+
+| Gate | Status |
+| --- | --- |
+| `cargo build --lib` | OK |
+| `cargo test --lib` | **465 / 0 / 14** (was 451 baseline, +14 new) |
+| `cargo check --all-targets` | OK |
+| `pnpm gen:bindings:check` | OK (post-commit) |
+| `pnpm typecheck` | OK |
+| `pnpm lint` | OK |
+| `pnpm test --run` | 64 / 1 (pre-existing locale flake — `App.test.tsx > RunInspector > /3,824 tokens/`; predates W5) |
+
+### New tests (14)
+
+- `parse_agent_target_strips_prefix`
+- `parse_agent_target_rejects_missing_prefix`
+- `parse_agent_target_rejects_empty_id`
+- `dispatcher_routes_matching_target`
+- `dispatcher_ignores_non_matching_target`
+- `dispatcher_emits_agent_result_with_parent_id`
+- `dispatcher_emits_error_result_on_invoke_failure`
+- `dispatcher_cancels_in_flight_invoke_on_job_cancel`
+- `dispatcher_ignores_job_cancel_for_other_job`
+- `dispatcher_handles_lagged_receiver`
+- `dispatcher_shutdown_drains_cleanly`
+- `swarm_agents_dispatch_to_agent_emits_dispatch_event`
+- `swarm_agents_dispatch_to_agent_validates_inputs`
+- `registry_ensure_dispatcher_is_idempotent`
+
+### Design notes
+
+- The dispatcher's main loop spawns each invoke into a child task
+  via `tokio::spawn` rather than awaiting `invoker.invoke_turn`
+  inline. This is required so the loop can keep selecting on
+  `JobCancel` events while the turn runs — the original inline
+  design deadlocked the cancel test because `recv()` was blocked
+  inside the awaiting `invoke_turn`. A dispatcher's
+  `current_invoke` slot routes cancels to the right child task's
+  `Notify`. Per WP §"Out of scope (multi-job-per-workspace)" the
+  IPC + W5-05 lock keep this single-in-flight in production; the
+  child-task design tolerates fan-out without the loop blocking.
+- `AgentInvoker` trait uses `impl Future` return (not `async fn`
+  in trait, which needs `async-trait`) per Charter §"no new deps"
+  — same pattern as the existing W3-12 `Transport` trait.
+- The IPC test `swarm_agents_dispatch_to_agent_emits_dispatch_event`
+  intentionally dispatches to an *unbundled* agent id so the
+  dispatcher's downstream `acquire_and_invoke_turn` returns
+  `NotFound` quickly (no real `claude` spawn) and the dispatcher's
+  error path emits an `error:` AgentResult chained back to the
+  dispatch row. This proves the IPC + emit + dispatcher error
+  surface end-to-end without the test needing a 60s claude
+  spawn timeout.
+- `shutdown_all` drains dispatchers BEFORE sessions to avoid
+  yanking `PersistentSession`s out from under live invoke tasks.
+  Order documented inline in the registry method.
+
+### Caveats / followups
+
+- Help-loop migration deferred to W5-03 (Coordinator brain WP) per
+  WP scope. The dispatcher unconditionally calls the non-help
+  `acquire_and_invoke_turn`; `neuron_help` blocks surface as plain
+  `assistant_text` so the W5-03 brain can parse them client-side.
+- Cancel routing through the bus is wired (W5-02's job): the
+  dispatcher's `current_invoke` slot signals the right `Notify`
+  on `JobCancel`. End-to-end IPC-level cancel (`swarm:cancel_job`
+  → emit `JobCancel` on bus → dispatcher routes) is W5-05 scope.
+- Multi-job-per-workspace serialisation stays in the FSM today;
+  W5-05 enforces via the bus + projector.
+
+### Next
+
+Orchestrator should ff-merge `wp-w5-02-agent-mailbox-subscription`
+→ `main` and dispatch W5-03.
+
