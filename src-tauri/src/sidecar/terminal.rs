@@ -60,6 +60,28 @@ use crate::tuning::{
 // READ_CHUNK_BYTES, KILL_GRACE, WAIT_POLL, MAX_PENDING_BYTES) live in
 // `crate::tuning` so the runtime profile is editable in one place.
 
+/// Env vars stripped from the inherited environment of a freshly
+/// spawned `claude-code` pane. The CLAUDE_CODE_* / CLAUDECODE / etc.
+/// keys are set by an outer `claude` shell to signal "this child is
+/// nested" — without stripping, the spawned REPL falls into the
+/// OAuth login picker on every spawn. The ANTHROPIC_API_KEY +
+/// provider switches mirror `swarm::binding::STRIPPED_ENV_VARS` so a
+/// stray BYOK env var can't silently re-route the subscription
+/// billing channel.
+const CLAUDE_AGENT_STRIPPED_ENV: &[&str] = &[
+    "CLAUDECODE",
+    "CLAUDE_CODE_SESSION_ID",
+    "CLAUDE_CODE_ENTRYPOINT",
+    "CLAUDE_CODE_EXECPATH",
+    "CLAUDE_CODE_AGENT",
+    "CLAUDE_EFFORT",
+    "AI_AGENT",
+    "ANTHROPIC_API_KEY",
+    "USE_BEDROCK",
+    "USE_VERTEX",
+    "USE_FOUNDRY",
+];
+
 // --------------------------------------------------------------------- //
 // Pane status discriminants                                             //
 // --------------------------------------------------------------------- //
@@ -229,6 +251,30 @@ impl TerminalRegistry {
         }
         builder.cwd(&cwd);
         builder.set_controlling_tty(true);
+
+        // When the agent we're spawning is `claude-code`, scrub the
+        // `CLAUDE*` / `ANTHROPIC*` env-var pollution the parent
+        // process accumulates. When the Neuron desktop is itself
+        // launched from inside a `claude` shell (or from a terminal
+        // whose npm wrapper exports these for the install path),
+        // the spawned claude REPL sees `CLAUDECODE=1` /
+        // `CLAUDE_CODE_SESSION_ID=…` / `CLAUDE_CODE_EXECPATH=…`
+        // and decides it's a nested instance — and re-runs the
+        // OAuth "Select login method" picker on every spawn,
+        // despite `~/.claude/.credentials.json` being valid.
+        // Stripping these isolates each pane's claude as if it
+        // were the user's first `claude` invocation of the day,
+        // which is exactly what we want.
+        //
+        // `ANTHROPIC_API_KEY` and the provider switches are
+        // stripped on the same grounds as `swarm::binding::
+        // subscription_env()` — they'd silently flip the spawn
+        // off the user's Pro/Max OAuth channel onto BYOK billing.
+        if agent_kind == "claude-code" {
+            for var in CLAUDE_AGENT_STRIPPED_ENV {
+                builder.env_remove(var);
+            }
+        }
         let child: Box<dyn Child + Send + Sync> = pty_pair
             .slave
             .spawn_command(builder)
