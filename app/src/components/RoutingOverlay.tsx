@@ -5,7 +5,7 @@ interface RouteEvent {
   source: string;
   target: string;
   body: string;
-  outcome: 'ok' | 'denied' | 'unknown_target';
+  outcome: 'ok' | 'denied' | 'unknown_target' | 'near_miss';
   ts: number;
 }
 
@@ -34,7 +34,8 @@ export function RoutingOverlay(): JSX.Element {
         outcome:
           p.outcome === 'ok' ||
           p.outcome === 'denied' ||
-          p.outcome === 'unknown_target'
+          p.outcome === 'unknown_target' ||
+          p.outcome === 'near_miss'
             ? p.outcome
             : 'unknown_target',
         ts: Date.now(),
@@ -98,7 +99,11 @@ export function RoutingOverlay(): JSX.Element {
                       : e.body}
                   </span>
                   <span className={`swarm-term-overlay-tag tag-${e.outcome}`}>
-                    {e.outcome === 'ok' ? 'routed' : e.outcome}
+                    {e.outcome === 'ok'
+                      ? 'routed'
+                      : e.outcome === 'near_miss'
+                      ? 'format!'
+                      : e.outcome}
                   </span>
                 </li>
               ))}

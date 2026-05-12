@@ -30,7 +30,7 @@ use tauri::{AppHandle, Emitter, EventId, Listener, Manager, Runtime};
 
 use crate::sidecar::terminal::TerminalRegistry;
 use crate::swarm_term::hierarchy::{allowed_for, is_allowed};
-use crate::swarm_term::marker::parse_marker_line;
+use crate::swarm_term::marker::{near_miss_regex, parse_marker_line};
 
 /// Dedupe window covers the rapid repaint loops claude's TUI runs
 /// while streaming an assistant token. A marker line gets repainted
@@ -168,7 +168,47 @@ fn handle_line<R: Runtime>(
             dedupe,
             Instant::now(),
         );
+        // Near-miss diagnostic: a segment that names a known agent
+        // via `@<id>:` but didn't fully parse to a marker is almost
+        // certainly claude trying to route but phrasing it in prose
+        // ("then I'll dispatch to @scout: do thing"). Log + emit a
+        // `near_miss` route event so the user can see WHY their
+        // route didn't fire instead of staring at silence.
+        if matches!(decision, RouteDecision::NoOp) {
+            if let Some(caps) = near_miss_regex().captures(trimmed) {
+                let candidate = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+                if panes_by_agent.contains_key(candidate) {
+                    tracing::warn!(
+                        source = %source_agent_id,
+                        candidate = %candidate,
+                        line = %truncate(trimmed, 200),
+                        "swarm-term: near-miss — `@{candidate}:` seen but marker grammar didn't match (claude probably phrased it in prose; route NOT fired)"
+                    );
+                    let _ = app.emit(
+                        "swarm-term:route",
+                        json!({
+                            "source": source_agent_id,
+                            "target": candidate,
+                            "body": truncate(trimmed, 240),
+                            "outcome": "near_miss",
+                        }),
+                    );
+                }
+            }
+        }
         apply_decision(decision, registry, app);
+    }
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        s.to_string()
+    } else {
+        let mut end = max;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}…", &s[..end])
     }
 }
 

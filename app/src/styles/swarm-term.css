@@ -239,7 +239,17 @@
   color: var(--fg);
 }
 
+.tag-near_miss {
+  background: color-mix(in oklab, var(--bg) 80%, #c87fd9);
+  color: var(--fg);
+}
+
 .swarm-term-overlay-row-denied .swarm-term-overlay-body-text {
   text-decoration: line-through;
   opacity: 0.7;
+}
+
+.swarm-term-overlay-row-near_miss .swarm-term-overlay-body-text {
+  font-style: italic;
+  opacity: 0.85;
 }

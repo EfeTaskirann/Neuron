@@ -277,19 +277,31 @@ fn build_persona_payload(agent_id: &str, body: &str) -> String {
     let allowed: Vec<String> =
         allowed_for(agent_id).iter().map(|s| s.to_string()).collect();
     let routing = format!(
-        "\n\n## Routing protocol\n\n\
-         Sen bu swarm'ın bir ajanısın (`{agent_id}`). Diğer ajanlara mesaj\n\
-         yönlendirmek için satırın başında (kolon 0, hiç boşluk yok) şu\n\
-         formatı kullan:\n\n\
-         \x20\x20\x20\x20>> @<agent-id>: <mesaj>\n\n\
-         Senin izin verilen destinasyonların: {allowed_list}.\n\n\
-         İzin verilmeyen bir hedefe yazdığında sistem sana `[neuron]\n\
-         route denied` notu döndürür ve mesaj iletilmez; başka bir izinli\n\
-         hedef seç.\n\n\
-         Sana gelen mesajların altında \"— from @<gönderen>\" imzası\n\
-         olacak; bu imzaya saygı göster ve cevabını ona göre düzenle.\n\n\
-         Şimdiden talimat almadan KULLANICI MESAJI VEYA KOMUT BEKLE.\n\
-         Yalnızca @{agent_id} rolünü üstlendiğini onayla, sonra sessiz kal.",
+        "\n\n## Routing protocol — KRİTİK\n\n\
+         Sen bu swarm'ın bir ajanısın (`{agent_id}`). Diğer ajanlara\n\
+         mesaj yönlendirmenin TEK YOLU şu literal formatı **kendi başına\n\
+         bir satırda**, satır başında, dekoratörsüz yazmak:\n\n\
+         >> @<agent-id>: <mesaj>\n\n\
+         **Doğru örnekler (bu satırlar router tarafından yakalanır):**\n\n\
+         >> @scout: api/auth.ts dosyasını oku ve özet çıkar\n\
+         >> @planner: scout sonucunu 3 maddelik plana çevir\n\n\
+         **Yanlış örnekler (router YAKALAYAMAZ, route düşmez):**\n\n\
+         - `Şimdi scout'a soracağım: api/auth.ts'i oku` (markerless prose)\n\
+         - `- >> @scout: ...` (yine olur ama bullet ekleme gereksiz)\n\
+         - `Sıradaki: @scout: api'yi oku` (`>>` yok)\n\
+         - `\"...\" şeklinde @scout: ...` (`>>` yok)\n\n\
+         **Kurallar:**\n\n\
+         1. Routing satırını başka metinle aynı satıra koyma.\n\
+         2. Birden fazla ajana gönderecekseniz her birini ayrı satıra\n\
+            yaz — sırayla ikisi de route edilir.\n\
+         3. Senin izin verilen destinasyonların: {allowed_list}.\n\
+         4. İzin verilmeyen hedefe yazarsan sistem RoutingOverlay'de\n\
+            `denied` etiketiyle gösterir; başka hedef seç.\n\
+         5. Sana gelen mesajların altında `— from @<gönderen>` imzası\n\
+            olur — kime cevap verdiğini bu imzaya bakarak belirle.\n\n\
+         **İLK YANIT:** Bu mesajı aldıktan sonra **yalnızca** şunu yaz\n\
+         ve sus: `@{agent_id} hazır.` — başka tek karakter yazma. Bir\n\
+         sonraki kullanıcı / route mesajını bekle.",
         agent_id = agent_id,
         allowed_list = if allowed.is_empty() {
             "(yok)".to_string()

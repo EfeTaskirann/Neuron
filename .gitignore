@@ -50,3 +50,6 @@ coverage/
 
 # Local user notes / scratch (not project artifacts)
 report/
+
+# Clipboard / screenshot pastes
+clipboard-*.png
