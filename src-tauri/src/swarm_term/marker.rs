@@ -39,9 +39,23 @@ pub struct Marker {
 fn marker_regex() -> &'static Regex {
     static R: OnceLock<Regex> = OnceLock::new();
     R.get_or_init(|| {
-        // Permissive form: zero-or-more whitespace around the `@`
-        // glue and the colon. Body still must be non-empty.
-        Regex::new(r"^>>\s*@([a-z][a-z0-9-]{1,40})\s*:\s*(.+?)\s*$")
+        // Prefix-agnostic form: 0–5 non-whitespace, non-`@`
+        // characters before the `@<id>:` glyph. The strict `>>`
+        // ASCII chevron is one of many shapes claude can render
+        // the marker as in interactive mode — `àáá`, `▶▶▶`, `»»`,
+        // `→`, depends on locale/font/its-own-judgement — so we
+        // accept anything ≤5 chars and rely on the hierarchy gate
+        // + `panes_by_agent` lookup to keep prose mentions of an
+        // agent (e.g. `Hi @scout: how are you?`) from blowing up:
+        // an unknown / forbidden target is still surfaced as
+        // `unknown_target` / `denied` in the overlay, not silently
+        // routed.
+        //
+        // Lazy `{0,5}?` ensures the prefix capture stays minimal
+        // so the `@<id>:` group lines up; `[^\s@]` excludes
+        // whitespace + `@` so we don't accidentally swallow part
+        // of the agent ref.
+        Regex::new(r"^([^\s@]{0,5}?)\s*@([a-z][a-z0-9-]{1,40})\s*:\s*(.+?)\s*$")
             .expect("marker regex compiles")
     })
 }
@@ -153,15 +167,12 @@ pub fn parse_marker_line(line: &str) -> Option<Marker> {
         return None;
     }
 
-    // Peel decorator prefixes until stable or the line starts with `>>`.
-    // Cap the loop at 6 rounds — pathological nesting is not worth
-    // unbounded work and 6 covers every realistic combination
-    // (e.g. `- **>> @scout: hi**` = bullet + bold).
+    // Peel decorator prefixes (bullets, blockquotes, bold,
+    // backticks) — claude sometimes wraps the marker in markdown
+    // and stripping the outer layer makes the regex line up. Capped
+    // at 6 rounds for safety against pathological nesting.
     let mut cur = line;
     for _ in 0..6 {
-        if cur.starts_with(">>") {
-            break;
-        }
         let next = strip_decorator_prefix(cur);
         if next.len() == cur.len() {
             break;
@@ -171,9 +182,13 @@ pub fn parse_marker_line(line: &str) -> Option<Marker> {
     let cur = strip_trailing_decorators(cur);
 
     let caps = marker_regex().captures(cur)?;
+    // Group 1 is the prefix capture (`>>`, `àáá`, `→`, …). Its only
+    // job is to anchor `^([^\s@]{0,5}?)` so the regex doesn't slurp
+    // arbitrary mid-line content; the marker semantics live in
+    // groups 2 (target) and 3 (body).
     Some(Marker {
-        target: caps.get(1)?.as_str().to_string(),
-        body: caps.get(2)?.as_str().trim().to_string(),
+        target: caps.get(2)?.as_str().to_string(),
+        body: caps.get(3)?.as_str().trim().to_string(),
     })
 }
 
@@ -220,8 +235,14 @@ mod tests {
     }
 
     #[test]
-    fn rejects_triple_chevron() {
-        assert!(parse_marker_line(">>> @scout: hi").is_none());
+    fn accepts_triple_chevron() {
+        // Used to reject. The new prefix-agnostic parser accepts
+        // any 0–5 non-whitespace prefix before `@<id>:`, so a
+        // stray third `>` (claude occasionally over-emphasises) is
+        // fine. Hierarchy + target lookup remain the real gate.
+        let m = parse_marker_line(">>> @scout: hi").unwrap();
+        assert_eq!(m.target, "scout");
+        assert_eq!(m.body, "hi");
     }
 
     #[test]
@@ -336,6 +357,49 @@ mod tests {
         let m = parse_marker_line(">>   @scout   :   hello").unwrap();
         assert_eq!(m.target, "scout");
         assert_eq!(m.body, "hello");
+    }
+
+    // --- prefix-agnostic acceptance (what the user actually sees) --
+
+    #[test]
+    fn accepts_unicode_chevron_prefix_uaaa() {
+        // Smoke output observed in the field: claude rendered the
+        // marker prefix as Latin-1 accented letters (font fallback
+        // for some non-ASCII chevron). Strict `>>` rejected it,
+        // routing never fired. Accept now.
+        let m = parse_marker_line("àáá @coordinator: Merhaba").unwrap();
+        assert_eq!(m.target, "coordinator");
+        assert_eq!(m.body, "Merhaba");
+    }
+
+    #[test]
+    fn accepts_unicode_arrow_prefix() {
+        for prefix in ["→", "▶", "▷", "»", "»»", "›", "⇒"] {
+            let line = format!("{prefix} @scout: hi");
+            let m = parse_marker_line(&line)
+                .unwrap_or_else(|| panic!("prefix `{prefix}` rejected"));
+            assert_eq!(m.target, "scout");
+            assert_eq!(m.body, "hi");
+        }
+    }
+
+    #[test]
+    fn accepts_no_prefix_at_all() {
+        // Bare `@<agent>:` at column 0 is legitimate too — claude
+        // sometimes drops the chevron entirely.
+        let m = parse_marker_line("@planner: outline the steps").unwrap();
+        assert_eq!(m.target, "planner");
+        assert_eq!(m.body, "outline the steps");
+    }
+
+    #[test]
+    fn rejects_two_words_before_at() {
+        // Two-word prose like `Sıradaki adım @scout: foo` should
+        // NOT trigger — the regex only allows ≤5 non-whitespace
+        // chars before `@`, so the second whitespace separator
+        // breaks the match.
+        assert!(parse_marker_line("hello world @scout: hi").is_none());
+        assert!(parse_marker_line("Sıradaki adım @scout: hi").is_none());
     }
 
     #[test]
