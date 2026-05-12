@@ -104,12 +104,24 @@ impl TerminalSwarmRegistry {
         // sets `cwd` on the child via `builder.cwd(&cwd)`, so claude
         // reads the project root naturally without the extra flag
         // (which on some versions makes the REPL exit silently).
+        //
+        // Permission mode: we use `--permission-mode bypassPermissions`
+        // (the documented mode enum value) instead of the
+        // `--dangerously-skip-permissions` toggle. Functionally the
+        // two share the "no per-tool approval prompts" outcome, but
+        // the explicit `--dangerously-…` flag advertises itself as
+        // sandbox-only and claude responds by re-running its safety
+        // confirmation (the dialog the user reported as "asks for
+        // auth again on every pane"). The mode value is the
+        // first-class way to set the same effect without tripping
+        // that gate, so we ship 9 panes that just open.
         let mut parts: Vec<String> =
             vec![format!("\"{}\"", spawn.program.display())];
         for a in &spawn.prefix_args {
             parts.push(format!("\"{}\"", a));
         }
-        parts.push("--dangerously-skip-permissions".to_string());
+        parts.push("--permission-mode".to_string());
+        parts.push("bypassPermissions".to_string());
         let _ = project_str.clone(); // kept for log diagnostics
         let cmd = parts.join(" ");
         tracing::info!(
