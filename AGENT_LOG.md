@@ -4,6 +4,168 @@ Running journal of agent-driven changes. Newest entry on top. See `AGENTS.md` §
 
 ---
 
+## 2026-05-13 swarm-term phase 1.6 shipped (9-pane terminal hierarchy + cross-pane routing operational)
+
+- track: post-W5 exploratory direction (NOT a formal WP) per the
+  2026-05-07 owner directive *"her ajan kendi terminal'inde tek
+  başına çalışsın, birbirleriyle iletişim de kurabilsin"*. The
+  mailbox-brain swarm (W5) satisfies the autonomy half; the
+  terminal-hierarchy swarm is the visible / interactive half that
+  exposes each agent as a real claude REPL the user can watch + chat
+  with. The two coexist; this entry is not a W5 sequel — it is a
+  parallel surface.
+- branch: `main` (direct landings, no per-WP branch — exploratory)
+- commits (initial landing → 5 iterative fixes → docs):
+  - `504ee2a` feat(swarm-term): land 9-pane terminal hierarchy + routing fix
+  - `7f0d785` fix(swarm-term): decorator-tolerant marker + near-miss diagnostic + persona reinforcement
+  - `3e68812` fix(swarm-term): swap `--dangerously-skip-permissions` for `--permission-mode bypassPermissions`
+  - `ecd7b4e` fix(swarm-term): prefix-agnostic marker parser
+  - `774e0ad` fix(swarm-term): strip `CLAUDE_CODE_*` env-var pollution before spawning panes
+  - `6d0f5b6` chore(swarm-term): sync `pty_smoke` example with production spawn
+  - `0d4654a` fix(swarm-term): UTF-8-safe `strip_ansi` + prefix-whitespace-tolerant marker
+  - `0c157b6` fix(swarm-term): substring fallback for claude REPL status overlay
+  - (this commit) docs: AGENT_LOG entry
+- LOC delta: +3650 / -3 across the 5 initial commits + 6d0f5b6
+  pty_smoke sync (+84 / -4 in the example bin) + 0d4654a UTF-8 fix
+  (+69 / -18 in router/marker) + 0c157b6 substring fallback
+  (+141 / -29 in marker.rs). Frontend: new TerminalSwarm route,
+  ProjectPicker, SwarmPane (xterm.js), RoutingOverlay (live timeline).
+  Backend: new `swarm_term/` module (router/marker/session/hierarchy)
+  + 9 persona files under `swarm/agents/term/` + `swarm:term:*`
+  IPC + `pty_smoke` debug binary.
+- tests: 493 → 515 (`+22` over the phase). The +22 distribution:
+  +20 in the initial 504ee2a landing (decide_route matrix +
+  MockRuntime + hierarchy), +2 in 0d4654a (strip_ansi UTF-8
+  preservation + multibyte-marker round trip), +5 in 0c157b6
+  (substring fallback — 3 happy paths for the 3 observed claude
+  overlay flavours, 1 HTML-escape reject, 1 column-0-path-still-
+  wins guard), -5 net adjustment from in-test refactors during
+  decorator additions. `cargo test --lib` 515/0/14 green;
+  `cargo check --example pty_smoke` exit 0; `pnpm gen:bindings:check`
+  exit 0 (no drift); frontend untouched in this phase.
+- acceptance:
+  - **9-pane spawn**: `pnpm tauri dev` → /terminal-swarm route →
+    pick project dir → Start → 9 claude REPLs spawn into the 3×3
+    grid (orchestrator + coordinator + scout + planner + 4
+    specialists + integration-tester). Each pane's claude
+    authenticates via the user's Pro/Max OAuth (no picker, no
+    BYOK env leak). Persona injection via bracketed paste; each
+    agent renders its body + routing-protocol footer + first
+    response `@<id> hazır.`
+  - **Cross-pane routing**: User types a task into the orchestrator
+    pane. Orchestrator emits `>> @target:` markers (rendered by
+    claude's REPL as `▎ ▎ @target:`); router parses + dedupes +
+    enforces hierarchy + pastes signed body into the target pane.
+    Live log of the 2026-05-13 smoke shows ~30+ successful
+    `route firing` lines across orchestrator → coordinator →
+    {scout,planner,backend-builder,frontend-builder,reviewers,
+    integration-tester} chains, plus hierarchy guard correctly
+    rejecting forbidden routes (e.g. backend-builder → planner,
+    frontend-reviewer → scout).
+  - **Near-miss diagnostic**: WARN-level log entry for any line
+    that contains `@<id>:` but doesn't match the marker grammar.
+    After the full phase, the only remaining near-misses are
+    `&gt;&gt; @target:` HTML-entity-escaped patterns inside
+    code-fenced documentation — these are claude quoting its
+    own protocol back to itself, NOT actual dispatch intent,
+    and correctly stay rejected.
+- design notes:
+  - **OAuth picker debugging arc** (3e68812 → 774e0ad): the smoke
+    initially showed every spawned pane landing on claude's
+    "Select login method" picker. Two hypotheses tested in order:
+    (1) the `--dangerously-skip-permissions` flag re-triggers
+    claude's safety-confirmation dialog; (2) `CLAUDE_CODE_*`
+    env-var inheritance signals "nested instance" to the child.
+    Both fixes landed. Post-mortem from the standalone smoke
+    (`6d0f5b6` `pty_smoke` example, 2026-05-12 18:30Z) showed
+    that for an isolated single-pane spawn, **neither fix was
+    strictly necessary** — `claude.exe` rendered the `Welcome back
+    efe!` banner under all 3 variants (bypass + strip,
+    bypass + pollution, dangerous + pollution). But in the
+    multi-pane Tauri spawn the user observed the picker, so
+    both fixes shipped as defence-in-depth. Whichever was the
+    actual root cause, the spawn is now clean.
+  - **`strip_ansi` Latin-1 bug** (0d4654a): the router-side
+    `strip_ansi` in `swarm_term::router` decoded the PTY byte
+    stream byte-by-byte (`out.push(b as char)` for non-ESC bytes),
+    so `▶` (U+25B6, UTF-8 `e2 96 b6`) became three Latin-1
+    scalars (`â`, `\x96`, `¶`). Turkish `ı`/`ş` likewise mangled.
+    The sister helper in `sidecar::terminal::strip_csi` (written
+    months earlier) already handled this correctly; this is
+    pure drift between two similar utilities. The fix lifts the
+    same UTF-8-aware single-byte / `chars().next()` pattern.
+  - **Prefix-whitespace tolerance** (0d4654a): claude's REPL
+    renders `>>` as a chevron pair separated by whitespace
+    (`▶ ▶ @target:`). Prior `[^\s@]{0,5}?` prefix rejected
+    internal whitespace; relaxed to `[^@]{0,10}?` (lazy, scalar-
+    capped). The cap preserves the original anti-prose guarantee:
+    `Sıradaki adım @scout: foo` (14 chars before `@`) still
+    rejects. `rejects_two_words_before_at` test stayed green
+    without modification.
+  - **Substring fallback** (0c157b6): even after the prefix
+    relaxation, the residual near-miss pattern was claude's
+    progress-indicator status bar getting cursor-positioned onto
+    the same PTY line as the marker. After strip_ansi the
+    composite looks like `4*  5✢  6711 tokens)● ▎ ▎ @target: body`.
+    The 10-char cap correctly rejects this (it'd false-positive
+    on long prose otherwise), so a second-pass regex with a
+    different discriminator was needed. The chosen signature is
+    the literal `▎ ▎` glyph pair (two U+258E LEFT ONE QUARTER
+    BLOCK separated by a space) — claude's REPL renders `>>` as
+    this pair, and the char is exotic enough that prose
+    false-positives are not a realistic risk. Path 1 (column-0
+    strict regex) fires first; path 2 is the fallback.
+  - **`pty_smoke` production-sync** (6d0f5b6): the `cargo run
+    --example pty_smoke` debug binary diverged from the
+    production spawn over the OAuth-picker fix arc. Brought it
+    back in sync with `sidecar::terminal::spawn_pane` so future
+    debugging hits the same code shape without firing up the
+    full Tauri app. Two env-flag opt-outs
+    (`NEURON_SMOKE_KEEP_CLAUDE_ENV=1`, `NEURON_SMOKE_LEGACY_FLAG=1`)
+    let the smoke deliberately reproduce the OAuth-picker bug
+    under pollution / legacy-flag conditions, which is how the
+    "neither fix was strictly necessary" finding was confirmed.
+- caveats / follow-ups (none of these block phase 1.6):
+  - **HTML-escaped near-miss noise**: `&gt;&gt; @target:` lines
+    inside claude's code-fenced docs emit WARN at INFO log
+    level, producing a few dozen lines per session. They are
+    correct rejects (no route should fire on documentation), but
+    cosmetically noisy. A future polish could demote the
+    near-miss to debug level OR skip the diagnostic entirely
+    when the line contains `&gt;` (HTML-entity escaped marker).
+  - **Substring fallback claude-version-specific**: the `▎ ▎`
+    glyph is what claude v2.1.139 renders for `>>`. If a future
+    claude rendering uses a different glyph (e.g. `▶▶` without
+    separation, or `»»`), the substring fallback misses. The
+    column-0 path with the 10-char cap handles those variants
+    already, so the fallback only loses its overlay coverage —
+    real intent still routes when claude doesn't paint a status
+    indicator on the same PTY line. Refresh required at the
+    next observed regression.
+  - **Persona reinforcement vs. claude noise**: agents
+    occasionally emit short "I'm thinking..." status text that
+    the router doesn't suppress; the user sees it in the pane
+    but it does not cause any wrong route. The persona footer
+    already instructs agents to stay terse — escalating that
+    further (e.g. forbidding free-form prose unless directly
+    answering the user) is a persona-tuning exercise, not a
+    routing one.
+  - **No formal WP file**: this was exploratory work, not a
+    contracted WP. If the terminal-hierarchy surface stabilises
+    into a long-term feature the team relies on, a retroactive
+    WP doc capturing the persona schema + routing-protocol
+    contract + hierarchy graph would be worth authoring.
+  - **AGENT_LOG entry timing**: this entry lands after the last
+    code commit (`0c157b6`) but before the live user-driven
+    smoke fully stabilises. The 2026-05-13 21:36Z smoke (under
+    `pnpm tauri dev`) showed ~30 successful `route firing`
+    lines, hierarchy guard rejecting forbidden routes, and only
+    HTML-escape near-misses remaining — the phase is
+    operational. If the user discovers a new failure mode in
+    extended use, a follow-up entry captures it.
+
+---
+
 ## 2026-05-10 WP-W5-06 completed (FSM deleted; autonomous swarm ships)
 
 - sub-agent: general-purpose (Claude Opus 4.7 1M)
