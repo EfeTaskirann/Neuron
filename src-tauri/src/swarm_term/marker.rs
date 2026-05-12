@@ -75,6 +75,34 @@ pub fn near_miss_regex() -> &'static Regex {
     })
 }
 
+/// Substring fallback for claude's specific REPL rendering of `>>`
+/// as `▎ ▎` (two U+258E LEFT ONE QUARTER BLOCK glyphs separated by
+/// a space) when its progress indicator status bar shares the PTY
+/// line with the marker via cursor positioning.
+///
+/// Observed in 2026-05-12 smoke as a recurring near-miss pattern:
+///
+///   `4*  5✢  6711 tokens)●  ▎ ▎ @orchestrator: Merhaba.`
+///   `e✢ N*✶✻✽✻  10s · ↓ 365 tokens)✶●  ▎ ▎ @orchestrator: Mesaj…`
+///
+/// The column-0 parser can't match because the noise prefix
+/// exceeds the 10-char cap. But the `▎ ▎` glyph pair is exclusive
+/// to claude's REPL renderer — it does not appear in user prose
+/// — so finding it anywhere in the line is a safe second-pass
+/// signal that the trailing text is a real marker.
+///
+/// Anchored at line end (`$`) so it only catches the marker if it
+/// sits at the END of the composite line (which is where claude
+/// puts the assistant text relative to the status overlay). Lazy
+/// body capture `(.+?)` + trailing `\s*$` keeps the body clean.
+fn marker_substring_regex() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| {
+        Regex::new(r"▎\s*▎\s*@([a-z][a-z0-9-]{1,40})\s*:\s*(.+?)\s*$")
+            .expect("substring marker regex compiles")
+    })
+}
+
 /// Peel one round of common markdown decorators off the front of a
 /// line. Returns the (possibly identical) trimmed remainder. The
 /// caller loops this until the line stabilises or starts with `>>`.
@@ -166,33 +194,48 @@ fn strip_trailing_decorators(s: &str) -> &str {
 /// non-whitespace markdown prefixes (`- `, `**`, `> `, etc.).
 pub fn parse_marker_line(line: &str) -> Option<Marker> {
     let line = line.trim_end_matches('\r').trim_end_matches('\n');
-    if line.starts_with(char::is_whitespace) {
-        return None;
-    }
 
-    // Peel decorator prefixes (bullets, blockquotes, bold,
-    // backticks) — claude sometimes wraps the marker in markdown
-    // and stripping the outer layer makes the regex line up. Capped
-    // at 6 rounds for safety against pathological nesting.
-    let mut cur = line;
-    for _ in 0..6 {
-        let next = strip_decorator_prefix(cur);
-        if next.len() == cur.len() {
-            break;
+    // Path 1: column-0 form (the canonical case — claude wrote the
+    // marker on its own line, possibly with markdown decoration).
+    if !line.starts_with(char::is_whitespace) {
+        // Peel decorator prefixes (bullets, blockquotes, bold,
+        // backticks) — claude sometimes wraps the marker in
+        // markdown and stripping the outer layer makes the regex
+        // line up. Capped at 6 rounds for safety against
+        // pathological nesting.
+        let mut cur = line;
+        for _ in 0..6 {
+            let next = strip_decorator_prefix(cur);
+            if next.len() == cur.len() {
+                break;
+            }
+            cur = next;
         }
-        cur = next;
-    }
-    let cur = strip_trailing_decorators(cur);
+        let cur = strip_trailing_decorators(cur);
 
-    let caps = marker_regex().captures(cur)?;
-    // Group 1 is the prefix capture (`>>`, `àáá`, `→`, …). Its only
-    // job is to anchor `^([^\s@]{0,5}?)` so the regex doesn't slurp
-    // arbitrary mid-line content; the marker semantics live in
-    // groups 2 (target) and 3 (body).
-    Some(Marker {
-        target: caps.get(2)?.as_str().to_string(),
-        body: caps.get(3)?.as_str().trim().to_string(),
-    })
+        if let Some(caps) = marker_regex().captures(cur) {
+            // Group 1 is the prefix capture, groups 2 + 3 are the
+            // target + body.
+            return Some(Marker {
+                target: caps.get(2)?.as_str().to_string(),
+                body: caps.get(3)?.as_str().trim().to_string(),
+            });
+        }
+    }
+
+    // Path 2: claude REPL status-overlay fallback. The progress
+    // indicator gets cursor-positioned ONTO the same PTY line as
+    // the marker, so the column-0 form sees a long noise prefix
+    // and bails out. Find the `▎ ▎` glyph pair as a substring —
+    // unique to claude's renderer, safe from prose false-positives.
+    if let Some(caps) = marker_substring_regex().captures(line) {
+        return Some(Marker {
+            target: caps.get(1)?.as_str().to_string(),
+            body: caps.get(2)?.as_str().trim().to_string(),
+        });
+    }
+
+    None
 }
 
 #[cfg(test)]
@@ -397,12 +440,81 @@ mod tests {
 
     #[test]
     fn rejects_two_words_before_at() {
-        // Two-word prose like `Sıradaki adım @scout: foo` should
-        // NOT trigger — the regex only allows ≤5 non-whitespace
-        // chars before `@`, so the second whitespace separator
-        // breaks the match.
+        // Long prose prefix like `Sıradaki adım @scout: foo` should
+        // NOT trigger column-0 path — the prefix exceeds the 10-char
+        // cap so the regex never matches. The substring fallback
+        // (path 2) wouldn't fire either because the prose doesn't
+        // contain the `▎ ▎` glyph signature.
         assert!(parse_marker_line("hello world @scout: hi").is_none());
         assert!(parse_marker_line("Sıradaki adım @scout: hi").is_none());
+    }
+
+    // --- claude REPL status-overlay substring fallback -------------
+    //
+    // claude's progress indicator gets cursor-positioned onto the
+    // same PTY line as the marker. After strip_ansi the composite
+    // looks like `<noise><tokens)● ▎ ▎ @target: body>`. The column-0
+    // path bails on the noise prefix; the substring fallback finds
+    // the `▎ ▎` glyph pair (U+258E, exclusive to claude's renderer)
+    // and extracts the trailing marker.
+
+    #[test]
+    fn accepts_claude_status_overlay_with_marker_at_end() {
+        let line =
+            "4*                  5✢                  6711 tokens)● ▎ ▎ @orchestrator: Merhaba.";
+        let m = parse_marker_line(line)
+            .expect("substring fallback must catch claude REPL overlay");
+        assert_eq!(m.target, "orchestrator");
+        assert_eq!(m.body, "Merhaba.");
+    }
+
+    #[test]
+    fn accepts_claude_overlay_with_token_count_and_spinner() {
+        let line =
+            "e✢ N*✶✻✽✻                10s · ↓ 365 tokens)✶● ▎ ▎ @orchestrator: Mesajın yarım geldi.";
+        let m = parse_marker_line(line).expect("substring fallback");
+        assert_eq!(m.target, "orchestrator");
+        assert_eq!(m.body, "Mesajın yarım geldi.");
+    }
+
+    #[test]
+    fn accepts_short_status_overlay() {
+        // The minimal observed form: a few padding chars + thinking
+        // indicator + the rendered marker. Column-0 path also fails
+        // here because `7          thinking● ` is >10 chars.
+        let line = "7          thinking● ▎ ▎ @coordinator: Henüz inceleyecek bir builder yok.";
+        let m = parse_marker_line(line).expect("substring fallback");
+        assert_eq!(m.target, "coordinator");
+        assert_eq!(m.body, "Henüz inceleyecek bir builder yok.");
+    }
+
+    #[test]
+    fn substring_fallback_rejects_html_escaped_marker_in_docs() {
+        // Persona excerpts / code-fenced docs render the marker as
+        // `&gt;&gt;` (HTML entity) — not the `▎ ▎` glyph pair. The
+        // substring fallback must NOT pick these up, otherwise
+        // claude documenting its own protocol would emit phantom
+        // routes. The current pattern (literal U+258E pair) makes
+        // this safe by construction; pin the assertion anyway.
+        assert!(
+            parse_marker_line("Bittiğinde `&gt;&gt; @frontend-reviewer: özet` yaz")
+                .is_none()
+        );
+        assert!(
+            parse_marker_line("- PASS → `&gt;&gt; @coordinator: tüm testler geçti`")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn substring_fallback_does_not_override_column_0_path() {
+        // A clean column-0 marker still goes through path 1 (the
+        // strict, decorator-tolerant regex), not path 2. Important
+        // because path 1 strips trailing markdown (`**`, `` ` ``)
+        // which path 2 does not.
+        let m = parse_marker_line(">> @scout: hi**").unwrap();
+        assert_eq!(m.target, "scout");
+        assert_eq!(m.body, "hi"); // trailing `**` peeled by path 1
     }
 
     #[test]
