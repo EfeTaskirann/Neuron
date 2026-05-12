@@ -439,8 +439,26 @@ fn strip_ansi(s: &str) -> String {
     while i < bytes.len() {
         let b = bytes[i];
         if b != 0x1b {
-            out.push(b as char);
-            i += 1;
+            // UTF-8-safe non-ESC byte handling. ASCII (`b < 0x80`)
+            // is a single-byte code point and pushes directly; every
+            // other byte starts a multi-byte sequence and we must
+            // advance over the FULL scalar — otherwise `▶` (`e2 96
+            // b6`) gets pushed byte-by-byte and rendered as three
+            // Latin-1 code points (`â`, `\x96`, `¶`), which is what
+            // mangled claude's `>>` glyph rendering and made the
+            // marker regex miss every routing emission. Mirrors the
+            // proven approach in `sidecar::terminal::strip_csi`.
+            if b < 0x80 {
+                out.push(b as char);
+                i += 1;
+            } else if let Some(c) = s[i..].chars().next() {
+                out.push(c);
+                i += c.len_utf8();
+            } else {
+                // Defensive: `&str` guarantees a valid scalar at any
+                // boundary, so this branch is unreachable in practice.
+                i += 1;
+            }
             continue;
         }
         let Some(&next) = bytes.get(i + 1) else {
@@ -592,6 +610,36 @@ mod tests {
         let m = parse_marker_line(&stripped).unwrap();
         assert_eq!(m.target, "planner");
         assert!(m.body.contains("do thing"));
+    }
+
+    #[test]
+    fn strip_ansi_preserves_multibyte_utf8() {
+        // ▶ = U+25B6 (e2 96 b6); previously the Latin-1 byte-by-byte
+        // path turned this into `â\x96¶` and the marker prefix regex
+        // miscounted the chevron decorator. With UTF-8-aware
+        // strip_ansi, the scalar passes through intact.
+        assert_eq!(strip_ansi("▶▶ @scout: hi"), "▶▶ @scout: hi");
+        assert_eq!(strip_ansi("\x1b[31m▶▶\x1b[0m @scout: hi"), "▶▶ @scout: hi");
+        // Turkish (`ı` = c4 b1, `ş` = c5 9f) must survive too — the
+        // Latin-1 path mangled these into `Ä±` / `Å` and broke any
+        // body text comparison.
+        assert_eq!(strip_ansi("Hedef mesajın boş geldi"), "Hedef mesajın boş geldi");
+    }
+
+    #[test]
+    fn strip_ansi_then_marker_parse_with_unicode_chevron() {
+        // The actual claude rendering observed in the 2026-05-12 smoke:
+        // claude wrote `>> @backend-builder: Merhaba!` and its REPL
+        // rendered it as two black-arrow glyphs separated by a space
+        // (`▶ ▶ @backend-builder: Merhaba!`). The prior
+        // byte-cast strip_ansi destroyed the `▶` codepoints; this
+        // test pins the post-fix round trip.
+        let raw = "▶ ▶ @backend-builder: Merhaba!";
+        let stripped = strip_ansi(raw);
+        let m = parse_marker_line(&stripped)
+            .expect("marker must parse after UTF-8-safe strip");
+        assert_eq!(m.target, "backend-builder");
+        assert_eq!(m.body, "Merhaba!");
     }
 
     // --- decide_route: pure brain ----------------------------------

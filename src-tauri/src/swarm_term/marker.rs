@@ -39,23 +39,26 @@ pub struct Marker {
 fn marker_regex() -> &'static Regex {
     static R: OnceLock<Regex> = OnceLock::new();
     R.get_or_init(|| {
-        // Prefix-agnostic form: 0–5 non-whitespace, non-`@`
-        // characters before the `@<id>:` glyph. The strict `>>`
-        // ASCII chevron is one of many shapes claude can render
-        // the marker as in interactive mode — `àáá`, `▶▶▶`, `»»`,
-        // `→`, depends on locale/font/its-own-judgement — so we
-        // accept anything ≤5 chars and rely on the hierarchy gate
-        // + `panes_by_agent` lookup to keep prose mentions of an
-        // agent (e.g. `Hi @scout: how are you?`) from blowing up:
-        // an unknown / forbidden target is still surfaced as
-        // `unknown_target` / `denied` in the overlay, not silently
-        // routed.
+        // Prefix-tolerant form: 0–10 chars (including whitespace)
+        // before the `@<id>:` glyph. claude renders the `>>`
+        // decorator in wildly variable shapes — ASCII `>>`, Unicode
+        // arrows `▶▶`, double-chevrons `»»`, `→`, or paired arrows
+        // SEPARATED BY A SPACE (`▶ ▶ @target:`, observed verbatim
+        // in 2026-05-12 smoke). The prior `[^\s@]{0,5}?` form
+        // rejected any decorator with internal whitespace and the
+        // route never fired — the near-miss diagnostic captured
+        // those misses by the dozen.
         //
-        // Lazy `{0,5}?` ensures the prefix capture stays minimal
-        // so the `@<id>:` group lines up; `[^\s@]` excludes
-        // whitespace + `@` so we don't accidentally swallow part
-        // of the agent ref.
-        Regex::new(r"^([^\s@]{0,5}?)\s*@([a-z][a-z0-9-]{1,40})\s*:\s*(.+?)\s*$")
+        // Lazy `{0,10}?` ensures the prefix capture stays minimal
+        // so the `@<id>:` group lines up; `[^@]` only excludes `@`
+        // so whitespace inside short decorator chains is OK. The
+        // cap of 10 chars (Unicode scalars, not bytes) still
+        // blocks long prose intros like `I'll now ask @scout: ...`
+        // (13 chars before `@`) from accidentally routing. The
+        // hierarchy gate + `panes_by_agent` lookup remain the
+        // second line of defence — unknown/forbidden targets land
+        // as `unknown_target` / `denied` events, not silent routes.
+        Regex::new(r"^([^@]{0,10}?)@([a-z][a-z0-9-]{1,40})\s*:\s*(.+?)\s*$")
             .expect("marker regex compiles")
     })
 }
