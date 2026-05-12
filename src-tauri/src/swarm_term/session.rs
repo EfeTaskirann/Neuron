@@ -29,6 +29,14 @@ use crate::swarm_term::hierarchy::{allowed_for, AGENT_IDS};
 
 const READY_DELAY_MS: u64 = 1500;
 
+/// Delay after persona injection before the auto-prompt
+/// (`NEURON_TERM_AUTO_PROMPT`) is pasted into the orchestrator pane.
+/// Claude's bracketed-paste render of the persona body + footer +
+/// first `@<id> hazır.` response settles in 5–10 s for short
+/// personas; 10 s is safe headroom. Only consulted when the env
+/// var is set, so production paths pay zero cost.
+const AUTO_PROMPT_DELAY_MS: u64 = 10_000;
+
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct TerminalSwarmSessionHandle {
@@ -140,7 +148,18 @@ impl TerminalSwarmRegistry {
             let input = PaneSpawnInput {
                 cwd: project_str.clone(),
                 cmd: Some(cmd.clone()),
-                cols: Some(120),
+                // PTY width matters for marker integrity, not for
+                // agent reasoning capacity. claude renders long
+                // assistant text wrapped at the terminal width, and
+                // `router::strip_ansi` then sees the wrap as a `\n`
+                // — the marker body gets split across two PTY lines
+                // and only the first segment routes to the target,
+                // so receivers report "mesaj yarım geldi". 400 cols
+                // keeps virtually every realistic marker body on a
+                // single line. xterm.js renders its own visual wrap
+                // independently, so the user's 3×3 grid view is
+                // unaffected.
+                cols: Some(400),
                 rows: Some(30),
                 agent_kind: Some("claude-code".into()),
                 role: Some(agent_id.to_string()),
@@ -234,6 +253,54 @@ impl TerminalSwarmRegistry {
                     );
                 }
             }
+
+            // Auto-prompt hook for reproducible smoke tests. If the
+            // `NEURON_TERM_AUTO_PROMPT` env var is set, wait for the
+            // orchestrator to finish rendering its `@orchestrator
+            // hazır.` ack (claude takes 5–10 s to settle after a
+            // bracketed paste), then paste the prompt into the
+            // orchestrator pane as if the user had typed it. Makes
+            // end-to-end swarm runs scriptable from the CLI:
+            //
+            //   $env:NEURON_TERM_AUTO_PROMPT='deep dive to neuron project and improve it'
+            //   pnpm tauri dev
+            //
+            // Empty / unset env = no auto-prompt (the default
+            // production behaviour: orchestrator waits for the
+            // user's first message in its xterm pane).
+            if let Ok(auto_prompt) = std::env::var("NEURON_TERM_AUTO_PROMPT") {
+                let trimmed = auto_prompt.trim();
+                if !trimmed.is_empty() {
+                    tokio::time::sleep(Duration::from_millis(AUTO_PROMPT_DELAY_MS)).await;
+                    if let Some(orch_pane) = panes_by_agent.get("orchestrator") {
+                        // Wrap in xterm bracketed paste so claude
+                        // treats it as a single user submission
+                        // instead of N Enter-split lines.
+                        let payload = format!(
+                            "\x1b[200~{trimmed}\x1b[201~\r"
+                        );
+                        if let Err(e) = registry_for_inject
+                            .write_to_pane(orch_pane, payload.as_bytes())
+                            .await
+                        {
+                            tracing::warn!(
+                                error = %e,
+                                "swarm-term: auto-prompt write failed"
+                            );
+                        } else {
+                            tracing::info!(
+                                prompt_len = trimmed.len(),
+                                "swarm-term: auto-prompt injected into orchestrator"
+                            );
+                        }
+                    } else {
+                        tracing::warn!(
+                            "swarm-term: auto-prompt set but orchestrator pane not found"
+                        );
+                    }
+                }
+            }
+
             // Optional second pane keeps the AppHandle alive for the
             // duration of the injection — without this Rust drops it
             // immediately and the writes still complete (the registry
