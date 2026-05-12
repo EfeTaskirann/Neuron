@@ -29,6 +29,8 @@ tauri-build = { version = "2.0", features = [] }
 # ("Tauri 2 minor-version breaking changes — pin to 2.x.y exact").
 # Future bumps go through an ADR.
 tauri = { version = "2.1", features = [] }
+# Terminal-Swarm — native directory-picker for the project-root chooser.
+tauri-plugin-dialog = "2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 # Async runtime — Tauri's setup hook is sync, so we drive sqlx via

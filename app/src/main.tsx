@@ -8,6 +8,7 @@ import './styles/app.css';
 import './styles/canvas.css';
 import './styles/terminal.css';
 import './styles/swarm.css';
+import './styles/swarm-term.css';
 
 const rootEl = document.getElementById('root');
 if (!rootEl) {

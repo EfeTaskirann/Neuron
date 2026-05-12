@@ -19,6 +19,7 @@ pub mod runs;
 pub mod secrets;
 pub mod settings;
 pub mod swarm;
+pub mod swarm_term;
 pub mod terminal;
 pub mod util;
 pub mod workflows;

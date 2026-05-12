@@ -391,6 +391,14 @@ export const commands = {
 	 *  consumers (W5-03 brain) can still read user intent.
 	 */
 	swarmAgentsDispatchToAgent: (workspaceId: string, agentId: string, prompt: string, jobId: string | null, withHelpLoop: boolean | null) => typedError<number, AppErrorWire>(__TAURI_INVOKE("swarm_agents_dispatch_to_agent", { workspaceId, agentId, prompt, jobId, withHelpLoop })),
+	swarmTermListPersonas: () => typedError<SwarmTermPersona[], AppErrorWire>(__TAURI_INVOKE("swarm_term_list_personas")),
+	swarmTermSessionStatus: () => typedError<{
+	sessionId: string,
+	projectDir: string,
+	panes: TerminalSwarmPane[],
+} | null, AppErrorWire>(__TAURI_INVOKE("swarm_term_session_status")),
+	swarmTermStartSession: (projectDir: string) => typedError<TerminalSwarmSessionHandle, AppErrorWire>(__TAURI_INVOKE("swarm_term_start_session", { projectDir })),
+	swarmTermStopSession: () => typedError<null, AppErrorWire>(__TAURI_INVOKE("swarm_term_stop_session")),
 };
 
 /* Types */
@@ -1531,6 +1539,24 @@ export type SwarmJobEvent =
  *  next stage starts).
  */
 { kind: "decision_made"; job_id: string; decision: CoordinatorDecision };
+
+export type SwarmTermPersona = {
+	id: string,
+	role: string,
+	description: string,
+	allowedDestinations: string[],
+};
+
+export type TerminalSwarmPane = {
+	agentId: string,
+	paneId: string,
+};
+
+export type TerminalSwarmSessionHandle = {
+	sessionId: string,
+	projectDir: string,
+	panes: TerminalSwarmPane[],
+};
 
 /**
  *  One row of `server_tools`. Materialised by [`crate::mcp::registry`]

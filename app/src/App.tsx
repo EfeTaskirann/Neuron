@@ -17,12 +17,22 @@ import { Canvas } from './routes/Canvas';
 import { RunInspector } from './routes/RunInspector';
 import { TerminalRoute } from './routes/Terminal';
 import { SwarmRoute } from './routes/SwarmRoute';
+import { TerminalSwarmRoute } from './routes/TerminalSwarm';
 
-type Route = 'canvas' | 'terminal' | 'swarm' | 'agents' | 'runs' | 'mcp' | 'settings';
+type Route =
+  | 'canvas'
+  | 'terminal'
+  | 'terminal-swarm'
+  | 'swarm'
+  | 'agents'
+  | 'runs'
+  | 'mcp'
+  | 'settings';
 
 const NAV: { id: Route; label: string; icon: IconName }[] = [
   { id: 'canvas', label: 'Workflow', icon: 'workflow' },
   { id: 'terminal', label: 'Terminal', icon: 'server' },
+  { id: 'terminal-swarm', label: 'Terminal Swarm', icon: 'bot' },
   { id: 'swarm', label: 'Swarm', icon: 'bot' },
   { id: 'agents', label: 'Agents', icon: 'bot' },
   { id: 'runs', label: 'Runs', icon: 'activity' },
@@ -33,6 +43,7 @@ const NAV: { id: Route; label: string; icon: IconName }[] = [
 const TOPBAR_TITLE: Record<Route, string> = {
   canvas: 'Daily summary',
   terminal: 'Terminal',
+  'terminal-swarm': 'Terminal Swarm',
   swarm: 'Swarm',
   agents: 'Agents',
   runs: 'Runs',
@@ -167,6 +178,12 @@ function RouteHost({ route }: { route: Route }): JSX.Element {
       return (
         <ErrorBoundary fallbackTitle="Couldn't load terminal">
           <TerminalRoute />
+        </ErrorBoundary>
+      );
+    case 'terminal-swarm':
+      return (
+        <ErrorBoundary fallbackTitle="Couldn't load terminal swarm">
+          <TerminalSwarmRoute />
         </ErrorBoundary>
       );
     case 'swarm':

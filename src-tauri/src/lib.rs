@@ -32,6 +32,7 @@ pub mod models;
 pub mod secrets;
 pub mod sidecar;
 pub mod swarm;
+pub mod swarm_term;
 pub mod telemetry;
 pub mod time;
 pub mod tuning;
@@ -120,6 +121,11 @@ pub fn specta_builder_for_export() -> tauri_specta::Builder<tauri::Wry> {
             commands::swarm::swarm_agents_list_status::<tauri::Wry>,
             commands::swarm::swarm_agents_shutdown_workspace::<tauri::Wry>,
             commands::swarm::swarm_agents_dispatch_to_agent::<tauri::Wry>,
+            // swarm-term (Terminal-Hierarchy Swarm)
+            commands::swarm_term::swarm_term_list_personas::<tauri::Wry>,
+            commands::swarm_term::swarm_term_session_status::<tauri::Wry>,
+            commands::swarm_term::swarm_term_start_session::<tauri::Wry>,
+            commands::swarm_term::swarm_term_stop_session::<tauri::Wry>,
         ])
         // Register the AppError once on the builder so the type lands
         // in `bindings.ts` as a referenceable shape rather than being
@@ -172,6 +178,7 @@ pub fn run() {
     let builder = specta_builder_for_export();
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .invoke_handler(builder.invoke_handler())
         .setup(move |app| {
             // Operational logger — first thing in setup so any error
@@ -336,6 +343,13 @@ pub fn run() {
             // processes outlive the app on next launch.
             app.manage(sidecar::terminal::TerminalRegistry::new());
 
+            // Terminal-Swarm — registry holds the currently active
+            // 9-pane session (one at a time). Empty at boot; the
+            // `swarm_term:start_session` IPC populates it (Phase 2+).
+            app.manage(std::sync::Arc::new(
+                swarm_term::TerminalSwarmRegistry::new(),
+            ));
+
             // WP-W3-06 — start the OTLP export sweep iff the
             // collector endpoint is configured. The loop is silent
             // (no panic / warn) when the env var is unset; users who
@@ -399,6 +413,20 @@ pub fn run() {
                     let cloned = handle.inner().clone();
                     tauri::async_runtime::block_on(async move {
                         cloned.shutdown().await;
+                    });
+                }
+                // Terminal-Swarm — clear the active session BEFORE
+                // shutting the TerminalRegistry down. `stop()` kills
+                // panes individually via kill_pane; the subsequent
+                // `shutdown_all` is a defensive sweep for any pane
+                // that wasn't tracked by the swarm-term session.
+                if let Some(swarm_term_registry) = app.try_state::<
+                    std::sync::Arc<crate::swarm_term::TerminalSwarmRegistry>,
+                >() {
+                    let cloned = swarm_term_registry.inner().clone();
+                    let app_handle = app.clone();
+                    tauri::async_runtime::block_on(async move {
+                        let _ = cloned.stop(app_handle).await;
                     });
                 }
                 if let Some(registry) = app.try_state::<sidecar::terminal::TerminalRegistry>() {

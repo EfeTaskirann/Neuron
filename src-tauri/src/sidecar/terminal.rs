@@ -716,6 +716,26 @@ fn run_reader<R: Runtime>(
         };
         pending.extend_from_slice(&buf[..n]);
 
+        // Intercept DSR-CPR queries (`\x1b[6n`) and respond. TUI apps
+        // like `claude` send this at startup to ask the terminal where
+        // its cursor is; they wait for an `\x1b[<row>;<col>R` reply
+        // before painting *anything* (banner, prompt, the lot). A real
+        // xterm replies automatically, but portable-pty + ConPTY's
+        // pseudo-tty does not — the responsibility falls on whoever
+        // owns the master end. Without this, claude under our PTY
+        // emits 4 bytes (the query) and then sits idle forever.
+        let dsr_count = extract_dsr_cpr_queries(&mut pending);
+        if dsr_count > 0 {
+            if let Ok(mut guard) = state.lock() {
+                if let Some(w) = guard.writer.as_mut() {
+                    for _ in 0..dsr_count {
+                        let _ = w.write_all(b"\x1b[1;1R");
+                    }
+                    let _ = w.flush();
+                }
+            }
+        }
+
         // Drain whole lines on each newline. Each line's bytes are
         // decoded once we have the full sequence — `from_utf8_lossy`
         // is now correct because no multi-byte char is split.
@@ -751,6 +771,34 @@ fn run_reader<R: Runtime>(
             );
         }
     }
+}
+
+/// Scan `buf` for every DSR-CPR query (`ESC [ 6 n`, 4 bytes) the child
+/// emitted, remove them from the buffer in-place, and return the count.
+///
+/// The bytes are stripped because they're protocol noise — `claude`
+/// doesn't echo them through to subsequent output and we don't want
+/// them in the line stream that emit_decoded_line ships to xterm.js.
+/// The caller is responsible for writing one `\x1b[1;1R` response per
+/// extracted query back through the PTY's master writer.
+fn extract_dsr_cpr_queries(buf: &mut Vec<u8>) -> usize {
+    const QUERY: &[u8] = b"\x1b[6n";
+    let mut count = 0;
+    let mut from = 0;
+    while from + QUERY.len() <= buf.len() {
+        if let Some(rel) = buf[from..]
+            .windows(QUERY.len())
+            .position(|w| w == QUERY)
+        {
+            let abs = from + rel;
+            buf.drain(abs..abs + QUERY.len());
+            count += 1;
+            from = abs;
+        } else {
+            break;
+        }
+    }
+    count
 }
 
 /// Strip trailing `\r` / `\n` from a raw byte buffer and decode the
@@ -1502,6 +1550,50 @@ mod tests {
     use std::collections::VecDeque;
     use std::time::Duration as StdDuration;
 
+    #[test]
+    fn extract_dsr_cpr_extracts_single_query() {
+        let mut buf = b"hello\x1b[6nworld".to_vec();
+        let n = extract_dsr_cpr_queries(&mut buf);
+        assert_eq!(n, 1);
+        assert_eq!(buf, b"helloworld");
+    }
+
+    #[test]
+    fn extract_dsr_cpr_returns_zero_when_absent() {
+        let mut buf = b"plain ascii text".to_vec();
+        let n = extract_dsr_cpr_queries(&mut buf);
+        assert_eq!(n, 0);
+        assert_eq!(buf, b"plain ascii text");
+    }
+
+    #[test]
+    fn extract_dsr_cpr_handles_back_to_back_queries() {
+        let mut buf = b"\x1b[6n\x1b[6nfoo".to_vec();
+        let n = extract_dsr_cpr_queries(&mut buf);
+        assert_eq!(n, 2);
+        assert_eq!(buf, b"foo");
+    }
+
+    #[test]
+    fn extract_dsr_cpr_does_not_consume_partial_match_at_buffer_tail() {
+        // A truncated `\x1b[6` (no `n` yet) stays in the buffer so the
+        // next read can complete it.
+        let mut buf = b"prefix\x1b[6".to_vec();
+        let n = extract_dsr_cpr_queries(&mut buf);
+        assert_eq!(n, 0);
+        assert_eq!(buf, b"prefix\x1b[6");
+    }
+
+    #[test]
+    fn extract_dsr_cpr_only_matches_exact_query() {
+        // Other CSI sequences (cursor save, mode set, …) must not be
+        // confused with the DSR-CPR query.
+        let mut buf = b"\x1b[?1049h\x1b[2J\x1b[Hbanner".to_vec();
+        let n = extract_dsr_cpr_queries(&mut buf);
+        assert_eq!(n, 0);
+        assert_eq!(buf, b"\x1b[?1049h\x1b[2J\x1b[Hbanner");
+    }
+
     /// K5 regression: `trim_terminal_line_end` strips trailing CR/LF
     /// without touching multi-byte UTF-8 chars or embedded `\r` used
     /// for in-place progress updates.
@@ -1780,6 +1872,106 @@ mod tests {
 
     /// Acceptance-criterion stand-in for the integration smoke test:
     /// spawn a real shell, write a single command, expect at least one
+    /// Integration: spawn `claude` interactive REPL through the real
+    /// `TerminalRegistry::spawn_pane` path and verify it actually
+    /// paints a banner. This is the end-to-end verification of the
+    /// DSR-CPR auto-responder fix: `claude` sends `\x1b[6n` at
+    /// startup and refuses to render anything until the terminal
+    /// answers `\x1b[r;cR`. portable-pty + ConPTY do not auto-reply,
+    /// so without the responder in `run_reader` the ring buffer
+    /// stays empty forever. With the responder, the ring fills with
+    /// banner lines (Welcome / Claude Code / Tips / What's new /
+    /// Try "…").
+    ///
+    /// Opt-in via `--ignored` because it needs a real `claude` install
+    /// (npm-global or NEURON_CLAUDE_BIN override) plus an active
+    /// Pro/Max OAuth session in `~/.claude/.credentials`. CI does not
+    /// have either.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires real `claude` binary + Pro/Max subscription"]
+    async fn integration_claude_dsr_responder_unblocks_banner() {
+        use crate::swarm::binding::resolve_claude_spawn;
+
+        let (pool, _dir) = fresh_pool().await;
+        let app = tauri::test::mock_builder()
+            .manage(pool.clone())
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .expect("mock app");
+        let registry = TerminalRegistry::new();
+
+        let spawn = match resolve_claude_spawn() {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("[skip] claude not installed on this host: {e}");
+                return;
+            }
+        };
+        let mut parts: Vec<String> =
+            vec![format!("\"{}\"", spawn.program.display())];
+        for a in &spawn.prefix_args {
+            parts.push(format!("\"{}\"", a));
+        }
+        parts.push("--dangerously-skip-permissions".to_string());
+        let cmd = parts.join(" ");
+
+        let pane = registry
+            .spawn_pane(
+                PaneSpawnInput {
+                    cwd: ".".into(),
+                    cmd: Some(cmd),
+                    cols: Some(120),
+                    rows: Some(30),
+                    agent_kind: Some("claude-code".into()),
+                    role: Some("orchestrator".into()),
+                    workspace: Some("swarm-term-test".into()),
+                },
+                app.handle().clone(),
+                pool.clone(),
+            )
+            .await
+            .expect("spawn claude");
+
+        // 4 s lets claude:
+        //   t≈0ms     send `\x1b[6n` query
+        //   t≈10ms    our reader strips it + answers `\x1b[1;1R`
+        //   t≈100ms   claude reads reply, proceeds with init
+        //   t≈300ms   claude paints banner + prompt
+        // The smoke test under standalone portable-pty hits this same
+        // pattern; here we cover the registry path (Reader → emit_line
+        // → ring buffer) end-to-end.
+        tokio::time::sleep(StdDuration::from_millis(4000)).await;
+
+        let lines = registry
+            .pane_lines(&pane.id, None, &pool)
+            .await
+            .expect("pane_lines");
+
+        let _ = registry.kill_pane(&pane.id, &pool).await;
+        tokio::time::sleep(StdDuration::from_millis(300)).await;
+
+        assert!(
+            !lines.is_empty(),
+            "DSR-CPR responder fix regressed: claude under \
+             TerminalRegistry produced ZERO lines in 4s. Pre-fix this \
+             was the silent-pane bug. Lines should contain at least \
+             one banner snippet."
+        );
+        // Heuristic: claude's banner mentions itself somewhere. Match
+        // a small set of known banner tokens (loose to survive
+        // version drift in the marketing copy).
+        let joined: String =
+            lines.iter().map(|l| l.text.as_str()).collect::<Vec<_>>().join(" ");
+        let any_banner_token = [
+            "Claude", "claude", "Welcome", "Tips", "Try", "/init",
+        ]
+        .iter()
+        .any(|tok| joined.contains(tok));
+        assert!(
+            any_banner_token,
+            "expected claude banner text in pane output, got: {joined}"
+        );
+    }
+
     /// `out` line, then kill. `#[ignore]`d so CI runners with no
     /// usable shell on PATH do not break — and on Windows the
     /// ConPTY reader pipe can outlive the child by an indeterminate

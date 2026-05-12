@@ -264,6 +264,99 @@ impl ProfileRegistry {
     pub fn list(&self) -> Vec<&Profile> {
         self.profiles.values().collect()
     }
+
+    pub fn profile_count(&self) -> usize { self.profiles.len() }
+
+    /// Terminal-Hierarchy Swarm variant. Loads from
+    /// `src/swarm/agents/term/*.md` (bundled via include_dir!) instead
+    /// of the top-level W5 personas, with optional workspace overrides
+    /// from `<workspace_dir>/term/*.md` when supplied.
+    ///
+    /// Identical parser, identical Profile shape — only the source root
+    /// differs. Keeps the W5 mailbox-bus personas (carrying JSON
+    /// OUTPUT CONTRACTs) untouched while letting the terminal-mode UI
+    /// load prose-only siblings.
+    pub fn load_term(
+        workspace_dir: Option<&Path>,
+    ) -> Result<Self, AppError> {
+        let mut profiles: HashMap<String, Profile> = HashMap::new();
+        let mut sources: HashMap<String, ProfileSource> = HashMap::new();
+
+        let Some(term_dir) = BUNDLED_AGENTS.get_dir("term") else {
+            return Err(AppError::Internal(
+                "bundled `term/` agent dir missing".into(),
+            ));
+        };
+        for file in term_dir.files() {
+            if file.path().extension().map(|e| e != "md").unwrap_or(true) {
+                continue;
+            }
+            let raw = std::str::from_utf8(file.contents()).map_err(|e| {
+                AppError::InvalidInput(format!(
+                    "{}: bundled term profile is not utf-8: {e}",
+                    file.path().display()
+                ))
+            })?;
+            let display = PathBuf::from("<bundled>").join(file.path());
+            let profile = parse_profile(raw, display.clone())?;
+            if profiles.contains_key(&profile.id) {
+                return Err(AppError::InvalidInput(format!(
+                    "{}: duplicate bundled term profile id `{}`",
+                    display.display(),
+                    profile.id
+                )));
+            }
+            sources.insert(profile.id.clone(), ProfileSource::Bundled);
+            profiles.insert(profile.id.clone(), profile);
+        }
+
+        if let Some(dir) = workspace_dir {
+            if dir.is_dir() {
+                let mut seen_in_workspace: HashMap<String, PathBuf> =
+                    HashMap::new();
+                for entry in std::fs::read_dir(dir).map_err(|e| {
+                    AppError::Internal(format!(
+                        "read workspace term agents dir {}: {e}",
+                        dir.display()
+                    ))
+                })? {
+                    let entry = entry.map_err(|e| {
+                        AppError::Internal(format!(
+                            "iter workspace term agents dir {}: {e}",
+                            dir.display()
+                        ))
+                    })?;
+                    let path = entry.path();
+                    if path.extension().map(|e| e != "md").unwrap_or(true) {
+                        continue;
+                    }
+                    let raw = std::fs::read_to_string(&path).map_err(|e| {
+                        AppError::Internal(format!(
+                            "read workspace term profile {}: {e}",
+                            path.display()
+                        ))
+                    })?;
+                    let profile = parse_profile(&raw, path.clone())?;
+                    if let Some(prior) = seen_in_workspace.get(&profile.id) {
+                        return Err(AppError::InvalidInput(format!(
+                            "duplicate workspace term profile id `{}` \
+                             (first seen at {}, also at {})",
+                            profile.id,
+                            prior.display(),
+                            path.display()
+                        )));
+                    }
+                    seen_in_workspace
+                        .insert(profile.id.clone(), path.clone());
+                    sources
+                        .insert(profile.id.clone(), ProfileSource::Workspace);
+                    profiles.insert(profile.id.clone(), profile);
+                }
+            }
+        }
+
+        Ok(Self { profiles, sources })
+    }
 }
 
 // --------------------------------------------------------------------- //
@@ -552,6 +645,35 @@ fn parse_allowed_tools(
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// Acceptance: `load_term` returns the 9 bundled terminal-swarm
+    /// personas with the exact agent ids the hierarchy graph expects.
+    /// Confirms the new `src/swarm/agents/term/*.md` files are
+    /// embedded + parse cleanly + their ids match the AGENT_IDS table
+    /// in `swarm_term::hierarchy`.
+    #[test]
+    fn load_term_returns_nine_personas() {
+        let registry = ProfileRegistry::load_term(None).expect("load_term");
+        let expected_ids = [
+            "orchestrator",
+            "coordinator",
+            "scout",
+            "planner",
+            "backend-builder",
+            "frontend-builder",
+            "backend-reviewer",
+            "frontend-reviewer",
+            "integration-tester",
+        ];
+        assert_eq!(registry.profile_count(), expected_ids.len());
+        for id in expected_ids {
+            let p = registry.get(id).unwrap_or_else(|| {
+                panic!("term persona {id} missing from registry")
+            });
+            assert_eq!(p.id, id);
+            assert!(!p.body.is_empty(), "term persona {id} body empty");
+        }
+    }
 
     /// Acceptance: load the bundled `scout.md` via the embedded
     /// registry path and assert all nine fields land in `Profile`.

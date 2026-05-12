@@ -24,6 +24,7 @@ build/
 # Rust / Tauri
 target/
 src-tauri/target/
+src-tauri/target-smoke/
 src-tauri/gen/
 
 # Vite / front-end caches
