@@ -54,9 +54,20 @@ pub(crate) struct DedupeCell {
 /// Tauri event emits.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RouteDecision {
-    /// Line had no marker (or only a marker that's been recently
-    /// routed and is still inside the dedupe window). No-op.
+    /// Line had no marker that the grammar could parse. The IO layer
+    /// may emit a `near_miss` diagnostic if the line *looks* like
+    /// it wanted to route (contains an `@<known-agent>:` substring).
     NoOp,
+    /// Line parsed cleanly as a marker, but its `(target, body)`
+    /// hash matched a recent emission from the same source pane
+    /// inside the dedupe window (1500 ms). The marker IS valid —
+    /// it's just a repaint-loop duplicate of an already-routed
+    /// message. The IO layer drops it silently; the `near_miss`
+    /// diagnostic does NOT fire (it would mislabel a successful
+    /// dedupe as a parse failure, which was a recurring source of
+    /// "why isn't my route working?" confusion in the 2026-05-12
+    /// smoke).
+    Deduped { source: String, target: String },
     /// `>> @<target>:` named a target that's not in the active
     /// session's `panes_by_agent`. The shell writes a notice back to
     /// the source pane and emits a `unknown_target` event.
@@ -252,7 +263,10 @@ pub(crate) fn decide_route(
                     target = %target_agent_id,
                     "swarm-term: dedupe suppressed repeat marker"
                 );
-                return RouteDecision::NoOp;
+                return RouteDecision::Deduped {
+                    source: source_agent_id.to_string(),
+                    target: target_agent_id,
+                };
             }
         }
         d.last
@@ -303,6 +317,21 @@ fn apply_decision<R: Runtime>(
 ) {
     match decision {
         RouteDecision::NoOp => {}
+        RouteDecision::Deduped { source, target } => {
+            // Silent at INFO; only an overlay-event for visibility so
+            // the user can see "this would've fired again but we
+            // suppressed it as a repaint duplicate". No log spam,
+            // no near-miss WARN (the pattern matcher upstream only
+            // checks NoOp).
+            let _ = app.emit(
+                "swarm-term:route",
+                json!({
+                    "source": source,
+                    "target": target,
+                    "outcome": "deduped",
+                }),
+            );
+        }
         RouteDecision::UnknownTarget { source, target, body } => {
             // `target_lookup_failed` instead of the agent name —
             // we don't know the source pane here, so this notice
@@ -742,7 +771,9 @@ mod tests {
             now,
         );
         assert!(matches!(r1, RouteDecision::Route { .. }));
-        // Repaint of the same row 100 ms later — must NOT re-fire.
+        // Repaint of the same row 100 ms later — must dedupe-suppress.
+        // The decision is `Deduped` (not `NoOp`) so the near-miss
+        // diagnostic doesn't fire a misleading WARN for it.
         let r2 = decide_route(
             ">> @scout: do thing",
             "orchestrator",
@@ -751,7 +782,10 @@ mod tests {
             &d,
             now + Duration::from_millis(100),
         );
-        assert_eq!(r2, RouteDecision::NoOp);
+        assert!(
+            matches!(r2, RouteDecision::Deduped { .. }),
+            "expected Deduped, got {r2:?}"
+        );
     }
 
     #[test]

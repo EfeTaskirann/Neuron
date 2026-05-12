@@ -44,7 +44,14 @@ const ALLOWED: &[(&str, &[&str])] = &[
             "integration-tester",
         ],
     ),
-    ("scout", &["coordinator", "orchestrator"]),
+    // Research tier: scout ↔ planner direct edge is intentional.
+    // Planner could already reach scout ("@scout: find X"); without
+    // the reverse edge scout couldn't reply to planner's question
+    // directly (`@planner: found X`) and was forced through
+    // coordinator. Asymmetric was the v1 default; v2 makes it
+    // symmetric so the most common research-research handoff stops
+    // emitting `route denied` noise and stops adding a hop's latency.
+    ("scout", &["coordinator", "orchestrator", "planner"]),
     ("planner", &["coordinator", "scout", "orchestrator"]),
     (
         "backend-builder",
@@ -126,6 +133,13 @@ mod tests {
         let scout_allowed = allowed_for("scout");
         assert!(scout_allowed.contains(&"coordinator"));
         assert!(scout_allowed.contains(&"orchestrator"));
-        assert_eq!(scout_allowed.len(), 2);
+        assert!(scout_allowed.contains(&"planner"));
+        assert_eq!(scout_allowed.len(), 3);
+    }
+
+    #[test]
+    fn scout_planner_edge_is_symmetric() {
+        assert!(is_allowed("scout", "planner"));
+        assert!(is_allowed("planner", "scout"));
     }
 }

@@ -373,32 +373,59 @@ impl TerminalSwarmRegistry {
 fn build_persona_payload(agent_id: &str, body: &str) -> String {
     let allowed: Vec<String> =
         allowed_for(agent_id).iter().map(|s| s.to_string()).collect();
+    // NOTE: every `>>` in the persona FOOTER examples below is
+    // emitted as `&gt;&gt;` — HTML-entity-escaped — on purpose. The
+    // marker parser correctly rejects `&gt;&gt;` prefixes (see the
+    // 0c157b6 test `substring_fallback_rejects_html_escaped_marker_in_docs`),
+    // so when claude's REPL renders this persona body back to its
+    // PTY at injection time the example lines DO NOT fire phantom
+    // routes. The agent reads them as syntax illustrations; when it
+    // actually wants to dispatch it writes `>>` (literal ASCII).
+    // This eliminates the session-start "scout→scout denied" burst
+    // that confused the 2026-05-12 22:11Z smoke logs.
     let routing = format!(
         "\n\n## Routing protocol — KRİTİK\n\n\
          Sen bu swarm'ın bir ajanısın (`{agent_id}`). Diğer ajanlara\n\
          mesaj yönlendirmenin TEK YOLU şu literal formatı **kendi başına\n\
          bir satırda**, satır başında, dekoratörsüz yazmak:\n\n\
-         >> @<agent-id>: <mesaj>\n\n\
-         **Doğru örnekler (bu satırlar router tarafından yakalanır):**\n\n\
-         >> @scout: api/auth.ts dosyasını oku ve özet çıkar\n\
-         >> @planner: scout sonucunu 3 maddelik plana çevir\n\n\
-         **Yanlış örnekler (router YAKALAYAMAZ, route düşmez):**\n\n\
+         &gt;&gt; @&lt;agent-id&gt;: &lt;mesaj&gt;\n\n\
+         (Yukarıdaki `&gt;&gt;` HTML-escape sadece bu açıklamayı yazarken;\n\
+         GERÇEK dispatch'te `&gt;` yerine literal `&gt;` karakterini yazacaksın —\n\
+         yani satır başında iki tane greater-than işareti.)\n\n\
+         **Doğru syntax örnekleri (escape ile gösterildi; sen `>>` yaz):**\n\n\
+         &gt;&gt; @scout: src-tauri/src/foo.rs dosyasındaki `bar` fonksiyonunu bul\n\
+         &gt;&gt; @planner: scout sonucuna göre 3 maddelik plan çıkar\n\n\
+         **Yanlış örnekler (router yakalamaz):**\n\n\
          - `Şimdi scout'a soracağım: api/auth.ts'i oku` (markerless prose)\n\
-         - `- >> @scout: ...` (yine olur ama bullet ekleme gereksiz)\n\
-         - `Sıradaki: @scout: api'yi oku` (`>>` yok)\n\
-         - `\"...\" şeklinde @scout: ...` (`>>` yok)\n\n\
+         - `Sıradaki: @scout: api'yi oku` (`&gt;&gt;` yok)\n\
+         - `\"...\" şeklinde @scout: ...` (`&gt;&gt;` yok)\n\n\
          **Kurallar:**\n\n\
-         1. Routing satırını başka metinle aynı satıra koyma.\n\
-         2. Birden fazla ajana gönderecekseniz her birini ayrı satıra\n\
-            yaz — sırayla ikisi de route edilir.\n\
+         1. Routing satırını başka metinle aynı satıra koyma. Tek başına bir satır.\n\
+         2. Birden fazla ajana gönderecekseniz her birini ayrı satıra yaz.\n\
          3. Senin izin verilen destinasyonların: {allowed_list}.\n\
-         4. İzin verilmeyen hedefe yazarsan sistem RoutingOverlay'de\n\
-            `denied` etiketiyle gösterir; başka hedef seç.\n\
-         5. Sana gelen mesajların altında `— from @<gönderen>` imzası\n\
-            olur — kime cevap verdiğini bu imzaya bakarak belirle.\n\n\
-         **İLK YANIT:** Bu mesajı aldıktan sonra **yalnızca** şunu yaz\n\
-         ve sus: `@{agent_id} hazır.` — başka tek karakter yazma. Bir\n\
-         sonraki kullanıcı / route mesajını bekle.",
+         4. İzin verilmeyen hedefe yazarsan sistem RoutingOverlay'de `denied`\n\
+            etiketiyle gösterir; başka hedef seç ya da coordinator'a sor.\n\
+         5. Sana gelen mesajların altında `— from @<gönderen>` imzası olur —\n\
+            kime cevap vereceğini bu imzaya bakarak belirle.\n\n\
+         ## Çalışma protokolü (4-state contract) — KRİTİK\n\n\
+         Sana bir dispatch geldiğinde **4 durumdan birine girersin** ve\n\
+         gönderene açıkça bildirirsin. Sessiz kalma — gönderen senin hangi\n\
+         state'de olduğunu bilmeden ilerleyemez.\n\n\
+         1. **alındı** (5 saniye içinde): `&gt;&gt; @<gönderen>: alındı — <bir cümlelik anlayışın>`.\n\
+            Bu acknowledgement'tır; sender kaybolmadığını bilir.\n\
+         2. **tamam** (iş bittiğinde): `&gt;&gt; @<gönderen>: tamam — <sonuç özeti,\n\
+            dosya yolları, ne değişti>`. Bu completion signal'idir; sender\n\
+            bir sonraki adıma geçer.\n\
+         3. **belirsiz** (dispatch net değilse): `&gt;&gt; @<gönderen>: belirsiz —\n\
+            <spesifik sorun: hangi dosya? hangi tür değişiklik?>` ve DUR.\n\
+            KESİNLİKLE tahmin yapma; tahminle çalışırsan reviewer reject eder.\n\
+         4. **hata** (yapamadıysan): `&gt;&gt; @<gönderen>: hata — <somut sebep:\n\
+            dosya yok / compile fail / tool izin yok>` ve dur.\n\n\
+         Bu 4 state swarm'ın state machine'idir. Eksiksiz uy.\n\n\
+         **İLK YANIT (kullanıcı/route gelmeden önce):** Bu persona mesajını\n\
+         aldıktan sonra **yalnızca** şunu yaz ve sus: `@{agent_id} hazır.`\n\
+         — başka tek karakter yazma. Bir sonraki kullanıcı/route mesajını\n\
+         bekle.",
         agent_id = agent_id,
         allowed_list = if allowed.is_empty() {
             "(yok)".to_string()
@@ -467,9 +494,39 @@ mod tests {
     fn payload_includes_routing_protocol_and_allowed_destinations() {
         let p = build_persona_payload("scout", "x");
         assert!(p.contains("## Routing protocol"));
-        assert!(p.contains(">> @<agent-id>: <mesaj>"));
+        // Syntax illustration uses HTML entities so persona injection
+        // doesn't fire phantom routes from echoed examples.
+        assert!(p.contains("&gt;&gt; @&lt;agent-id&gt;: &lt;mesaj&gt;"));
         assert!(p.contains("coordinator"));
         assert!(p.contains("orchestrator"));
+    }
+
+    #[test]
+    fn payload_example_lines_do_not_contain_literal_marker_at_col0() {
+        // Belt-and-suspenders: literal `>> @<real-agent>:` at the
+        // start of a line would still fire a route at injection
+        // time, because the marker regex's relaxed prefix lets it
+        // match. So the persona footer MUST escape every `>>` in
+        // examples; this test pins that property by asserting no
+        // line in the payload starts with `>> @<known-agent>:`.
+        let p = build_persona_payload("orchestrator", "x");
+        for line in p.split('\n') {
+            assert!(
+                !line.starts_with(">> @"),
+                "persona footer has bare `>> @` at column 0 — example would fire a phantom route: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn payload_includes_lifecycle_protocol() {
+        // The 4-state contract (alındı / tamam / belirsiz / hata) is
+        // load-bearing for stopping `ne yapayım?` heartbeat loops.
+        let p = build_persona_payload("scout", "x");
+        assert!(p.contains("alındı"));
+        assert!(p.contains("tamam"));
+        assert!(p.contains("belirsiz"));
+        assert!(p.contains("hata"));
     }
 
     #[test]
