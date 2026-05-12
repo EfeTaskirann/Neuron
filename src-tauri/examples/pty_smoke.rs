@@ -2,12 +2,26 @@
 //! and prints whatever it emits across a 6-second window, optionally
 //! poking stdin to see if the REPL is waiting for an Enter to render.
 //!
-//! Diagnoses two failure modes:
+//! Mirrors `sidecar::terminal::spawn_pane` for the `agent_kind="claude-code"`
+//! path so it reproduces what the Tauri app does in isolation:
+//!
+//!   * spawn flag is `--permission-mode bypassPermissions` (NOT the
+//!     `--dangerously-skip-permissions` toggle that retriggers the
+//!     safety-confirmation dialog on every spawn).
+//!   * `CLAUDE_CODE_*` / `CLAUDECODE` / `ANTHROPIC_API_KEY` /
+//!     `USE_BEDROCK` / `USE_VERTEX` / `USE_FOUNDRY` env vars are
+//!     scrubbed before spawn so an outer claude session can't pollute
+//!     the child and force it onto the OAuth login picker.
+//!
+//! Diagnoses three failure modes:
 //!   (a) claude emits NOTHING under portable-pty — TTY-detection issue
 //!   (b) claude emits a few bytes (e.g. mode escapes) and then waits
 //!       for keystrokes before painting the banner — fixable by sending
 //!       a `\r` after a short delay, by setting `TERM`, or by
 //!       triggering a resize.
+//!   (c) claude renders the "Select login method" OAuth picker even
+//!       though `~/.claude/.credentials.json` is valid — env-var
+//!       pollution from a parent claude session.
 //!
 //! Run with:
 //!   $env:CARGO_TARGET_DIR='src-tauri\target-smoke'
@@ -15,6 +29,19 @@
 //!
 //! Optional first arg: path to a claude binary (defaults to the npm
 //! install layout).
+//!
+//! Env flags:
+//!   NEURON_SMOKE_TERM=1            inject TERM=xterm-256color
+//!   NEURON_SMOKE_RESIZE=1          mid-flight SIGWINCH equivalent
+//!   NEURON_SMOKE_POKE=1            send `\r` at 800ms
+//!   NEURON_SMOKE_KEEP_CLAUDE_ENV=1 SKIP the CLAUDE_CODE_* strip, so
+//!                                  the smoke reproduces the OAuth-
+//!                                  picker bug under env-var pollution
+//!                                  (use to confirm the fix matters).
+//!   NEURON_SMOKE_LEGACY_FLAG=1     use `--dangerously-skip-permissions`
+//!                                  instead of `--permission-mode
+//!                                  bypassPermissions` (compares the
+//!                                  two flag modes side by side).
 
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
@@ -22,6 +49,24 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+
+/// Mirror of `sidecar::terminal::CLAUDE_AGENT_STRIPPED_ENV`. Kept in
+/// sync by hand — the smoke example is a standalone bin and cannot
+/// import from the neuron lib without dragging the whole crate graph
+/// in. If the production list changes, update here too.
+const CLAUDE_AGENT_STRIPPED_ENV: &[&str] = &[
+    "CLAUDECODE",
+    "CLAUDE_CODE_SESSION_ID",
+    "CLAUDE_CODE_ENTRYPOINT",
+    "CLAUDE_CODE_EXECPATH",
+    "CLAUDE_CODE_AGENT",
+    "CLAUDE_EFFORT",
+    "AI_AGENT",
+    "ANTHROPIC_API_KEY",
+    "USE_BEDROCK",
+    "USE_VERTEX",
+    "USE_FOUNDRY",
+];
 
 fn hex_dump(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 4);
@@ -79,10 +124,27 @@ fn main() {
     let do_poke = std::env::var("NEURON_SMOKE_POKE")
         .map(|v| v == "1")
         .unwrap_or(false);
+    let keep_claude_env = std::env::var("NEURON_SMOKE_KEEP_CLAUDE_ENV")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    let legacy_flag = std::env::var("NEURON_SMOKE_LEGACY_FLAG")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+
+    let (flag_a, flag_b): (&str, Option<&str>) = if legacy_flag {
+        ("--dangerously-skip-permissions", None)
+    } else {
+        ("--permission-mode", Some("bypassPermissions"))
+    };
+    let flag_display = match flag_b {
+        Some(v) => format!("{flag_a} {v}"),
+        None => flag_a.to_string(),
+    };
 
     eprintln!(
-        "[smoke] spawning: {claude_path} --dangerously-skip-permissions  \
-         (TERM={inject_term}, resize={do_resize}, poke-stdin={do_poke})"
+        "[smoke] spawning: {claude_path} {flag_display}  \
+         (TERM={inject_term}, resize={do_resize}, poke-stdin={do_poke}, \
+         keep-claude-env={keep_claude_env})"
     );
     let pty_system = native_pty_system();
     let pair = pty_system
@@ -95,11 +157,29 @@ fn main() {
         .expect("openpty");
 
     let mut cmd = CommandBuilder::new(&claude_path);
-    cmd.arg("--dangerously-skip-permissions");
+    cmd.arg(flag_a);
+    if let Some(v) = flag_b {
+        cmd.arg(v);
+    }
     cmd.cwd(std::env::current_dir().unwrap());
     cmd.set_controlling_tty(true);
     if inject_term {
         cmd.env("TERM", "xterm-256color");
+    }
+    // Mirror `sidecar::terminal::CLAUDE_AGENT_STRIPPED_ENV`. Without
+    // this, running the smoke from inside a claude session re-runs
+    // the OAuth login picker on every spawn even though credentials
+    // are valid — see commit 774e0ad.
+    if !keep_claude_env {
+        for var in CLAUDE_AGENT_STRIPPED_ENV {
+            cmd.env_remove(var);
+        }
+        eprintln!(
+            "[smoke] stripped {} CLAUDE_*/ANTHROPIC_* env vars",
+            CLAUDE_AGENT_STRIPPED_ENV.len()
+        );
+    } else {
+        eprintln!("[smoke] KEEPING CLAUDE_* env vars (pollution mode)");
     }
 
     let mut child = pair.slave.spawn_command(cmd).expect("spawn");
