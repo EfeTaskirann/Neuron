@@ -37,6 +37,18 @@ const READY_DELAY_MS: u64 = 1500;
 /// var is set, so production paths pay zero cost.
 const AUTO_PROMPT_DELAY_MS: u64 = 10_000;
 
+/// Gap between consecutive `claude.exe` PTY spawns. claude writes
+/// `~/.claude.json` (startup counter, tipsHistory, lastPlanModeUse
+/// etc.) within the first ~300 ms of process boot. Without a gap,
+/// 9 parallel-ish spawns all open the file in write mode, race,
+/// and leave it as concatenated `...}\n}\n}` — invalid JSON. On
+/// next launch claude refuses to start and shows
+/// `Configuration Error: invalid JSON` (the user hit this in the
+/// 2026-05-12 22:11Z smoke; all 9 panes died with `exit 1`).
+/// 500 ms is generous against observed first-write timing and
+/// imperceptible against the 11–13 s persona-injection budget.
+const SPAWN_STAGGER_MS: u64 = 500;
+
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct TerminalSwarmSessionHandle {
@@ -144,7 +156,13 @@ impl TerminalSwarmRegistry {
 
         let mut panes_by_agent: HashMap<String, String> = HashMap::new();
         let mut spawned: Vec<String> = Vec::new();
-        for &agent_id in AGENT_IDS {
+        for (idx, &agent_id) in AGENT_IDS.iter().enumerate() {
+            // Stagger spawns so each claude.exe finishes its
+            // `~/.claude.json` startup write before the next process
+            // opens the same file in write mode. See SPAWN_STAGGER_MS.
+            if idx > 0 {
+                tokio::time::sleep(Duration::from_millis(SPAWN_STAGGER_MS)).await;
+            }
             let input = PaneSpawnInput {
                 cwd: project_str.clone(),
                 cmd: Some(cmd.clone()),
