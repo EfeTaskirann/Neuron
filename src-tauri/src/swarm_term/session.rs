@@ -471,8 +471,9 @@ fn seed_pane_home(
     })?;
     let real_home = real_user_home()?;
     let real_claude_json = real_home.join(".claude.json");
-    let real_credentials = real_home.join(".claude").join(".credentials.json");
+    let real_claude_dir = real_home.join(".claude");
 
+    // Top-level: copy `~/.claude.json` (one file, ~27 KB).
     if real_claude_json.is_file() {
         std::fs::copy(&real_claude_json, pane_home.join(".claude.json"))
             .map_err(|e| {
@@ -482,6 +483,30 @@ fn seed_pane_home(
                 ))
             })?;
     }
+
+    // `~/.claude/` directory: shallow copy of FILES (skip
+    // subdirectories). The 2026-05-13 00:41Z smoke proved that
+    // copying only `.credentials.json` is not enough — claude.exe
+    // exited within ~15 s when its expected `settings.json` and
+    // friends were missing. The full file set in the user's
+    // `~/.claude/` includes:
+    //   .credentials.json        (OAuth tokens, ~500 B)
+    //   .last-cleanup            (timestamp, ~24 B)
+    //   history.jsonl            (prompt history, can be 100s of KB)
+    //   mcp-needs-auth-cache.json
+    //   settings.json            (claude settings, ~200 B)
+    //   settings.local.json
+    // …plus subdirs (backups/, cache/, file-history/, paste-cache/,
+    // plans/, plugins/, projects/, session-env/, sessions/,
+    // shell-snapshots/, tasks/).
+    //
+    // We copy every TOP-LEVEL FILE, including history.jsonl (the
+    // most expensive at ~100 KB), so claude has the complete
+    // settings surface. Subdirectories are not copied — claude
+    // recreates whatever it needs on demand and the runtime state
+    // there (sessions, plans, projects) is naturally per-process
+    // anyway. This keeps the disk footprint to ~9 × ~150 KB ≈
+    // 1.4 MB per swarm-term session, cleaned up in `stop()`.
     let pane_claude_dir = pane_home.join(".claude");
     std::fs::create_dir_all(&pane_claude_dir).map_err(|e| {
         AppError::Internal(format!(
@@ -489,17 +514,26 @@ fn seed_pane_home(
             pane_claude_dir.display()
         ))
     })?;
-    if real_credentials.is_file() {
-        std::fs::copy(
-            &real_credentials,
-            pane_claude_dir.join(".credentials.json"),
-        )
-        .map_err(|e| {
-            AppError::Internal(format!(
-                "copy {} → pane: {e}",
-                real_credentials.display()
-            ))
-        })?;
+    if real_claude_dir.is_dir() {
+        if let Ok(read) = std::fs::read_dir(&real_claude_dir) {
+            for entry in read.flatten() {
+                let src = entry.path();
+                let Ok(meta) = entry.metadata() else { continue };
+                if !meta.is_file() {
+                    continue;
+                }
+                let Some(name) = src.file_name() else { continue };
+                let dst = pane_claude_dir.join(name);
+                if let Err(e) = std::fs::copy(&src, &dst) {
+                    tracing::warn!(
+                        agent_id = %agent_id,
+                        src = %src.display(),
+                        error = %e,
+                        "swarm-term: pane home seed — file copy failed (non-fatal)"
+                    );
+                }
+            }
+        }
     }
     Ok(pane_home)
 }
