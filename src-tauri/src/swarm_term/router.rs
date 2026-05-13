@@ -514,23 +514,33 @@ fn strip_ansi(s: &str) -> String {
                 let params = &bytes[start..j];
                 match final_b {
                     b'C' => {
+                        // Cursor-right — substitute spaces. Preserves
+                        // intra-line visual layout (column-tab style).
                         let n = first_uint_or(params, 1).min(200);
                         for _ in 0..n {
                             out.push(' ');
                         }
                     }
-                    b'B' | b'E' => {
-                        let n = first_uint_or(params, 1).min(20);
-                        for _ in 0..n {
-                            out.push('\n');
-                        }
-                    }
-                    b'H' | b'f' => {
-                        // Avoid stacking redundant newlines when claude
-                        // jumps to the same column twice in a row.
-                        if !out.ends_with('\n') {
-                            out.push('\n');
-                        }
+                    b'B' | b'E' | b'H' | b'f' => {
+                        // Cursor-down (B/E) and cursor-position (H/f).
+                        // Pre-2026-05-13: these were emitted as `\n`
+                        // so visual rows mapped to text lines. But
+                        // claude's streaming responses use cursor
+                        // moves mid-stream to update its spinner /
+                        // status bar — a single assistant marker
+                        // line gets split into multiple `\n`-
+                        // separated chunks, and the body capture
+                        // only grabs the first chunk ("~5 kelime
+                        // kesilme" — observed verbatim in the
+                        // 2026-05-13 00:49Z smoke). For marker
+                        // routing we don't care about visual rows;
+                        // we care about logical content. Discard
+                        // these escape sequences silently so the
+                        // full body stays on one segment. The PTY
+                        // reader still splits on real `\n` bytes
+                        // upstream, so genuine line breaks are
+                        // preserved — only cursor-positioning is
+                        // suppressed.
                     }
                     _ => { /* SGR, mode-set, erase, …: strip */ }
                 }
@@ -653,6 +663,36 @@ mod tests {
         // Latin-1 path mangled these into `Ä±` / `Å` and broke any
         // body text comparison.
         assert_eq!(strip_ansi("Hedef mesajın boş geldi"), "Hedef mesajın boş geldi");
+    }
+
+    #[test]
+    fn strip_ansi_does_not_split_marker_body_on_cursor_position() {
+        // The 2026-05-13 00:49Z smoke saw orchestrator complain that
+        // scout's responses were truncated to ~5 words. Root cause:
+        // claude's REPL streams its response while updating a spinner
+        // via `\x1b[r;cH` cursor-position sequences. The old strip_ansi
+        // turned every such sequence into a `\n`, which the router
+        // then used as a body terminator — so a long response landed
+        // as a 5-word body + several orphan continuation lines.
+        // Post-fix strip_ansi silently drops cursor-position /
+        // cursor-down sequences; the full body stays on one segment.
+        let raw = ">> @scout: Bulgular: src/main.rs:42 M flag tanımı\x1b[10;1Hsuffix that used to be lost\x1b[15;3H— from earlier rev";
+        let stripped = strip_ansi(raw);
+        let m = parse_marker_line(&stripped).expect("marker must parse intact");
+        assert_eq!(m.target, "scout");
+        // The pre-fix output was "Bulgular: src/main.rs:42 M flag tanımı"
+        // (truncated at the first `\x1b[H`). Post-fix the body extends
+        // through the rest of the input.
+        assert!(
+            m.body.contains("suffix that used to be lost"),
+            "body truncated by cursor-position cut: {}",
+            m.body
+        );
+        assert!(
+            m.body.contains("from earlier rev"),
+            "body truncated by second cursor-position cut: {}",
+            m.body
+        );
     }
 
     #[test]
