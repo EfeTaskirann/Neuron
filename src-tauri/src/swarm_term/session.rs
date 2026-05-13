@@ -74,6 +74,11 @@ pub(crate) struct ActiveSession {
     pub project_dir: PathBuf,
     pub panes_by_agent: HashMap<String, String>,
     pub router_listeners: Vec<EventId>,
+    /// Per-session HOME isolation root (under
+    /// `app_data_dir/swarm-term/homes/<session_id>`). Cleaned up
+    /// in `stop()`. `None` for synthetic / test sessions that
+    /// bypass the spawn loop.
+    pub homes_root: Option<PathBuf>,
 }
 
 impl TerminalSwarmRegistry {
@@ -154,15 +159,49 @@ impl TerminalSwarmRegistry {
             app.state::<TerminalRegistry>().inner().clone();
         let pool = app.state::<DbPool>().inner().clone();
 
+        // Per-session HOME isolation root. Each pane gets a private
+        // subdir with copies of `~/.claude.json` + `~/.claude/.credentials.json`
+        // so the 9 claude.exe processes don't race on the user's
+        // real `~/.claude.json` and truncate it (the 2026-05-12 23:46Z
+        // smoke saw 27000 → 1023 bytes corruption from concurrent writes).
+        // Cleaned up in `stop()` via `fs::remove_dir_all`.
+        let session_id = format!("swarm-term-{}", Ulid::new());
+        let homes_root = prepare_isolated_homes_root(&app, &session_id)?;
+
         let mut panes_by_agent: HashMap<String, String> = HashMap::new();
         let mut spawned: Vec<String> = Vec::new();
         for (idx, &agent_id) in AGENT_IDS.iter().enumerate() {
             // Stagger spawns so each claude.exe finishes its
             // `~/.claude.json` startup write before the next process
-            // opens the same file in write mode. See SPAWN_STAGGER_MS.
+            // opens the same file in write mode. With per-pane HOME
+            // isolation the race window is eliminated structurally,
+            // but stagger stays as defence-in-depth + UI smoothing
+            // (panes appear one at a time instead of in a burst).
             if idx > 0 {
                 tokio::time::sleep(Duration::from_millis(SPAWN_STAGGER_MS)).await;
             }
+            let pane_home = match seed_pane_home(&homes_root, agent_id) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::error!(
+                        agent_id = %agent_id,
+                        error = %e,
+                        "swarm-term: failed to seed pane HOME — falling back to shared HOME (corruption risk)"
+                    );
+                    // Roll back already-spawned panes + bail.
+                    for pid in &spawned {
+                        let _ = registry.kill_pane(pid, &pool).await;
+                    }
+                    let _ = std::fs::remove_dir_all(&homes_root);
+                    return Err(AppError::Internal(format!(
+                        "seed_pane_home({agent_id}): {e}"
+                    )));
+                }
+            };
+            let mut extra_env: HashMap<String, String> = HashMap::new();
+            let pane_home_str = pane_home.display().to_string();
+            extra_env.insert("HOME".to_string(), pane_home_str.clone());
+            extra_env.insert("USERPROFILE".to_string(), pane_home_str);
             let input = PaneSpawnInput {
                 cwd: project_str.clone(),
                 cmd: Some(cmd.clone()),
@@ -182,6 +221,7 @@ impl TerminalSwarmRegistry {
                 agent_kind: Some("claude-code".into()),
                 role: Some(agent_id.to_string()),
                 workspace: Some("swarm-term".into()),
+                extra_env: Some(extra_env),
             };
             match registry
                 .clone()
@@ -212,10 +252,11 @@ impl TerminalSwarmRegistry {
             crate::swarm_term::router::install(app.clone(), panes_by_agent.clone());
 
         let session = ActiveSession {
-            session_id: format!("swarm-term-{}", Ulid::new()),
+            session_id,
             project_dir: project_dir.clone(),
             panes_by_agent: panes_by_agent.clone(),
             router_listeners,
+            homes_root: Some(homes_root),
         };
         let handle = handle_from(&session);
         {
@@ -336,7 +377,11 @@ impl TerminalSwarmRegistry {
         &self,
         app: AppHandle<R>,
     ) -> Result<(), AppError> {
-        let (pane_ids, listeners): (Vec<String>, Vec<EventId>) = {
+        let (pane_ids, listeners, homes_root): (
+            Vec<String>,
+            Vec<EventId>,
+            Option<PathBuf>,
+        ) = {
             let mut guard = self.inner.lock().map_err(|_| {
                 AppError::Internal("swarm-term registry poisoned".into())
             })?;
@@ -344,6 +389,7 @@ impl TerminalSwarmRegistry {
                 Some(s) => (
                     s.panes_by_agent.into_values().collect(),
                     s.router_listeners,
+                    s.homes_root,
                 ),
                 None => return Ok(()),
             }
@@ -356,8 +402,128 @@ impl TerminalSwarmRegistry {
         for pid in pane_ids {
             let _ = registry.kill_pane(&pid, &pool).await;
         }
+        // Clean up the isolated HOME directory tree after all panes
+        // are dead. claude.exe stops writing to its per-pane
+        // `.claude.json` once the process exits, so `remove_dir_all`
+        // is safe to run unconditionally — no race against an active
+        // writer. Errors here are logged but don't fail the stop
+        // call (the temp homes accumulate harmlessly until the next
+        // session if removal fails for any reason).
+        if let Some(root) = homes_root {
+            if let Err(e) = std::fs::remove_dir_all(&root) {
+                tracing::warn!(
+                    path = %root.display(),
+                    error = %e,
+                    "swarm-term: isolated homes cleanup failed"
+                );
+            } else {
+                tracing::info!(
+                    path = %root.display(),
+                    "swarm-term: isolated homes cleaned up"
+                );
+            }
+        }
         Ok(())
     }
+}
+
+/// Create the per-session HOME isolation root under
+/// `app_data_dir/swarm-term/homes/<session_id>/`. The directory is
+/// fresh each session — no carry-over between sessions, no cleanup
+/// race against running panes.
+fn prepare_isolated_homes_root<R: Runtime>(
+    app: &AppHandle<R>,
+    session_id: &str,
+) -> Result<PathBuf, AppError> {
+    let app_data = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| AppError::Internal(format!("app_data_dir: {e}")))?;
+    let root = app_data
+        .join("swarm-term")
+        .join("homes")
+        .join(session_id);
+    std::fs::create_dir_all(&root).map_err(|e| {
+        AppError::Internal(format!("mkdir {}: {e}", root.display()))
+    })?;
+    Ok(root)
+}
+
+/// Seed a per-pane HOME directory by copying the user's real
+/// `~/.claude.json` + `~/.claude/.credentials.json` into the pane's
+/// isolated home. Once the claude.exe in that pane has its own
+/// private `~/.claude.json` to read/write, the 9-way concurrent-write
+/// race on the real shared file is eliminated.
+///
+/// The copies are one-shot snapshots taken at session-start. claude's
+/// runtime writes (tipsHistory, lastPlanModeUse, etc.) go to the
+/// per-pane copies and are discarded when the session ends. This
+/// keeps the user's real config stable across sessions; the only
+/// downside is per-pane state diverges over time within a long
+/// session (unlikely to matter — these counters are cosmetic).
+fn seed_pane_home(
+    homes_root: &Path,
+    agent_id: &str,
+) -> Result<PathBuf, AppError> {
+    let pane_home = homes_root.join(agent_id);
+    std::fs::create_dir_all(&pane_home).map_err(|e| {
+        AppError::Internal(format!("mkdir {}: {e}", pane_home.display()))
+    })?;
+    let real_home = real_user_home()?;
+    let real_claude_json = real_home.join(".claude.json");
+    let real_credentials = real_home.join(".claude").join(".credentials.json");
+
+    if real_claude_json.is_file() {
+        std::fs::copy(&real_claude_json, pane_home.join(".claude.json"))
+            .map_err(|e| {
+                AppError::Internal(format!(
+                    "copy {} → pane: {e}",
+                    real_claude_json.display()
+                ))
+            })?;
+    }
+    let pane_claude_dir = pane_home.join(".claude");
+    std::fs::create_dir_all(&pane_claude_dir).map_err(|e| {
+        AppError::Internal(format!(
+            "mkdir {}: {e}",
+            pane_claude_dir.display()
+        ))
+    })?;
+    if real_credentials.is_file() {
+        std::fs::copy(
+            &real_credentials,
+            pane_claude_dir.join(".credentials.json"),
+        )
+        .map_err(|e| {
+            AppError::Internal(format!(
+                "copy {} → pane: {e}",
+                real_credentials.display()
+            ))
+        })?;
+    }
+    Ok(pane_home)
+}
+
+/// Resolve the user's real home directory. Mirrors the same
+/// fallback chain that `swarm::binding::home_dir` uses (HOME first,
+/// USERPROFILE on Windows) since we don't want to take a new
+/// `dirs` crate dependency just for one call site.
+fn real_user_home() -> Result<PathBuf, AppError> {
+    if let Ok(home) = std::env::var("HOME") {
+        if !home.is_empty() {
+            return Ok(PathBuf::from(home));
+        }
+    }
+    if cfg!(target_os = "windows") {
+        if let Ok(profile) = std::env::var("USERPROFILE") {
+            if !profile.is_empty() {
+                return Ok(PathBuf::from(profile));
+            }
+        }
+    }
+    Err(AppError::Internal(
+        "cannot resolve user home directory (HOME and USERPROFILE both unset)".into(),
+    ))
 }
 
 /// Build the persona-injection payload for one agent.
@@ -373,32 +539,41 @@ impl TerminalSwarmRegistry {
 fn build_persona_payload(agent_id: &str, body: &str) -> String {
     let allowed: Vec<String> =
         allowed_for(agent_id).iter().map(|s| s.to_string()).collect();
-    // NOTE: every `>>` in the persona FOOTER examples below is
-    // emitted as `&gt;&gt;` — HTML-entity-escaped — on purpose. The
-    // marker parser correctly rejects `&gt;&gt;` prefixes (see the
-    // 0c157b6 test `substring_fallback_rejects_html_escaped_marker_in_docs`),
-    // so when claude's REPL renders this persona body back to its
-    // PTY at injection time the example lines DO NOT fire phantom
-    // routes. The agent reads them as syntax illustrations; when it
-    // actually wants to dispatch it writes `>>` (literal ASCII).
-    // This eliminates the session-start "scout→scout denied" burst
-    // that confused the 2026-05-12 22:11Z smoke logs.
+    // NOTE: the example marker lines below use HTML entities
+    // (`&gt;&gt;`) instead of literal `>>` so that when claude's
+    // REPL renders this persona body back to its PTY at injection
+    // time, the example lines do NOT fire phantom routes. The
+    // marker parser correctly rejects the `&gt;&gt;` prefix (pinned
+    // by `substring_fallback_rejects_html_escaped_marker_in_docs`).
+    //
+    // The PROSE that EXPLAINS the syntax to claude refers to the
+    // marker characters by NAME (`iki adet "greater-than" işareti`,
+    // also written `>>` plainly inside paragraph prose). Earlier
+    // attempt at v3 had `\`&gt;\` yerine literal \`&gt;\`` — both
+    // halves were the same escaped entity, which read as a
+    // tautology and confused claude into emitting `&gt;&gt;` in its
+    // real dispatches (78-second silence in the 2026-05-12 23:45Z
+    // smoke). This v4 keeps prose mentions of `>>` literal because
+    // they're inline (not at column-0 line start, so the marker
+    // regex won't false-positive on them).
     let routing = format!(
         "\n\n## Routing protocol — KRİTİK\n\n\
          Sen bu swarm'ın bir ajanısın (`{agent_id}`). Diğer ajanlara\n\
-         mesaj yönlendirmenin TEK YOLU şu literal formatı **kendi başına\n\
-         bir satırda**, satır başında, dekoratörsüz yazmak:\n\n\
-         &gt;&gt; @&lt;agent-id&gt;: &lt;mesaj&gt;\n\n\
-         (Yukarıdaki `&gt;&gt;` HTML-escape sadece bu açıklamayı yazarken;\n\
-         GERÇEK dispatch'te `&gt;` yerine literal `&gt;` karakterini yazacaksın —\n\
-         yani satır başında iki tane greater-than işareti.)\n\n\
-         **Doğru syntax örnekleri (escape ile gösterildi; sen `>>` yaz):**\n\n\
+         mesaj yollamak için **satır başında**, dekoratörsüz, kendi\n\
+         başına bir satır olarak şunu yaz:\n\n\
+             [iki tane > karakteri] [boşluk] @<hedef-ajan-id> [iki nokta] [boşluk] <mesaj gövdesi>\n\n\
+         Yani literal olarak: chevron-chevron + space + @ + agent-id + colon + space + body.\n\
+         Aşağıda örnekler verirken bu chevron çiftini `&gt;&gt;` olarak\n\
+         HTML-escape ediyorum (persona injection sırasında yanlışlıkla\n\
+         route fire etmesinler diye); SEN gerçek dispatch yazarken\n\
+         doğrudan iki greater-than karakterini (ASCII 0x3E ikilisi) kullan.\n\n\
+         **Syntax örnekleri (sen `&gt;&gt;` yerine düz iki chevron yaz):**\n\n\
          &gt;&gt; @scout: src-tauri/src/foo.rs dosyasındaki `bar` fonksiyonunu bul\n\
          &gt;&gt; @planner: scout sonucuna göre 3 maddelik plan çıkar\n\n\
          **Yanlış örnekler (router yakalamaz):**\n\n\
-         - `Şimdi scout'a soracağım: api/auth.ts'i oku` (markerless prose)\n\
-         - `Sıradaki: @scout: api'yi oku` (`&gt;&gt;` yok)\n\
-         - `\"...\" şeklinde @scout: ...` (`&gt;&gt;` yok)\n\n\
+         - `Şimdi scout'a soracağım: api/auth.ts'i oku` (chevron yok)\n\
+         - `Sıradaki: @scout: api'yi oku` (chevron yok)\n\
+         - `\"...\" şeklinde @scout: ...` (chevron yok)\n\n\
          **Kurallar:**\n\n\
          1. Routing satırını başka metinle aynı satıra koyma. Tek başına bir satır.\n\
          2. Birden fazla ajana gönderecekseniz her birini ayrı satıra yaz.\n\
@@ -406,22 +581,38 @@ fn build_persona_payload(agent_id: &str, body: &str) -> String {
          4. İzin verilmeyen hedefe yazarsan sistem RoutingOverlay'de `denied`\n\
             etiketiyle gösterir; başka hedef seç ya da coordinator'a sor.\n\
          5. Sana gelen mesajların altında `— from @<gönderen>` imzası olur —\n\
-            kime cevap vereceğini bu imzaya bakarak belirle.\n\n\
+            kime cevap vereceğini bu imzaya bakarak belirle.\n\
+         6. Sana gelen mesajı CEVAP'INDA verbatim alıntılama (`>>` satırını\n\
+            kopyalama). Paraphrase et. Yoksa router senin echo'nu yeni\n\
+            dispatch sanıp yine fire eder.\n\n\
          ## Çalışma protokolü (4-state contract) — KRİTİK\n\n\
-         Sana bir dispatch geldiğinde **4 durumdan birine girersin** ve\n\
-         gönderene açıkça bildirirsin. Sessiz kalma — gönderen senin hangi\n\
-         state'de olduğunu bilmeden ilerleyemez.\n\n\
+         **Eğer dispatch ALAN tarafsan** (örn. scout'a `>> @scout: X` geldi):\n\
+         Sessiz kalma. 4 durumdan birine gir ve gönderene mutlaka bildir:\n\n\
          1. **alındı** (5 saniye içinde): `&gt;&gt; @<gönderen>: alındı — <bir cümlelik anlayışın>`.\n\
-            Bu acknowledgement'tır; sender kaybolmadığını bilir.\n\
+            Acknowledgement; sender bekleyecek mi yoksa kayıp mı bilir.\n\
          2. **tamam** (iş bittiğinde): `&gt;&gt; @<gönderen>: tamam — <sonuç özeti,\n\
-            dosya yolları, ne değişti>`. Bu completion signal'idir; sender\n\
+            dosya yolları, ne değişti>`. Bu completion signal'i; sender\n\
             bir sonraki adıma geçer.\n\
          3. **belirsiz** (dispatch net değilse): `&gt;&gt; @<gönderen>: belirsiz —\n\
             <spesifik sorun: hangi dosya? hangi tür değişiklik?>` ve DUR.\n\
             KESİNLİKLE tahmin yapma; tahminle çalışırsan reviewer reject eder.\n\
          4. **hata** (yapamadıysan): `&gt;&gt; @<gönderen>: hata — <somut sebep:\n\
             dosya yok / compile fail / tool izin yok>` ve dur.\n\n\
-         Bu 4 state swarm'ın state machine'idir. Eksiksiz uy.\n\n\
+         **Eğer dispatch GÖNDEREN tarafsan** (örn. orchestrator/coordinator):\n\
+         Alıcıdan dönen state markerına BAK ve buna göre davran:\n\n\
+         - `alındı —` aldıysan: SUS. Specialist çalışıyor; ikinci dispatch atma,\n\
+           polling yapma. `tamam`'ı bekle.\n\
+         - `tamam —` aldıysan: completion'ı kabul et, bir sonraki faza geç\n\
+           (Faz 1 → 2 → 3 sırası, ya da Faz 3 paralel dispatchlerinden bir\n\
+           sonrakine).\n\
+         - `belirsiz —` aldıysan: aynı vague task'i tekrar gönderme; specialist'in\n\
+           sorduğu spesifik sorunu (dosya/değişiklik tipi/kabul kriteri) çöz ve\n\
+           yeni dispatch yaz.\n\
+         - `hata —` aldıysan: retry mı, alternative specialist mi, escalate mi\n\
+           karar ver. Aynı dispatch'i tekrar yollama (3 kez denersen reviewer\n\
+           bunu rejected bir verdict sayar).\n\n\
+         Bu 4 state swarm'ın state machine'i. Çift yönlü kontrat — receiver\n\
+         state üretir, sender state tüketir. Eksiksiz uy.\n\n\
          **İLK YANIT (kullanıcı/route gelmeden önce):** Bu persona mesajını\n\
          aldıktan sonra **yalnızca** şunu yaz ve sus: `@{agent_id} hazır.`\n\
          — başka tek karakter yazma. Bir sonraki kullanıcı/route mesajını\n\
@@ -494,9 +685,12 @@ mod tests {
     fn payload_includes_routing_protocol_and_allowed_destinations() {
         let p = build_persona_payload("scout", "x");
         assert!(p.contains("## Routing protocol"));
-        // Syntax illustration uses HTML entities so persona injection
-        // doesn't fire phantom routes from echoed examples.
-        assert!(p.contains("&gt;&gt; @&lt;agent-id&gt;: &lt;mesaj&gt;"));
+        // v4 footer describes the marker shape in bracketed prose
+        // (so the description itself can't fire phantom routes) and
+        // shows examples in HTML-escaped form. Both signatures must
+        // be present.
+        assert!(p.contains("[iki tane > karakteri]"));
+        assert!(p.contains("&gt;&gt; @scout:"));
         assert!(p.contains("coordinator"));
         assert!(p.contains("orchestrator"));
     }

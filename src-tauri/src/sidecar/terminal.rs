@@ -275,6 +275,18 @@ impl TerminalRegistry {
                 builder.env_remove(var);
             }
         }
+        // Apply caller-supplied env overrides AFTER the scrub list,
+        // so `extra_env` can re-set anything we just removed AND can
+        // point the spawned process at a private HOME / USERPROFILE.
+        // Used by `swarm-term::session` to give each claude REPL its
+        // own `~/.claude.json` (preventing the 9-way concurrent-write
+        // race that progressively truncated the user's shared config
+        // in the 2026-05-12 23:46Z smoke).
+        if let Some(extra) = &opts.extra_env {
+            for (k, v) in extra {
+                builder.env(k, v);
+            }
+        }
         let child: Box<dyn Child + Send + Sync> = pty_pair
             .slave
             .spawn_command(builder)
@@ -1970,6 +1982,7 @@ mod tests {
                     agent_kind: Some("claude-code".into()),
                     role: Some("orchestrator".into()),
                     workspace: Some("swarm-term-test".into()),
+                    extra_env: None,
                 },
                 app.handle().clone(),
                 pool.clone(),
@@ -2062,6 +2075,7 @@ mod tests {
                     agent_kind: Some("shell".into()),
                     role: None,
                     workspace: None,
+                    extra_env: None,
                 },
                 app.handle().clone(),
                 pool.clone(),

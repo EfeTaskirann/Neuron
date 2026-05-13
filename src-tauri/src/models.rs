@@ -371,6 +371,13 @@ pub struct PaneSpawnInput {
     pub agent_kind: Option<String>,
     pub role: Option<String>,
     pub workspace: Option<String>,
+    /// Extra environment variables to set on the spawned process
+    /// AFTER the agent-kind-specific scrub list runs. Used by
+    /// `swarm-term` to point each claude pane at a private
+    /// `HOME`/`USERPROFILE` directory so the 9 concurrent claude.exe
+    /// REPLs don't race on a shared `~/.claude.json` and corrupt it.
+    /// `None` = no extra env (typical for terminal:spawn callers).
+    pub extra_env: Option<std::collections::HashMap<String, String>>,
 }
 
 /// One line of pane scrollback as returned by `terminal:lines`. Mirrors
