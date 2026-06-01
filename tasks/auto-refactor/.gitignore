@@ -1,0 +1,7 @@
+# Tur çıktıları yerel kalsın — sistem dosyaları (PLAYBOOK/BACKLOG/run.ps1/...) commit'lenebilir.
+log/*
+!log/.gitkeep
+proposals/*
+!proposals/.gitkeep
+LATEST.md
+HISTORY.md
