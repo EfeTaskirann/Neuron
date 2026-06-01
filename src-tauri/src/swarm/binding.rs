@@ -22,13 +22,42 @@ use crate::error::AppError;
 use crate::swarm::profile::{PermissionMode, Profile};
 
 /// Env var names stripped from the spawned process so the `claude`
-/// CLI cannot fall back to API-key auth or a non-Anthropic provider.
-/// Documented at `report/Neuron Multi-Agent Orchestration ...` §3.4.
-const STRIPPED_ENV_VARS: &[&str] = &[
+/// CLI cannot fall back to API-key auth, a non-Anthropic provider, or
+/// a parent-supplied OAuth token that overrides the user's
+/// `~/.claude/.credentials.json`. Documented at
+/// `report/Neuron Multi-Agent Orchestration ...` §3.4.
+///
+/// Re-exported as `pub(crate)` so the brain spawn paths
+/// (`transport::SubprocessTransport`, `swarm::persistent_session`) can
+/// iterate over it instead of hard-coding their own redundant
+/// `env_remove` calls. The 2026-05-13 `/login` regression pinned the
+/// missing entries — `CLAUDE_CODE_OAUTH_TOKEN` in particular leaks
+/// from a parent `claude` shell (Neuron launched from within Claude
+/// Code) and silently overrides the per-pane credentials seed.
+pub(crate) const STRIPPED_ENV_VARS: &[&str] = &[
+    // Auth-bypass tokens.
     "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    // Endpoint overrides — point claude at a different API server,
+    // which has its own auth state distinct from the user's session.
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_API_URL",
+    "ANTHROPIC_CUSTOM_HEADERS",
+    // Provider-routing toggles (USE_*: legacy; CLAUDE_CODE_USE_*:
+    // current). Setting any of these silently flips the spawn off
+    // the user's Pro/Max OAuth onto BYOK / cloud billing.
     "USE_BEDROCK",
     "USE_VERTEX",
     "USE_FOUNDRY",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_SKIP_BEDROCK_AUTH",
+    "CLAUDE_CODE_SKIP_VERTEX_AUTH",
+    // Config-dir override — if set in parent, the child ignores HOME
+    // and reads from the override path, defeating the per-process
+    // isolation downstream callers may have arranged.
+    "CLAUDE_CONFIG_DIR",
 ];
 
 /// Env var name a developer / CI run sets to override the resolved
@@ -385,6 +414,62 @@ mod tests {
                 });
             });
         });
+    }
+
+    /// 2026-05-13 `/login` regression: a parent `claude` shell exports
+    /// `CLAUDE_CODE_OAUTH_TOKEN` for nested processes so they can
+    /// authenticate against the same session. When a SUB-claude
+    /// spawned by Neuron inherits this token, it prefers it over the
+    /// per-pane `.credentials.json` we seeded — and if the session
+    /// scope differs, the spawned claude drops into `/login`. Strip
+    /// it (and the related auth-bypass vars) so every spawn uses the
+    /// credentials we control.
+    #[test]
+    fn subscription_env_strips_oauth_token_and_endpoint_overrides() {
+        let auth_vars = [
+            "ANTHROPIC_AUTH_TOKEN",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "ANTHROPIC_BASE_URL",
+            "ANTHROPIC_API_URL",
+            "ANTHROPIC_CUSTOM_HEADERS",
+            "CLAUDE_CONFIG_DIR",
+        ];
+        // Set each one in turn and verify subscription_env() drops
+        // it. We don't set all six at once because `with_env` doesn't
+        // compose more than ~3 deep without becoming illegible —
+        // serial per-var checks give the same coverage.
+        for var in auth_vars {
+            with_env(var, Some("set-by-parent-shell"), || {
+                let env = subscription_env();
+                assert!(
+                    !env.contains_key(var),
+                    "{var} must not survive subscription_env() — \
+                     parent-supplied auth/config would override the \
+                     per-pane credentials seed"
+                );
+            });
+        }
+    }
+
+    /// The canonical strip list must include the OAuth bypass set so
+    /// the brain spawn paths (`transport`, `persistent_session`) — which
+    /// iterate over `STRIPPED_ENV_VARS` directly when calling
+    /// `Command::env_remove` — also clear it from the inherited env.
+    #[test]
+    fn stripped_env_vars_includes_oauth_bypass_set() {
+        for required in [
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "CLAUDE_CONFIG_DIR",
+        ] {
+            assert!(
+                STRIPPED_ENV_VARS.contains(&required),
+                "STRIPPED_ENV_VARS must list {required} — both spawn \
+                 paths read this constant to decide which env vars \
+                 to remove from the child"
+            );
+        }
     }
 
     /// Pass-through env vars survive (negative control for the strip).

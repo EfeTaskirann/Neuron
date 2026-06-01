@@ -61,14 +61,42 @@ use crate::tuning::{
 // `crate::tuning` so the runtime profile is editable in one place.
 
 /// Env vars stripped from the inherited environment of a freshly
-/// spawned `claude-code` pane. The CLAUDE_CODE_* / CLAUDECODE / etc.
-/// keys are set by an outer `claude` shell to signal "this child is
-/// nested" — without stripping, the spawned REPL falls into the
-/// OAuth login picker on every spawn. The ANTHROPIC_API_KEY +
-/// provider switches mirror `swarm::binding::STRIPPED_ENV_VARS` so a
-/// stray BYOK env var can't silently re-route the subscription
-/// billing channel.
+/// spawned `claude-code` pane. Four categories:
+///
+/// 1. **Nested-instance signals** (`CLAUDECODE`, `CLAUDE_CODE_SESSION_ID`,
+///    `CLAUDE_CODE_ENTRYPOINT`, `CLAUDE_CODE_EXECPATH`, `CLAUDE_CODE_AGENT`,
+///    `CLAUDE_EFFORT`, `AI_AGENT`) — set by an outer `claude` shell to
+///    flag "this child is nested". Without stripping, the spawned REPL
+///    falls into the OAuth login picker on every spawn.
+///
+/// 2. **Auth-bypass tokens / endpoint overrides** (`ANTHROPIC_API_KEY`,
+///    `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`,
+///    `ANTHROPIC_BASE_URL`, `ANTHROPIC_API_URL`,
+///    `ANTHROPIC_CUSTOM_HEADERS`) — any of these, when inherited from
+///    the parent process, override the per-pane `.credentials.json` we
+///    seed into each isolated HOME. The 2026-05-13 `/login` regression
+///    pinned this to `CLAUDE_CODE_OAUTH_TOKEN`: when Neuron is launched
+///    from inside a Claude Code shell (the user's typical dev loop),
+///    Claude Code exports its session token here for nested processes.
+///    Each spawned pane then prefers the parent's token over its own
+///    seeded credentials, finds it scoped to a different session, and
+///    drops into `/login`. Stripping all six forces the pane to use
+///    the local `.credentials.json` we control.
+///
+/// 3. **Provider-routing toggles** (`USE_BEDROCK`, `USE_VERTEX`,
+///    `USE_FOUNDRY`, `CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_VERTEX`,
+///    `CLAUDE_CODE_SKIP_BEDROCK_AUTH`, `CLAUDE_CODE_SKIP_VERTEX_AUTH`)
+///    — silently flip the spawn off the user's Pro/Max OAuth channel
+///    onto BYOK billing or a different cloud provider, breaking the
+///    subscription-only contract mirrored from
+///    `swarm::binding::STRIPPED_ENV_VARS`.
+///
+/// 4. **Config-dir override** (`CLAUDE_CONFIG_DIR`) — if set in the
+///    parent, every pane ignores its per-pane HOME and races on the
+///    shared real config dir, undoing the isolation that prevents
+///    `.claude.json` truncation under 9-way concurrent writes.
 const CLAUDE_AGENT_STRIPPED_ENV: &[&str] = &[
+    // Nested-instance signals.
     "CLAUDECODE",
     "CLAUDE_CODE_SESSION_ID",
     "CLAUDE_CODE_ENTRYPOINT",
@@ -76,10 +104,23 @@ const CLAUDE_AGENT_STRIPPED_ENV: &[&str] = &[
     "CLAUDE_CODE_AGENT",
     "CLAUDE_EFFORT",
     "AI_AGENT",
+    // Auth-bypass tokens / endpoint overrides.
     "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_API_URL",
+    "ANTHROPIC_CUSTOM_HEADERS",
+    // Provider-routing toggles.
     "USE_BEDROCK",
     "USE_VERTEX",
     "USE_FOUNDRY",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_SKIP_BEDROCK_AUTH",
+    "CLAUDE_CODE_SKIP_VERTEX_AUTH",
+    // Config-dir override.
+    "CLAUDE_CONFIG_DIR",
 ];
 
 // --------------------------------------------------------------------- //
@@ -405,6 +446,26 @@ impl TerminalRegistry {
     /// passthrough: the frontend collects keystrokes and ships them
     /// here. Bytes are written verbatim; the shell handles line
     /// editing.
+    /// Read-only snapshot of a pane's lifecycle status.
+    ///
+    /// Returns one of the values from `status::*` (`starting`,
+    /// `running`, `awaiting_approval`, `success`, `error`) or `None`
+    /// if no such pane is registered.
+    ///
+    /// Used by `swarm_term::bridge::process_one`'s pane-status gate to
+    /// skip writes to panes that are in `awaiting_approval` (the
+    /// receiver is blocked on a safety prompt and would silently
+    /// swallow the route) or `error` (the receiver is already dead —
+    /// write would just log `Pane … has no stdin`). A `success` / idle
+    /// pane IS a valid delivery target and is NOT gated.
+    pub async fn pane_status(&self, pane_id: &str) -> Option<&'static str> {
+        let panes = self.inner.panes.lock().await;
+        let state = panes.get(pane_id).cloned()?;
+        drop(panes);
+        let guard = state.lock().ok()?;
+        Some(guard.status)
+    }
+
     pub async fn write_to_pane(&self, pane_id: &str, data: &[u8]) -> Result<(), AppError> {
         let panes = self.inner.panes.lock().await;
         let state = panes

@@ -18,6 +18,7 @@ import { RunInspector } from './routes/RunInspector';
 import { TerminalRoute } from './routes/Terminal';
 import { SwarmRoute } from './routes/SwarmRoute';
 import { TerminalSwarmRoute } from './routes/TerminalSwarm';
+import { RoutingLogRoute } from './routes/RoutingLogRoute';
 
 type Route =
   | 'canvas'
@@ -27,6 +28,7 @@ type Route =
   | 'agents'
   | 'runs'
   | 'mcp'
+  | 'routing-log'
   | 'settings';
 
 const NAV: { id: Route; label: string; icon: IconName }[] = [
@@ -37,6 +39,7 @@ const NAV: { id: Route; label: string; icon: IconName }[] = [
   { id: 'agents', label: 'Agents', icon: 'bot' },
   { id: 'runs', label: 'Runs', icon: 'activity' },
   { id: 'mcp', label: 'MCP', icon: 'store' },
+  { id: 'routing-log', label: 'Routing Log', icon: 'branch' },
   { id: 'settings', label: 'Settings', icon: 'settings' },
 ];
 
@@ -48,6 +51,7 @@ const TOPBAR_TITLE: Record<Route, string> = {
   agents: 'Agents',
   runs: 'Runs',
   mcp: 'MCP marketplace',
+  'routing-log': 'Routing Log',
   settings: 'Settings',
 };
 
@@ -171,7 +175,7 @@ function RouteHost({ route }: { route: Route }): JSX.Element {
     case 'canvas':
       return (
         <ErrorBoundary fallbackTitle="Couldn't load workflow">
-          <Canvas />
+          <Canvas workflowId={null} />
         </ErrorBoundary>
       );
     case 'terminal':
@@ -208,6 +212,12 @@ function RouteHost({ route }: { route: Route }): JSX.Element {
       return (
         <ErrorBoundary fallbackTitle="Couldn't load servers">
           <MCPRoute />
+        </ErrorBoundary>
+      );
+    case 'routing-log':
+      return (
+        <ErrorBoundary fallbackTitle="Couldn't load routing log">
+          <RoutingLogRoute />
         </ErrorBoundary>
       );
     case 'settings':

@@ -115,18 +115,25 @@ impl PersistentSession {
         //    don't collide (e.g. all 9 W4-02 agents spawning at once).
         let tmp_path = write_persona_tmp(app, profile).await?;
 
-        // 3. Build argv + env. `subscription_env` strips
-        //    `ANTHROPIC_API_KEY` / `USE_BEDROCK` / `USE_VERTEX` /
-        //    `USE_FOUNDRY` so the OAuth subscription is preserved.
+        // 3. Build argv + env. `subscription_env` returns the inherited
+        //    parent env minus the auth-bypass / provider-routing
+        //    variables in `STRIPPED_ENV_VARS`. We still have to call
+        //    `env_remove` for the same set because tokio's `Command`
+        //    inherits the parent's env by default — `.envs(&env)` only
+        //    overrides the keys it carries, it does not clear the
+        //    inherited slate. Iterating over the canonical list keeps
+        //    this site in lockstep with `binding::STRIPPED_ENV_VARS`,
+        //    so adding (e.g.) `CLAUDE_CODE_OAUTH_TOKEN` upstream
+        //    automatically applies here too.
         let env = subscription_env();
         let args = build_specialist_args(profile, &tmp_path);
 
-        let mut child = Command::new(&binary.path)
-            .envs(&env)
-            .env_remove("ANTHROPIC_API_KEY")
-            .env_remove("USE_BEDROCK")
-            .env_remove("USE_VERTEX")
-            .env_remove("USE_FOUNDRY")
+        let mut cmd = Command::new(&binary.path);
+        cmd.envs(&env);
+        for var in crate::swarm::binding::STRIPPED_ENV_VARS {
+            cmd.env_remove(var);
+        }
+        let mut child = cmd
             .args(&args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -622,7 +629,7 @@ mod tests {
                 drop(writer);
             }
         });
-        let mut buf_reader = BufReader::new(reader);
+        let buf_reader = BufReader::new(reader);
         // Local copy of the read loop adapted to a generic
         // `AsyncBufReadExt` reader. The production fn is bound to
         // `BufReader<ChildStdout>` so we can't reuse it directly in

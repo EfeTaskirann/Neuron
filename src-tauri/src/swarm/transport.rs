@@ -188,14 +188,20 @@ impl Transport for SubprocessTransport {
         let env = subscription_env();
         let args = build_specialist_args(profile, &tmp_path);
 
-        let mut child = Command::new(&binary.path)
-            .envs(&env)
-            // Drop env that `subscription_env` wanted gone — `envs(&env)`
-            // doesn't *clear* the inherited slate, so re-strip:
-            .env_remove("ANTHROPIC_API_KEY")
-            .env_remove("USE_BEDROCK")
-            .env_remove("USE_VERTEX")
-            .env_remove("USE_FOUNDRY")
+        // Drop env vars that `subscription_env` wanted gone —
+        // `envs(&env)` doesn't *clear* the inherited slate, so re-strip
+        // by iterating over the canonical `STRIPPED_ENV_VARS` list.
+        // Keeping the strip set centralized in `binding` makes future
+        // additions (e.g. CLAUDE_CODE_OAUTH_TOKEN, which leaks from a
+        // parent Claude Code shell and overrides credentials) apply
+        // uniformly across both PTY-pane and one-shot subprocess
+        // spawn paths.
+        let mut cmd = Command::new(&binary.path);
+        cmd.envs(&env);
+        for var in crate::swarm::binding::STRIPPED_ENV_VARS {
+            cmd.env_remove(var);
+        }
+        let mut child = cmd
             .args(&args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

@@ -2,33 +2,32 @@
 // data sources: usePanes() (snapshot of every pane) +
 // usePaneLines(paneId) (per-pane scrollback + live line events).
 //
-// xterm.js integration (WP-W2-08 spec §7) is deferred to a follow-
-// up sub-commit — this route renders the structured line shape
-// (`{seq,k,text}`) the backend already strips ANSI from. Users see
-// real PTY lines but without colour rendering until xterm lands.
-//
-// Spawn / write / kill mutations live in Phase E. For now the
-// route shows the empty state and the layout switcher; new panes
-// require running a `terminalSpawn` command from devtools or the
-// upcoming Phase E button.
+// Tab-strip layout: panes accumulate over time (swarm launches each
+// produce 9 panes), and trying to render every xterm at once melts
+// the renderer + spams live-line subscriptions for dead PTYs. The
+// route now shows every pane in a horizontally-scrollable tab strip
+// and mounts an xterm only for the *active* tab. Closed/error panes
+// stay visible (their scrollback hydrates from the persisted
+// `pane_lines` table) until the user hits "Clean closed".
 import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { Terminal as XTerm } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import '@xterm/xterm/css/xterm.css';
 import { NIcon } from '../components/icons';
+import { useActiveProject } from '../hooks/useActiveProject';
 import { usePanes } from '../hooks/usePanes';
 import { usePaneLines } from '../hooks/usePaneLines';
 import { useMailbox } from '../hooks/useMailbox';
 import {
+  useTerminalDelete,
   useTerminalKill,
+  useTerminalPurgeClosed,
   useTerminalResize,
   useTerminalSpawn,
   useTerminalWrite,
 } from '../hooks/mutations';
 import type { MailboxEntry, Pane, PaneLine } from '../lib/bindings';
-
-type Layout = '1' | '2v' | '2h' | '2x2' | '3x4';
 
 interface AgentInfo {
   name: string;
@@ -51,10 +50,25 @@ function metaFor(agent: string): AgentInfo {
   return AGENT_META[agent] ?? { name: agent, accent: 'shell', icon: 'shell' };
 }
 
+// Panes in a terminal state — kill alone won't free the row, only
+// `terminal:purge_closed` will. UI uses this set to skip the live
+// `panes:{id}:line` subscription (dead PTY emits nothing) and to
+// disable the per-tab close button in favour of the bulk cleanup.
+const TERMINAL_STATUSES = new Set(['closed', 'error', 'success']);
+
 export function TerminalRoute(): JSX.Element {
   const { data: panes = [], isLoading, isError, error } = usePanes();
-  const [layout, setLayout] = useState<Layout>('2x2');
   const [activeId, setActiveId] = useState<string | null>(null);
+
+  // Resolve the active pane at render time so a purged-out
+  // `activeId` falls back to the first live pane without an effect
+  // round-trip. The state still owns the user's last click; this
+  // memo just narrows it to whatever exists right now.
+  const resolvedActiveId = useMemo<string | null>(() => {
+    if (panes.length === 0) return null;
+    if (activeId != null && panes.some((p) => p.id === activeId)) return activeId;
+    return panes[0]!.id;
+  }, [panes, activeId]);
 
   if (isLoading) {
     return <div className="term-route route-loading">Loading panes…</div>;
@@ -70,24 +84,31 @@ export function TerminalRoute(): JSX.Element {
       </div>
     );
   }
-  const active = activeId ?? panes[0]!.id;
+  const activePane =
+    panes.find((p) => p.id === resolvedActiveId) ?? panes[0]!;
   return (
     <div className="term-route">
       <MailboxPanel />
       <div className="term-toolbar">
         <NewPaneButton />
+        <PurgeClosedButton panes={panes} />
       </div>
-      <div className={`pane-grid layout-${layout}`}>
-        {panes.map((p) => (
+      <div className="pane-main">
+        <PaneTabStrip
+          panes={panes}
+          activeId={activePane.id}
+          onSelect={setActiveId}
+        />
+        <div className="pane-active">
           <PaneView
-            key={p.id}
-            pane={p}
-            active={p.id === active}
-            onActivate={() => setActiveId(p.id)}
+            key={activePane.id}
+            pane={activePane}
+            active
+            onActivate={() => setActiveId(activePane.id)}
           />
-        ))}
+        </div>
       </div>
-      <TermStatusBar layout={layout} setLayout={setLayout} panes={panes} />
+      <TermStatusBar panes={panes} />
     </div>
   );
 }
@@ -95,10 +116,18 @@ export function TerminalRoute(): JSX.Element {
 // Inline spawn dialog. Button collapses into a small form; submit
 // calls terminal:spawn with the typed cwd. cmd/cols/rows fall
 // back to the platform default per WP-W2-06's ergonomics.
+//
+// Default cwd is the App-level active project folder (if set);
+// the user can still edit the field for one-off spawns elsewhere.
+// Pre-2026-05-13 this defaulted to literal `.` (process CWD = the
+// Neuron .exe install dir), which was almost never what the user
+// wanted.
 function NewPaneButton(): JSX.Element {
   const spawn = useTerminalSpawn();
+  const { project } = useActiveProject();
+  const defaultCwd = project?.path ?? '.';
   const [open, setOpen] = useState(false);
-  const [cwd, setCwd] = useState('.');
+  const [cwd, setCwd] = useState(defaultCwd);
 
   if (!open) {
     return (
@@ -120,11 +149,12 @@ function NewPaneButton(): JSX.Element {
         agentKind: null,
         role: null,
         workspace: null,
+        extraEnv: null,
       },
       {
         onSuccess: () => {
           setOpen(false);
-          setCwd('.');
+          setCwd(defaultCwd);
         },
       },
     );
@@ -149,6 +179,90 @@ function NewPaneButton(): JSX.Element {
         Cancel
       </button>
     </form>
+  );
+}
+
+// "Clean closed" — bulk-removes closed/error/success panes from the
+// DB so the tab strip stops accumulating after each swarm launch.
+// Disabled when nothing is purgeable so users don't fire a no-op.
+function PurgeClosedButton({ panes }: { panes: Pane[] }): JSX.Element {
+  const purge = useTerminalPurgeClosed();
+  const purgeable = panes.filter((p) => TERMINAL_STATUSES.has(p.status)).length;
+  const disabled = purgeable === 0 || purge.isPending;
+  return (
+    <button
+      type="button"
+      className="btn ghost sm"
+      disabled={disabled}
+      onClick={() => purge.mutate()}
+      title={
+        purgeable === 0
+          ? 'No closed panes'
+          : `Remove ${purgeable} closed/errored pane${purgeable === 1 ? '' : 's'}`
+      }
+    >
+      <NIcon name="trash" size={12} />
+      <span>
+        {purge.isPending
+          ? 'Cleaning…'
+          : `Clean closed${purgeable > 0 ? ` (${purgeable})` : ''}`}
+      </span>
+    </button>
+  );
+}
+
+// Horizontal tab strip — every pane gets a chip with status dot,
+// agent name, optional role, and a kill button. Only one pane is
+// mounted in the body at a time (see `PaneView`), so this scales to
+// the 50+ panes a long-running session accumulates without melting
+// xterm.js. Scrollable when the strip overflows.
+interface PaneTabStripProps {
+  panes: Pane[];
+  activeId: string;
+  onSelect: (id: string) => void;
+}
+
+function PaneTabStrip({ panes, activeId, onSelect }: PaneTabStripProps): JSX.Element {
+  // Tab "✕" force-removes the pane (kill + DB delete in one call) so
+  // the strip actually shrinks. `terminal:kill` alone only flips
+  // status to `closed` and leaves the row in place — that's why the
+  // pre-fix tabs felt "unclosable".
+  const del = useTerminalDelete();
+  return (
+    <div className="pane-tabs" role="tablist">
+      {panes.map((p) => {
+        const meta = metaFor(p.agent);
+        const isActive = p.id === activeId;
+        return (
+          <button
+            key={p.id}
+            role="tab"
+            aria-selected={isActive}
+            className={`pane-tab status-${p.status}${isActive ? ' active' : ''}`}
+            onClick={() => onSelect(p.id)}
+            title={`${meta.name} · ${p.cwd}`}
+          >
+            <span className={`pane-tab-dot status-${p.status}`} />
+            <span className="pane-tab-name">{meta.name}</span>
+            {p.role && <span className="pane-tab-role">· {p.role}</span>}
+            <span
+              role="button"
+              tabIndex={-1}
+              className="pane-tab-close"
+              title="Close pane"
+              aria-disabled={del.isPending}
+              onClick={(e) => {
+                e.stopPropagation();
+                if (del.isPending) return;
+                del.mutate(p.id);
+              }}
+            >
+              <NIcon name="close" size={10} />
+            </span>
+          </button>
+        );
+      })}
+    </div>
   );
 }
 
@@ -316,6 +430,7 @@ function PaneBody({ pane }: { pane: Pane }): JSX.Element {
   const { data: snapshot } = usePaneLines(pane.id);
   const writeMut = useTerminalWrite();
   const resizeMut = useTerminalResize();
+  const isTerminal = TERMINAL_STATUSES.has(pane.status);
 
   // Mount xterm once per pane. The PTY lifecycle is independent of
   // the React render — drop the instance only when the pane id
@@ -389,6 +504,8 @@ function PaneBody({ pane }: { pane: Pane }): JSX.Element {
       lastCols = term.cols;
       lastRows = term.rows;
       if (pendingTimer != null) clearTimeout(pendingTimer);
+      // Closed/errored panes have no PTY behind them; resize would 404.
+      if (isTerminal) return;
       pendingTimer = setTimeout(() => {
         pendingTimer = null;
         const t = xtermRef.current;
@@ -402,7 +519,7 @@ function PaneBody({ pane }: { pane: Pane }): JSX.Element {
       if (pendingTimer != null) clearTimeout(pendingTimer);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [pane.id]);
+  }, [pane.id, isTerminal]);
 
   // Write the snapshot scrollback once it arrives, then incrementally
   // append new tail entries pushed by `usePaneLines`'s cache update.
@@ -428,7 +545,12 @@ function PaneBody({ pane }: { pane: Pane }): JSX.Element {
   }, [snapshot]);
 
   // Live subscription — write each event payload as a single line.
+  // Skipped for closed/error/success panes: the PTY is gone, so no
+  // events will ever fire and the subscription is wasted work (and
+  // for a long-lived session, 50 dead subscriptions was the symptom
+  // the tab refactor is meant to cure).
   useEffect(() => {
+    if (isTerminal) return;
     let unlisten: UnlistenFn | undefined;
     let cancelled = false;
     listen<PaneLine>(`panes:${pane.id}:line`, (event) => {
@@ -453,26 +575,25 @@ function PaneBody({ pane }: { pane: Pane }): JSX.Element {
       cancelled = true;
       unlisten?.();
     };
-  }, [pane.id]);
+  }, [pane.id, isTerminal]);
 
   return <div className="pane-body pane-body-xterm" ref={containerRef} />;
 }
 
 interface TermStatusBarProps {
-  layout: Layout;
-  setLayout: (l: Layout) => void;
   panes: Pane[];
 }
 
-function TermStatusBar({ layout, setLayout, panes }: TermStatusBarProps): JSX.Element {
+function TermStatusBar({ panes }: TermStatusBarProps): JSX.Element {
   const counts = useMemo(() => {
-    const c = { running: 0, idle: 0, error: 0, awaiting: 0, success: 0 };
+    const c = { running: 0, idle: 0, error: 0, awaiting: 0, success: 0, closed: 0 };
     for (const p of panes) {
       if (p.status === 'running') c.running++;
       else if (p.status === 'idle') c.idle++;
       else if (p.status === 'error') c.error++;
       else if (p.status === 'awaiting_approval') c.awaiting++;
       else if (p.status === 'success') c.success++;
+      else if (p.status === 'closed') c.closed++;
     }
     return c;
   }, [panes]);
@@ -501,88 +622,11 @@ function TermStatusBar({ layout, setLayout, panes }: TermStatusBarProps): JSX.El
         {counts.error > 0 && (
           <span className="tsb-pill st-error">{counts.error} error</span>
         )}
+        {counts.closed > 0 && (
+          <span className="tsb-pill st-idle">{counts.closed} closed</span>
+        )}
       </div>
-      <div className="tsb-r">
-        <LayoutSwitcher layout={layout} setLayout={setLayout} />
-      </div>
-    </div>
-  );
-}
-
-const LAYOUT_OPTS: { id: Layout; icon: JSX.Element }[] = [
-  { id: '1', icon: <rect x="3" y="3" width="18" height="18" rx="2" /> },
-  {
-    id: '2v',
-    icon: (
-      <g>
-        <rect x="3" y="3" width="8" height="18" rx="2" />
-        <rect x="13" y="3" width="8" height="18" rx="2" />
-      </g>
-    ),
-  },
-  {
-    id: '2h',
-    icon: (
-      <g>
-        <rect x="3" y="3" width="18" height="8" rx="2" />
-        <rect x="3" y="13" width="18" height="8" rx="2" />
-      </g>
-    ),
-  },
-  {
-    id: '2x2',
-    icon: (
-      <g>
-        <rect x="3" y="3" width="8" height="8" rx="2" />
-        <rect x="13" y="3" width="8" height="8" rx="2" />
-        <rect x="3" y="13" width="8" height="8" rx="2" />
-        <rect x="13" y="13" width="8" height="8" rx="2" />
-      </g>
-    ),
-  },
-  {
-    id: '3x4',
-    icon: (
-      <g>
-        <rect x="3" y="3" width="5" height="8" rx="1.2" />
-        <rect x="9.5" y="3" width="5" height="8" rx="1.2" />
-        <rect x="16" y="3" width="5" height="8" rx="1.2" />
-        <rect x="3" y="13" width="5" height="8" rx="1.2" />
-        <rect x="9.5" y="13" width="5" height="8" rx="1.2" />
-        <rect x="16" y="13" width="5" height="8" rx="1.2" />
-      </g>
-    ),
-  },
-];
-
-function LayoutSwitcher({
-  layout,
-  setLayout,
-}: {
-  layout: Layout;
-  setLayout: (l: Layout) => void;
-}): JSX.Element {
-  return (
-    <div className="layout-switcher">
-      {LAYOUT_OPTS.map((o) => (
-        <button
-          key={o.id}
-          className={`ls-btn${layout === o.id ? ' active' : ''}`}
-          onClick={() => setLayout(o.id)}
-          title={o.id}
-        >
-          <svg
-            width="16"
-            height="16"
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth="1.75"
-          >
-            {o.icon}
-          </svg>
-        </button>
-      ))}
+      <div className="tsb-r" />
     </div>
   );
 }

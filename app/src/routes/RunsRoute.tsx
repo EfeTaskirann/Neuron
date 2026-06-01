@@ -6,6 +6,7 @@
 import { useState, useMemo } from 'react';
 import { useRuns } from '../hooks/useRuns';
 import type { Run } from '../lib/bindings';
+import { runStatusLabel, runStatusFilterLabel } from '../lib/copy';
 
 type StatusFilter = 'all' | 'running' | 'success' | 'error';
 
@@ -38,7 +39,7 @@ export function RunsRoute(): JSX.Element {
               onClick={() => setFilter(f)}
             >
               {f === 'running' && <span className="pulse-dot" />}
-              {f}
+              {runStatusFilterLabel(f)}
             </button>
           ))}
         </div>
@@ -54,6 +55,14 @@ export function RunsRoute(): JSX.Element {
           </span>
         </div>
       </div>
+      {runs.length === 0 ? (
+        <div className="runs-empty" data-testid="runs-empty">
+          <h3 className="runs-empty-title">Henüz hiç çalışma yok</h3>
+          <p className="runs-empty-desc">
+            Bir workflow çalıştırdığında geçmiş burada listelenir.
+          </p>
+        </div>
+      ) : (
       <table className="runs-table">
         <thead>
           <tr>
@@ -73,7 +82,7 @@ export function RunsRoute(): JSX.Element {
               <td>{r.workflow}</td>
               <td className="mute">{formatStarted(r.startedAt)}</td>
               <td>{r.dur != null ? `${(r.dur / 1000).toFixed(2)}s` : '—'}</td>
-              <td>{r.tokens.toLocaleString()}</td>
+              <td>{r.tokens.toLocaleString('en-US')}</td>
               <td>${r.cost.toFixed(4)}</td>
               <td>
                 <span
@@ -86,13 +95,14 @@ export function RunsRoute(): JSX.Element {
                   }`}
                 >
                   {r.status === 'running' && <span className="pulse-dot" />}
-                  {r.status}
+                  {runStatusLabel(r.status)}
                 </span>
               </td>
             </tr>
           ))}
         </tbody>
       </table>
+      )}
     </div>
   );
 }

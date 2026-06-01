@@ -53,3 +53,6 @@ report/
 
 # Clipboard / screenshot pastes
 clipboard-*.png
+
+# Per-agent activity log (runtime artifact, not project source)
+AGENT_LOG.md

@@ -146,6 +146,57 @@ pub async fn terminal_kill(
     registry.inner().kill_pane(&id, pool.inner()).await
 }
 
+/// Bulk-remove terminal-state panes (`closed` / `error` / `success`)
+/// from the DB. `pane_lines` rows cascade via the FK. Returns the
+/// number of pane rows actually deleted so the UI can surface a toast
+/// like "removed 47 closed panes".
+///
+/// Safe to call any time: live panes (`running` / `idle` /
+/// `awaiting_approval` / `starting`) are excluded by the status filter.
+#[tauri::command(rename_all = "camelCase")]
+#[specta::specta]
+pub async fn terminal_purge_closed(pool: State<'_, DbPool>) -> Result<i64, AppError> {
+    let res = sqlx::query(
+        "DELETE FROM panes WHERE status IN ('closed', 'error', 'success')",
+    )
+    .execute(pool.inner())
+    .await?;
+    Ok(res.rows_affected() as i64)
+}
+
+/// Force-remove a single pane regardless of its current status. The
+/// kill-then-delete sequence is what the UI's tab "✕" button needs:
+/// `terminal:kill` only flips status to `closed` and leaves the row,
+/// so without this command the tab strip never shrinks.
+///
+/// Live panes are killed first so the PTY + reader/waiter tasks
+/// finalise cleanly (otherwise the DB row gets deleted out from under
+/// the waiter, which would log a confused "pane vanished" warning).
+/// 404 if the id was never seen by either the registry or the DB.
+#[tauri::command(rename_all = "camelCase")]
+#[specta::specta]
+pub async fn terminal_delete(
+    registry: State<'_, TerminalRegistry>,
+    pool: State<'_, DbPool>,
+    id: String,
+) -> Result<(), AppError> {
+    // Best-effort kill: ignore NotFound (already-dead pane) and let the
+    // delete below speak the canonical "no such pane" error.
+    match registry.inner().kill_pane(&id, pool.inner()).await {
+        Ok(()) => {}
+        Err(e) if e.kind() == "not_found" => {}
+        Err(e) => return Err(e),
+    }
+    let res = sqlx::query("DELETE FROM panes WHERE id = ?")
+        .bind(&id)
+        .execute(pool.inner())
+        .await?;
+    if res.rows_affected() == 0 {
+        return Err(AppError::NotFound(format!("Pane {id} not found")));
+    }
+    Ok(())
+}
+
 /// Return the most recent scrollback for a pane. Live panes read from
 /// the in-memory ring; closed panes read from `pane_lines` (persisted
 /// at pane close). `sinceSeq` (exclusive) lets the UI hydrate
@@ -335,6 +386,60 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.kind(), "invalid_input");
+    }
+
+    #[tokio::test]
+    async fn terminal_delete_removes_stub_row() {
+        let (app, pool, _dir) = mock_app_with_pool().await;
+        seed_pane(&pool, "p-gone").await;
+        let pool_state = app.state::<crate::db::DbPool>();
+        let registry_state = app.state::<TerminalRegistry>();
+        terminal_delete(registry_state, pool_state, "p-gone".into())
+            .await
+            .expect("ok");
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM panes WHERE id = 'p-gone'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn terminal_delete_unknown_id_is_not_found() {
+        let (app, _pool, _dir) = mock_app_with_pool().await;
+        let pool_state = app.state::<crate::db::DbPool>();
+        let registry_state = app.state::<TerminalRegistry>();
+        let err = terminal_delete(registry_state, pool_state, "nope".into())
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), "not_found");
+    }
+
+    #[tokio::test]
+    async fn terminal_purge_closed_drops_only_terminal_state_rows() {
+        let (app, pool, _dir) = mock_app_with_pool().await;
+        sqlx::query(
+            "INSERT INTO panes (id, workspace, agent_kind, role, cwd, status, pid) VALUES \
+             ('p-live',   'personal', 'shell', NULL, '/tmp', 'running',           NULL), \
+             ('p-await',  'personal', 'shell', NULL, '/tmp', 'awaiting_approval', NULL), \
+             ('p-closed', 'personal', 'shell', NULL, '/tmp', 'closed',            NULL), \
+             ('p-err',    'personal', 'shell', NULL, '/tmp', 'error',             NULL), \
+             ('p-ok',     'personal', 'shell', NULL, '/tmp', 'success',           NULL)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let pool_state = app.state::<crate::db::DbPool>();
+        let removed = terminal_purge_closed(pool_state).await.expect("ok");
+        assert_eq!(removed, 3, "should drop closed + error + success");
+
+        let remaining: Vec<(String,)> = sqlx::query_as("SELECT id FROM panes ORDER BY id")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        let ids: Vec<&str> = remaining.iter().map(|r| r.0.as_str()).collect();
+        assert_eq!(ids, vec!["p-await", "p-live"]);
     }
 
     #[tokio::test]

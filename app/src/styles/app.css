@@ -562,6 +562,28 @@ kbd {
 .runs-table .mono { font-size: 11.5px; color: var(--muted-foreground); }
 .runs-table .mute { color: var(--muted-foreground); }
 
+.runs-empty {
+  display: grid;
+  place-items: center;
+  gap: 8px;
+  padding: 48px 16px;
+  text-align: center;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+}
+.runs-empty-title {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--foreground);
+}
+.runs-empty-desc {
+  margin: 0;
+  font-size: 12.5px;
+  color: var(--muted-foreground);
+}
+
 /* ============================================================
    MCP ROUTE
    ============================================================ */
@@ -808,6 +830,32 @@ kbd {
   position: relative;
   min-width: 100%;
   z-index: 2;
+}
+
+.canvas-empty {
+  display: grid;
+  place-items: center;
+  padding: 32px 16px;
+}
+.canvas-empty-panel {
+  max-width: 360px;
+  padding: 24px 28px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  text-align: center;
+}
+.canvas-empty-title {
+  margin: 0 0 6px;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--foreground);
+}
+.canvas-empty-desc {
+  margin: 0;
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--muted-foreground);
 }
 
 /* node card */
@@ -1231,6 +1279,75 @@ kbd {
   }
 }
 
+/* ============================================================
+   APPEARANCE — DENSITY (data-density on <html>)
+   Targets the most visible surfaces; lets typography and the
+   design system handle the rest via inherited padding/heights.
+   ============================================================ */
+html[data-density="compact"] .app-shell {
+  grid-template-rows: 48px 1fr;
+}
+html[data-density="compact"] .topbar {
+  height: 48px;
+}
+html[data-density="compact"] .sb-item {
+  height: 28px;
+  padding: 5px 10px;
+  font-size: 12.5px;
+}
+html[data-density="compact"] .set-item {
+  height: 28px;
+  padding: 0 10px;
+  font-size: 12.5px;
+}
+html[data-density="compact"] .set-row {
+  padding: 12px 16px;
+}
+html[data-density="compact"] .settings-pane {
+  padding: 20px 28px 32px;
+}
+html[data-density="compact"] .btn {
+  height: 28px;
+  padding: 0 10px;
+  font-size: 12px;
+}
+html[data-density="compact"] .agent-card,
+html[data-density="compact"] .server-card {
+  padding: 12px;
+}
+html[data-density="compact"] .route {
+  padding: 16px 20px 24px;
+}
+
+/* ============================================================
+   APPEARANCE — MOTION (data-motion on <html>)
+   "reduced" keeps the interface alive but skips signature
+   shimmers/pulses. "off" disables every animation and transition.
+   ============================================================ */
+html[data-motion="reduced"] {
+  --duration-instant: 0ms;
+  --duration-fast: 80ms;
+  --duration-normal: 120ms;
+  --duration-moderate: 160ms;
+  --duration-slow: 200ms;
+  --duration-slower: 240ms;
+}
+html[data-motion="reduced"] .pulse-dot,
+html[data-motion="reduced"] .node-card.status-running,
+html[data-motion="reduced"] .node-card.status-running .node-rail,
+html[data-motion="reduced"] .span-bar.wf-shimmer::after,
+html[data-motion="reduced"] .ins-pulse,
+html[data-motion="reduced"] .ins-stream-cursor {
+  animation: none !important;
+}
+
+html[data-motion="off"] *,
+html[data-motion="off"] *::before,
+html[data-motion="off"] *::after {
+  animation: none !important;
+  transition: none !important;
+}
+
 /* WP-W2-08 phase E — inline new-agent form. Fits the existing
    .agent-card vibe rather than a separate modal. */
 .agent-card-new { gap: 6px; }
@@ -1255,4 +1372,316 @@ kbd {
 .agent-form-row > input:focus {
   outline: none;
   border-color: var(--neuron-violet-400);
+}
+
+/* ---------- ProjectPickerRoute (full-screen gate) ---------- */
+.project-picker-route {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 32px;
+  background: var(--background);
+  z-index: 100;
+}
+.project-picker-card {
+  width: min(560px, 100%);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 18px;
+  padding: 40px 32px;
+  background: var(--surface-1);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-lg, 0 24px 56px rgba(0, 0, 0, 0.45));
+  text-align: center;
+}
+.project-picker-brand {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.project-picker-brand h1 {
+  margin: 0;
+  font-size: 22px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+.project-picker-title {
+  margin: 4px 0 0;
+  font-size: 18px;
+  font-weight: 500;
+}
+.project-picker-subtitle {
+  margin: 0;
+  max-width: 440px;
+  color: var(--muted-foreground);
+  font-size: 13px;
+  line-height: 1.55;
+}
+.project-picker-cta {
+  margin-top: 8px;
+  min-width: 200px;
+}
+.project-picker-error {
+  width: 100%;
+  padding: 8px 12px;
+  background: color-mix(in oklch, var(--destructive, #d04444) 18%, transparent);
+  border: 1px solid var(--destructive, #d04444);
+  border-radius: var(--radius-md);
+  color: var(--destructive, #d04444);
+  font-size: 12px;
+}
+.project-picker-hint {
+  margin: 8px 0 0;
+  color: var(--muted-foreground);
+  font-size: 11px;
+}
+
+/* ---------- active-project chip in topbar ---------- */
+.topbar-project-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 10px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  font-size: 12px;
+  color: var(--muted-foreground);
+}
+.topbar-project-chip .topbar-project-name {
+  color: var(--foreground);
+  font-weight: 500;
+  max-width: 200px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.topbar-project-chip .topbar-project-change {
+  color: var(--neuron-violet-400);
+  font-size: 11px;
+  cursor: pointer;
+}
+.topbar-project-chip .topbar-project-change:hover {
+  color: var(--neuron-violet-300);
+  text-decoration: underline;
+}
+
+/* ---------- RoutingLogRoute (full-screen routing events) ---------- */
+.route-routing-log {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 16px 20px 20px;
+  min-height: 0;
+}
+.routing-log-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+}
+.routing-log-title {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  font-size: 14px;
+  font-weight: 500;
+}
+.routing-log-counter {
+  color: var(--muted-foreground);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+/* Filter chips reuse the global `.chip` / `.chip-row` baseline. Per-outcome
+   tint only overrides background / border-color / color on the active
+   state, so the palette mirrors the row tags below and is visible in the
+   default-all-active state (all 8 outcomes enabled). */
+.route-routing-log .chip.chip-outcome-ok.active {
+  background: color-mix(in oklch, oklch(0.72 0.16 145) 18%, transparent);
+  border-color: oklch(0.72 0.16 145);
+  color: oklch(0.92 0.16 145);
+}
+.route-routing-log .chip.chip-outcome-malformed.active,
+.route-routing-log .chip.chip-outcome-denied.active,
+.route-routing-log .chip.chip-outcome-unknown_target.active,
+.route-routing-log .chip.chip-outcome-target_locked.active,
+.route-routing-log .chip.chip-outcome-target_write_timeout.active {
+  background: color-mix(in oklch, oklch(0.62 0.18 25) 18%, transparent);
+  border-color: oklch(0.62 0.18 25);
+  color: oklch(0.92 0.18 25);
+}
+.route-routing-log .chip.chip-outcome-target_not_ready.active {
+  background: color-mix(in oklch, oklch(0.7 0.16 80) 18%, transparent);
+  border-color: oklch(0.7 0.16 80);
+  color: oklch(0.93 0.16 80);
+}
+.route-routing-log .chip.chip-outcome-lifecycle_fanout.active {
+  background: color-mix(in oklch, var(--neuron-violet-500) 18%, transparent);
+  border-color: var(--neuron-violet-500);
+  color: oklch(0.9 0.1 290);
+}
+.routing-log-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  background: var(--surface-1);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+}
+.routing-log-empty {
+  padding: 32px 24px;
+  text-align: center;
+  color: var(--muted-foreground);
+  font-size: 13px;
+}
+.routing-log-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+.routing-log-table thead th {
+  position: sticky;
+  top: 0;
+  background: var(--surface-2);
+  padding: 8px 12px;
+  text-align: left;
+  font-weight: 500;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted-foreground);
+  border-bottom: 1px solid var(--border);
+}
+.routing-log-row {
+  border-bottom: 1px solid var(--border);
+}
+.routing-log-row:hover {
+  background: color-mix(in oklch, var(--neuron-violet-500) 5%, transparent);
+}
+.routing-log-row td {
+  padding: 8px 12px;
+  vertical-align: top;
+}
+.routing-log-time {
+  font-family: var(--font-mono);
+  white-space: nowrap;
+  color: var(--muted-foreground);
+}
+.routing-log-edge {
+  font-family: var(--font-mono);
+  white-space: nowrap;
+}
+.routing-log-arrow {
+  margin: 0 6px;
+  color: var(--muted-foreground);
+}
+.routing-log-src,
+.routing-log-dst {
+  color: var(--foreground);
+}
+.routing-log-tag {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+}
+.routing-log-tag-ok {
+  background: color-mix(in oklch, oklch(0.72 0.16 145) 15%, transparent);
+  border-color: oklch(0.72 0.16 145);
+  color: oklch(0.85 0.16 145);
+}
+.routing-log-tag-malformed,
+.routing-log-tag-denied,
+.routing-log-tag-unknown_target,
+.routing-log-tag-target_locked,
+.routing-log-tag-target_write_timeout {
+  background: color-mix(in oklch, oklch(0.62 0.18 25) 18%, transparent);
+  border-color: oklch(0.62 0.18 25);
+  color: oklch(0.85 0.18 25);
+}
+.routing-log-tag-target_not_ready {
+  background: color-mix(in oklch, oklch(0.7 0.16 80) 18%, transparent);
+  border-color: oklch(0.7 0.16 80);
+  color: oklch(0.88 0.16 80);
+}
+.routing-log-tag-lifecycle_fanout {
+  background: color-mix(in oklch, var(--neuron-violet-500) 16%, transparent);
+  border-color: var(--neuron-violet-500);
+  color: oklch(0.85 0.1 290);
+}
+.routing-log-body-text {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--foreground);
+  cursor: pointer;
+  max-width: 480px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.routing-log-body-text:hover {
+  text-decoration: underline;
+}
+
+/* ---------- Toasts (transient mutation feedback) ---------- */
+.toast-host {
+  position: fixed;
+  bottom: 16px;
+  right: 16px;
+  display: flex;
+  flex-direction: column-reverse;
+  gap: 8px;
+  pointer-events: none;
+  z-index: 9999;
+}
+.toast {
+  pointer-events: auto;
+  min-width: 280px;
+  max-width: 480px;
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 10px 12px;
+  border-radius: var(--radius-md);
+  background: var(--surface-1);
+  border: 1px solid var(--border);
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.32);
+  font-size: 12px;
+  color: var(--foreground);
+}
+.toast--info {
+  border-left: 3px solid var(--neuron-violet-500);
+}
+.toast--success {
+  border-left: 3px solid oklch(0.72 0.16 145);
+}
+.toast--error {
+  border-left: 3px solid oklch(0.62 0.18 25);
+}
+.toast-body {
+  flex: 1 1 auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.toast-close {
+  flex: 0 0 auto;
+  background: none;
+  border: none;
+  color: var(--muted-foreground);
+  cursor: pointer;
+  font-size: 16px;
+  line-height: 1;
+  padding: 0 4px;
+}
+.toast-close:hover {
+  color: var(--foreground);
 }

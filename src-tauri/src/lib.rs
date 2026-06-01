@@ -93,6 +93,8 @@ pub fn specta_builder_for_export() -> tauri_specta::Builder<tauri::Wry> {
             commands::terminal::terminal_write,
             commands::terminal::terminal_resize,
             commands::terminal::terminal_lines,
+            commands::terminal::terminal_purge_closed,
+            commands::terminal::terminal_delete,
             // mailbox
             commands::mailbox::mailbox_list,
             commands::mailbox::mailbox_emit::<tauri::Wry>,
@@ -107,25 +109,31 @@ pub fn specta_builder_for_export() -> tauri_specta::Builder<tauri::Wry> {
             commands::settings::settings_set,
             commands::settings::settings_delete,
             commands::settings::settings_list,
-            // swarm
-            commands::swarm::swarm_profiles_list::<tauri::Wry>,
-            commands::swarm::swarm_test_invoke::<tauri::Wry>,
-            commands::swarm::swarm_run_job::<tauri::Wry>,
-            commands::swarm::swarm_orchestrator_decide::<tauri::Wry>,
-            commands::swarm::swarm_orchestrator_history::<tauri::Wry>,
-            commands::swarm::swarm_orchestrator_clear_history::<tauri::Wry>,
-            commands::swarm::swarm_orchestrator_log_job::<tauri::Wry>,
-            commands::swarm::swarm_cancel_job::<tauri::Wry>,
-            commands::swarm::swarm_list_jobs::<tauri::Wry>,
-            commands::swarm::swarm_get_job::<tauri::Wry>,
-            commands::swarm::swarm_agents_list_status::<tauri::Wry>,
-            commands::swarm::swarm_agents_shutdown_workspace::<tauri::Wry>,
-            commands::swarm::swarm_agents_dispatch_to_agent::<tauri::Wry>,
+            // swarm — paths resolve to the per-area submodules
+            // because `#[tauri::command]` / `#[specta::specta]`
+            // generate `__cmd__*` / `__specta__fn__*` helpers in
+            // the module the command is defined in; the parent
+            // `commands::swarm` only re-exports the user-facing
+            // function symbol, not those macro helpers.
+            commands::swarm::profiles::swarm_profiles_list::<tauri::Wry>,
+            commands::swarm::profiles::swarm_test_invoke::<tauri::Wry>,
+            commands::swarm::run::swarm_run_job::<tauri::Wry>,
+            commands::swarm::orchestrator::swarm_orchestrator_decide::<tauri::Wry>,
+            commands::swarm::orchestrator::swarm_orchestrator_history::<tauri::Wry>,
+            commands::swarm::orchestrator::swarm_orchestrator_clear_history::<tauri::Wry>,
+            commands::swarm::orchestrator::swarm_orchestrator_log_job::<tauri::Wry>,
+            commands::swarm::jobs::swarm_cancel_job::<tauri::Wry>,
+            commands::swarm::jobs::swarm_list_jobs::<tauri::Wry>,
+            commands::swarm::jobs::swarm_get_job::<tauri::Wry>,
+            commands::swarm::agents::swarm_agents_list_status::<tauri::Wry>,
+            commands::swarm::agents::swarm_agents_shutdown_workspace::<tauri::Wry>,
+            commands::swarm::dispatch::swarm_agents_dispatch_to_agent::<tauri::Wry>,
             // swarm-term (Terminal-Hierarchy Swarm)
             commands::swarm_term::swarm_term_list_personas::<tauri::Wry>,
             commands::swarm_term::swarm_term_session_status::<tauri::Wry>,
             commands::swarm_term::swarm_term_start_session::<tauri::Wry>,
             commands::swarm_term::swarm_term_stop_session::<tauri::Wry>,
+            commands::swarm_term::swarm_term_run_update::<tauri::Wry>,
         ])
         // Register the AppError once on the builder so the type lands
         // in `bindings.ts` as a referenceable shape rather than being

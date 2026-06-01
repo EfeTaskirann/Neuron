@@ -118,3 +118,23 @@ export function useTerminalResize() {
       unwrap(commands.terminalResize(paneId, cols, rows)),
   });
 }
+
+export function useTerminalPurgeClosed() {
+  const qc = useQueryClient();
+  return useMutation<number, Error, void>({
+    mutationFn: () => unwrap(commands.terminalPurgeClosed()),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['panes'] });
+    },
+  });
+}
+
+export function useTerminalDelete() {
+  const qc = useQueryClient();
+  return useMutation<null, Error, string>({
+    mutationFn: (id) => unwrap(commands.terminalDelete(id)),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['panes'] });
+    },
+  });
+}

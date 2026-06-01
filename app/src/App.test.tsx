@@ -2,6 +2,7 @@ import { describe, expect, it, vi, beforeEach } from 'vitest';
 import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import { QueryClientProvider, QueryClient } from '@tanstack/react-query';
 import { App } from './App';
+import { Canvas } from './routes/Canvas';
 
 // Mock the bindings layer so tests don't try to reach Tauri's
 // `__TAURI_INVOKE`. Each test sets a happy-path default in
@@ -287,9 +288,10 @@ describe('RunsRoute', () => {
     renderApp();
     fireEvent.click(screen.getByText('Runs'));
     await waitFor(() => expect(screen.getByText('r-1')).toBeInTheDocument());
-    // "running" appears as both a chip button and a status pill on
-    // r-2's row; scope to button role to pick the chip.
-    fireEvent.click(screen.getByRole('button', { name: /running/i }));
+    // The "Çalışıyor" (running) label appears as both a chip button
+    // and a status pill on r-2's row; scope to button role to pick
+    // the chip.
+    fireEvent.click(screen.getByRole('button', { name: /Çalışıyor/i }));
     expect(screen.queryByText('r-1')).not.toBeInTheDocument();
     expect(screen.getByText('r-2')).toBeInTheDocument();
   });
@@ -312,10 +314,17 @@ describe('MCPRoute', () => {
 });
 
 describe('Canvas', () => {
+  // App passes `workflowId={null}` to Canvas, which short-circuits
+  // to the no-workflow empty state — useWorkflow never fires. To
+  // exercise the node/edge render path we mount Canvas directly with
+  // a non-null id; the mocked `workflowsGet` then returns WORKFLOW_OK.
   it('renders nodes and edges from useWorkflow()', async () => {
-    renderApp();
-    // Canvas is the default route — content streams in once
-    // workflowsGet resolves.
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={qc}>
+        <Canvas workflowId="daily-summary" />
+      </QueryClientProvider>,
+    );
     await waitFor(() => expect(screen.getByText('Planner')).toBeInTheDocument());
     expect(screen.getByText('fetch_docs')).toBeInTheDocument();
     // Edge renders as <path> inside the canvas-edges svg; class
@@ -397,7 +406,10 @@ describe('TerminalRoute', () => {
 
     renderApp();
     fireEvent.click(screen.getByText('Terminal'));
-    await screen.findByText('Claude');
+    // The pane name renders twice (tab strip + pane header); findAllByText
+    // both waits for the route to settle and tolerates the duplicate.
+    const claudeMatches = await screen.findAllByText('Claude');
+    expect(claudeMatches.length).toBeGreaterThanOrEqual(1);
     expect(screen.getByText('~/work/neuron')).toBeInTheDocument();
     expect(screen.getByText(/^running$/)).toBeInTheDocument();
     // Scrollback content lives inside the xterm canvas (mocked
@@ -508,7 +520,10 @@ describe('Mailbox', () => {
     });
     renderApp();
     fireEvent.click(screen.getByText('Terminal'));
-    await screen.findByText('Shell'); // pane header arrives
+    // Pane name renders in both the tab strip and the pane header —
+    // wait on findAllByText to allow the duplicate.
+    const shellMatches = await screen.findAllByText('Shell');
+    expect(shellMatches.length).toBeGreaterThanOrEqual(1);
     expect(screen.queryByText(/Mailbox/i)).not.toBeInTheDocument();
   });
 

@@ -6,6 +6,7 @@ import { useMemo, useState } from 'react';
 import { NIcon } from '../components/icons';
 import { useRun } from '../hooks/useRun';
 import type { Span } from '../lib/bindings';
+import { runStatusLabel } from '../lib/copy';
 
 interface RunInspectorProps {
   runId: string | null;
@@ -64,9 +65,9 @@ export function RunInspector({ runId, onClose }: RunInspectorProps): JSX.Element
         <div className="ins-head-r">
           <span className={`pill st-${run.status === 'success' ? 'ok' : run.status === 'running' ? 'running' : 'error'}`}>
             {run.status === 'running' && <span className="pulse-dot" />}
-            {run.status}
+            {runStatusLabel(run.status)}
           </span>
-          <span className="pill st-outline">{run.tokens.toLocaleString()} tokens</span>
+          <span className="pill st-outline">{run.tokens.toLocaleString('en-US')} tokens</span>
           <span className="pill st-outline">${run.cost.toFixed(4)}</span>
           {onClose && (
             <button className="icon-btn" onClick={onClose} title="Close">
@@ -218,7 +219,7 @@ function formatAttrValue(v: unknown): string {
   if (v === false) return 'false';
   if (v == null) return '—';
   if (typeof v === 'number') {
-    if (Number.isInteger(v)) return v.toLocaleString();
+    if (Number.isInteger(v)) return v.toLocaleString('en-US');
     return v.toString();
   }
   return String(v);

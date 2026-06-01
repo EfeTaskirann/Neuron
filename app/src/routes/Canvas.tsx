@@ -1,6 +1,9 @@
-// Ports `Neuron Design/app/canvas.jsx::WorkflowCanvas`. Hardcoded
-// NODES/EDGES → useWorkflow('daily-summary'). Field renames at the
-// edge level — backend ships `fromNode`/`toNode`, the prototype's
+// Ports `Neuron Design/app/canvas.jsx::WorkflowCanvas`. The
+// workflow id is now driven by App-level state (the user's active
+// selection, persisted across reopens) rather than the WP-W2 seed
+// — passing `null` renders the no-workflow empty state instead of
+// falling back to `'daily-summary'`. Field renames at the edge
+// level: backend ships `fromNode`/`toNode` so the prototype's
 // `from`/`to` keys go away (cleaner than an adapter).
 //
 // Inspector lives in `RunInspector.tsx` (phase C/2); this file
@@ -14,12 +17,15 @@ const NODE_W = 220;
 const NODE_H = 92;
 
 interface CanvasProps {
-  workflowId?: string;
+  workflowId: string | null;
   onSelectNode?: (id: string) => void;
 }
 
-export function Canvas({ workflowId = 'daily-summary', onSelectNode }: CanvasProps): JSX.Element {
-  const { data, isLoading, isError, error } = useWorkflow(workflowId);
+export function Canvas({ workflowId, onSelectNode }: CanvasProps): JSX.Element {
+  // `useWorkflow` gates its query on a truthy id, so passing '' when
+  // we have no selection keeps the hook call site unconditional
+  // (rules-of-hooks) without firing an invalid `workflows:get('')`.
+  const { data, isLoading, isError, error } = useWorkflow(workflowId ?? '');
   const [selected, setSelected] = useState<string | null>(null);
 
   // Stabilize the `?? []` fallback through useMemo so the byId
@@ -33,6 +39,15 @@ export function Canvas({ workflowId = 'daily-summary', onSelectNode }: CanvasPro
     [nodes],
   );
 
+  if (!workflowId) {
+    return (
+      <div className="canvas canvas-empty" data-testid="canvas-no-workflow">
+        <p className="text-muted">
+          No workflow selected. Create one to start building.
+        </p>
+      </div>
+    );
+  }
   if (isLoading) {
     return <div className="canvas canvas-loading">Loading canvas…</div>;
   }
@@ -41,8 +56,13 @@ export function Canvas({ workflowId = 'daily-summary', onSelectNode }: CanvasPro
   }
   if (nodes.length === 0) {
     return (
-      <div className="canvas canvas-empty">
-        <p className="text-muted">No nodes yet for this workflow.</p>
+      <div className="canvas canvas-empty" data-testid="canvas-empty">
+        <div className="canvas-empty-panel">
+          <h3 className="canvas-empty-title">Bu workflow henüz boş</h3>
+          <p className="canvas-empty-desc">
+            Düğümler swarm çalışmaları sırasında oluşur ve burada görünür.
+          </p>
+        </div>
       </div>
     );
   }

@@ -12,8 +12,20 @@
 
 .swarm-term-toolbar {
   display: flex;
+  flex-direction: row;
   align-items: center;
   gap: 12px;
+}
+
+.swarm-term-session-timer {
+  flex: 0 0 auto;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  color: var(--fg-muted);
+  padding: 2px 8px;
+  border-left: 1px solid var(--border-subtle, rgba(255, 255, 255, 0.08));
+  margin-left: 4px;
 }
 
 .swarm-term-picker {
@@ -25,6 +37,34 @@
 }
 
 .swarm-term-picker-path {
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 12px;
+  color: var(--fg-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+/* Project readout — replaces the inline picker after the App-level
+ * gate. Keeps the path visible next to the launch/restart/stop
+ * buttons, but non-interactive — the "change project" action lives
+ * in the topbar chip now. */
+.swarm-term-project-readout {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.swarm-term-project-label {
+  font-size: 11px;
+  color: var(--fg-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+.swarm-term-project-path {
   font-family: var(--font-mono, ui-monospace, monospace);
   font-size: 12px;
   color: var(--fg-muted);
@@ -74,6 +114,43 @@
 .swarm-term-pane-role {
   font-size: 11px;
   color: var(--fg-muted);
+  flex: 1 1 auto;
+}
+
+/* Click-to-expand button. Lives in the pane header on the right;
+ * lights up the pane to fill the whole grid container when clicked.
+ * Plan §D. */
+.swarm-term-pane-expand {
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  padding: 2px 6px;
+  font-size: 13px;
+  line-height: 1;
+  color: var(--fg-muted);
+  cursor: pointer;
+}
+.swarm-term-pane-expand:hover {
+  color: var(--accent);
+  border-color: var(--border);
+  background: var(--bg-elev);
+}
+.swarm-term-pane.expanded .swarm-term-pane-expand {
+  color: var(--accent);
+}
+
+/* Grid in expanded mode: one row × one column, only the .expanded
+ * tile is visible. The xterm wrapper inside re-fits via the
+ * existing ResizeObserver in SwarmPane.tsx, so claude REPL's
+ * reported `cols`/`rows` follow the new viewport (PTY width on
+ * the Rust side is fixed at 400 cols — see session.rs:219 — so
+ * marker integrity is preserved regardless of visual size). */
+.swarm-term-grid--expanded {
+  grid-template-columns: 1fr;
+  grid-template-rows: 1fr;
+}
+.swarm-term-grid--expanded .swarm-term-pane:not(.expanded) {
+  display: none;
 }
 
 .swarm-term-pane-body {
@@ -137,119 +214,357 @@
   outline-offset: -1px;
 }
 
-.swarm-term-overlay {
+/* ── Visually-hidden helper for live-region text only screen readers
+ *    should reach. Standard pattern (clip + 1px box) so assistive
+ *    tech still receives the announcement. */
+.route-swarm-term .sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* ── Hierarchy diagram (tier strip) ────────────────────────────────
+ * Compact, single-row strip mounted between the toolbar and the chat
+ * input. Mirrors the 4 tiers documented in the Rust hierarchy graph;
+ * each chip glows when it participates in the most-recent live route
+ * (sub-3 s window, computed in `useActiveEdge`). Phase colour comes
+ * from the `data-phase` attribute the chip carries — keeps the
+ * markup chip-id-agnostic. */
+.swarm-term-hierarchy {
+  display: flex;
+  flex-direction: row;
+  align-items: stretch;
+  gap: 10px;
+  padding: 8px 10px;
   background: var(--bg-elev);
   border: 1px solid var(--border);
-  border-radius: 6px;
-  overflow: hidden;
+  border-radius: 8px;
+  flex-wrap: wrap;
 }
 
-.swarm-term-overlay-head {
+.swarm-term-hier-tier {
   display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 6px 12px;
-  background: var(--bg);
-  border-bottom: 1px solid var(--border);
-  font-size: 11px;
-  color: var(--fg-muted);
-  cursor: pointer;
-  user-select: none;
+  flex-direction: column;
+  gap: 4px;
+  padding: 2px 8px;
+  border-left: 2px solid color-mix(in oklab, var(--border) 80%, transparent);
+}
+.swarm-term-hier-tier:first-child {
+  border-left: none;
+  padding-left: 4px;
 }
 
-.swarm-term-overlay.collapsed .swarm-term-overlay-head {
-  border-bottom: none;
-}
-
-.swarm-term-overlay-title {
+.swarm-term-hier-label {
+  font-size: 10px;
   font-weight: 600;
-  letter-spacing: 0.04em;
+  letter-spacing: 0.08em;
   text-transform: uppercase;
-}
-
-.swarm-term-overlay-body {
-  max-height: 140px;
-  overflow-y: auto;
-}
-
-.swarm-term-overlay-empty {
-  padding: 8px 12px;
-  font-size: 11px;
   color: var(--fg-muted);
+}
+
+.swarm-term-hier-row {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: row;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.swarm-term-hier-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 8px;
+  border-radius: 999px;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 11px;
+  line-height: 1;
+  color: var(--fg);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  transition:
+    background 180ms ease,
+    border-color 180ms ease,
+    box-shadow 180ms ease;
+}
+
+.swarm-term-hier-chip.is-offline {
+  opacity: 0.55;
   font-style: italic;
 }
 
-.swarm-term-overlay-list {
-  list-style: none;
-  padding: 0;
-  margin: 0;
+.swarm-term-hier-chip-id {
+  white-space: nowrap;
 }
 
-.swarm-term-overlay-row {
-  display: grid;
-  grid-template-columns: auto auto auto 1fr auto;
-  gap: 8px;
-  align-items: baseline;
-  padding: 4px 12px;
-  font-size: 11px;
-  font-family: var(--font-mono, ui-monospace, monospace);
-  border-bottom: 1px solid color-mix(in oklab, var(--border) 60%, transparent);
+/* Phase-tinted chip backgrounds. Backgrounds are mixed against
+ * `--bg` so the chip never inverts contrast in dark themes (the
+ * project's default) while still telegraphing phase at a glance.
+ * Foreground stays on `--fg` because mix targets are dark enough
+ * to maintain ≥4.5:1 against the text colour the theme already
+ * shipped. */
+.swarm-term-hier-chip[data-phase='assigned'] {
+  background: color-mix(in oklab, var(--bg) 75%, #5a9cff);
+  border-color: color-mix(in oklab, var(--border) 50%, #5a9cff);
+}
+.swarm-term-hier-chip[data-phase='building'] {
+  background: color-mix(in oklab, var(--bg) 72%, #d6a85a);
+  border-color: color-mix(in oklab, var(--border) 50%, #d6a85a);
+}
+.swarm-term-hier-chip[data-phase='review'] {
+  background: color-mix(in oklab, var(--bg) 72%, #c87fd9);
+  border-color: color-mix(in oklab, var(--border) 50%, #c87fd9);
+}
+.swarm-term-hier-chip[data-phase='done'] {
+  background: color-mix(in oklab, var(--bg) 72%, #5ec77f);
+  border-color: color-mix(in oklab, var(--border) 50%, #5ec77f);
 }
 
-.swarm-term-overlay-row:last-child {
-  border-bottom: none;
+/* Active edge: source and target both glow with a pulsing outline
+ * so the operator can spot the live conversation at a glance. */
+.swarm-term-hier-chip.is-source,
+.swarm-term-hier-chip.is-target {
+  box-shadow:
+    0 0 0 2px color-mix(in oklab, var(--accent) 80%, transparent),
+    0 0 12px color-mix(in oklab, var(--accent) 50%, transparent);
+  border-color: var(--accent);
+  animation: swarm-term-hier-pulse 1.2s ease-in-out infinite;
+}
+.swarm-term-hier-chip.is-source {
+  font-weight: 600;
 }
 
-.swarm-term-overlay-src,
-.swarm-term-overlay-dst {
-  color: var(--accent);
+@keyframes swarm-term-hier-pulse {
+  0%,
+  100% {
+    box-shadow:
+      0 0 0 2px color-mix(in oklab, var(--accent) 80%, transparent),
+      0 0 12px color-mix(in oklab, var(--accent) 50%, transparent);
+  }
+  50% {
+    box-shadow:
+      0 0 0 2px color-mix(in oklab, var(--accent) 60%, transparent),
+      0 0 18px color-mix(in oklab, var(--accent) 70%, transparent);
+  }
 }
 
-.swarm-term-overlay-arrow {
+/* Reduce-motion users get the highlight without the pulse — they
+ * still need to spot the active edge, just without the animation. */
+@media (prefers-reduced-motion: reduce) {
+  .swarm-term-hier-chip.is-source,
+  .swarm-term-hier-chip.is-target {
+    animation: none;
+  }
+}
+
+/* ── Lifecycle pill (per-pane header) ──────────────────────────────
+ * Small rounded badge that mirrors the same phase palette as the
+ * hierarchy chip, sitting next to the role label in the pane head. */
+.swarm-term-pane-phase {
+  display: inline-flex;
+  align-items: center;
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  padding: 2px 7px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--bg-elev);
+  color: var(--fg-muted);
+  flex: 0 0 auto;
+}
+.swarm-term-pane-phase--idle {
   color: var(--fg-muted);
 }
-
-.swarm-term-overlay-body-text {
+.swarm-term-pane-phase--assigned {
+  background: color-mix(in oklab, var(--bg) 70%, #5a9cff);
+  border-color: color-mix(in oklab, var(--border) 40%, #5a9cff);
   color: var(--fg);
+}
+.swarm-term-pane-phase--building {
+  background: color-mix(in oklab, var(--bg) 70%, #d6a85a);
+  border-color: color-mix(in oklab, var(--border) 40%, #d6a85a);
+  color: var(--fg);
+}
+.swarm-term-pane-phase--review {
+  background: color-mix(in oklab, var(--bg) 70%, #c87fd9);
+  border-color: color-mix(in oklab, var(--border) 40%, #c87fd9);
+  color: var(--fg);
+}
+.swarm-term-pane-phase--done {
+  background: color-mix(in oklab, var(--bg) 70%, #5ec77f);
+  border-color: color-mix(in oklab, var(--border) 40%, #5ec77f);
+  color: var(--fg);
+}
+
+/* Active pane outline — visually reinforces the hierarchy chip glow
+ * inside the 3×3 grid so it's clear WHICH terminal just received the
+ * latest message even when the operator isn't looking at the strip. */
+.swarm-term-pane.swarm-term-pane--active {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent);
+}
+
+/* ── Accessibility: focus ring on pane wrappers ────────────────────
+ * Two-tone ring (accent on top of a dark inner stroke) keeps the
+ * indicator ≥3:1 against both the pane background AND the page
+ * background, satisfying WCAG 2.1 AA focus-indicator contrast. */
+.swarm-term-pane:focus {
+  outline: none;
+}
+.swarm-term-pane:focus-visible {
+  outline: 3px solid var(--accent);
+  outline-offset: 2px;
+  box-shadow: 0 0 0 1px #000;
+}
+
+/* ── Run-autonomously toggle (chat toolbar) ────────────────────────
+ * Native checkbox kept for a11y; track + thumb are decorative siblings
+ * with `aria-hidden` so screen readers announce the underlying input
+ * and its visible label only. Keyboard focus is conveyed via a
+ * high-contrast ring on the track. */
+.swarm-term-auto-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  user-select: none;
+  flex: 0 0 auto;
+  padding: 4px 8px;
+  border-radius: 6px;
+}
+.swarm-term-auto-toggle input[type='checkbox'] {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+  width: 1px;
+  height: 1px;
+  margin: 0;
+}
+.swarm-term-auto-toggle-track {
+  position: relative;
+  display: inline-block;
+  width: 34px;
+  height: 18px;
+  border-radius: 999px;
+  background: color-mix(in oklab, var(--bg) 70%, var(--fg-muted));
+  border: 1px solid var(--border);
+  transition: background 180ms ease;
+  flex: 0 0 auto;
+}
+.swarm-term-auto-toggle-thumb {
+  position: absolute;
+  top: 1px;
+  left: 1px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--fg);
+  transition: transform 180ms ease;
+}
+.swarm-term-auto-toggle
+  input[type='checkbox']:checked
+  ~ .swarm-term-auto-toggle-track {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+.swarm-term-auto-toggle
+  input[type='checkbox']:checked
+  ~ .swarm-term-auto-toggle-track
+  .swarm-term-auto-toggle-thumb {
+  transform: translateX(16px);
+}
+.swarm-term-auto-toggle
+  input[type='checkbox']:focus-visible
+  ~ .swarm-term-auto-toggle-track {
+  outline: 3px solid var(--accent);
+  outline-offset: 2px;
+  box-shadow: 0 0 0 1px #000;
+}
+.swarm-term-auto-toggle-label {
+  font-size: 12px;
+  color: var(--fg);
+}
+
+/* AUTO chip — visible while autonomous mode is ON so the operator
+ * always knows agent dispatches are NOT going to pause for them. */
+.swarm-term-auto-chip {
+  display: inline-flex;
+  align-items: center;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: color-mix(in oklab, var(--bg) 50%, var(--accent));
+  border: 1px solid var(--accent);
+  color: var(--fg);
+  flex: 0 0 auto;
+}
+
+/* Chat form decoration when autonomous mode is on: a subtle left
+ * stripe so the input never looks like "waiting for me". */
+.swarm-term-chat--auto {
+  box-shadow: inset 3px 0 0 var(--accent);
+  padding-left: 8px;
+  border-radius: 6px;
+}
+
+/* Body-level marker for non-React surfaces (approval modals) to
+ * detect autonomous mode and self-suppress if they choose to. */
+body[data-swarm-autonomous='1'] .approval-prompt,
+body[data-swarm-autonomous='1'] [data-suppress-when-autonomous] {
+  display: none !important;
+}
+
+/* "Update Claude" corner — fixed bottom-left, only meaningfully usable
+ * when no swarm session is running (button disables itself otherwise).
+ * Exists because claude CLI's in-process auto-updater would otherwise
+ * fire mid-session and force a full app restart; the button gives the
+ * user explicit control over when the binary is swapped. */
+.swarm-term-update-corner {
+  position: fixed;
+  bottom: 12px;
+  left: 12px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  z-index: 50;
+}
+
+.swarm-term-update-status {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--muted, #a4a4a4);
+}
+
+.swarm-term-update-status--ok {
+  color: var(--accent, #86efac);
+}
+
+.swarm-term-update-status--err {
+  color: var(--danger, #fca5a5);
+}
+
+.swarm-term-update-corner .btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.swarm-term-update-progress {
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 12px;
+  color: var(--muted, #888);
+  max-width: 50ch;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-}
-
-.swarm-term-overlay-tag {
-  font-size: 10px;
-  padding: 1px 6px;
-  border-radius: 3px;
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
-}
-
-.tag-ok {
-  background: color-mix(in oklab, var(--bg) 80%, #5ec77f);
-  color: var(--fg);
-}
-
-.tag-denied {
-  background: color-mix(in oklab, var(--bg) 80%, #e07070);
-  color: var(--fg);
-}
-
-.tag-unknown_target {
-  background: color-mix(in oklab, var(--bg) 80%, #d6a85a);
-  color: var(--fg);
-}
-
-.tag-near_miss {
-  background: color-mix(in oklab, var(--bg) 80%, #c87fd9);
-  color: var(--fg);
-}
-
-.swarm-term-overlay-row-denied .swarm-term-overlay-body-text {
-  text-decoration: line-through;
-  opacity: 0.7;
-}
-
-.swarm-term-overlay-row-near_miss .swarm-term-overlay-body-text {
-  font-style: italic;
-  opacity: 0.85;
 }

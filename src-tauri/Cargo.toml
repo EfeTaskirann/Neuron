@@ -151,7 +151,11 @@ keyring = { version = "=3.6.3", features = ["linux-native", "sync-secret-service
 tempfile = "3"
 # `#[tokio::test]` lives in the test runtime, so the macros feature
 # must be visible here too even though `tokio` is also a regular dep.
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
+# `test-util` is needed for `start_paused = true` / `tokio::time::pause`,
+# which lets the route-write timeout tests fire deterministically
+# against a `std::future::pending` future without a real 2-second
+# wall-clock wait.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "test-util"] }
 # Tauri's mock runtime — used by `mailbox::tests` to assert that
 # `mailbox:emit` actually fires a `mailbox.new` event payload.
 # `test` feature gates `tauri::test::*`.

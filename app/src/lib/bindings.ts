@@ -103,6 +103,28 @@ export const commands = {
 	 *  incrementally on mount.
 	 */
 	terminalLines: (paneId: string, sinceSeq: number | null) => typedError<PaneLine[], AppErrorWire>(__TAURI_INVOKE("terminal_lines", { paneId, sinceSeq })),
+	/**
+	 *  Bulk-remove terminal-state panes (`closed` / `error` / `success`)
+	 *  from the DB. `pane_lines` rows cascade via the FK. Returns the
+	 *  number of pane rows actually deleted so the UI can surface a toast
+	 *  like "removed 47 closed panes".
+	 * 
+	 *  Safe to call any time: live panes (`running` / `idle` /
+	 *  `awaiting_approval` / `starting`) are excluded by the status filter.
+	 */
+	terminalPurgeClosed: () => typedError<number, AppErrorWire>(__TAURI_INVOKE("terminal_purge_closed")),
+	/**
+	 *  Force-remove a single pane regardless of its current status. The
+	 *  kill-then-delete sequence is what the UI's tab "✕" button needs:
+	 *  `terminal:kill` only flips status to `closed` and leaves the row,
+	 *  so without this command the tab strip never shrinks.
+	 * 
+	 *  Live panes are killed first so the PTY + reader/waiter tasks
+	 *  finalise cleanly (otherwise the DB row gets deleted out from under
+	 *  the waiter, which would log a confused "pane vanished" warning).
+	 *  404 if the id was never seen by either the registry or the DB.
+	 */
+	terminalDelete: (id: string) => typedError<null, AppErrorWire>(__TAURI_INVOKE("terminal_delete", { id })),
 	mailboxList: (sinceTs: number | null) => typedError<MailboxEntry[], AppErrorWire>(__TAURI_INVOKE("mailbox_list", { sinceTs })),
 	/**
 	 *  Insert one row, return the inserted entry, **and** emit a
@@ -399,6 +421,7 @@ export const commands = {
 } | null, AppErrorWire>(__TAURI_INVOKE("swarm_term_session_status")),
 	swarmTermStartSession: (projectDir: string) => typedError<TerminalSwarmSessionHandle, AppErrorWire>(__TAURI_INVOKE("swarm_term_start_session", { projectDir })),
 	swarmTermStopSession: () => typedError<null, AppErrorWire>(__TAURI_INVOKE("swarm_term_stop_session")),
+	swarmTermRunUpdate: () => typedError<ClaudeUpdateResult, AppErrorWire>(__TAURI_INVOKE("swarm_term_run_update")),
 };
 
 /* Types */
@@ -1565,6 +1588,12 @@ export type TerminalSwarmSessionHandle = {
 	sessionId: string,
 	projectDir: string,
 	panes: TerminalSwarmPane[],
+};
+
+export type ClaudeUpdateResult = {
+	exitCode: number,
+	stdoutTail: string,
+	stderrTail: string,
 };
 
 /**

@@ -364,13 +364,13 @@
 }
 
 .swarm-chat-msg.orchestrator.action-clarify {
-  border-color: color-mix(in oklch, var(--neuron-amber-500, var(--syn-warn)) 30%, var(--border));
-  background: color-mix(in oklch, var(--neuron-amber-500, var(--syn-warn)) 6%, var(--surface-2));
+  border-color: color-mix(in oklch, var(--neuron-amber-500) 30%, var(--border));
+  background: color-mix(in oklch, var(--neuron-amber-500) 6%, var(--surface-2));
 }
 
 .swarm-chat-msg.orchestrator.action-dispatch {
-  border-color: color-mix(in oklch, var(--syn-ok) 30%, var(--border));
-  background: color-mix(in oklch, var(--syn-ok) 6%, var(--surface-2));
+  border-color: color-mix(in oklch, var(--syn-success) 30%, var(--border));
+  background: color-mix(in oklch, var(--syn-success) 6%, var(--surface-2));
 }
 
 .swarm-chat-msg.orchestrator.pending {
@@ -385,8 +385,8 @@
   gap: 6px;
   padding: 6px 10px;
   border-radius: 999px;
-  background: color-mix(in oklch, var(--syn-ok) 10%, var(--surface-2));
-  border: 1px solid color-mix(in oklch, var(--syn-ok) 30%, var(--border));
+  background: color-mix(in oklch, var(--syn-success) 10%, var(--surface-2));
+  border: 1px solid color-mix(in oklch, var(--syn-success) 30%, var(--border));
   font-size: 12px;
   max-width: 100%;
 }
@@ -736,9 +736,9 @@
 /* ---------- Verdict + retry rendering (W3-12d/e follow-up) ---------- */
 
 .swarm-retry-pill {
-  background: color-mix(in oklch, var(--neuron-amber-500, var(--syn-warn, #d97706)) 18%, transparent);
-  color: color-mix(in oklch, var(--neuron-amber-500, var(--syn-warn, #d97706)) 70%, var(--foreground));
-  border: 1px solid color-mix(in oklch, var(--neuron-amber-500, var(--syn-warn, #d97706)) 35%, transparent);
+  background: color-mix(in oklch, var(--neuron-amber-500) 18%, transparent);
+  color: color-mix(in oklch, var(--neuron-amber-500) 70%, var(--foreground));
+  border: 1px solid color-mix(in oklch, var(--neuron-amber-500) 35%, transparent);
 }
 
 .swarm-verdict {
@@ -751,8 +751,8 @@
 }
 
 .swarm-verdict.approved {
-  border-color: color-mix(in oklch, var(--syn-ok, #10b981) 30%, transparent);
-  background: color-mix(in oklch, var(--syn-ok, #10b981) 6%, transparent);
+  border-color: color-mix(in oklch, var(--syn-success) 30%, transparent);
+  background: color-mix(in oklch, var(--syn-success) 6%, transparent);
 }
 
 .swarm-verdict.rejected {
@@ -801,7 +801,7 @@
 }
 
 .swarm-verdict-issue[data-severity='med'] {
-  border-color: color-mix(in oklch, var(--neuron-amber-500, var(--syn-warn, #d97706)) 30%, transparent);
+  border-color: color-mix(in oklch, var(--neuron-amber-500) 30%, transparent);
 }
 
 .swarm-issue-loc {
@@ -822,8 +822,8 @@
 }
 
 .pill.swarm-sev-med {
-  background: color-mix(in oklch, var(--neuron-amber-500, var(--syn-warn, #d97706)) 18%, transparent);
-  color: color-mix(in oklch, var(--neuron-amber-500, var(--syn-warn, #d97706)) 75%, var(--foreground));
+  background: color-mix(in oklch, var(--neuron-amber-500) 18%, transparent);
+  color: color-mix(in oklch, var(--neuron-amber-500) 75%, var(--foreground));
 }
 
 .pill.swarm-sev-low {

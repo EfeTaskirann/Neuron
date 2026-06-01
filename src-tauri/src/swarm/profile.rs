@@ -675,6 +675,95 @@ mod tests {
         }
     }
 
+    /// Pins the 2026-05-13 autonomy fix: orchestrator + coordinator
+    /// personas must include the explicit "no mid-execution
+    /// approval" rules. If a future edit accidentally reverts these,
+    /// the swarm regresses to the "should I run P0?" pause loop the
+    /// user reported.
+    #[test]
+    fn term_personas_contain_autonomy_rules() {
+        let registry = ProfileRegistry::load_term(None).expect("load_term");
+
+        // Orchestrator: Phase 3 must auto-start (no user approval).
+        let orch = registry.get("orchestrator").expect("orchestrator");
+        assert!(
+            orch.body.contains("OTOMATİK BAŞLAR"),
+            "orchestrator persona missing 'Faz 3 — OTOMATİK BAŞLAR' \
+             rule — regression of 2026-05-13 autonomy fix. body \
+             head: {}",
+            &orch.body[..orch.body.len().min(400)]
+        );
+        assert!(
+            orch.body.contains("Onay isteme reflekslerini"),
+            "orchestrator persona missing 'suppress approval reflex' \
+             clause"
+        );
+
+        // Coordinator: must have the "execute without approval" rule
+        // and the stand-down reset clause.
+        let coord = registry.get("coordinator").expect("coordinator");
+        assert!(
+            coord.body.contains("ONAYI BEKLEMEDEN EXECUTE ET"),
+            "coordinator persona missing 'ONAYI BEKLEMEDEN EXECUTE \
+             ET' rule — regression of 2026-05-13 autonomy fix."
+        );
+        assert!(
+            coord.body.contains("stand-down")
+                || coord.body.contains("Stand-down"),
+            "coordinator persona missing stand-down reset clause"
+        );
+    }
+
+    /// Pins the 2026-05-13 example-leak fix, carried through the
+    /// 2026-05-15 file-IPC cutover: orchestrator + coordinator example
+    /// dispatches must use `<EXAMPLE/...>` placeholders for file paths
+    /// AND every fenced example must be labelled "ÖRNEK BODY" so
+    /// claude recognises it as illustrative rather than dispatchable.
+    /// If someone reverts these defenses, swarm regresses to
+    /// copy-pasting persona examples as real dispatches (the original
+    /// bug: frontend-builder implemented the example session-timer
+    /// dispatch verbatim instead of the user's actual Workflow+models
+    /// task).
+    ///
+    /// The pre-2026-05-15 assertion checked `&gt;&gt;` HTML-escapes on
+    /// the examples, since literal `>>` at column 0 used to fire a
+    /// PTY-marker route at persona-injection time. The file-IPC
+    /// design parses no PTY text, so the chevron escape is no longer
+    /// load-bearing and was dropped.
+    #[test]
+    fn term_personas_examples_use_warning_marker_and_placeholders() {
+        let registry = ProfileRegistry::load_term(None).expect("load_term");
+
+        for id in ["orchestrator", "coordinator"] {
+            let p = registry.get(id).unwrap_or_else(|| {
+                panic!("term persona {id} missing")
+            });
+            assert!(
+                p.body.contains("<EXAMPLE/"),
+                "{id} persona missing `<EXAMPLE/...>` path \
+                 placeholders — regression of 2026-05-13 \
+                 example-leak fix"
+            );
+            assert!(
+                p.body.contains("ÖRNEK BODY"),
+                "{id} persona missing 'ÖRNEK BODY' warning label on \
+                 example blocks — without it claude treats the body \
+                 inside the fenced block as a real dispatch \
+                 (regression of 2026-05-13 example-leak fix)"
+            );
+        }
+
+        // Orchestrator must also carry the incident-citation
+        // anti-pattern so future readers know WHY the defenses exist.
+        let orch = registry.get("orchestrator").expect("orchestrator");
+        assert!(
+            orch.body.contains("2026-05-13"),
+            "orchestrator persona missing 2026-05-13 incident \
+             citation in anti-patterns — the defenses look arbitrary \
+             without it"
+        );
+    }
+
     /// Acceptance: load the bundled `scout.md` via the embedded
     /// registry path and assert all nine fields land in `Profile`.
     #[test]

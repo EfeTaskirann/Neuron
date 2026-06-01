@@ -12,23 +12,120 @@
 
 .term-route {
   position: absolute; inset: 0;
-  display: grid;
-  grid-template-rows: 1fr 32px;
+  display: flex;
+  flex-direction: column;
   background:
     radial-gradient(circle at 30% 10%, color-mix(in oklch, var(--neuron-violet-500) 5%, transparent), transparent 40%),
     var(--background);
   overflow: hidden;
 }
 
-.pane-grid {
-  display: grid; gap: 8px; padding: 12px 12px 8px;
+/* `pane-main` owns the tab strip (auto height) and the single active
+   pane body (1fr). Only one xterm is mounted at a time — the strip is
+   the navigator. */
+.pane-main {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
   min-height: 0;
 }
-.pane-grid.layout-1   { grid-template: 1fr / 1fr; }
-.pane-grid.layout-2v  { grid-template: 1fr / 1fr 1fr; }
-.pane-grid.layout-2h  { grid-template: 1fr 1fr / 1fr; }
-.pane-grid.layout-2x2 { grid-template: 1fr 1fr / 1fr 1fr; }
-.pane-grid.layout-3x4 { grid-template: 1fr 1fr / 1fr 1fr 1fr; }
+
+.pane-active {
+  flex: 1;
+  min-height: 0;
+  padding: 8px 12px;
+  display: flex;
+}
+.pane-active > .pane { width: 100%; }
+
+/* Horizontal tab strip. Scrolls when there are more panes than the
+   viewport can fit (a single swarm launch produces 9 panes; sessions
+   accumulate fast). Each tab is a status-coloured chip with an inline
+   kill button. */
+.pane-tabs {
+  display: flex;
+  align-items: stretch;
+  gap: 4px;
+  padding: 6px 12px 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: thin;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface-1);
+  flex: none;
+}
+.pane-tabs::-webkit-scrollbar { height: 4px; }
+.pane-tabs::-webkit-scrollbar-thumb {
+  background: color-mix(in oklch, var(--neuron-violet-500) 50%, transparent);
+  border-radius: 2px;
+}
+
+.pane-tab {
+  --tab-color: oklch(0.555 0.020 258);
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 8px 6px 10px;
+  border: 1px solid color-mix(in oklch, var(--tab-color) 30%, var(--border));
+  border-bottom: none;
+  border-top-left-radius: var(--radius-sm);
+  border-top-right-radius: var(--radius-sm);
+  background: color-mix(in oklch, var(--tab-color) 8%, var(--surface-2));
+  color: var(--muted-foreground);
+  font-size: 11.5px;
+  font-family: var(--font-mono);
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background-color 120ms ease, border-color 120ms ease, color 120ms ease;
+  flex: 0 0 auto;
+  max-width: 200px;
+}
+.pane-tab:hover {
+  background: color-mix(in oklch, var(--tab-color) 14%, var(--surface-2));
+  color: var(--foreground);
+}
+.pane-tab.active {
+  background: var(--term-bg);
+  border-color: var(--tab-color);
+  color: var(--foreground);
+  box-shadow:
+    0 0 0 1px color-mix(in oklch, var(--tab-color) 55%, transparent),
+    0 4px 14px -8px color-mix(in oklch, var(--tab-color) 45%, transparent);
+}
+.pane-tab.status-idle              { --tab-color: oklch(0.555 0.020 258); }
+.pane-tab.status-running           { --tab-color: oklch(0.737 0.159 299); }
+.pane-tab.status-success           { --tab-color: oklch(0.700 0.170 158); }
+.pane-tab.status-error             { --tab-color: oklch(0.640 0.230 18); }
+.pane-tab.status-awaiting_approval { --tab-color: oklch(0.795 0.165 78); }
+.pane-tab.status-closed            { --tab-color: oklch(0.485 0.014 258); opacity: 0.78; }
+
+.pane-tab-dot {
+  width: 6px; height: 6px; border-radius: 50%;
+  background: var(--tab-color);
+  flex: none;
+}
+.pane-tab.status-running .pane-tab-dot,
+.pane-tab.status-awaiting_approval .pane-tab-dot { animation: pulse 1.6s ease-in-out infinite; }
+.pane-tab-name { font-weight: 500; }
+.pane-tab-role { color: var(--muted-foreground); font-size: 10.5px; }
+.pane-tab-close {
+  display: inline-grid;
+  place-items: center;
+  width: 16px; height: 16px;
+  margin-left: 4px;
+  border-radius: 4px;
+  color: var(--muted-foreground);
+  transition: background-color 120ms ease, color 120ms ease;
+}
+.pane-tab-close:hover {
+  background: color-mix(in oklch, var(--syn-error) 25%, transparent);
+  color: var(--foreground);
+}
+.pane-tab-close[aria-disabled="true"] {
+  opacity: 0.35;
+  cursor: not-allowed;
+  pointer-events: none;
+}
 
 /* Status → color map. Single source of truth — border, stripe, glow all read --st-color.
    --st-color is set as a CONCRETE oklch value (not via var()) so color-mix can resolve it
@@ -272,15 +369,6 @@
 .tsb-pill.st-running::before,
 .tsb-pill.st-awaiting::before { animation: pulse 1.6s ease-in-out infinite; }
 
-.layout-switcher { display: flex; gap: 1px; padding: 2px; background: var(--surface-2); border-radius: var(--radius-sm); }
-.ls-btn {
-  display: grid; place-items: center;
-  width: 22px; height: 22px;
-  border: 0; background: transparent; cursor: pointer; border-radius: 4px;
-  color: var(--muted-foreground);
-}
-.ls-btn:hover { color: var(--foreground); }
-.ls-btn.active { background: var(--surface-3); color: var(--neuron-violet-300); }
 
 /* Mailbox panel — slim header strip above the pane grid that
    surfaces cross-pane events from useMailbox(). Hidden when the

@@ -35,10 +35,21 @@ pub fn run_span(run_id: &str) -> String {
 }
 
 /// `panes:{id}:line` — one line of PTY output for the given pane.
-/// Frontend subscribes per-pane.
+/// Frontend subscribes per-pane. Used for ring-buffer rehydration of
+/// closed panes and `terminal:lines` snapshot reads.
 #[inline]
 pub fn pane_line(pane_id: &str) -> String {
     format!("panes:{pane_id}:line")
+}
+
+/// `panes:{id}:chunk` — raw PTY output chunk for the given pane, emitted
+/// immediately on each read so that user keystrokes (echoed by the PTY)
+/// surface in xterm without waiting for a newline. Payload is a UTF-8
+/// `text` field; the frontend writes it verbatim to xterm so ANSI
+/// escapes (cursor, color, echo) render correctly.
+#[inline]
+pub fn pane_chunk(pane_id: &str) -> String {
+    format!("panes:{pane_id}:chunk")
 }
 
 /// `swarm:job:{id}:event` — per-job streaming lifecycle event for
@@ -51,6 +62,26 @@ pub fn pane_line(pane_id: &str) -> String {
 pub fn swarm_job_event(job_id: &str) -> String {
     format!("swarm:job:{job_id}:event")
 }
+
+// --- Swarm-term (W6 file-IPC bridge) --------------------------------- //
+
+/// `swarm-term:route` — one inter-agent message hop processed by the
+/// file-IPC bridge watcher (`swarm_term::bridge`). Payload:
+/// `{ source, target, body, outcome, reason?, allowed?, attempts?,
+/// status? }`. `outcome` ∈ ok / malformed / denied / unknown_target /
+/// target_not_ready / target_locked / target_write_timeout /
+/// lifecycle_fanout.
+pub const SWARM_TERM_ROUTE: &str = "swarm-term:route";
+
+/// `swarm-term:lifecycle` — a task-lifecycle transition recorded by
+/// `swarm_term::lifecycle::LifecycleStore`. Payload:
+/// `{ source, source_pane, task_id, transition, state }`.
+pub const SWARM_TERM_LIFECYCLE: &str = "swarm-term:lifecycle";
+
+/// `swarm-term:update:log` — one stdout/stderr line from the bundled
+/// `claude` self-update child (`swarm_term_run_update`). Payload:
+/// `{ stream, line }`.
+pub const SWARM_TERM_UPDATE_LOG: &str = "swarm-term:update:log";
 
 #[cfg(test)]
 mod tests {
@@ -82,6 +113,9 @@ mod tests {
             MAILBOX_NEW,
             MCP_INSTALLED,
             MCP_UNINSTALLED,
+            SWARM_TERM_ROUTE,
+            SWARM_TERM_LIFECYCLE,
+            SWARM_TERM_UPDATE_LOG,
         ] {
             assert!(!s.contains('.'), "static event name `{s}` must not contain `.`");
         }
