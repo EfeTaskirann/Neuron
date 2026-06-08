@@ -421,6 +421,23 @@ export const commands = {
 } | null, AppErrorWire>(__TAURI_INVOKE("swarm_term_session_status")),
 	swarmTermStartSession: (projectDir: string) => typedError<TerminalSwarmSessionHandle, AppErrorWire>(__TAURI_INVOKE("swarm_term_start_session", { projectDir })),
 	swarmTermStopSession: () => typedError<null, AppErrorWire>(__TAURI_INVOKE("swarm_term_stop_session")),
+	/**
+	 *  Update the host's `claude` CLI to the latest version. Rejects while a
+	 *  swarm-term session is running so the binary on disk isn't swapped
+	 *  out from under the spawned REPLs.
+	 * 
+	 *  Resolution strategy:
+	 *  1. Resolve the active claude binary via `resolve_claude_spawn()`.
+	 *  2. If the resolved path looks like an npm install (under `\npm\` or
+	 *     `node_modules\@anthropic-ai\claude-code`), run
+	 *     `npm install -g @anthropic-ai/claude-code@latest`.
+	 *  3. Otherwise, invoke `claude update` directly — the v2.x native
+	 *     installer supports this subcommand.
+	 * 
+	 *  Stdout / stderr are streamed line-by-line as `swarm-term:update:log`
+	 *  events. The final result carries the exit code plus the last 4KB of
+	 *  each stream for a post-mortem display.
+	 */
 	swarmTermRunUpdate: () => typedError<ClaudeUpdateResult, AppErrorWire>(__TAURI_INVOKE("swarm_term_run_update")),
 };
 
@@ -590,6 +607,18 @@ export type BrainAction =
 export type CallToolResult = {
 	content: ToolContent[],
 	isError: boolean,
+};
+
+/**
+ *  Result returned by `swarm_term_run_update` once the update child has
+ *  exited. The tails are bounded so the frontend can show a final
+ *  success / failure summary without the full transcript — the live
+ *  stream is delivered as `swarm-term:update:log` events.
+ */
+export type ClaudeUpdateResult = {
+	exitCode: number,
+	stdoutTail: string,
+	stderrTail: string,
 };
 
 /**
@@ -1588,12 +1617,6 @@ export type TerminalSwarmSessionHandle = {
 	sessionId: string,
 	projectDir: string,
 	panes: TerminalSwarmPane[],
-};
-
-export type ClaudeUpdateResult = {
-	exitCode: number,
-	stdoutTail: string,
-	stderrTail: string,
 };
 
 /**

@@ -13,7 +13,11 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { commands, type PaneLine } from '../lib/bindings';
 import { unwrap } from '../lib/unwrap';
 
-export function usePaneLines(paneId: string | null | undefined) {
+export function usePaneLines(
+  paneId: string | null | undefined,
+  opts?: { live?: boolean },
+) {
+  const live = opts?.live ?? true;
   const qc = useQueryClient();
   const query = useQuery<PaneLine[]>({
     queryKey: ['panes', paneId, 'lines'],
@@ -21,8 +25,17 @@ export function usePaneLines(paneId: string | null | undefined) {
     enabled: !!paneId,
   });
 
+  // Live subscription is opt-in. The xterm-backed consumers (SwarmPane,
+  // Terminal's PaneBody) render new lines by writing to xterm directly
+  // from their own `panes:{id}:line` listener, so they only need the
+  // one-shot snapshot from the query above. Keeping the live listener
+  // on for them would (a) double the IPC subscription per pane — 9 panes
+  // → 18 listeners — and (b) grow this React-Query array unbounded:
+  // xterm caps its own scrollback at 5000 lines, this array does not.
+  // A future plain-React log viewer that renders from `query.data` can
+  // opt back in with `{ live: true }`.
   useEffect(() => {
-    if (!paneId) return;
+    if (!paneId || !live) return;
     let unlisten: UnlistenFn | undefined;
     let cancelled = false;
     const channel = `panes:${paneId}:line`;
@@ -52,7 +65,7 @@ export function usePaneLines(paneId: string | null | undefined) {
       cancelled = true;
       unlisten?.();
     };
-  }, [paneId, qc]);
+  }, [paneId, qc, live]);
 
   return query;
 }

@@ -427,7 +427,11 @@ function PaneBody({ pane }: { pane: Pane }): JSX.Element {
   // every new line event (was O(n) per event, now O(new tail)).
   const writtenSeqsRef = useRef<Set<number>>(new Set());
   const seenSnapshotLenRef = useRef(0);
-  const { data: snapshot } = usePaneLines(pane.id);
+  // `live: false` — snapshot hydrates xterm once; the live stream is
+  // owned by this component's own `panes:{id}:line` listener (below,
+  // skipped for dead PTYs). Letting usePaneLines also subscribe would
+  // duplicate the listener and grow an unbounded line array per pane.
+  const { data: snapshot } = usePaneLines(pane.id, { live: false });
   const writeMut = useTerminalWrite();
   const resizeMut = useTerminalResize();
   const isTerminal = TERMINAL_STATUSES.has(pane.status);

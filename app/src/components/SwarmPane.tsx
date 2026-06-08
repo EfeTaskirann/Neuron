@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react';
+import { memo, useEffect, useRef } from 'react';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { Terminal as XTerm } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
@@ -15,13 +15,17 @@ interface Props {
   agentId: string;
 }
 
-export function SwarmPane({ paneId, agentId }: Props): JSX.Element {
+function SwarmPaneImpl({ paneId, agentId }: Props): JSX.Element {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const xtermRef = useRef<XTerm | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
   const writtenSeqsRef = useRef<Set<number>>(new Set());
   const seenSnapshotLenRef = useRef(0);
-  const { data: snapshot } = usePaneLines(paneId);
+  // `live: false` — the snapshot hydrates xterm once on mount; the live
+  // `panes:{id}:line` stream is handled by this component's own listener
+  // below, so we don't want usePaneLines to open a second subscription
+  // (and grow an unbounded line array) for the same channel.
+  const { data: snapshot } = usePaneLines(paneId, { live: false });
   const writeMut = useTerminalWrite();
   const resizeMut = useTerminalResize();
 
@@ -137,3 +141,9 @@ export function SwarmPane({ paneId, agentId }: Props): JSX.Element {
 
   return <div className="swarm-term-xterm" ref={containerRef} />;
 }
+
+// Memoized: TerminalSwarmRoute re-renders on its routing-edge (~1.5 s)
+// and lifecycle (5 s) timers. `paneId`/`agentId` are stable for a pane's
+// lifetime, so memo keeps those parent ticks from reconciling all 9
+// xterm panes for nothing.
+export const SwarmPane = memo(SwarmPaneImpl);
