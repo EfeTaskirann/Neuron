@@ -9,7 +9,14 @@
 // and mounts an xterm only for the *active* tab. Closed/error panes
 // stay visible (their scrollback hydrates from the persisted
 // `pane_lines` table) until the user hits "Clean closed".
-import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type FormEvent,
+  type MutableRefObject,
+} from 'react';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { Terminal as XTerm } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
@@ -325,15 +332,23 @@ interface PaneViewProps {
 
 function PaneView({ pane, active, onActivate }: PaneViewProps): JSX.Element {
   const agent = metaFor(pane.agent);
+  // PaneBody owns the xterm instance; it registers its `clear()` here so
+  // the header's Clear button (a sibling component) can invoke it without
+  // lifting the whole instance up.
+  const clearRef = useRef<(() => void) | null>(null);
   return (
     <div
       className={`pane status-${pane.status}${active ? ' active' : ''}`}
       onClick={onActivate}
     >
       <div className="pane-stripe" />
-      <PaneHeader pane={pane} agent={agent} />
+      <PaneHeader
+        pane={pane}
+        agent={agent}
+        onClear={() => clearRef.current?.()}
+      />
       {pane.approval && <ApprovalBanner approval={pane.approval} />}
-      <PaneBody pane={pane} />
+      <PaneBody pane={pane} clearRef={clearRef} />
     </div>
   );
 }
@@ -348,7 +363,15 @@ const STATUS_LABEL: Record<string, string> = {
   closed: 'closed',
 };
 
-function PaneHeader({ pane, agent }: { pane: Pane; agent: AgentInfo }): JSX.Element {
+function PaneHeader({
+  pane,
+  agent,
+  onClear,
+}: {
+  pane: Pane;
+  agent: AgentInfo;
+  onClear: () => void;
+}): JSX.Element {
   const kill = useTerminalKill();
   return (
     <div className="pane-head">
@@ -363,7 +386,14 @@ function PaneHeader({ pane, agent }: { pane: Pane; agent: AgentInfo }): JSX.Elem
         {pane.cwd}
       </div>
       <div className="pane-head-r">
-        <button className="icon-btn sm" title="Clear">
+        <button
+          className="icon-btn sm"
+          title="Clear scrollback"
+          onClick={(e) => {
+            e.stopPropagation();
+            onClear();
+          }}
+        >
           <NIcon name="trash" size={12} />
         </button>
         <button className="icon-btn sm" title="Restart">
@@ -416,7 +446,13 @@ function ApprovalBanner({ approval }: { approval: NonNullable<Pane['approval']> 
 // terminal.rs::LineEventPayload — `text` is plain). xterm still
 // gives us a real cursor, scroll, font, and input handling; ANSI
 // rendering follows when the backend event payload changes.
-function PaneBody({ pane }: { pane: Pane }): JSX.Element {
+function PaneBody({
+  pane,
+  clearRef,
+}: {
+  pane: Pane;
+  clearRef?: MutableRefObject<(() => void) | null>;
+}): JSX.Element {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const xtermRef = useRef<XTerm | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
@@ -470,11 +506,18 @@ function PaneBody({ pane }: { pane: Pane }): JSX.Element {
 
     xtermRef.current = term;
     fitRef.current = fit;
+    // Expose clear() to the header's Clear button (UI-004). Wipes the
+    // visible scrollback; the PTY/shell state is untouched, so new output
+    // streams in normally afterwards.
+    if (clearRef) {
+      clearRef.current = () => term.clear();
+    }
     return () => {
       onDataDisp.dispose();
       term.dispose();
       xtermRef.current = null;
       fitRef.current = null;
+      if (clearRef) clearRef.current = null;
       writtenSeqs.clear();
       seenSnapshotLenRef.current = 0;
     };
