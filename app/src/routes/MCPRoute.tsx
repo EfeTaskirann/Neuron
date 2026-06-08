@@ -2,28 +2,56 @@
 // from `data.servers` → `useServers()`. ServerCard / ServerRow are
 // internal helpers kept in this file; promote when a second
 // consumer needs them (none planned for Week 2).
+import { useState } from 'react';
 import { NIcon, NodeGlyph } from '../components/icons';
 import { useServers } from '../hooks/useServers';
 import { useMcpInstall, useMcpUninstall } from '../hooks/mutations';
 import type { Server } from '../lib/bindings';
 
+type McpFilter = 'all' | 'official' | 'community' | 'installed';
+const FILTERS: McpFilter[] = ['all', 'official', 'community', 'installed'];
+
 export function MCPRoute(): JSX.Element {
   const { data: servers = [], isLoading, isError, error } = useServers();
+  const [search, setSearch] = useState('');
+  const [filter, setFilter] = useState<McpFilter>('all');
   if (isLoading) {
     return <div className="route route-mcp route-loading">Loading servers…</div>;
   }
   if (isError) {
     throw error instanceof Error ? error : new Error(String(error));
   }
-  const featured = servers.filter((s) => s.featured);
+  const q = search.trim().toLowerCase();
+  // "official" maps to the curated/featured entries and "community" to
+  // the rest; "installed" is the explicit per-server flag. Search
+  // matches name / description / author substring.
+  const visible = servers.filter((s) => {
+    if (filter === 'installed' && !s.installed) return false;
+    if (filter === 'official' && !s.featured) return false;
+    if (filter === 'community' && s.featured) return false;
+    if (q && !`${s.name} ${s.desc} ${s.by}`.toLowerCase().includes(q)) {
+      return false;
+    }
+    return true;
+  });
+  const featured = visible.filter((s) => s.featured);
   return (
     <div className="route route-mcp">
       <div className="mcp-search">
         <NIcon name="search" size={16} />
-        <input placeholder={`Search ${servers.length} servers…`} />
+        <input
+          placeholder={`Search ${servers.length} servers…`}
+          value={search}
+          onChange={(e) => setSearch(e.target.value)}
+        />
         <div className="chip-row mcp-chips">
-          {(['all', 'official', 'community', 'installed'] as const).map((c, i) => (
-            <button key={c} className={`chip${i === 0 ? ' active' : ''}`}>
+          {FILTERS.map((c) => (
+            <button
+              key={c}
+              type="button"
+              className={`chip${filter === c ? ' active' : ''}`}
+              onClick={() => setFilter(c)}
+            >
               {c}
             </button>
           ))}
@@ -40,19 +68,29 @@ export function MCPRoute(): JSX.Element {
         </div>
       ) : (
         <>
-          <h3 className="route-section-title">Featured</h3>
-          <div className="mcp-featured">
-            {featured.map((s) => (
-              <ServerCard key={s.id} s={s} featured />
-            ))}
-          </div>
+          {featured.length > 0 && (
+            <>
+              <h3 className="route-section-title">Featured</h3>
+              <div className="mcp-featured">
+                {featured.map((s) => (
+                  <ServerCard key={s.id} s={s} featured />
+                ))}
+              </div>
+            </>
+          )}
 
           <h3 className="route-section-title">All servers</h3>
-          <div className="mcp-list">
-            {servers.map((s) => (
-              <ServerRow key={s.id} s={s} />
-            ))}
-          </div>
+          {visible.length > 0 ? (
+            <div className="mcp-list">
+              {visible.map((s) => (
+                <ServerRow key={s.id} s={s} />
+              ))}
+            </div>
+          ) : (
+            <p className="text-muted mcp-empty">
+              No servers match your search{filter !== 'all' ? ` in “${filter}”` : ''}.
+            </p>
+          )}
         </>
       )}
     </div>

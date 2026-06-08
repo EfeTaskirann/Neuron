@@ -50,6 +50,7 @@ export function AgentsRoute(): JSX.Element {
 
 function AgentCard({ agent }: { agent: Agent }): JSX.Element {
   const del = useAgentDelete();
+  const dup = useAgentCreate();
   return (
     <div className="agent-card">
       <div className="agent-card-head">
@@ -67,9 +68,21 @@ function AgentCard({ agent }: { agent: Agent }): JSX.Element {
       </div>
       <div className="agent-role">{agent.role}</div>
       <div className="agent-foot">
-        <button className="btn ghost sm">
+        <button
+          className="btn ghost sm"
+          disabled={dup.isPending}
+          onClick={() =>
+            dup.mutate({
+              name: `${agent.name} (copy)`,
+              model: agent.model,
+              temp: agent.temp,
+              role: agent.role,
+            })
+          }
+          title="Duplicate agent"
+        >
           <NIcon name="copy" size={12} />
-          <span>Duplicate</span>
+          <span>{dup.isPending ? 'Duplicating…' : 'Duplicate'}</span>
         </button>
         <button
           className="btn ghost sm"
