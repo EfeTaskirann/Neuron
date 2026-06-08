@@ -20,6 +20,13 @@ export function AgentsRoute(): JSX.Element {
   }
   return (
     <div className="route route-agents">
+      {agents.length === 0 && !creating && (
+        <div className="agents-empty">
+          <p className="text-muted">
+            No agents yet. Create your first agent to get started.
+          </p>
+        </div>
+      )}
       <div className="route-grid">
         {agents.map((a: Agent) => (
           <AgentCard key={a.id} agent={a} />

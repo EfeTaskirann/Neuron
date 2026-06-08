@@ -1,8 +1,8 @@
-// WP-W2-08 phase A — shell scaffold. Mirrors `Neuron Design/app/shell.jsx`'s
-// DOM and class names verbatim so the moved CSS resolves unchanged.
-// Routes are stubs ("coming soon"); phases B/C/D port real routes
-// in over their respective hooks. User/workspace strings are
-// placeholders until `useMe()` lands in phase B.
+// WP-W2-08 — app shell. Mirrors `Neuron Design/app/shell.jsx`'s DOM
+// and class names verbatim so the moved CSS resolves unchanged. All
+// nine routes are now wired to real components in `RouteHost`;
+// `RouteStub` survives only as the defensive `default:` fallback.
+// User/workspace strings come from `useMe()`.
 import { useState } from 'react';
 import { Brandmark, NIcon, type IconName } from './components/icons';
 import { ErrorBoundary } from './components/ErrorBoundary';
@@ -73,7 +73,19 @@ function Sidebar({ route, onNavigate, collapsed, onToggle }: SidebarProps): JSX.
   const workspaceCount = me?.workspace.count;
   return (
     <nav className="sidebar" role="navigation">
-      <div className="sb-brand" onClick={onToggle} role="button" title="Toggle sidebar">
+      <div
+        className="sb-brand"
+        onClick={onToggle}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault();
+            onToggle();
+          }
+        }}
+        role="button"
+        tabIndex={0}
+        title="Toggle sidebar"
+      >
         <Brandmark size={28} />
         {!collapsed && <span className="sb-wordmark">Neuron</span>}
       </div>
@@ -94,7 +106,16 @@ function Sidebar({ route, onNavigate, collapsed, onToggle }: SidebarProps): JSX.
           <li
             key={item.id}
             className={`sb-item${route === item.id ? ' active' : ''}`}
+            role="button"
+            tabIndex={0}
+            aria-current={route === item.id ? 'page' : undefined}
             onClick={() => onNavigate(item.id)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault();
+                onNavigate(item.id);
+              }
+            }}
           >
             <NIcon name={item.icon} size={18} />
             {!collapsed && <span>{item.label}</span>}

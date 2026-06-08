@@ -30,19 +30,31 @@ export function MCPRoute(): JSX.Element {
         </div>
       </div>
 
-      <h3 className="route-section-title">Featured</h3>
-      <div className="mcp-featured">
-        {featured.map((s) => (
-          <ServerCard key={s.id} s={s} featured />
-        ))}
-      </div>
+      {servers.length === 0 ? (
+        <div className="mcp-empty">
+          <h3 className="route-section-title">No servers in the catalog</h3>
+          <p className="text-muted">
+            The MCP marketplace is empty right now. Check back once servers
+            are published.
+          </p>
+        </div>
+      ) : (
+        <>
+          <h3 className="route-section-title">Featured</h3>
+          <div className="mcp-featured">
+            {featured.map((s) => (
+              <ServerCard key={s.id} s={s} featured />
+            ))}
+          </div>
 
-      <h3 className="route-section-title">All servers</h3>
-      <div className="mcp-list">
-        {servers.map((s) => (
-          <ServerRow key={s.id} s={s} />
-        ))}
-      </div>
+          <h3 className="route-section-title">All servers</h3>
+          <div className="mcp-list">
+            {servers.map((s) => (
+              <ServerRow key={s.id} s={s} />
+            ))}
+          </div>
+        </>
+      )}
     </div>
   );
 }

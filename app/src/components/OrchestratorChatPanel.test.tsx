@@ -242,12 +242,17 @@ describe('OrchestratorChatPanel', () => {
     const { commands } = await import('../lib/bindings');
     vi.mocked(commands.swarmOrchestratorDecide).mockResolvedValue({
       status: 'error',
-      error: { kind: 'SwarmInvoke', message: 'persona blew up' },
+      error: { kind: 'swarm_invoke', message: 'persona blew up' },
     });
     renderPanel();
     await typeAndSend('boom');
+    // `unwrap` maps the known snake_case `kind` to localized copy via
+    // `AppErrorClient`, so the banner shows the Turkish user message (the
+    // raw backend string is preserved on `.detail`, not shown in the UI).
     await waitFor(() =>
-      expect(screen.getByRole('alert')).toHaveTextContent('persona blew up'),
+      expect(screen.getByRole('alert')).toHaveTextContent(
+        'Ajan çağrısı başarısız oldu.',
+      ),
     );
   });
 
