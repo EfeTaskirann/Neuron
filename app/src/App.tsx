@@ -159,7 +159,12 @@ function Topbar({ route }: { route: Route }): JSX.Element {
       </div>
 
       <div className="topbar-r">
-        {route === 'canvas' ? (
+        {/* The topbar primary action is "Run" on the run-oriented routes.
+            Other routes carry their own primary affordance in the route
+            body (Terminal's New-pane form, Agents' New-agent card, MCP
+            install, Swarm chat …), so the topbar omits a redundant — and
+            previously dead — button rather than firing a vague action. */}
+        {route === 'canvas' || route === 'runs' ? (
           <button
             className="btn primary"
             disabled={runCreate.isPending}
@@ -168,12 +173,7 @@ function Topbar({ route }: { route: Route }): JSX.Element {
             <NIcon name="play" size={12} />
             <span>{runCreate.isPending ? 'Starting…' : 'Run'}</span>
           </button>
-        ) : (
-          <button className="btn primary">
-            <NIcon name="plus" size={14} />
-            <span>New</span>
-          </button>
-        )}
+        ) : null}
       </div>
     </header>
   );
