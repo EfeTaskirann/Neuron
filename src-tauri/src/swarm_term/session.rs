@@ -137,6 +137,17 @@ impl TerminalSwarmRegistry {
         app: AppHandle<R>,
         project_dir: PathBuf,
     ) -> Result<TerminalSwarmSessionHandle, AppError> {
+        // PATH-01: reject parent-dir traversal segments so a crafted
+        // project_dir cannot walk out of wherever the caller intended
+        // (the 9 REPLs spawn with bypassPermissions and cwd = this dir).
+        if project_dir
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err(AppError::InvalidInput(
+                "project_dir must not contain '..' path segments".into(),
+            ));
+        }
         if !project_dir.is_dir() {
             return Err(AppError::InvalidInput(format!(
                 "project_dir {} does not exist or is not a directory",
@@ -236,6 +247,14 @@ impl TerminalSwarmRegistry {
             // versions — both are cheap and only one needs to land.
             extra_env.insert("DISABLE_AUTOUPDATER".to_string(), "1".to_string());
             extra_env.insert("CLAUDE_CODE_DISABLE_AUTOUPDATE".to_string(), "1".to_string());
+            // ENV-01: belt-and-suspenders auth isolation. The registry
+            // already env_remove's these for claude-code panes, but if
+            // Neuron itself was launched from a Claude shell the parent's
+            // token could bleed in via inheritance order. Forcing them
+            // empty guarantees each pane authenticates only from its own
+            // seeded ~/.claude/.credentials.json (the isolated HOME).
+            extra_env.insert("CLAUDE_CODE_OAUTH_TOKEN".to_string(), String::new());
+            extra_env.insert("ANTHROPIC_API_KEY".to_string(), String::new());
             // Bridge-related env vars. Each pane's claude REPL reads
             // these from the persona body (interpolated by
             // `build_persona_payload`), so they're informational here

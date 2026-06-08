@@ -291,16 +291,29 @@ impl SwarmAgentRegistry {
             let key =
                 (workspace_id.to_string(), profile.id.clone());
             let row = match read.get(&key) {
-                Some(slot_arc) => {
-                    let slot = slot_arc.lock().await;
-                    AgentStatusRow {
+                Some(slot_arc) => match slot_arc.try_lock() {
+                    Ok(slot) => AgentStatusRow {
                         workspace_id: workspace_id.to_string(),
                         agent_id: profile.id.clone(),
                         status: slot.status,
                         turns_taken: slot.turns_taken,
                         last_activity_ms: slot.last_activity_ms,
-                    }
-                }
+                    },
+                    // CONC-02: the slot is locked → an `invoke_turn` is in
+                    // flight. Do NOT block on it here: this runs while
+                    // holding the `sessions` RwLock read, and blocking for
+                    // a full turn would stall a concurrent new-agent spawn
+                    // waiting on the write lock. Report `Running` (accurate
+                    // by construction); the next poll reads exact counters
+                    // once the turn releases the slot.
+                    Err(_) => AgentStatusRow {
+                        workspace_id: workspace_id.to_string(),
+                        agent_id: profile.id.clone(),
+                        status: AgentStatus::Running,
+                        turns_taken: 0,
+                        last_activity_ms: Some(now_millis()),
+                    },
+                },
                 None => AgentStatusRow {
                     workspace_id: workspace_id.to_string(),
                     agent_id: profile.id.clone(),

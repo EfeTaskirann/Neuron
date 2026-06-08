@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
 use crate::error::AppError;
@@ -14,6 +14,11 @@ use crate::tuning::MCP_REQUEST_TIMEOUT;
 
 use super::rpc::{Notification, Request, Response};
 use super::types::{CallToolOutput, ToolDescriptor, MCP_PROTOCOL_VERSION};
+
+/// Upper bound on a single NDJSON response line (TIMEOUT-01). Bounds
+/// memory if a server never emits a newline; 16 MiB is far above any
+/// legitimate `tools/call` result.
+const MAX_RESPONSE_LINE_BYTES: u64 = 16 * 1024 * 1024;
 
 /// One live MCP server connection. Owns the child process and its
 /// stdio pipes; drops kill the child via `kill_on_drop(true)`.
@@ -302,13 +307,23 @@ impl McpClient {
     /// `Ok(None)` on a clean EOF (server closed without bytes).
     async fn read_line(&mut self) -> Result<Option<String>, AppError> {
         let mut buf = String::new();
-        let n = self
-            .stdout
+        // TIMEOUT-01: bound the read so a malicious or broken server that
+        // never emits a newline cannot grow `buf` until OOM. A legitimate
+        // NDJSON frame — even a large `tools/call` result — stays well
+        // under the cap; an over-long frame fails the request instead.
+        let n = (&mut self.stdout)
+            .take(MAX_RESPONSE_LINE_BYTES)
             .read_line(&mut buf)
             .await
             .map_err(|e| AppError::McpProtocol(format!("read line: {e}")))?;
         if n == 0 {
             return Ok(None);
+        }
+        if buf.len() as u64 >= MAX_RESPONSE_LINE_BYTES && !buf.ends_with('\n') {
+            return Err(AppError::McpProtocol(format!(
+                "response line exceeded the {} MiB cap without a newline",
+                MAX_RESPONSE_LINE_BYTES / (1024 * 1024)
+            )));
         }
         // Strip the trailing newline so json deser does not see it.
         let trimmed = buf.trim_end_matches(['\r', '\n']).to_string();
