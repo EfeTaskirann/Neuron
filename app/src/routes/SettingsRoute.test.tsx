@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
-import { render, screen, fireEvent } from '@testing-library/react';
+import { render, screen, fireEvent, waitFor } from '@testing-library/react';
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 
 // T1-01 render-smoke for the `settings` tab, which had none. The route
 // has no query deps; its only stateful child is the Appearance pane via
@@ -22,6 +23,15 @@ vi.mock('../hooks/useAppearance', async (importOriginal) => {
     })),
   };
 });
+
+// The Keys pane drives the secrets:* keychain commands.
+vi.mock('../lib/bindings', () => ({
+  commands: {
+    secretsHas: vi.fn(),
+    secretsSet: vi.fn(),
+    secretsDelete: vi.fn(),
+  },
+}));
 
 import { SettingsRoute } from './SettingsRoute';
 
@@ -52,5 +62,28 @@ describe('SettingsRoute', () => {
     expect(
       screen.queryByRole('radiogroup', { name: /theme/i }),
     ).not.toBeInTheDocument();
+  });
+
+  it('renders the Keys pane and saves an API key via the keychain', async () => {
+    const { commands } = await import('../lib/bindings');
+    vi.mocked(commands.secretsHas).mockResolvedValue({ status: 'ok', data: false });
+    vi.mocked(commands.secretsSet).mockResolvedValue({ status: 'ok', data: null });
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={qc}>
+        <SettingsRoute />
+      </QueryClientProvider>,
+    );
+    fireEvent.click(screen.getByRole('button', { name: /keys/i }));
+    await waitFor(() =>
+      expect(screen.getByText('Anthropic (Claude)')).toBeInTheDocument(),
+    );
+    fireEvent.change(screen.getByLabelText(/anthropic \(claude\) api key/i), {
+      target: { value: 'sk-ant-test' },
+    });
+    fireEvent.click(screen.getAllByRole('button', { name: /^save$/i })[0]!);
+    await waitFor(() =>
+      expect(commands.secretsSet).toHaveBeenCalledWith('anthropic', 'sk-ant-test'),
+    );
   });
 });
