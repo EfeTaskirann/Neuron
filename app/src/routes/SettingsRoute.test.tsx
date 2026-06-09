@@ -30,6 +30,8 @@ vi.mock('../lib/bindings', () => ({
     secretsHas: vi.fn(),
     secretsSet: vi.fn(),
     secretsDelete: vi.fn(),
+    meGet: vi.fn(),
+    runsList: vi.fn(),
   },
 }));
 
@@ -85,5 +87,59 @@ describe('SettingsRoute', () => {
     await waitFor(() =>
       expect(commands.secretsSet).toHaveBeenCalledWith('anthropic', 'sk-ant-test'),
     );
+  });
+
+  it('renders the Account pane with the current user + workspace', async () => {
+    const { commands } = await import('../lib/bindings');
+    vi.mocked(commands.meGet).mockResolvedValue({
+      status: 'ok',
+      data: {
+        user: { name: 'Efe', initials: 'ET' },
+        workspace: { name: 'Personal', count: 3 },
+      },
+    });
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={qc}>
+        <SettingsRoute />
+      </QueryClientProvider>,
+    );
+    fireEvent.click(screen.getByRole('button', { name: /account/i }));
+    await waitFor(() =>
+      expect(screen.getByText(/Efe · ET/)).toBeInTheDocument(),
+    );
+    expect(screen.getByText(/Personal · 3 workflows/)).toBeInTheDocument();
+  });
+
+  it('renders the Data pane with an enabled Export button when runs exist', async () => {
+    const { commands } = await import('../lib/bindings');
+    vi.mocked(commands.runsList).mockResolvedValue({
+      status: 'ok',
+      data: [
+        {
+          id: 'r1',
+          workflow: 'wf',
+          workflowId: 'w1',
+          startedAt: 1,
+          dur: 10,
+          tokens: 5,
+          cost: 0.01,
+          status: 'success',
+        },
+      ],
+    });
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={qc}>
+        <SettingsRoute />
+      </QueryClientProvider>,
+    );
+    fireEvent.click(screen.getByRole('button', { name: /^data$/i }));
+    await waitFor(() =>
+      expect(screen.getByText(/1 runs · \$0\.0100 total/)).toBeInTheDocument(),
+    );
+    expect(
+      screen.getByRole('button', { name: /export json/i }),
+    ).not.toBeDisabled();
   });
 });

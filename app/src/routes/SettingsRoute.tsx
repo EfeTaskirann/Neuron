@@ -14,6 +14,8 @@ import {
   type Theme,
 } from '../hooks/useAppearance';
 import { useSecretHas, useSecretSet, useSecretDelete } from '../hooks/useSecrets';
+import { useMe } from '../hooks/useMe';
+import { useRuns } from '../hooks/useRuns';
 
 interface SettingsSection {
   id: string;
@@ -54,6 +56,10 @@ export function SettingsRoute(): JSX.Element {
           <AppearancePane />
         ) : active === 'keys' ? (
           <KeysPane />
+        ) : active === 'account' ? (
+          <AccountPane />
+        ) : active === 'data' ? (
+          <DataPane />
         ) : (
           <div className="set-empty">
             <h2 className="text-h2" style={{ marginTop: 0 }}>
@@ -269,5 +275,92 @@ function KeyRow({ slot }: { slot: KeySlot }): JSX.Element {
         )}
       </div>
     </div>
+  );
+}
+
+function AccountPane(): JSX.Element {
+  const me = useMe();
+  const user = me.data?.user;
+  const ws = me.data?.workspace;
+  return (
+    <>
+      <h2 className="text-h2" style={{ marginTop: 0 }}>
+        Account
+      </h2>
+      <p className="text-muted">
+        Neuron runs locally as a single-user desktop app — there is no cloud
+        account or sign-in.
+      </p>
+      <div className="set-card">
+        <div className="set-row">
+          <div>
+            <div className="set-row-title">User</div>
+            <div className="set-row-sub">
+              {me.isLoading
+                ? 'Loading…'
+                : `${user?.name ?? '—'} · ${user?.initials ?? '··'}`}
+            </div>
+          </div>
+        </div>
+        <div className="set-row">
+          <div>
+            <div className="set-row-title">Workspace</div>
+            <div className="set-row-sub">
+              {me.isLoading
+                ? 'Loading…'
+                : `${ws?.name ?? '—'} · ${ws?.count ?? 0} workflows`}
+            </div>
+          </div>
+        </div>
+      </div>
+    </>
+  );
+}
+
+function DataPane(): JSX.Element {
+  const runs = useRuns();
+  const list = runs.data ?? [];
+  const totalCost = list.reduce((sum, r) => sum + r.cost, 0);
+  const exportRuns = (): void => {
+    const blob = new Blob([JSON.stringify(list, null, 2)], {
+      type: 'application/json',
+    });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `neuron-runs-${list.length}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+  return (
+    <>
+      <h2 className="text-h2" style={{ marginTop: 0 }}>
+        Data
+      </h2>
+      <p className="text-muted">
+        Your runs, agents, and settings live in a local SQLite database on
+        this machine — nothing is synced.
+      </p>
+      <div className="set-card">
+        <div className="set-row">
+          <div>
+            <div className="set-row-title">Run history</div>
+            <div className="set-row-sub">
+              {runs.isLoading
+                ? 'Loading…'
+                : `${list.length} runs · $${totalCost.toFixed(4)} total`}
+            </div>
+          </div>
+          <button
+            type="button"
+            className="btn ghost sm"
+            onClick={exportRuns}
+            disabled={runs.isLoading || list.length === 0}
+          >
+            Export JSON
+          </button>
+        </div>
+      </div>
+    </>
   );
 }
