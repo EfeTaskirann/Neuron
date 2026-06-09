@@ -575,10 +575,10 @@ describe('SettingsRoute', () => {
     // Appearance pane is the default — Theme/Accent rows render.
     expect(screen.getByText('Theme')).toBeInTheDocument();
     expect(screen.getByText('Accent')).toBeInTheDocument();
-    // Click "Keys" — Appearance content should disappear and the
-    // generic empty state for Keys should render.
-    fireEvent.click(screen.getByText('Keys'));
+    // Click "Models" — Appearance content should disappear and the
+    // Models pane (now a real pane, not a placeholder) should render.
+    fireEvent.click(screen.getByText('Models'));
     expect(screen.queryByText('Theme')).not.toBeInTheDocument();
-    expect(screen.getByText('Settings for this section.')).toBeInTheDocument();
+    expect(screen.getByText('claude-opus-4')).toBeInTheDocument();
   });
 });

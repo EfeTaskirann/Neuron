@@ -56,10 +56,15 @@ describe('SettingsRoute', () => {
     expect(screen.getByRole('radiogroup', { name: /motion/i })).toBeInTheDocument();
   });
 
-  it('switches to a placeholder pane when a non-appearance section is picked', () => {
+  it('renders real panes (no placeholder) for the Models and Workflows sections', () => {
     render(<SettingsRoute />);
+    fireEvent.click(screen.getByRole('button', { name: /models/i }));
+    expect(screen.getByText('claude-opus-4')).toBeInTheDocument();
+    expect(
+      screen.queryByText(/settings for this section/i),
+    ).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: /workflows/i }));
-    expect(screen.getByText(/settings for this section/i)).toBeInTheDocument();
+    expect(screen.getByText(/built visually on the canvas/i)).toBeInTheDocument();
     // The appearance radiogroups are gone once another section is active.
     expect(
       screen.queryByRole('radiogroup', { name: /theme/i }),

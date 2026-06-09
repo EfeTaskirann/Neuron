@@ -60,6 +60,23 @@ export function SettingsRoute(): JSX.Element {
           <AccountPane />
         ) : active === 'data' ? (
           <DataPane />
+        ) : active === 'models' ? (
+          <ModelsPane />
+        ) : active === 'workflows' ? (
+          <LinkPane
+            label="Workflows"
+            body="Workflows are built visually on the canvas. Open the Workflow tab to create, edit, or run them."
+          />
+        ) : active === 'agents' ? (
+          <LinkPane
+            label="Agents"
+            body="Agents — name, model, temperature, and role — are configured in the Agents tab."
+          />
+        ) : active === 'mcp' ? (
+          <LinkPane
+            label="MCP"
+            body="Browse, install, and uninstall MCP servers from the MCP tab. Per-server API keys live under Keys."
+          />
         ) : (
           <div className="set-empty">
             <h2 className="text-h2" style={{ marginTop: 0 }}>
@@ -275,6 +292,58 @@ function KeyRow({ slot }: { slot: KeySlot }): JSX.Element {
         )}
       </div>
     </div>
+  );
+}
+
+// Sections whose primary surface is a dedicated tab — the settings pane
+// is a brief pointer rather than a duplicate of that tab's controls.
+function LinkPane({ label, body }: { label: string; body: string }): JSX.Element {
+  return (
+    <>
+      <h2 className="text-h2" style={{ marginTop: 0 }}>
+        {label}
+      </h2>
+      <p className="text-muted">{body}</p>
+    </>
+  );
+}
+
+interface ModelInfo {
+  id: string;
+  provider: string;
+  note: string;
+}
+
+const MODEL_CATALOG: ModelInfo[] = [
+  { id: 'claude-opus-4', provider: 'Anthropic', note: 'Most capable; drives the swarm agents.' },
+  { id: 'claude-sonnet-4', provider: 'Anthropic', note: 'Balanced cost and quality.' },
+  { id: 'claude-haiku-4', provider: 'Anthropic', note: 'Fastest and cheapest.' },
+  { id: 'gpt-4o', provider: 'OpenAI', note: 'Default model for new agents.' },
+  { id: 'gemini-2.5-pro', provider: 'Google', note: 'Long-context, multimodal.' },
+];
+
+function ModelsPane(): JSX.Element {
+  return (
+    <>
+      <h2 className="text-h2" style={{ marginTop: 0 }}>
+        Models
+      </h2>
+      <p className="text-muted">
+        Models available to agents. Pick a per-agent model in the Agents tab;
+        provider API keys live under Keys.
+      </p>
+      <div className="set-card">
+        {MODEL_CATALOG.map((m) => (
+          <div className="set-row" key={m.id}>
+            <div>
+              <div className="set-row-title">{m.id}</div>
+              <div className="set-row-sub">{m.note}</div>
+            </div>
+            <span className="text-muted">{m.provider}</span>
+          </div>
+        ))}
+      </div>
+    </>
   );
 }
 
