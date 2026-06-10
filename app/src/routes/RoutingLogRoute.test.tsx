@@ -16,6 +16,7 @@ import { RoutingLogRoute } from './RoutingLogRoute';
 import { useRoutingEvents, type RouteEvent } from '../hooks/useRoutingEvents';
 
 const OK_EVENT: RouteEvent = {
+  id: 1,
   source: 'planner',
   target: 'backend-builder',
   body: 'build the API',
@@ -24,6 +25,7 @@ const OK_EVENT: RouteEvent = {
 };
 
 const DENIED_EVENT: RouteEvent = {
+  id: 2,
   source: 'scout',
   target: 'reviewer',
   body: 'denied edge body',

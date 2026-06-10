@@ -10,7 +10,6 @@ import {
   commands,
   type Agent,
   type AgentCreateInput,
-  type AgentPatch,
   type Pane,
   type PaneSpawnInput,
   type Run,
@@ -24,17 +23,6 @@ export function useAgentCreate() {
     mutationFn: (input) => unwrap(commands.agentsCreate(input)),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['agents'] });
-    },
-  });
-}
-
-export function useAgentUpdate() {
-  const qc = useQueryClient();
-  return useMutation<Agent, Error, { id: string; patch: AgentPatch }>({
-    mutationFn: ({ id, patch }) => unwrap(commands.agentsUpdate(id, patch)),
-    onSuccess: (_data, { id }) => {
-      qc.invalidateQueries({ queryKey: ['agents'] });
-      qc.invalidateQueries({ queryKey: ['agent', id] });
     },
   });
 }

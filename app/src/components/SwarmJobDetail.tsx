@@ -163,13 +163,19 @@ function StageRow({ stage }: { stage: StageResult }): JSX.Element {
           </span>
         )}
       </div>
-      <div
-        className={`swarm-stage-body${truncated ? ' truncated' : ''}`}
-        onClick={() => text.length > TRUNCATE && setExpanded((v) => !v)}
-        title={text.length > TRUNCATE ? 'Click to expand' : undefined}
-      >
+      <div className={`swarm-stage-body${truncated ? ' truncated' : ''}`}>
         {display}
       </div>
+      {text.length > TRUNCATE && (
+        <button
+          type="button"
+          className="btn ghost sm"
+          aria-expanded={expanded}
+          onClick={() => setExpanded((v) => !v)}
+        >
+          {expanded ? 'Show less' : 'Show more'}
+        </button>
+      )}
       {isVerdictStage && stage.verdict && (
         <VerdictBlock verdict={stage.verdict} />
       )}

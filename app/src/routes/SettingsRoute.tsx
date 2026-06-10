@@ -260,7 +260,26 @@ function KeyRow({ slot }: { slot: KeySlot }): JSX.Element {
       <div>
         <div className="set-row-title">{slot.label}</div>
         <div className="set-row-sub">
-          {has.isLoading ? 'Checking…' : configured ? 'Configured ✓' : 'Not set'}
+          {has.isLoading ? (
+            'Checking…'
+          ) : has.isError ? (
+            // Probe failure ≠ "not set" — saying "Not set" here would
+            // hide the Forget affordance for a key that may exist.
+            <>
+              Status unreadable{' '}
+              <button
+                type="button"
+                className="btn ghost sm"
+                onClick={() => void has.refetch()}
+              >
+                Retry
+              </button>
+            </>
+          ) : configured ? (
+            'Configured ✓'
+          ) : (
+            'Not set'
+          )}
         </div>
       </div>
       <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>

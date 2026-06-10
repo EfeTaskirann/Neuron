@@ -7,15 +7,14 @@
 //
 // `applySwarmEventToJobDetail` is exported so the helper can be
 // driven directly by tests without spinning up the hook.
-import { useEffect } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import {
   commands,
   type JobDetail,
   type SwarmJobEvent,
 } from '../lib/bindings';
 import { unwrap } from '../lib/unwrap';
+import { useTauriEvent } from './useTauriEvent';
 
 export function applySwarmEventToJobDetail(
   prev: JobDetail,
@@ -87,13 +86,9 @@ export function useSwarmJob(jobId: string | null) {
     enabled: !!jobId,
   });
 
-  useEffect(() => {
-    if (!jobId) return;
-    let unlisten: UnlistenFn | undefined;
-    let cancelled = false;
-    const channel = `swarm:job:${jobId}:event`;
-    listen<SwarmJobEvent>(channel, (event) => {
-      const payload = event.payload;
+  useTauriEvent<SwarmJobEvent>(
+    jobId ? `swarm:job:${jobId}:event` : null,
+    (payload) => {
       qc.setQueryData<JobDetail>(['swarm-job', jobId], (prev) => {
         if (!prev) return prev;
         return applySwarmEventToJobDetail(prev, payload);
@@ -103,24 +98,8 @@ export function useSwarmJob(jobId: string | null) {
         // flip lands without waiting on the 5s poll.
         qc.invalidateQueries({ queryKey: ['swarm-jobs'] });
       }
-    })
-      .then((fn) => {
-        if (cancelled) {
-          fn();
-        } else {
-          unlisten = fn;
-        }
-      })
-      .catch((err) => {
-        // Listener registration is best-effort — Tauri rejects
-        // when the runtime is not initialised (jsdom tests).
-        console.warn('[useSwarmJob] failed to subscribe to', channel, err);
-      });
-    return () => {
-      cancelled = true;
-      unlisten?.();
-    };
-  }, [jobId, qc]);
+    },
+  );
 
   return query;
 }

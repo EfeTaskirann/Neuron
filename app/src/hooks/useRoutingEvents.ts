@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+import { useTauriEvent } from './useTauriEvent';
 
 // Shared event-collection hook for the swarm-term routing event
 // stream. The backend (`src-tauri/src/swarm_term/bridge.rs`) emits
@@ -30,6 +30,9 @@ export type RouteOutcome =
   | 'lifecycle_fanout';
 
 export interface RouteEvent {
+  /** Client-minted monotonic id — a stable React list key (rows
+   *  prepend, so index/ts keys would re-key every row per event). */
+  id: number;
   source: string;
   target: string;
   body: string;
@@ -69,46 +72,31 @@ function coerceOutcome(raw: string): RouteOutcome {
     : 'unknown_target';
 }
 
+// Module-level so ids stay unique across remounts of the hook.
+let nextRouteEventId = 0;
+
 export function useRoutingEvents(maxRows = 500): {
   events: RouteEvent[];
   clear: () => void;
 } {
   const [events, setEvents] = useState<RouteEvent[]>([]);
 
-  useEffect(() => {
-    let unlisten: UnlistenFn | undefined;
-    let cancelled = false;
-    listen<RawPayload>('swarm-term:route', (event) => {
-      const p = event.payload;
-      const next: RouteEvent = {
-        source: p.source,
-        target: p.target,
-        body: typeof p.body === 'string' ? p.body : '',
-        outcome: coerceOutcome(p.outcome),
-        reason: typeof p.reason === 'string' ? p.reason : undefined,
-        ts: Date.now(),
-      };
-      setEvents((prev) => {
-        const out = [next, ...prev];
-        if (out.length > maxRows) out.length = maxRows;
-        return out;
-      });
-    })
-      .then((fn) => {
-        if (cancelled) {
-          fn();
-        } else {
-          unlisten = fn;
-        }
-      })
-      .catch((err) => {
-        console.warn('[useRoutingEvents] subscribe failed', err);
-      });
-    return () => {
-      cancelled = true;
-      unlisten?.();
+  useTauriEvent<RawPayload>('swarm-term:route', (p) => {
+    const next: RouteEvent = {
+      id: nextRouteEventId++,
+      source: p.source,
+      target: p.target,
+      body: typeof p.body === 'string' ? p.body : '',
+      outcome: coerceOutcome(p.outcome),
+      reason: typeof p.reason === 'string' ? p.reason : undefined,
+      ts: Date.now(),
     };
-  }, [maxRows]);
+    setEvents((prev) => {
+      const out = [next, ...prev];
+      if (out.length > maxRows) out.length = maxRows;
+      return out;
+    });
+  });
 
   return {
     events,
@@ -142,7 +130,7 @@ const REVIEWER_AGENTS = new Set([
 /**
  * Body-text heuristic that flags an agent's own message as a
  * task-completion signal. Mirrors the 4-state contract documented in
- * the personas under `src/swarm/agents/term/*.md`: agents announce
+ * the personas under `src-tauri/src/swarm/agents/term/*.md`: agents announce
  * "tamam — …" (TR) / "done — …" / ✓ when their assigned slice is
  * finished. We only need to recognise the START of the body so that
  * mid-message occurrences of the word "tamam" (e.g. quoted) don't
@@ -191,10 +179,11 @@ export function useActiveEdge(
 
 /**
  * Authoritative per-agent lifecycle phase, sourced from the backend
- * `swarm-term:lifecycle` event (emitted by
- * `swarm_term::lifecycle::LifecycleStore`). The backend state machine
- * is the source of truth; the body-text heuristic below can disagree
- * with it, so authoritative state wins on merge.
+ * `swarm-term:lifecycle` event (recorded by
+ * `swarm_term::lifecycle::LifecycleStore` and emitted by the bridge's
+ * `lifecycle_synthesise` path). The backend state machine is the
+ * source of truth; the body-text heuristic below can disagree with
+ * it, so authoritative state wins on merge.
  */
 interface LifecyclePayload {
   source: string;
@@ -216,29 +205,11 @@ const LIFECYCLE_STATE_TO_PHASE: Record<string, AgentLifecycle> = {
 export function useLifecycleEvents(): Record<string, AgentLifecycle> {
   const [map, setMap] = useState<Record<string, AgentLifecycle>>({});
 
-  useEffect(() => {
-    let unlisten: UnlistenFn | undefined;
-    let cancelled = false;
-    listen<LifecyclePayload>('swarm-term:lifecycle', (event) => {
-      const phase = LIFECYCLE_STATE_TO_PHASE[event.payload.state];
-      if (!phase) return;
-      setMap((prev) => ({ ...prev, [event.payload.source]: phase }));
-    })
-      .then((fn) => {
-        if (cancelled) {
-          fn();
-        } else {
-          unlisten = fn;
-        }
-      })
-      .catch((err) => {
-        console.warn('[useLifecycleEvents] subscribe failed', err);
-      });
-    return () => {
-      cancelled = true;
-      unlisten?.();
-    };
-  }, []);
+  useTauriEvent<LifecyclePayload>('swarm-term:lifecycle', (payload) => {
+    const phase = LIFECYCLE_STATE_TO_PHASE[payload.state];
+    if (!phase) return;
+    setMap((prev) => ({ ...prev, [payload.source]: phase }));
+  });
 
   return map;
 }

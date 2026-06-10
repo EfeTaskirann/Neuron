@@ -40,6 +40,7 @@ export function MCPRoute(): JSX.Element {
       <div className="mcp-search">
         <NIcon name="search" size={16} />
         <input
+          aria-label="Search MCP servers"
           placeholder={`Search ${servers.length} servers…`}
           value={search}
           onChange={(e) => setSearch(e.target.value)}

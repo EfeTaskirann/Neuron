@@ -9,11 +9,10 @@
 // Order: most recent first (descending by ts) — matches the
 // prototype's mailbox panel rendering and keeps `entries[0]` as
 // the freshest message for headline displays.
-import { useEffect } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { commands, type MailboxEntry } from '../lib/bindings';
 import { unwrap } from '../lib/unwrap';
+import { useTauriEvent } from './useTauriEvent';
 
 export function useMailbox() {
   const qc = useQueryClient();
@@ -25,32 +24,13 @@ export function useMailbox() {
     },
   });
 
-  useEffect(() => {
-    let unlisten: UnlistenFn | undefined;
-    let cancelled = false;
-    listen<MailboxEntry>('mailbox:new', (event) => {
-      const incoming = event.payload;
-      qc.setQueryData<MailboxEntry[]>(['mailbox'], (prev = []) => {
-        if (prev.some((e) => e.id === incoming.id)) return prev;
-        // Newest at index 0 — keeps the panel order stable.
-        return [incoming, ...prev];
-      });
-    })
-      .then((fn) => {
-        if (cancelled) {
-          fn();
-        } else {
-          unlisten = fn;
-        }
-      })
-      .catch((err) => {
-        console.warn('[useMailbox] failed to subscribe to mailbox:new', err);
-      });
-    return () => {
-      cancelled = true;
-      unlisten?.();
-    };
-  }, [qc]);
+  useTauriEvent<MailboxEntry>('mailbox:new', (incoming) => {
+    qc.setQueryData<MailboxEntry[]>(['mailbox'], (prev = []) => {
+      if (prev.some((e) => e.id === incoming.id)) return prev;
+      // Newest at index 0 — keeps the panel order stable.
+      return [incoming, ...prev];
+    });
+  });
 
   return query;
 }

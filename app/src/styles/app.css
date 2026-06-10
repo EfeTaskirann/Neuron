@@ -1624,6 +1624,12 @@ html[data-motion="off"] *::after {
   color: oklch(0.85 0.1 290);
 }
 .routing-log-body-text {
+  /* real <button> (copy-to-clipboard) for keyboard reach — strip UA chrome */
+  background: none;
+  border: none;
+  padding: 0;
+  text-align: left;
+  display: block;
   font-family: var(--font-mono);
   font-size: 11px;
   color: var(--foreground);
