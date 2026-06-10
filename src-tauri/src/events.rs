@@ -42,16 +42,6 @@ pub fn pane_line(pane_id: &str) -> String {
     format!("panes:{pane_id}:line")
 }
 
-/// `panes:{id}:chunk` — raw PTY output chunk for the given pane, emitted
-/// immediately on each read so that user keystrokes (echoed by the PTY)
-/// surface in xterm without waiting for a newline. Payload is a UTF-8
-/// `text` field; the frontend writes it verbatim to xterm so ANSI
-/// escapes (cursor, color, echo) render correctly.
-#[inline]
-pub fn pane_chunk(pane_id: &str) -> String {
-    format!("panes:{pane_id}:chunk")
-}
-
 /// `swarm:job:{id}:event` — per-job streaming lifecycle event for
 /// the swarm coordinator FSM (WP-W3-12c). Payload is a tagged
 /// `SwarmJobEvent` enum with a `kind` discriminator covering

@@ -1080,8 +1080,8 @@ async fn dispatcher_with_help_loop_respects_max_rounds() {
 }
 
 /// Help-loop with `escalate` outcome surfaces as an error
-/// AgentResult (mirrors the W4-05 / acquire_and_invoke_turn_with_help
-/// semantic).
+/// AgentResult (the W4-05 semantic, owned by the dispatcher since
+/// W5-06).
 #[tokio::test]
 async fn dispatcher_with_help_loop_escalate_surfaces_as_error_result() {
     let (app, pool, _dir) = mock_app_with_pool().await;

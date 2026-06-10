@@ -46,42 +46,6 @@
 //! graph — the lifecycle helpers do NOT relax the hierarchy, they
 //! just remove a typing step.
 
-use serde::{Deserialize, Serialize};
-use specta::Type;
-
-/// Wire-stable alias for the agent's kebab-case id. Kept as `String`
-/// on the wire so the JSON shape stays trivially interoperable with
-/// the frontend.
-pub type AgentId = String;
-
-/// Static dump of the routing graph used by the Workflow tab. Captures
-/// the full set of agents and every (`from` → `to`) edge present in
-/// [`ALLOWED`]. The function [`topology`] builds a fresh snapshot per
-/// call; the value is small (9 nodes / 35 edges) so we don't bother
-/// caching it.
-#[derive(Debug, Clone, Serialize, Deserialize, Type)]
-#[serde(rename_all = "camelCase")]
-pub struct Topology {
-    pub nodes: Vec<AgentId>,
-    pub edges: Vec<(AgentId, AgentId)>,
-}
-
-/// Build a fresh [`Topology`] snapshot from the compile-time tables.
-/// Order is stable: nodes follow [`AGENT_IDS`]; edges iterate
-/// [`ALLOWED`] in declaration order so consumers can rely on a
-/// deterministic shape without sorting.
-pub fn topology() -> Topology {
-    let nodes: Vec<AgentId> =
-        AGENT_IDS.iter().map(|s| (*s).to_string()).collect();
-    let mut edges: Vec<(AgentId, AgentId)> = Vec::new();
-    for (src, dsts) in ALLOWED {
-        for dst in *dsts {
-            edges.push(((*src).to_string(), (*dst).to_string()));
-        }
-    }
-    Topology { nodes, edges }
-}
-
 pub const AGENT_IDS: &[&str] = &[
     "orchestrator",
     "coordinator",

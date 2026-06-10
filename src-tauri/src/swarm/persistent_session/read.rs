@@ -211,9 +211,9 @@ pub(super) async fn drain_post_cancel(reader: &mut BufReader<ChildStdout>) {
     let _ = tokio::time::timeout(POST_CANCEL_DRAIN_TIMEOUT, drain_loop).await;
 }
 
-/// Mirror of the private `InvokeAccum` in `transport.rs`. Kept local
-/// to this module to avoid widening the transport.rs visibility for
-/// what is, conceptually, just running state of one read scope.
+/// Mirror of the private `InvokeAccum` in `transport::subprocess`.
+/// Kept local to this module to avoid widening transport visibility
+/// for what is, conceptually, just running state of one read scope.
 #[derive(Default)]
 pub(super) struct InvokeAccum {
     pub(super) session_id: Option<String>,

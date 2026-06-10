@@ -11,9 +11,9 @@
 /// Tauri channel.
 ///
 /// Why a separate enum instead of `SwarmAgentEvent` directly:
-/// `persistent_session` deliberately doesn't depend on
-/// `agent_registry.rs` (the dep would cycle on the registry's use of
-/// `PersistentSession`). Keeping a thin local enum + lifting at the
+/// `persistent_session` deliberately doesn't depend on the
+/// `agent_registry` module (the dep would cycle on the registry's use
+/// of `PersistentSession`). Keeping a thin local enum + lifting at the
 /// registry boundary keeps the dep graph acyclic.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TurnStreamEvent {

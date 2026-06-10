@@ -309,34 +309,6 @@
   background: color-mix(in oklch, var(--neuron-violet-500) 50%, transparent); border-radius: 2px;
 }
 
-.tl { white-space: pre-wrap; word-break: break-word; }
-.tl.sys      { color: var(--muted-foreground); font-style: italic; }
-.tl.prompt   { color: var(--neuron-violet-300); }
-.tl-prompt-sigil { color: var(--neuron-violet-400); }
-.tl-cmd      { color: var(--foreground); }
-.tl.command  { color: var(--foreground); margin-bottom: 2px; }
-.tl.thinking { color: var(--muted-foreground); font-style: italic; padding-left: 14px; }
-.tl-think-dot {
-  display: inline-block; width: 6px; height: 6px; border-radius: 50%;
-  background: var(--neuron-violet-300); margin-right: 8px;
-  animation: pulse 1.6s ease-in-out infinite; vertical-align: 1px;
-}
-.tl.tool {
-  color: var(--neuron-sky-300); padding-left: 14px;
-  display: flex; align-items: baseline; gap: 6px;
-}
-.tl.tool span { color: var(--muted-foreground); }
-.tl.out { color: oklch(0.872 0.044 258); }
-.tl.err { color: var(--syn-error); }
-
-.term-cursor-line { padding-left: 0; }
-.term-cursor {
-  display: inline-block; width: 8px; height: 14px;
-  background: var(--neuron-violet-400); vertical-align: -2px;
-  animation: blink 1s steps(1) infinite;
-  box-shadow: 0 0 10px 0 color-mix(in oklch, var(--neuron-violet-400) 60%, transparent);
-}
-
 /* status bar */
 .term-statusbar {
   display: grid; grid-template-columns: 1fr auto 1fr;

@@ -9,14 +9,15 @@
 /// hold a full `claude` traceback; small enough that the bound is
 /// hit only on adversarial output.
 ///
-/// Pub-within-crate so `persistent_session.rs` can dimension its own
-/// stderr drain to the same budget without re-litigating the size.
+/// Pub-within-crate so the `persistent_session` module can dimension
+/// its own stderr drain to the same budget without re-litigating the
+/// size.
 pub(crate) const STDERR_RING_CAPACITY: usize = 64 * 1024;
 
 /// Tail-only ring buffer. `append` truncates oldest bytes when full.
 ///
-/// Pub-within-crate so `persistent_session.rs` reuses the same shape
-/// for its own stderr drain.
+/// Pub-within-crate so the `persistent_session` module reuses the
+/// same shape for its own stderr drain.
 pub(crate) struct RingBuffer {
     buf: Vec<u8>,
     capacity: usize,

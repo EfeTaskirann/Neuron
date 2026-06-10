@@ -275,9 +275,9 @@ async fn run_invoke_with_help_loop<R: Runtime, I: AgentInvoker>(
         };
 
         // Translate the outcome into the next turn's user message.
-        // Mirrors agent_registry.rs::acquire_and_invoke_turn_with_help
-        // semantics so the W4-05 substrate behaves identically across
-        // both paths.
+        // Same W4-05 help-outcome semantics that
+        // `agent_registry::registry::acquire_and_invoke_turn` used to
+        // host before W5-06 made the dispatcher the single owner.
         use crate::swarm::help_request::CoordinatorHelpOutcome;
         let parsed: CoordinatorHelpOutcome =
             serde_json::from_str(&outcome).map_err(|e| {

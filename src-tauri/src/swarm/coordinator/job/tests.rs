@@ -365,16 +365,12 @@ async fn signal_cancel_wakes_registered_notify() {
         .expect("waiter task panicked");
 }
 
-/// The `WorkspaceGuard` (defined in `fsm.rs`) calls
-/// `release_workspace` on Drop. We simulate that here with a
-/// minimal closure-scoped guard so the registry-side test stays
-/// independent of the FSM module's internals.
-///
-/// W3-12b update: `release_workspace` is async, but Drop is
-/// sync — we exercise it by calling `release_workspace` from
-/// an async block here rather than from a Drop handler. The
-/// FSM-side guard uses `tauri::async_runtime::block_on` which
-/// is integration-tested in fsm.rs.
+/// Historical: the W4-06 FSM owned a `WorkspaceGuard` that called
+/// `release_workspace` on Drop (both removed in W5-06 along with
+/// fsm.rs). The release contract survives — callers invoke
+/// `release_workspace` on success and failure paths — so this test
+/// still exercises the double-release idempotency from an async
+/// block.
 #[tokio::test]
 async fn try_acquire_workspace_releases_for_re_acquire() {
     let reg = JobRegistry::new();

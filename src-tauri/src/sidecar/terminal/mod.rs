@@ -50,7 +50,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use portable_pty::{native_pty_system, Child, ChildKiller, CommandBuilder, MasterPty, PtySize};
-use tauri::{AppHandle, Manager, Runtime};
+use tauri::{AppHandle, Runtime};
 use tokio::sync::Mutex as AsyncMutex;
 use ulid::Ulid;
 
@@ -732,14 +732,3 @@ impl Default for TerminalRegistry {
     }
 }
 
-// --------------------------------------------------------------------- //
-// Convenience accessor for command modules                              //
-// --------------------------------------------------------------------- //
-
-/// Resolve the registry from the Tauri app handle. Commands prefer
-/// `State<TerminalRegistry>` injection, but a few ergonomic call
-/// sites (e.g., the shutdown hook) don't have a `State` and need
-/// the raw lookup.
-pub fn registry_from<R: Runtime>(app: &AppHandle<R>) -> Option<TerminalRegistry> {
-    app.try_state::<TerminalRegistry>().map(|s| s.inner().clone())
-}

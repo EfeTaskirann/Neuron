@@ -74,25 +74,6 @@ pub async fn seed_minimal(pool: &DbPool) {
         .expect("seed workflow");
 }
 
-/// Insert one MCP server with `installed=0` so install/uninstall
-/// tests have a known starting state.
-pub async fn seed_server_uninstalled(pool: &DbPool) {
-    sqlx::query(
-        "INSERT INTO servers (id, name, by, description, installs, rating, featured, installed) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, 0)",
-    )
-    .bind("s3")
-    .bind("PostgreSQL")
-    .bind("Anthropic")
-    .bind("Query relational databases.")
-    .bind(8100_i64)
-    .bind(4.8_f64)
-    .bind(0_i64)
-    .execute(pool)
-    .await
-    .expect("seed server");
-}
-
 /// Insert one pane row with `status='idle'` for terminal:list / kill
 /// tests.
 pub async fn seed_pane(pool: &DbPool, id: &str) {

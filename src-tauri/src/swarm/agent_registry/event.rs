@@ -34,7 +34,7 @@ pub enum SwarmAgentEvent {
     /// Claude is using a tool. `name` is the tool name (Read, Edit,
     /// Glob, etc.); `input_summary` is a one-line truncation of the
     /// tool input (capped via `TOOL_USE_INPUT_SUMMARY_CAP` in
-    /// `transport.rs`). The W4-04 pane shows "Scout is reading
+    /// `transport::classify`). The W4-04 pane shows "Scout is reading
     /// SwarmJobList.tsx" badges.
     ToolUse { name: String, input_summary: String },
     /// Turn finished cleanly. Final assistant text + accounting.

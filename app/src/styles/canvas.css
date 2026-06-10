@@ -265,30 +265,7 @@
   --syn-info:    var(--neuron-sky-500);
 }
 
-/* ============================================================
-   BASE TYPOGRAPHY UTILITIES
-   ============================================================ */
-.text-display { font-family: var(--font-display); font-size: var(--text-display); line-height: var(--text-display-lh); letter-spacing: var(--text-display-tr); font-weight: 900; }
-.text-h1      { font-family: var(--font-display); font-size: var(--text-h1); line-height: var(--text-h1-lh); letter-spacing: var(--text-h1-tr); font-weight: 900; }
-.text-h2      { font-family: var(--font-sans); font-size: var(--text-h2); line-height: var(--text-h2-lh); letter-spacing: var(--text-h2-tr); font-weight: 600; }
-.text-h3      { font-family: var(--font-sans); font-size: var(--text-h3); line-height: var(--text-h3-lh); letter-spacing: var(--text-h3-tr); font-weight: 600; }
-.text-h4      { font-family: var(--font-sans); font-size: var(--text-h4); line-height: var(--text-h4-lh); font-weight: 600; }
-.text-body-lg { font-family: var(--font-sans); font-size: var(--text-body-lg); line-height: var(--text-body-lg-lh); font-weight: 400; }
-.text-body    { font-family: var(--font-sans); font-size: var(--text-body); line-height: var(--text-body-lh); font-weight: 400; }
-.text-body-sm { font-family: var(--font-sans); font-size: var(--text-body-sm); line-height: var(--text-body-sm-lh); font-weight: 400; }
-.text-caption { font-family: var(--font-sans); font-size: var(--text-caption); line-height: var(--text-caption-lh); letter-spacing: var(--text-caption-tr); font-weight: 500; }
-.text-overline{ font-family: var(--font-sans); font-size: var(--text-overline); line-height: var(--text-overline-lh); letter-spacing: var(--text-overline-tr); font-weight: 600; text-transform: uppercase; }
-.text-code    { font-family: var(--font-mono); font-size: var(--text-code); line-height: var(--text-code-lh); }
-.text-code-block { font-family: var(--font-mono); font-size: var(--text-code-block); line-height: var(--text-code-block-lh); }
+/* Typography utilities live in colors_and_type.css (the canonical
+   design-system sheet) — the copy that used to sit here was a
+   byte-for-byte duplicate loaded later, silently shadowing it. */
 
-/* ============================================================
-   PREVIEW CARD HELPERS
-   ============================================================ */
-.neuron-card-host {
-  margin: 0;
-  padding: 0;
-  font-family: var(--font-sans);
-  background: var(--background);
-  color: var(--foreground);
-  -webkit-font-smoothing: antialiased;
-}

@@ -222,36 +222,3 @@ pub struct JobDetail {
     pub source: String,
 }
 
-impl JobDetail {
-    /// Build a detail wire-shape from a `Job` snapshot + the
-    /// `workspace_id` it was created for + the `finished_at_ms`
-    /// the DB persisted on the terminal transition. Aggregates
-    /// `total_cost_usd` / `total_duration_ms` from `stages` so the
-    /// sums always reflect the actual stage rows (not an out-of-
-    /// sync cached value).
-    pub fn from_job(
-        job: Job,
-        workspace_id: String,
-        finished_at_ms: Option<i64>,
-    ) -> Self {
-        let total_cost_usd: f64 =
-            job.stages.iter().map(|s| s.total_cost_usd).sum();
-        let total_duration_ms: u64 =
-            job.stages.iter().map(|s| s.duration_ms).sum();
-        Self {
-            id: job.id,
-            workspace_id,
-            goal: job.goal,
-            created_at_ms: job.created_at_ms,
-            finished_at_ms,
-            state: job.state,
-            retry_count: job.retry_count,
-            stages: job.stages,
-            last_error: job.last_error,
-            total_cost_usd,
-            total_duration_ms,
-            last_verdict: job.last_verdict,
-            source: job.source,
-        }
-    }
-}

@@ -22,7 +22,7 @@
 //!
 //! The offline cache (`src-tauri/.sqlx/`) must be regenerated whenever
 //! the schema changes. Mirrors the rationale in
-//! `swarm/coordinator/store.rs`: forcing a multi-step ritual onto a
+//! `swarm/coordinator/store/`: forcing a multi-step ritual onto a
 //! straightforward append-only log was strictly worse than runtime-
 //! checked `sqlx::query`.
 //!

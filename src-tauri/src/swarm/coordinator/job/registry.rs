@@ -180,10 +180,11 @@ impl JobRegistry {
     }
 
     /// Release the workspace lock for `(workspace_id, job_id)`.
-    /// Idempotent: the FSM always calls this on the success and
-    /// failure paths, and a `Drop`-driven defensive call from
-    /// `WorkspaceGuard` may also fire — calling twice (or against a
-    /// workspace that another job has since taken over) is a no-op.
+    /// Idempotent: callers (the brain since W5-06; previously the
+    /// W4-06 FSM and its Drop-driven `WorkspaceGuard`, both removed)
+    /// invoke this on success and failure paths — calling twice (or
+    /// against a workspace that another job has since taken over) is
+    /// a no-op.
     ///
     /// On SQL failure the in-memory remove is **not** rolled back —
     /// the lock is gone from app state and the worst case is a
