@@ -162,15 +162,14 @@
 - **Görünürlük:** public yüzey **birebir** — `mod.rs` `pub use {agent::{…}, …, workflow::{…}}` ile `crate::models::<Type>` flat yolunu yeniden yayımlıyor; `lib.rs:31 pub mod models;` dizin modülünü çözer (değişmedi) ve **26 tüketici referansının tamamı** `crate::models::<Type>` flat (alt-modül yolu kullanan yok) olduğundan **hiçbiri değişmedi**. Submodüller arası tip atfı yok → tümü `pub` kaldı, `pub(super)` gerekmedi. Davranış birebir.
 - **Wire-shape / bindings:** struct adları + serde rename'leri + `#[serde(tag/rename_all)]`'ler birebir taşındı → `bindings.ts` **byte-identik** (tek doc-comment sapması yakalandı ve orijinaline geri alındı). **Kanıt:** `cargo run --bin export-bindings` sonrası `git diff -- app/src/lib/bindings.ts` = **0 satır** (içerik HEAD ile aynı; status'taki `M` yalnız autocrlf stat-dirty). `cargo check --all-targets` → `Finished` exit 0, **0 uyarı**.
 
-### T3-04 ☐ refactor-v1 ertelenenleri — **hâlâ açık mı doğrula**
-Repo W2'den W6'ya ilerledi; bu maddeler kapanmış olabilir. Her turda önce **var/yok teyidi**:
-- `Supervisor` trait soyutlaması (C1) — `agent.rs` + `terminal.rs` ortak supervisor. ⏸ üçüncü sidecar gelince. **Not (2026-06-07_1400):** her iki dosya da artık modül paketi (`agent/` T3-13, `terminal/` T3-03); ortak supervisor trait'i ileride `agent/mod.rs::SidecarHandle` + `terminal/mod.rs::TerminalRegistry` üzerinden çıkarılabilir.
-- MCP session pool + pending request map (C5) — `mcp/client/` paketi (T3-15 ile bölündü; `McpClient` artık `connection.rs`'te). ⏸ ayrı WP (davranışsal: session-pool + pending-request-map). Yapısal split tamam.
-- Ortak `Status` enum (C2) — terminal vs run status ayrı enum'lar.
-- Seeds modülü konsolidasyonu (D2).
-- Capabilities daraltma (E1) — `tauri.conf.json` komut yüzeyi sabitlenince.
-- Repo-level pre-commit hook (E2) — Co-Author trailer + gate; `core.hooksPath`/Husky ADR'ı ile.
-- **Mod:** her biri audit + (küçükse) apply.
+### T3-04 ◐ refactor-v1 ertelenenleri — 2026-06-10 (3. tur) tasfiyesi
+- `Supervisor` trait soyutlaması (C1) — ⏸ üçüncü sidecar gelince (değişmedi).
+- MCP session pool + pending request map (C5) — ⏸ ayrı davranışsal WP (değişmedi).
+- Ortak `Status` enum (C2) — **☒ yapılmayacak (2026-06-10):** pane/run status'ları ayrı wire-contract'lar (bindings.ts union'ları + DB string'leri + CSS sınıf adları). Birleştirme her katmanda kırılım riski yaratıp kullanıcıya sıfır değer üretiyor; durumlar zaten domain-spesifik (pane: awaiting_approval/closed; run: queued vb.). Kapatıldı.
+- Seeds modülü konsolidasyonu (D2) — **☑ (2026-06-10):** `db/seed.rs` (3 seed fn `pub(super)`, docs birebir; `init` + testler güncellendi).
+- Capabilities daraltma (E1) — **☑ fiilen kapalı (2026-06-10):** `capabilities/default.json` zaten minimal (`core:default` + `dialog:allow-open`, tek pencere); daraltılacak yüzey yok. Yeni plugin eklenirse yeniden değerlendir.
+- Repo-level pre-commit hook (E2) — **☑ opt-in olarak (2026-06-10):** `.githooks/pre-commit` eklendi (app dosyası stage'liyse tsc+eslint; src-tauri stage'liyse cargo check, `NEURON_SKIP_RUST_HOOK=1` ile atlanabilir). Otomatik etkin DEĞİL — kullanıcı `git config core.hooksPath .githooks` ile açar (workflow kararı kullanıcının).
+- **Ek (2026-06-10):** `tier_of` ölü kod olarak silindi (kapsama invariant'ı zaten `tiers_cover_every_agent_id_exactly_once` testinde); `state_of` test-seam olarak `#[cfg(test)]`'e alındı.
 
 ### T3-05 ☐ `tracing` / yapılandırılmış log denetimi
 - **Etki:** refactor-v1 §⑨ `tracing` adopt etmişti; W3-W6 yeni kodda kaçak `eprintln!`/`println!` var mı?

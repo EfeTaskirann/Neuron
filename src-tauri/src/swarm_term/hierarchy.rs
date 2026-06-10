@@ -162,18 +162,6 @@ pub const TIERS: &[(&str, &[&str])] = &[
     ),
 ];
 
-/// Look up the tier name for an agent id. Returns `None` for unknown
-/// ids — callers should treat this as a programming error (every
-/// agent in `AGENT_IDS` is covered by `TIERS`).
-pub fn tier_of(agent: &str) -> Option<&'static str> {
-    for (tier, ids) in TIERS {
-        if ids.contains(&agent) {
-            return Some(*tier);
-        }
-    }
-    None
-}
-
 // --------------------------------------------------------------------- //
 // Pure agent-role classifiers (used by lifecycle + persona helpers).    //
 // --------------------------------------------------------------------- //
@@ -313,20 +301,6 @@ mod tests {
                 "agent `{id}` not assigned to any tier"
             );
         }
-    }
-
-    #[test]
-    fn tier_of_returns_expected_groupings() {
-        assert_eq!(tier_of("orchestrator"), Some("orchestration"));
-        assert_eq!(tier_of("coordinator"), Some("orchestration"));
-        assert_eq!(tier_of("scout"), Some("research"));
-        assert_eq!(tier_of("planner"), Some("research"));
-        assert_eq!(tier_of("backend-builder"), Some("build"));
-        assert_eq!(tier_of("frontend-builder"), Some("build"));
-        assert_eq!(tier_of("backend-reviewer"), Some("review"));
-        assert_eq!(tier_of("frontend-reviewer"), Some("review"));
-        assert_eq!(tier_of("integration-tester"), Some("review"));
-        assert_eq!(tier_of("nobody"), None);
     }
 
     // ----------------------------------------------------------------- //

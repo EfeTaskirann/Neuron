@@ -275,6 +275,12 @@ impl LifecycleStore {
 
     /// Look up the current state without mutating. Returns `None`
     /// for an unseen `(source_pane, task_id)` pair.
+    ///
+    /// Test seam: production consumers react to the
+    /// `swarm-term:lifecycle` event stream instead of polling the
+    /// store, so this accessor is gated to tests — ungate it if a
+    /// poll-style UI consumer ever appears.
+    #[cfg(test)]
     pub fn state_of(
         &self,
         source_pane: &str,

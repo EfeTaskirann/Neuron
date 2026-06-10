@@ -1,6 +1,7 @@
 //! These tests run against ephemeral on-disk SQLite files (sqlx
 //! does not load `:memory:` migrations in shared mode reliably on
 //! Windows, so a tempdir is the simplest correct path).
+use super::seed::{seed_demo_canvas, seed_demo_workflow, seed_mcp_servers};
 use super::*;
 
 /// Spin up a fresh pool against a unique temp path. Callers should
