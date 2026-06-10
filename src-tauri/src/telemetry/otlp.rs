@@ -339,12 +339,7 @@ fn attrs_indicate_error(raw: &str) -> bool {
     false
 }
 
-/// Truncate `s` to at most `cap` chars (UTF-8-safe — splits on a
-/// codepoint boundary). Used for prompt/completion payloads.
-fn truncate_chars(s: &str, cap: usize) -> String {
-    if s.chars().count() <= cap {
-        return s.to_string();
-    }
-    s.chars().take(cap).collect()
-}
+// Char-bounded truncation for prompt/completion payloads lives in
+// `crate::text::truncate_chars` (shared implementation).
+use crate::text::truncate_chars;
 

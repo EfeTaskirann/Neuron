@@ -17,6 +17,8 @@ use serde::{Deserialize, Serialize};
 use specta::Type;
 
 use crate::error::AppError;
+use crate::swarm::llm_json::{first_balanced_object, strip_fence};
+use crate::text::truncate_chars;
 
 /// Severity of a single Verdict issue. Reviewers grade findings on
 /// this three-rung ladder; Tester surfaces failing-test names with
@@ -99,7 +101,7 @@ pub fn parse_verdict(raw: &str) -> Result<Verdict, AppError> {
     }
     // Step 2: strip a markdown fence wrapping. Common pattern when
     // the LLM falls back to "render as markdown code block" reflex.
-    if let Some(stripped) = strip_markdown_fence(raw) {
+    if let Some(stripped) = strip_fence(raw) {
         if let Ok(v) = serde_json::from_str::<Verdict>(stripped) {
             return Ok(v);
         }
@@ -108,7 +110,7 @@ pub fn parse_verdict(raw: &str) -> Result<Verdict, AppError> {
     // "Here's my verdict: { ... }" and similar conversational
     // preambles. String-aware brace counting so quoted `}` doesn't
     // close the object early.
-    if let Some(sub) = first_balanced_json_object(raw) {
+    if let Some(sub) = first_balanced_object(raw) {
         if let Ok(v) = serde_json::from_str::<Verdict>(sub) {
             return Ok(v);
         }
@@ -122,104 +124,8 @@ pub fn parse_verdict(raw: &str) -> Result<Verdict, AppError> {
     )))
 }
 
-/// Strip a single markdown code fence wrapping. Returns the inner
-/// text (without the fence lines) when the input is a fenced block,
-/// else `None`. Recognises:
-///
-/// - ` ```json\n ... \n``` ` (language-tagged, the canonical form)
-/// - ` ```\n ... \n``` ` (untagged)
-/// - Trailing newline / whitespace before / after the fences is
-///   tolerated so the fence-stripping step is idempotent.
-///
-/// We do NOT strip multiple nested fences — if a verdict contains a
-/// fenced block in its `summary` text the inner fence is part of the
-/// JSON string literal and serde_json handles it. Only the outer
-/// wrapper is in scope here.
-fn strip_markdown_fence(raw: &str) -> Option<&str> {
-    let trimmed = raw.trim();
-    // Must start with three backticks. After the backticks we may
-    // see an optional language tag (any non-newline run) followed
-    // by a newline.
-    let after_open = trimmed.strip_prefix("```")?;
-    let after_lang = match after_open.find('\n') {
-        Some(idx) => &after_open[idx + 1..],
-        None => return None,
-    };
-    // Find the closing fence. We scan from the end so a verdict that
-    // happens to contain "```" inside a string literal (rare but
-    // possible) doesn't fool the strip logic — the LAST `\n```` is
-    // the closer.
-    let close_idx = after_lang.rfind("```")?;
-    let inner = &after_lang[..close_idx];
-    Some(inner.trim_end_matches('\n').trim())
-}
-
-/// Find the first balanced `{...}` substring in `raw`. String-aware:
-/// a `{` or `}` inside a `"..."` literal does not affect the depth
-/// counter, and a backslash-escaped `\"` inside that literal does
-/// not close the string.
-///
-/// Returns `None` if there is no `{` at all, or if the input is
-/// unbalanced (more `{` than `}` even at end-of-input).
-fn first_balanced_json_object(raw: &str) -> Option<&str> {
-    let bytes = raw.as_bytes();
-    // Scan for the first `{` that opens an object. Anything before
-    // it (preamble, fence remnants) is dropped.
-    let start = bytes.iter().position(|&b| b == b'{')?;
-
-    let mut depth: i32 = 0;
-    let mut in_string = false;
-    let mut prev_was_backslash = false;
-    // Walk char-indices so the returned slice lands on a UTF-8
-    // codepoint boundary even when the JSON contains multi-byte
-    // characters in string literals (Turkish, emoji, etc.).
-    for (idx, ch) in raw[start..].char_indices() {
-        let abs = start + idx;
-        if in_string {
-            if prev_was_backslash {
-                // Whatever follows a backslash is consumed literally
-                // by JSON parsers; skip it without affecting state.
-                prev_was_backslash = false;
-                continue;
-            }
-            match ch {
-                '\\' => prev_was_backslash = true,
-                '"' => in_string = false,
-                _ => {}
-            }
-            continue;
-        }
-        match ch {
-            '"' => in_string = true,
-            '{' => depth += 1,
-            '}' => {
-                depth -= 1;
-                if depth == 0 {
-                    let end = abs + ch.len_utf8();
-                    return Some(&raw[start..end]);
-                }
-                if depth < 0 {
-                    // Unbalanced — more `}` than `{`. Bail out so
-                    // the caller falls through to the error step.
-                    return None;
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-/// Truncate `s` to at most `max_chars` Unicode characters. Bounded
-/// by `chars()` (not bytes) so the error message never splits on a
-/// multi-byte boundary.
-fn truncate_chars(s: &str, max_chars: usize) -> String {
-    if s.chars().count() <= max_chars {
-        s.to_string()
-    } else {
-        s.chars().take(max_chars).collect()
-    }
-}
+// Fence-strip + balanced-object scan live in `swarm::llm_json` —
+// the shared home of the 4-step extraction recipe.
 
 // --------------------------------------------------------------------- //
 // Tests                                                                  //
@@ -366,28 +272,7 @@ mod tests {
         assert!(v.rejected());
     }
 
-    /// `strip_markdown_fence` returns `None` on inputs that aren't
-    /// fenced, so step 2 falls through cleanly to step 3.
-    #[test]
-    fn strip_markdown_fence_no_fence_returns_none() {
-        assert!(strip_markdown_fence("plain text").is_none());
-        assert!(strip_markdown_fence("{\"approved\":true}").is_none());
-    }
-
-    /// `first_balanced_json_object` returns `None` when there's no
-    /// `{` at all.
-    #[test]
-    fn first_balanced_json_object_no_brace_returns_none() {
-        assert!(first_balanced_json_object("hello world").is_none());
-    }
-
-    /// `first_balanced_json_object` recovers the nested object even
-    /// when extra junk follows it.
-    #[test]
-    fn first_balanced_json_object_recovers_with_trailing_junk() {
-        let raw = r#"prefix {"a":{"b":1}} trailing junk"#;
-        let inner = first_balanced_json_object(raw)
-            .expect("balanced object found");
-        assert_eq!(inner, r#"{"a":{"b":1}}"#);
-    }
+    // Fence/balanced-scan helper tests live in `swarm::llm_json`
+    // alongside the shared implementation; the parse_verdict tests
+    // above still exercise both through the public parser.
 }

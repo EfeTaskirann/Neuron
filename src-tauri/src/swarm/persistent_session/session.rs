@@ -4,25 +4,21 @@
 //! `attach_stderr_tail` error-context helper.
 
 use std::path::PathBuf;
-use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::json;
 use tauri::{AppHandle, Runtime};
 use tokio::io::{AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::{Mutex, Notify};
 
 use crate::error::AppError;
-use crate::swarm::binding::{
-    build_specialist_args, resolve_claude_binary, subscription_env,
-};
 use crate::swarm::profile::Profile;
 use crate::swarm::transport::{
-    fmt_stderr_tail, write_persona_tmp, InvokeResult, RingBuffer,
-    STDERR_RING_CAPACITY,
+    fmt_stderr_tail, spawn_claude_child, InvokeResult, RingBuffer,
+    SpawnedClaude,
 };
 
 use super::event::TurnStreamEvent;
@@ -61,82 +57,25 @@ impl PersistentSession {
         app: &AppHandle<R>,
         profile: &Profile,
     ) -> Result<Self, AppError> {
-        // 1. Resolve the binary — same path that `SubprocessTransport`
-        //    uses, including the `<bundled>` lookup chain.
-        let binary = resolve_claude_binary()?;
-
-        // 2. Persona tmp file. ULID-named so concurrent sessions
-        //    don't collide (e.g. all 9 W4-02 agents spawning at once).
-        let tmp_path = write_persona_tmp(app, profile).await?;
-
-        // 3. Build argv + env. `subscription_env` returns the inherited
-        //    parent env minus the auth-bypass / provider-routing
-        //    variables in `STRIPPED_ENV_VARS`. We still have to call
-        //    `env_remove` for the same set because tokio's `Command`
-        //    inherits the parent's env by default — `.envs(&env)` only
-        //    overrides the keys it carries, it does not clear the
-        //    inherited slate. Iterating over the canonical list keeps
-        //    this site in lockstep with `binding::STRIPPED_ENV_VARS`,
-        //    so adding (e.g.) `CLAUDE_CODE_OAUTH_TOKEN` upstream
-        //    automatically applies here too.
-        let env = subscription_env();
-        let args = build_specialist_args(profile, &tmp_path);
-
-        let mut cmd = Command::new(&binary.path);
-        cmd.envs(&env);
-        for var in crate::swarm::binding::STRIPPED_ENV_VARS {
-            cmd.env_remove(var);
-        }
-        let mut child = cmd
-            .args(&args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|e| {
-                let _ = std::fs::remove_file(&tmp_path);
-                AppError::SwarmInvoke(format!(
-                    "spawn failed for `{}`: {e}",
-                    binary.path.display()
-                ))
-            })?;
-
-        let stdin = child.stdin.take().ok_or_else(|| {
-            AppError::SwarmInvoke("child stdin pipe missing".into())
-        })?;
-        let stdout = child.stdout.take().ok_or_else(|| {
-            AppError::SwarmInvoke("child stdout pipe missing".into())
-        })?;
-        let stderr = child.stderr.take().ok_or_else(|| {
-            AppError::SwarmInvoke("child stderr pipe missing".into())
-        })?;
-
-        // 4. Stderr drain task — same ring-buffer pattern as one-shot.
-        //    Captures the tail so error paths can attach context.
-        let stderr_ring: Arc<Mutex<RingBuffer>> =
-            Arc::new(Mutex::new(RingBuffer::new(STDERR_RING_CAPACITY)));
-        let stderr_ring_for_task = Arc::clone(&stderr_ring);
-        let stderr_task = tokio::spawn(async move {
-            let mut reader = BufReader::new(stderr);
-            let mut buf = [0u8; 4096];
-            loop {
-                match tokio::io::AsyncReadExt::read(&mut reader, &mut buf)
-                    .await
-                {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        let mut ring = stderr_ring_for_task.lock().await;
-                        ring.append(&buf[..n]);
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
+        // Shared spawn prelude with `SubprocessTransport::invoke`
+        // (binary resolution, persona tmp file, argv/env incl. the
+        // STRIPPED_ENV_VARS re-strip, kill_on_drop spawn, pipe
+        // hand-off, stderr ring drain) — see
+        // `transport::spawn_claude_child`. This session retains the
+        // child + pipes for multi-turn use; the persona tmp file is
+        // cleaned up by `shutdown()` / `Drop`.
+        let SpawnedClaude {
+            child,
+            stdin,
+            stdout,
+            stderr_ring,
+            stderr_task,
+            persona_tmp_path,
+        } = spawn_claude_child(app, profile).await?;
 
         Ok(Self {
             profile_id: profile.id.clone(),
-            persona_tmp_path: tmp_path,
+            persona_tmp_path,
             child,
             stdin: Some(stdin),
             stdout: BufReader::new(stdout),

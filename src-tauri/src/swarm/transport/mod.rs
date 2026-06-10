@@ -25,7 +25,8 @@
 //! - [`ring`] — the tail-only stderr `RingBuffer` + `fmt_stderr_tail`,
 //!   shared with `persistent_session`.
 //! - [`subprocess`] — the stateful spawn/drive side: the `Transport`
-//!   trait, `SubprocessTransport`, and the `write_persona_tmp` helper.
+//!   trait, `SubprocessTransport`, and the shared `spawn_claude_child`
+//!   prelude (also used by `persistent_session`).
 
 mod classify;
 mod event;
@@ -40,5 +41,5 @@ pub use subprocess::{SubprocessTransport, Transport};
 
 pub(crate) use classify::classify_event;
 pub(crate) use event::StreamEvent;
-pub(crate) use ring::{fmt_stderr_tail, RingBuffer, STDERR_RING_CAPACITY};
-pub(crate) use subprocess::write_persona_tmp;
+pub(crate) use ring::{fmt_stderr_tail, RingBuffer};
+pub(crate) use subprocess::{spawn_claude_child, SpawnedClaude};

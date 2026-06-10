@@ -24,6 +24,7 @@ use serde_json::Value;
 use specta::Type;
 
 use crate::error::AppError;
+use crate::swarm::llm_json::{first_balanced_object, strip_fence};
 
 /// Specialist's structured "I'm blocked" payload. Mirrors the JSON
 /// the persona emits — `reason` is a one-liner explanation,
@@ -152,61 +153,8 @@ fn try_parse_outcome(s: &str) -> Option<CoordinatorHelpOutcome> {
     serde_json::from_str::<CoordinatorHelpOutcome>(s).ok()
 }
 
-/// Strip the FIRST ```json ... ``` (or ```...```) fence in `s` and
-/// return the inner contents. Returns None when no fence is
-/// present.
-fn strip_fence(s: &str) -> Option<&str> {
-    let start_idx = s.find("```")?;
-    let after_open = &s[start_idx + 3..];
-    let after_lang = match after_open.find('\n') {
-        Some(n) => &after_open[n + 1..],
-        None => after_open,
-    };
-    let close_idx = after_lang.find("```")?;
-    Some(&after_lang[..close_idx])
-}
-
-/// Walk `s` and return the FIRST balanced `{...}` substring (count
-/// braces, account for strings). Returns None when no balanced
-/// object is found.
-fn first_balanced_object(s: &str) -> Option<&str> {
-    let bytes = s.as_bytes();
-    let mut start: Option<usize> = None;
-    let mut depth: i32 = 0;
-    let mut in_string = false;
-    let mut escape = false;
-    for (i, &b) in bytes.iter().enumerate() {
-        if in_string {
-            if escape {
-                escape = false;
-            } else if b == b'\\' {
-                escape = true;
-            } else if b == b'"' {
-                in_string = false;
-            }
-            continue;
-        }
-        match b {
-            b'"' => in_string = true,
-            b'{' => {
-                if start.is_none() {
-                    start = Some(i);
-                }
-                depth += 1;
-            }
-            b'}' => {
-                depth -= 1;
-                if depth == 0 {
-                    if let Some(s_idx) = start {
-                        return std::str::from_utf8(&bytes[s_idx..=i]).ok();
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
+// Fence-strip + balanced-object scan live in `swarm::llm_json` —
+// the shared home of the 4-step extraction recipe.
 
 // WP-W5-06 — `process_help_request` and `format_help_message`
 // were the registry-level helpers the FSM (`RegistryTransport`)
@@ -345,25 +293,6 @@ mod tests {
         assert_eq!(err.kind(), "swarm_invoke");
     }
 
-    // -- helpers --
-
-    #[test]
-    fn strip_fence_extracts_inner_content() {
-        let s = "before\n```json\n{\"x\":1}\n```\nafter";
-        assert_eq!(strip_fence(s), Some("{\"x\":1}\n"));
-    }
-
-    #[test]
-    fn strip_fence_returns_none_without_fence() {
-        assert!(strip_fence("no fences here").is_none());
-    }
-
-    #[test]
-    fn first_balanced_object_handles_strings_with_braces() {
-        let s = r#"hi {"key": "value with } inside", "n": 1} bye"#;
-        assert_eq!(
-            first_balanced_object(s),
-            Some(r#"{"key": "value with } inside", "n": 1}"#)
-        );
-    }
+    // Fence/balanced-scan helper tests live in `swarm::llm_json`
+    // alongside the shared implementation.
 }

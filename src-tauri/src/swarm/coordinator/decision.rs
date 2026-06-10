@@ -11,21 +11,24 @@
 //! architectural report §7.1 ("Robust JSON Extraction") for the
 //! four-step recipe.
 //!
-//! The Verdict and Decision parsers run the same brace-counting +
-//! fence-stripping logic; they were intentionally duplicated rather
-//! than consolidated into a generic `parse_robust_json<T>` helper.
-//! See the module-level note next to `parse_decision` for the
-//! rationale.
+//! The Verdict and Decision parsers share the brace-counting +
+//! fence-stripping primitives via `swarm::llm_json`; the typed
+//! 4-step walk stays per-module so the two shapes can diverge
+//! independently (e.g. Decision accepting a string-only
+//! "research_only" fallback some day).
 //!
-//! Cross-runtime hygiene: this module imports only from `serde_json`
-//! and `crate::error::AppError`. No `sidecar/`, no `agent_runtime/`,
-//! no Tauri runtime — the parser is a pure helper the FSM calls
-//! after `transport.invoke` returns the assistant text.
+//! Cross-runtime hygiene: this module imports only `serde_json`,
+//! `crate::error::AppError` and the pure `llm_json`/`text` helpers.
+//! No `sidecar/`, no `agent_runtime/`, no Tauri runtime — the parser
+//! is a pure helper called after `transport.invoke` returns the
+//! assistant text.
 
 use serde::{Deserialize, Serialize};
 use specta::Type;
 
 use crate::error::AppError;
+use crate::swarm::llm_json::{first_balanced_object, strip_fence};
+use crate::text::truncate_chars;
 
 /// Routing rail the Coordinator picks for the job. Wire form is
 /// snake_case (`"research_only"` / `"execute_plan"`) so the
@@ -138,7 +141,7 @@ pub fn parse_decision(raw: &str) -> Result<CoordinatorDecision, AppError> {
     }
     // Step 2: strip a markdown fence wrapping. Common pattern when
     // the LLM falls back to "render as markdown code block" reflex.
-    if let Some(stripped) = strip_markdown_fence(raw) {
+    if let Some(stripped) = strip_fence(raw) {
         if let Ok(d) = serde_json::from_str::<CoordinatorDecision>(stripped) {
             return Ok(d);
         }
@@ -147,7 +150,7 @@ pub fn parse_decision(raw: &str) -> Result<CoordinatorDecision, AppError> {
     // "Here's my decision: { ... }" and similar conversational
     // preambles. String-aware brace counting so quoted `}` doesn't
     // close the object early.
-    if let Some(sub) = first_balanced_json_object(raw) {
+    if let Some(sub) = first_balanced_object(raw) {
         if let Ok(d) = serde_json::from_str::<CoordinatorDecision>(sub) {
             return Ok(d);
         }
@@ -161,83 +164,9 @@ pub fn parse_decision(raw: &str) -> Result<CoordinatorDecision, AppError> {
     )))
 }
 
-/// Strip a single markdown code fence wrapping. Returns the inner
-/// text (without the fence lines) when the input is a fenced block,
-/// else `None`. Recognises:
-///
-/// - ` ```json\n ... \n``` ` (language-tagged, the canonical form)
-/// - ` ```\n ... \n``` ` (untagged)
-/// - Trailing newline / whitespace before / after the fences is
-///   tolerated so the fence-stripping step is idempotent.
-fn strip_markdown_fence(raw: &str) -> Option<&str> {
-    let trimmed = raw.trim();
-    let after_open = trimmed.strip_prefix("```")?;
-    let after_lang = match after_open.find('\n') {
-        Some(idx) => &after_open[idx + 1..],
-        None => return None,
-    };
-    let close_idx = after_lang.rfind("```")?;
-    let inner = &after_lang[..close_idx];
-    Some(inner.trim_end_matches('\n').trim())
-}
-
-/// Find the first balanced `{...}` substring in `raw`. String-aware:
-/// a `{` or `}` inside a `"..."` literal does not affect the depth
-/// counter, and a backslash-escaped `\"` inside that literal does
-/// not close the string.
-///
-/// Returns `None` if there is no `{` at all, or if the input is
-/// unbalanced (more `{` than `}` even at end-of-input).
-fn first_balanced_json_object(raw: &str) -> Option<&str> {
-    let bytes = raw.as_bytes();
-    let start = bytes.iter().position(|&b| b == b'{')?;
-
-    let mut depth: i32 = 0;
-    let mut in_string = false;
-    let mut prev_was_backslash = false;
-    for (idx, ch) in raw[start..].char_indices() {
-        let abs = start + idx;
-        if in_string {
-            if prev_was_backslash {
-                prev_was_backslash = false;
-                continue;
-            }
-            match ch {
-                '\\' => prev_was_backslash = true,
-                '"' => in_string = false,
-                _ => {}
-            }
-            continue;
-        }
-        match ch {
-            '"' => in_string = true,
-            '{' => depth += 1,
-            '}' => {
-                depth -= 1;
-                if depth == 0 {
-                    let end = abs + ch.len_utf8();
-                    return Some(&raw[start..end]);
-                }
-                if depth < 0 {
-                    return None;
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-/// Truncate `s` to at most `max_chars` Unicode characters. Bounded
-/// by `chars()` (not bytes) so multi-byte Turkish text is never
-/// split mid-codepoint in the error message.
-fn truncate_chars(s: &str, max_chars: usize) -> String {
-    if s.chars().count() <= max_chars {
-        s.to_string()
-    } else {
-        s.chars().take(max_chars).collect()
-    }
-}
+// Fence-strip + balanced-object scan live in `swarm::llm_json`;
+// `truncate_chars` in `crate::text` — shared homes of the 4-step
+// extraction recipe.
 
 // --------------------------------------------------------------------- //
 // Tests                                                                  //

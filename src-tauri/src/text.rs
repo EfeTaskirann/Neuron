@@ -19,6 +19,32 @@ pub fn truncate_to_char_boundary(s: &str, cap: usize) -> &str {
     &s[..end]
 }
 
+/// Truncate `s` to at most `max_chars` Unicode characters. Bounded
+/// by `chars()` (not bytes) so the result never splits a multi-byte
+/// codepoint. (Consolidates the five identical local copies that
+/// used to live in verdict/decision/orchestrator/store-cols/otlp.)
+pub fn truncate_chars(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        s.to_string()
+    } else {
+        s.chars().take(max_chars).collect()
+    }
+}
+
+/// Truncate a string for mailbox `summary` fields — 80 chars with an
+/// ellipsis is enough for the mailbox UI to render a recognisable
+/// line without overflowing. (Consolidates the identical copies in
+/// `commands::swarm::dispatch` and `swarm::brain::prompt`.)
+pub fn truncate_for_summary(s: &str) -> String {
+    const CAP: usize = 80;
+    if s.chars().count() <= CAP {
+        s.to_string()
+    } else {
+        let truncated: String = s.chars().take(CAP).collect();
+        format!("{truncated}…")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::truncate_to_char_boundary;

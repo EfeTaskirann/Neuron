@@ -98,14 +98,8 @@ pub(super) fn render_after_help_outcome() -> String {
         .into()
 }
 
-/// Truncate a string for summary fields — same shape as the
-/// `commands::swarm::truncate_for_summary` helper.
-pub(super) fn truncate_for_summary(s: &str) -> String {
-    const CAP: usize = 80;
-    if s.chars().count() <= CAP {
-        s.to_string()
-    } else {
-        let truncated: String = s.chars().take(CAP).collect();
-        format!("{truncated}…")
-    }
-}
+// Re-export the shared summary truncation so `brain::mod`'s
+// `use prompt::truncate_for_summary` path keeps resolving; the
+// implementation lives in `crate::text` (shared with
+// `commands::swarm::dispatch`).
+pub(super) use crate::text::truncate_for_summary;

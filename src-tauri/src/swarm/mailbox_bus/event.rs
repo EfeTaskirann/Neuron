@@ -87,10 +87,9 @@ pub enum MailboxEvent {
     JobCancel {
         job_id: String,
     },
-    /// Legacy free-form note. The default kind for back-compat
-    /// emitters (`mailbox::emit_internal` / `mailbox_emit` IPCs
-    /// keep emitting `kind='note'` implicitly via the migration
-    /// 0010 column default).
+    /// Legacy free-form note. The default kind for the back-compat
+    /// `mailbox_emit` IPC, which keeps emitting `kind='note'`
+    /// implicitly via the migration 0010 column default.
     Note,
 }
 

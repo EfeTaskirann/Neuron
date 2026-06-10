@@ -11,6 +11,7 @@ use serde_json::Value;
 use specta::Type;
 
 use crate::error::AppError;
+use crate::swarm::llm_json::{first_balanced_object, strip_fence};
 
 /// Default cap on `Dispatch` actions per job. Past this many
 /// dispatches the brain bails with `JobFinished {outcome:"failed",
@@ -146,64 +147,8 @@ fn try_parse_brain_action(s: &str) -> Option<BrainAction> {
     serde_json::from_value::<BrainAction>(v).ok()
 }
 
-/// Strip the FIRST ```json ... ``` (or ```...```) fence in `s` and
-/// return the inner contents. Mirrors `help_request::strip_fence`
-/// — duplicated here rather than re-exported to keep the module's
-/// dependencies minimal (brain doesn't need anything else from
-/// help_request).
-fn strip_fence(s: &str) -> Option<&str> {
-    let start_idx = s.find("```")?;
-    let after_open = &s[start_idx + 3..];
-    let after_lang = match after_open.find('\n') {
-        Some(n) => &after_open[n + 1..],
-        None => after_open,
-    };
-    let close_idx = after_lang.find("```")?;
-    Some(&after_lang[..close_idx])
-}
-
-/// Walk `s` and return the FIRST balanced `{...}` substring,
-/// counting braces and accounting for string boundaries. Same
-/// implementation as `help_request::first_balanced_object`,
-/// duplicated for the same isolation reason as `strip_fence`.
-fn first_balanced_object(s: &str) -> Option<&str> {
-    let bytes = s.as_bytes();
-    let mut start: Option<usize> = None;
-    let mut depth: i32 = 0;
-    let mut in_string = false;
-    let mut escape = false;
-    for (i, &b) in bytes.iter().enumerate() {
-        if in_string {
-            if escape {
-                escape = false;
-            } else if b == b'\\' {
-                escape = true;
-            } else if b == b'"' {
-                in_string = false;
-            }
-            continue;
-        }
-        match b {
-            b'"' => in_string = true,
-            b'{' => {
-                if start.is_none() {
-                    start = Some(i);
-                }
-                depth += 1;
-            }
-            b'}' => {
-                depth -= 1;
-                if depth == 0 {
-                    if let Some(s_idx) = start {
-                        return std::str::from_utf8(&bytes[s_idx..=i]).ok();
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
+// Fence-strip + balanced-object scan live in `swarm::llm_json` —
+// the shared home of the 4-step extraction recipe.
 
 /// Resolve the per-process max-dispatches cap. Same env-reading
 /// pattern as `commands/swarm.rs::stage_timeout`: numeric > 0 wins;

@@ -32,6 +32,7 @@ pub mod binding;
 pub mod brain;
 pub mod coordinator;
 pub mod help_request;
+pub(crate) mod llm_json;
 pub mod mailbox_bus;
 pub mod persistent_session;
 pub mod profile;

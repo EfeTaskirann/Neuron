@@ -81,14 +81,7 @@ pub(super) fn deserialize_decision(
     }
 }
 
-/// Truncate `s` to at most `max_chars` Unicode characters. Bounded
-/// by `chars()` (not bytes) so multi-byte Turkish text is never
-/// split mid-codepoint. Returns the original string when it's
-/// already within the cap.
-pub(super) fn truncate_chars(s: &str, max_chars: usize) -> String {
-    if s.chars().count() <= max_chars {
-        s.to_string()
-    } else {
-        s.chars().take(max_chars).collect()
-    }
-}
+// Re-export the shared char-bounded truncation so sibling submodules
+// (`read.rs`, `tests.rs`) keep their `super::cols::truncate_chars`
+// path; the implementation lives in `crate::text`.
+pub(super) use crate::text::truncate_chars;
