@@ -10,31 +10,25 @@
 // stay visible (their scrollback hydrates from the persisted
 // `pane_lines` table) until the user hits "Clean closed".
 import {
-  useEffect,
   useMemo,
   useRef,
   useState,
   type FormEvent,
   type MutableRefObject,
 } from 'react';
-import { listen, type UnlistenFn } from '@tauri-apps/api/event';
-import { Terminal as XTerm } from '@xterm/xterm';
-import { FitAddon } from '@xterm/addon-fit';
-import '@xterm/xterm/css/xterm.css';
 import { NIcon } from '../components/icons';
 import { useActiveProject } from '../hooks/useActiveProject';
 import { usePanes } from '../hooks/usePanes';
-import { usePaneLines } from '../hooks/usePaneLines';
+import { useXtermPane } from '../hooks/useXtermPane';
 import { useMailbox } from '../hooks/useMailbox';
 import {
   useTerminalDelete,
   useTerminalKill,
   useTerminalPurgeClosed,
-  useTerminalResize,
   useTerminalSpawn,
   useTerminalWrite,
 } from '../hooks/mutations';
-import type { MailboxEntry, Pane, PaneLine } from '../lib/bindings';
+import type { MailboxEntry, Pane } from '../lib/bindings';
 
 interface AgentInfo {
   name: string;
@@ -241,32 +235,43 @@ function PaneTabStrip({ panes, activeId, onSelect }: PaneTabStripProps): JSX.Ele
         const meta = metaFor(p.agent);
         const isActive = p.id === activeId;
         return (
-          <button
+          // div, not button: the close affordance nested inside must be
+          // a REAL <button> (it's the only caller of terminal:delete —
+          // PaneHeader close just flips status), and interactive
+          // elements can't nest. Keyboard select comes from the
+          // role/tabIndex/onKeyDown trio.
+          <div
             key={p.id}
             role="tab"
             aria-selected={isActive}
+            tabIndex={0}
             className={`pane-tab status-${p.status}${isActive ? ' active' : ''}`}
             onClick={() => onSelect(p.id)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault();
+                onSelect(p.id);
+              }
+            }}
             title={`${meta.name} · ${p.cwd}`}
           >
             <span className={`pane-tab-dot status-${p.status}`} />
             <span className="pane-tab-name">{meta.name}</span>
             {p.role && <span className="pane-tab-role">· {p.role}</span>}
-            <span
-              role="button"
-              tabIndex={-1}
+            <button
+              type="button"
               className="pane-tab-close"
               title="Close pane"
-              aria-disabled={del.isPending}
+              aria-label={`Close ${meta.name} pane`}
+              disabled={del.isPending}
               onClick={(e) => {
                 e.stopPropagation();
-                if (del.isPending) return;
                 del.mutate(p.id);
               }}
             >
               <NIcon name="close" size={10} />
-            </span>
-          </button>
+            </button>
+          </div>
         );
       })}
     </div>
@@ -347,7 +352,9 @@ function PaneView({ pane, active, onActivate }: PaneViewProps): JSX.Element {
         agent={agent}
         onClear={() => clearRef.current?.()}
       />
-      {pane.approval && <ApprovalBanner approval={pane.approval} />}
+      {pane.approval && (
+        <ApprovalBanner paneId={pane.id} approval={pane.approval} />
+      )}
       <PaneBody pane={pane} clearRef={clearRef} />
     </div>
   );
@@ -389,6 +396,7 @@ function PaneHeader({
         <button
           className="icon-btn sm"
           title="Clear scrollback"
+          aria-label="Clear scrollback"
           onClick={(e) => {
             e.stopPropagation();
             onClear();
@@ -396,15 +404,13 @@ function PaneHeader({
         >
           <NIcon name="trash" size={12} />
         </button>
-        <button className="icon-btn sm" title="Restart">
-          <NIcon name="play" size={12} />
-        </button>
-        <button className="icon-btn sm" title="Pop out">
-          <NIcon name="layers" size={12} />
-        </button>
+        {/* Restart / Pop-out stubs removed: no backend command exists
+            for either yet — fake controls on a real pane erode trust.
+            Re-add alongside the real IPCs. */}
         <button
           className="icon-btn sm"
           title="Close pane"
+          aria-label="Close pane"
           disabled={kill.isPending}
           onClick={(e) => {
             e.stopPropagation();
@@ -418,7 +424,21 @@ function PaneHeader({
   );
 }
 
-function ApprovalBanner({ approval }: { approval: NonNullable<Pane['approval']> }): JSX.Element {
+// Accept/Reject answer the agent's pending y/n prompt by writing the
+// keystrokes straight to the PTY — there is no dedicated approval IPC;
+// the agent process itself owns the prompt, we just type for the user.
+function ApprovalBanner({
+  paneId,
+  approval,
+}: {
+  paneId: string;
+  approval: NonNullable<Pane['approval']>;
+}): JSX.Element {
+  const write = useTerminalWrite();
+  const answer = (keys: string) => {
+    if (write.isPending) return;
+    write.mutate({ paneId, data: keys });
+  };
   return (
     <div className="approval-banner">
       <span className="ab-tag">tool</span>
@@ -430,17 +450,29 @@ function ApprovalBanner({ approval }: { approval: NonNullable<Pane['approval']> 
         <span className="ab-rem">−{approval.removed}</span>
       </span>
       <div className="ab-spacer" />
-      <button className="btn ghost sm">Reject</button>
-      <button className="btn primary sm">Accept</button>
+      <button
+        className="btn ghost sm"
+        disabled={write.isPending}
+        onClick={() => answer('n\r')}
+      >
+        Reject
+      </button>
+      <button
+        className="btn primary sm"
+        disabled={write.isPending}
+        onClick={() => answer('y\r')}
+      >
+        Accept
+      </button>
     </div>
   );
 }
 
-// xterm-backed pane body. Snapshot lines (terminal:lines) write
-// once on mount; subsequent panes:{id}:line events stream into
-// xterm directly. Keystrokes go out via terminal:write. Resize is
-// hooked to a ResizeObserver around the container so layout
-// switches and window resizes propagate to the PTY.
+// xterm-backed pane body — a thin wrapper over the shared
+// `useXtermPane` hook (mount/teardown, write, resize, snapshot
+// hydration, live stream; see the hook for the ordering contract).
+// Dead PTYs (closed/error/success) mount with `live: false`: no
+// event will ever fire and the PTY behind the resize IPC is gone.
 //
 // Backend currently strips ANSI before emitting (see
 // terminal.rs::LineEventPayload — `text` is plain). xterm still
@@ -453,179 +485,14 @@ function PaneBody({
   pane: Pane;
   clearRef?: MutableRefObject<(() => void) | null>;
 }): JSX.Element {
-  const containerRef = useRef<HTMLDivElement | null>(null);
-  const xtermRef = useRef<XTerm | null>(null);
-  const fitRef = useRef<FitAddon | null>(null);
-  // `writtenSeqsRef` guards against the snapshot/live race (a live
-  // event may arrive before the snapshot resolves). `seenSnapshotLenRef`
-  // is the high-water mark into the cached snapshot array — it keeps
-  // the snapshot effect from re-iterating the entire scrollback on
-  // every new line event (was O(n) per event, now O(new tail)).
-  const writtenSeqsRef = useRef<Set<number>>(new Set());
-  const seenSnapshotLenRef = useRef(0);
-  // `live: false` — snapshot hydrates xterm once; the live stream is
-  // owned by this component's own `panes:{id}:line` listener (below,
-  // skipped for dead PTYs). Letting usePaneLines also subscribe would
-  // duplicate the listener and grow an unbounded line array per pane.
-  const { data: snapshot } = usePaneLines(pane.id, { live: false });
-  const writeMut = useTerminalWrite();
-  const resizeMut = useTerminalResize();
-  const isTerminal = TERMINAL_STATUSES.has(pane.status);
-
-  // Mount xterm once per pane. The PTY lifecycle is independent of
-  // the React render — drop the instance only when the pane id
-  // changes, not on every render.
-  useEffect(() => {
-    if (!containerRef.current) return;
-    // Copy the ref's current Set into a local so the cleanup uses the
-    // exact instance captured at mount time (per react-hooks rule). For
-    // a `useRef<Set>` whose .current never reassigns this is equivalent,
-    // but the lint rule is right to flag the pattern in general.
-    const writtenSeqs = writtenSeqsRef.current;
-    const term = new XTerm({
-      fontFamily: 'var(--font-mono), Menlo, Consolas, monospace',
-      fontSize: 12,
-      theme: { background: '#0a0a0f', foreground: '#e6e6ea' },
-      cursorBlink: true,
-      convertEol: true,
-      scrollback: 5000,
-    });
-    const fit = new FitAddon();
-    term.loadAddon(fit);
-    term.open(containerRef.current);
-    try {
-      fit.fit();
-    } catch {
-      // fit() can throw if the container has 0 dimensions during
-      // initial mount; ResizeObserver below picks it up shortly.
-    }
-
-    const onDataDisp = term.onData((data) => {
-      writeMut.mutate({ paneId: pane.id, data });
-    });
-
-    xtermRef.current = term;
-    fitRef.current = fit;
-    // Expose clear() to the header's Clear button (UI-004). Wipes the
-    // visible scrollback; the PTY/shell state is untouched, so new output
-    // streams in normally afterwards.
-    if (clearRef) {
-      clearRef.current = () => term.clear();
-    }
-    return () => {
-      onDataDisp.dispose();
-      term.dispose();
-      xtermRef.current = null;
-      fitRef.current = null;
-      if (clearRef) clearRef.current = null;
-      writtenSeqs.clear();
-      seenSnapshotLenRef.current = 0;
-    };
-    // pane.id is the only useful dep — write/resize mutations are
-    // stable refs from TanStack Query.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [pane.id]);
-
-  // Resize observer: refit xterm when the container size changes,
-  // then propagate the new cols/rows to the PTY. Window drags fire
-  // ResizeObserver every animation frame; `fit()` stays inline so
-  // the visual snaps immediately, but the IPC `terminal:resize` is
-  // trailing-debounced so the PTY only sees the final size.
-  useEffect(() => {
-    if (!containerRef.current) return;
-    let pendingTimer: ReturnType<typeof setTimeout> | null = null;
-    let lastCols = -1;
-    let lastRows = -1;
-    const obs = new ResizeObserver(() => {
-      const fit = fitRef.current;
-      const term = xtermRef.current;
-      if (!fit || !term) return;
-      try {
-        fit.fit();
-      } catch {
-        return;
-      }
-      // Skip the IPC entirely if the cell grid didn't actually change
-      // — happens often when the wrapper resizes by a sub-cell amount.
-      if (term.cols === lastCols && term.rows === lastRows) return;
-      lastCols = term.cols;
-      lastRows = term.rows;
-      if (pendingTimer != null) clearTimeout(pendingTimer);
-      // Closed/errored panes have no PTY behind them; resize would 404.
-      if (isTerminal) return;
-      pendingTimer = setTimeout(() => {
-        pendingTimer = null;
-        const t = xtermRef.current;
-        if (!t) return;
-        resizeMut.mutate({ paneId: pane.id, cols: t.cols, rows: t.rows });
-      }, 80);
-    });
-    obs.observe(containerRef.current);
-    return () => {
-      obs.disconnect();
-      if (pendingTimer != null) clearTimeout(pendingTimer);
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [pane.id, isTerminal]);
-
-  // Write the snapshot scrollback once it arrives, then incrementally
-  // append new tail entries pushed by `usePaneLines`'s cache update.
-  // The watermark avoids re-scanning the entire snapshot array (which
-  // could be tens of thousands of lines) on every line event — a hot
-  // path for any active terminal. `writtenSeqsRef` still gates the
-  // initial-write loop so a snapshot/live race can't double-render.
-  useEffect(() => {
-    const term = xtermRef.current;
-    if (!term || !snapshot) return;
-    // Snapshot length shrank — cache was reset (refetch / pane swap);
-    // restart from index 0.
-    if (snapshot.length < seenSnapshotLenRef.current) {
-      seenSnapshotLenRef.current = 0;
-    }
-    for (let i = seenSnapshotLenRef.current; i < snapshot.length; i++) {
-      const line = snapshot[i]!;
-      if (writtenSeqsRef.current.has(line.seq)) continue;
-      writtenSeqsRef.current.add(line.seq);
-      term.write(line.text + '\r\n');
-    }
-    seenSnapshotLenRef.current = snapshot.length;
-  }, [snapshot]);
-
-  // Live subscription — write each event payload as a single line.
-  // Skipped for closed/error/success panes: the PTY is gone, so no
-  // events will ever fire and the subscription is wasted work (and
-  // for a long-lived session, 50 dead subscriptions was the symptom
-  // the tab refactor is meant to cure).
-  useEffect(() => {
-    if (isTerminal) return;
-    let unlisten: UnlistenFn | undefined;
-    let cancelled = false;
-    listen<PaneLine>(`panes:${pane.id}:line`, (event) => {
-      const term = xtermRef.current;
-      if (!term) return;
-      const incoming = event.payload;
-      if (writtenSeqsRef.current.has(incoming.seq)) return;
-      writtenSeqsRef.current.add(incoming.seq);
-      term.write(incoming.text + '\r\n');
-    })
-      .then((fn) => {
-        if (cancelled) {
-          fn();
-        } else {
-          unlisten = fn;
-        }
-      })
-      .catch((err) => {
-        console.warn('[PaneBody] failed to subscribe', err);
-      });
-    return () => {
-      cancelled = true;
-      unlisten?.();
-    };
-  }, [pane.id, isTerminal]);
-
+  const containerRef = useXtermPane(pane.id, {
+    fontSize: 12,
+    live: !TERMINAL_STATUSES.has(pane.status),
+    clearRef,
+  });
   return <div className="pane-body pane-body-xterm" ref={containerRef} />;
 }
+
 
 interface TermStatusBarProps {
   panes: Pane[];

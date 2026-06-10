@@ -109,6 +109,12 @@
 .pane-tab-name { font-weight: 500; }
 .pane-tab-role { color: var(--muted-foreground); font-size: 10.5px; }
 .pane-tab-close {
+  /* real <button> for keyboard reach — strip the UA chrome */
+  background: none;
+  border: none;
+  padding: 0;
+  font: inherit;
+  cursor: pointer;
   display: inline-grid;
   place-items: center;
   width: 16px; height: 16px;
@@ -121,7 +127,7 @@
   background: color-mix(in oklch, var(--syn-error) 25%, transparent);
   color: var(--foreground);
 }
-.pane-tab-close[aria-disabled="true"] {
+.pane-tab-close:disabled {
   opacity: 0.35;
   cursor: not-allowed;
   pointer-events: none;

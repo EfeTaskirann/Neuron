@@ -3,6 +3,10 @@ import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import { QueryClientProvider, QueryClient } from '@tanstack/react-query';
 import { App } from './App';
 import { Canvas } from './routes/Canvas';
+import {
+  clearActiveProject,
+  setActiveProject,
+} from './hooks/useActiveProject';
 
 // Mock the bindings layer so tests don't try to reach Tauri's
 // `__TAURI_INVOKE`. Each test sets a happy-path default in
@@ -61,6 +65,10 @@ vi.mock('@xterm/addon-fit', () => ({
 vi.mock('@xterm/xterm/css/xterm.css', () => ({}));
 
 function renderApp(): void {
+  // The shell is gated behind the project picker — give the store an
+  // active project so tests land on the sidebar/topbar layout. The
+  // gate itself is asserted in its own test below.
+  setActiveProject('C:\\test-project');
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   render(
     <QueryClientProvider client={qc}>
@@ -231,21 +239,37 @@ beforeEach(async () => {
 });
 
 describe('App shell', () => {
-  it('renders the sidebar with all 7 nav items', () => {
+  it('renders the sidebar with all 9 nav items', () => {
     renderApp();
     const nav = screen.getByRole('navigation');
     expect(nav).toBeInTheDocument();
     for (const label of [
       'Workflow',
       'Terminal',
+      'Terminal Swarm',
       'Swarm',
       'Agents',
       'Runs',
       'MCP',
+      'Routing Log',
       'Settings',
     ]) {
       expect(screen.getByText(label)).toBeInTheDocument();
     }
+  });
+
+  it('gates the shell behind the project picker when no project is set', () => {
+    clearActiveProject();
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    render(
+      <QueryClientProvider client={qc}>
+        <App />
+      </QueryClientProvider>,
+    );
+    expect(screen.getByText('Pick a project')).toBeInTheDocument();
+    expect(screen.queryByRole('navigation')).not.toBeInTheDocument();
   });
 
   // No stub-only routes remain after phase D/1 — every nav item

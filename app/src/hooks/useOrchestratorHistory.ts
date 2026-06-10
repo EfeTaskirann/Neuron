@@ -4,10 +4,11 @@
 // keyed by workspaceId so a future multi-workspace UI can swap
 // without churning the cache key strategy.
 //
-// `staleTime: Infinity` — history is loaded once on mount; mutations
-// (`useOrchestratorDecide`, `useLogOrchestratorJob`,
-// `useClearOrchestratorHistory`) invalidate the query explicitly so
-// the cache stays correct without polling.
+// `staleTime: Infinity` + `refetchOnMount: 'always'` — no background
+// polling, but every remount refetches: messages appended by the
+// backend during a session (job lines, orchestrator replies) are NOT
+// invalidated by any mutation, so a view toggle would otherwise show
+// a thread frozen at first-mount state.
 import { useQuery } from '@tanstack/react-query';
 import { commands, type OrchestratorMessage } from '../lib/bindings';
 import { unwrap } from '../lib/unwrap';
@@ -17,5 +18,6 @@ export function useOrchestratorHistory(workspaceId: string) {
     queryKey: ['orchestrator-history', workspaceId],
     queryFn: () => unwrap(commands.swarmOrchestratorHistory(workspaceId, null)),
     staleTime: Infinity,
+    refetchOnMount: 'always',
   });
 }
