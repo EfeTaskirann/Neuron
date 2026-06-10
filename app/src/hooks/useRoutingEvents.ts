@@ -1,5 +1,11 @@
-import { useEffect, useMemo, useState } from 'react';
-import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+import {
+  useEffect,
+  useMemo,
+  useState,
+  useSyncExternalStore,
+} from 'react';
+import { listen } from '@tauri-apps/api/event';
+import { useTauriEvent } from './useTauriEvent';
 
 // Shared event-collection hook for the swarm-term routing event
 // stream. The backend (`src-tauri/src/swarm_term/bridge.rs`) emits
@@ -15,9 +21,12 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 //   target_write_timeout — write_to_pane exceeded the 2 s cap (bridge.rs)
 //   lifecycle_fanout     — bridge-synthesised autonomy follow-up
 //
-// Hook lifetime is the consumer component's lifetime; the listener
-// is cleaned up on unmount via the unlisten function the Tauri SDK
-// returns from `listen()`.
+// Collection is a MODULE-LEVEL store (mirrors lib/toast.ts): one
+// app-lifetime listener starts on the first consumer mount and the
+// event array survives unmounts, so the Routing Log keeps its history
+// across tab navigation instead of restarting empty. Consumers read
+// it via useSyncExternalStore. The backend tracing log remains the
+// forensic source of truth; this buffer is display-grade (capped).
 
 export type RouteOutcome =
   | 'ok'
@@ -30,6 +39,9 @@ export type RouteOutcome =
   | 'lifecycle_fanout';
 
 export interface RouteEvent {
+  /** Client-minted monotonic id — a stable React list key (rows
+   *  prepend, so index/ts keys would re-key every row per event). */
+  id: number;
   source: string;
   target: string;
   body: string;
@@ -69,50 +81,85 @@ function coerceOutcome(raw: string): RouteOutcome {
     : 'unknown_target';
 }
 
-export function useRoutingEvents(maxRows = 500): {
+// ── Module-level event store ───────────────────────────────────────
+// Newest-first, capped. Array identity changes on every push so
+// useSyncExternalStore consumers re-render; ids stay unique for the
+// app lifetime (stable React keys).
+const ROUTE_EVENT_CAP = 500;
+let nextRouteEventId = 0;
+let routeEvents: RouteEvent[] = [];
+const routeStoreListeners = new Set<() => void>();
+let routeListenerStarted = false;
+
+function emitRouteStore(): void {
+  for (const l of routeStoreListeners) l();
+}
+
+function pushRouteEvent(p: RawPayload): void {
+  const next: RouteEvent = {
+    id: nextRouteEventId++,
+    source: p.source,
+    target: p.target,
+    body: typeof p.body === 'string' ? p.body : '',
+    outcome: coerceOutcome(p.outcome),
+    reason: typeof p.reason === 'string' ? p.reason : undefined,
+    ts: Date.now(),
+  };
+  const out = [next, ...routeEvents];
+  if (out.length > ROUTE_EVENT_CAP) out.length = ROUTE_EVENT_CAP;
+  routeEvents = out;
+  emitRouteStore();
+}
+
+export function clearRoutingEvents(): void {
+  routeEvents = [];
+  emitRouteStore();
+}
+
+// Lazy app-lifetime subscription — started by the first consumer,
+// never torn down (the whole point: history outlives any one tab).
+// Registration is best-effort, same as useTauriEvent: jsdom has no
+// Tauri bridge, so a rejected listen() is logged, not thrown.
+function ensureRouteListener(): void {
+  if (routeListenerStarted) return;
+  routeListenerStarted = true;
+  listen<RawPayload>('swarm-term:route', (event) => {
+    pushRouteEvent(event.payload);
+  }).catch((err) => {
+    console.warn('[useRoutingEvents] subscribe failed', err);
+  });
+}
+
+function subscribeRouteStore(cb: () => void): () => void {
+  routeStoreListeners.add(cb);
+  return () => {
+    routeStoreListeners.delete(cb);
+  };
+}
+
+function routeStoreSnapshot(): RouteEvent[] {
+  return routeEvents;
+}
+
+export function useRoutingEvents(maxRows = ROUTE_EVENT_CAP): {
   events: RouteEvent[];
   clear: () => void;
 } {
-  const [events, setEvents] = useState<RouteEvent[]>([]);
-
-  useEffect(() => {
-    let unlisten: UnlistenFn | undefined;
-    let cancelled = false;
-    listen<RawPayload>('swarm-term:route', (event) => {
-      const p = event.payload;
-      const next: RouteEvent = {
-        source: p.source,
-        target: p.target,
-        body: typeof p.body === 'string' ? p.body : '',
-        outcome: coerceOutcome(p.outcome),
-        reason: typeof p.reason === 'string' ? p.reason : undefined,
-        ts: Date.now(),
-      };
-      setEvents((prev) => {
-        const out = [next, ...prev];
-        if (out.length > maxRows) out.length = maxRows;
-        return out;
-      });
-    })
-      .then((fn) => {
-        if (cancelled) {
-          fn();
-        } else {
-          unlisten = fn;
-        }
-      })
-      .catch((err) => {
-        console.warn('[useRoutingEvents] subscribe failed', err);
-      });
-    return () => {
-      cancelled = true;
-      unlisten?.();
-    };
-  }, [maxRows]);
-
+  ensureRouteListener();
+  const all = useSyncExternalStore(
+    subscribeRouteStore,
+    routeStoreSnapshot,
+    routeStoreSnapshot,
+  );
+  // The store caps at ROUTE_EVENT_CAP; a consumer asking for fewer
+  // rows gets a memoized slice so its identity is stable per push.
+  const events = useMemo(
+    () => (all.length > maxRows ? all.slice(0, maxRows) : all),
+    [all, maxRows],
+  );
   return {
     events,
-    clear: () => setEvents([]),
+    clear: clearRoutingEvents,
   };
 }
 
@@ -142,7 +189,7 @@ const REVIEWER_AGENTS = new Set([
 /**
  * Body-text heuristic that flags an agent's own message as a
  * task-completion signal. Mirrors the 4-state contract documented in
- * the personas under `src/swarm/agents/term/*.md`: agents announce
+ * the personas under `src-tauri/src/swarm/agents/term/*.md`: agents announce
  * "tamam — …" (TR) / "done — …" / ✓ when their assigned slice is
  * finished. We only need to recognise the START of the body so that
  * mid-message occurrences of the word "tamam" (e.g. quoted) don't
@@ -191,10 +238,11 @@ export function useActiveEdge(
 
 /**
  * Authoritative per-agent lifecycle phase, sourced from the backend
- * `swarm-term:lifecycle` event (emitted by
- * `swarm_term::lifecycle::LifecycleStore`). The backend state machine
- * is the source of truth; the body-text heuristic below can disagree
- * with it, so authoritative state wins on merge.
+ * `swarm-term:lifecycle` event (recorded by
+ * `swarm_term::lifecycle::LifecycleStore` and emitted by the bridge's
+ * `lifecycle_synthesise` path). The backend state machine is the
+ * source of truth; the body-text heuristic below can disagree with
+ * it, so authoritative state wins on merge.
  */
 interface LifecyclePayload {
   source: string;
@@ -216,29 +264,11 @@ const LIFECYCLE_STATE_TO_PHASE: Record<string, AgentLifecycle> = {
 export function useLifecycleEvents(): Record<string, AgentLifecycle> {
   const [map, setMap] = useState<Record<string, AgentLifecycle>>({});
 
-  useEffect(() => {
-    let unlisten: UnlistenFn | undefined;
-    let cancelled = false;
-    listen<LifecyclePayload>('swarm-term:lifecycle', (event) => {
-      const phase = LIFECYCLE_STATE_TO_PHASE[event.payload.state];
-      if (!phase) return;
-      setMap((prev) => ({ ...prev, [event.payload.source]: phase }));
-    })
-      .then((fn) => {
-        if (cancelled) {
-          fn();
-        } else {
-          unlisten = fn;
-        }
-      })
-      .catch((err) => {
-        console.warn('[useLifecycleEvents] subscribe failed', err);
-      });
-    return () => {
-      cancelled = true;
-      unlisten?.();
-    };
-  }, []);
+  useTauriEvent<LifecyclePayload>('swarm-term:lifecycle', (payload) => {
+    const phase = LIFECYCLE_STATE_TO_PHASE[payload.state];
+    if (!phase) return;
+    setMap((prev) => ({ ...prev, [payload.source]: phase }));
+  });
 
   return map;
 }

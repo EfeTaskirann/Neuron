@@ -8,6 +8,7 @@
 //! / `swarm-term:lifecycle` events — not a command.
 
 use std::process::Stdio;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use specta::Type;
@@ -130,6 +131,27 @@ fn tail_keep(buf: &str, limit: usize) -> String {
     buf[i..].to_string()
 }
 
+/// In-flight guard for [`swarm_term_run_update`]: two concurrent
+/// `npm install -g` runs corrupt the global claude install. The
+/// frontend disables the button on `isPending`, but a hung updater
+/// keeps the mutation pending across remounts — the backend is the
+/// authoritative gate.
+static UPDATE_IN_FLIGHT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Ceiling on the updater subprocess. npm installs finish in well
+/// under a minute on a healthy network; 10 min only catches a wedged
+/// npm/registry hang so the in-flight guard can't stay latched forever.
+const UPDATE_WAIT_BUDGET: Duration = Duration::from_secs(10 * 60);
+
+struct UpdateGuard;
+
+impl Drop for UpdateGuard {
+    fn drop(&mut self) {
+        UPDATE_IN_FLIGHT.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// Update the host's `claude` CLI to the latest version. Rejects while a
 /// swarm-term session is running so the binary on disk isn't swapped
 /// out from under the spawned REPLs.
@@ -150,6 +172,13 @@ fn tail_keep(buf: &str, limit: usize) -> String {
 pub async fn swarm_term_run_update<R: Runtime>(
     app: AppHandle<R>,
 ) -> Result<ClaudeUpdateResult, AppError> {
+    if UPDATE_IN_FLIGHT.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return Err(AppError::Conflict(
+            "a claude update is already in progress".into(),
+        ));
+    }
+    let _guard = UpdateGuard;
+
     // Gate: refuse while a session is live — replacing the binary
     // mid-flight is exactly the failure mode the button exists to avoid.
     {
@@ -247,10 +276,21 @@ pub async fn swarm_term_run_update<R: Runtime>(
         buf
     });
 
-    let status = child
-        .wait()
+    let status = match tokio::time::timeout(UPDATE_WAIT_BUDGET, child.wait())
         .await
-        .map_err(|e| AppError::Internal(format!("wait updater: {e}")))?;
+    {
+        Ok(res) => res
+            .map_err(|e| AppError::Internal(format!("wait updater: {e}")))?,
+        Err(_) => {
+            // Kill the wedged updater so the next attempt starts clean
+            // (kill_on_drop is belt-and-suspenders for the kill failing).
+            let _ = child.kill().await;
+            return Err(AppError::Timeout(format!(
+                "claude updater did not finish within {}s",
+                UPDATE_WAIT_BUDGET.as_secs()
+            )));
+        }
+    };
 
     let stdout_full = stdout_task.await.unwrap_or_default();
     let stderr_full = stderr_task.await.unwrap_or_default();

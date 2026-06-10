@@ -104,6 +104,17 @@ pub struct Transition {
     pub task_id: String,
 }
 
+/// Hard cap on a lifecycle task id (VAL-01). A single routed body
+/// cannot grow the store's key arbitrarily — legitimate ids are short
+/// ULIDs / integers, so 128 chars is far above any real id.
+const MAX_TASK_ID_LEN: usize = 128;
+
+/// Soft cap on distinct tracked lifecycle entries (VAL-01). When
+/// exceeded, `record` evicts terminal-state entries (Approved / Failed
+/// / Done) — they only drive a brief UI badge — to bound memory over a
+/// long session that sees many unique task ids.
+const MAX_LIFECYCLE_ENTRIES: usize = 2048;
+
 /// Pure: extract a [`Transition`] from a routed envelope body. Returns
 /// `None` if the body doesn't start with one of the four lifecycle
 /// prefixes or if the post-prefix tail has no first whitespace-
@@ -125,7 +136,7 @@ pub fn parse_lifecycle_token(body: &str) -> Option<Transition> {
     ] {
         if let Some(rest) = body.strip_prefix(prefix) {
             let task_id = rest.split_whitespace().next()?;
-            if task_id.is_empty() {
+            if task_id.is_empty() || task_id.len() > MAX_TASK_ID_LEN {
                 return None;
             }
             return Some(Transition {
@@ -156,7 +167,7 @@ pub fn parse_lifecycle_token_with_fallback(
     }
     let id = fallback_task_id
         .map(str::trim)
-        .filter(|s| !s.is_empty())?;
+        .filter(|s| !s.is_empty() && s.len() <= MAX_TASK_ID_LEN)?;
     let trimmed = body.trim();
     for (prefix, kind) in [
         (BUILDING_PREFIX, TransitionKind::Building),
@@ -232,10 +243,30 @@ impl LifecycleStore {
         transition: &Transition,
     ) -> LifecycleState {
         let key = (source_pane.to_string(), transition.task_id.clone());
+        // CONC-01: recover the guard on poison instead of panicking on
+        // this hot path. A poisoned lock only means some *other* holder
+        // panicked; the HashMap itself is intact, and this store is
+        // display-only (not load-bearing for message routing), so it is
+        // always safe to keep using it. `state_of`/`len`/`mark_done`
+        // already degrade gracefully — `record` was the lone panic.
         let mut g = self
             .inner
             .lock()
-            .expect("lifecycle store poisoned");
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // VAL-01: bound memory over a long session. If we're at the cap
+        // and about to add a new key, evict terminal-state entries first
+        // (Approved / Failed / Done are closed; they only linger for a
+        // brief badge), keeping in-flight (Building / AwaitingReview).
+        if g.len() >= MAX_LIFECYCLE_ENTRIES && !g.contains_key(&key) {
+            g.retain(|_, st| {
+                !matches!(
+                    st,
+                    LifecycleState::Approved
+                        | LifecycleState::Failed
+                        | LifecycleState::Done
+                )
+            });
+        }
         let prev = g.get(&key).copied();
         let next = apply_transition(prev, transition);
         g.insert(key, next);
@@ -244,6 +275,12 @@ impl LifecycleStore {
 
     /// Look up the current state without mutating. Returns `None`
     /// for an unseen `(source_pane, task_id)` pair.
+    ///
+    /// Test seam: production consumers react to the
+    /// `swarm-term:lifecycle` event stream instead of polling the
+    /// store, so this accessor is gated to tests — ungate it if a
+    /// poll-style UI consumer ever appears.
+    #[cfg(test)]
     pub fn state_of(
         &self,
         source_pane: &str,

@@ -80,6 +80,27 @@ pub struct TerminalSwarmPane {
 #[derive(Default)]
 pub struct TerminalSwarmRegistry {
     inner: Mutex<Option<ActiveSession>>,
+    /// TOCTOU guard for `start()`: the busy-check and the final slot
+    /// insert are separated by a multi-second await window (9 staggered
+    /// pane spawns). A second concurrent `start` passing the `is_some()`
+    /// check in that window would overwrite the first session at insert
+    /// time, leaking its 9 PTY panes and bridge watcher. Set under the
+    /// same lock as the busy-check; cleared by [`StartReservation`] on
+    /// every exit path.
+    starting: std::sync::atomic::AtomicBool,
+}
+
+/// RAII clear for [`TerminalSwarmRegistry::starting`] — dropping it
+/// releases the reservation on success and on every early-error return
+/// of `start()` alike.
+struct StartReservation<'a>(&'a TerminalSwarmRegistry);
+
+impl Drop for StartReservation<'_> {
+    fn drop(&mut self) {
+        self.0
+            .starting
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 pub(crate) struct ActiveSession {
@@ -137,13 +158,24 @@ impl TerminalSwarmRegistry {
         app: AppHandle<R>,
         project_dir: PathBuf,
     ) -> Result<TerminalSwarmSessionHandle, AppError> {
+        // PATH-01: reject parent-dir traversal segments so a crafted
+        // project_dir cannot walk out of wherever the caller intended
+        // (the 9 REPLs spawn with bypassPermissions and cwd = this dir).
+        if project_dir
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err(AppError::InvalidInput(
+                "project_dir must not contain '..' path segments".into(),
+            ));
+        }
         if !project_dir.is_dir() {
             return Err(AppError::InvalidInput(format!(
                 "project_dir {} does not exist or is not a directory",
                 project_dir.display()
             )));
         }
-        {
+        let _reservation = {
             let guard = self.inner.lock().map_err(|_| {
                 AppError::Internal("swarm-term registry poisoned".into())
             })?;
@@ -153,7 +185,20 @@ impl TerminalSwarmRegistry {
                         .into(),
                 ));
             }
-        }
+            // Reserve the slot while still under the lock — the spawn
+            // sequence below awaits for seconds, and a second start()
+            // racing through this window would otherwise overwrite the
+            // session at the final insert.
+            if self
+                .starting
+                .swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(AppError::Conflict(
+                    "a terminal-swarm session is already starting".into(),
+                ));
+            }
+            StartReservation(self)
+        };
 
         let spawn = resolve_claude_spawn()?;
         let project_str = project_dir.display().to_string();
@@ -236,6 +281,14 @@ impl TerminalSwarmRegistry {
             // versions — both are cheap and only one needs to land.
             extra_env.insert("DISABLE_AUTOUPDATER".to_string(), "1".to_string());
             extra_env.insert("CLAUDE_CODE_DISABLE_AUTOUPDATE".to_string(), "1".to_string());
+            // ENV-01: belt-and-suspenders auth isolation. The registry
+            // already env_remove's these for claude-code panes, but if
+            // Neuron itself was launched from a Claude shell the parent's
+            // token could bleed in via inheritance order. Forcing them
+            // empty guarantees each pane authenticates only from its own
+            // seeded ~/.claude/.credentials.json (the isolated HOME).
+            extra_env.insert("CLAUDE_CODE_OAUTH_TOKEN".to_string(), String::new());
+            extra_env.insert("ANTHROPIC_API_KEY".to_string(), String::new());
             // Bridge-related env vars. Each pane's claude REPL reads
             // these from the persona body (interpolated by
             // `build_persona_payload`), so they're informational here

@@ -128,6 +128,12 @@ function NodeCard({ node, selected, onSelect }: NodeCardProps): JSX.Element {
       className={cls}
       style={{ left: node.x, top: node.y }}
       onClick={() => onSelect(node.id)}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          onSelect(node.id);
+        }
+      }}
       role="button"
       tabIndex={0}
     >

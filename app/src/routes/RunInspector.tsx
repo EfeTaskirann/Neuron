@@ -49,7 +49,15 @@ export function RunInspector({ runId, onClose }: RunInspectorProps): JSX.Element
   if (isError) {
     throw error instanceof Error ? error : new Error(String(error));
   }
-  if (!data) return <></>;
+  if (!data) {
+    // Reachable when the query is paused (e.g. React Query's offline
+    // pause: isPending without isLoading) — never render a blank pane.
+    return (
+      <div className="inspector inspector-empty">
+        <p className="text-muted">Run not available.</p>
+      </div>
+    );
+  }
 
   const { run, spans } = data;
   const selectedSpan =
@@ -70,7 +78,12 @@ export function RunInspector({ runId, onClose }: RunInspectorProps): JSX.Element
           <span className="pill st-outline">{run.tokens.toLocaleString('en-US')} tokens</span>
           <span className="pill st-outline">${run.cost.toFixed(4)}</span>
           {onClose && (
-            <button className="icon-btn" onClick={onClose} title="Close">
+            <button
+              className="icon-btn"
+              onClick={onClose}
+              title="Close"
+              aria-label="Close inspector"
+            >
               <NIcon name="close" size={14} />
             </button>
           )}
@@ -133,7 +146,19 @@ function SpanRow({ span, total, selected, onSelect }: SpanRowProps): JSX.Element
   const barClass = `span-bar kind-${span.type}${span.isRunning ? ' running wf-shimmer' : ''}`;
   const rowClass = `span-row${selected ? ' selected' : ''}`;
   return (
-    <div className={rowClass} onClick={() => onSelect(span.id)}>
+    <div
+      className={rowClass}
+      role="button"
+      tabIndex={0}
+      aria-pressed={selected}
+      onClick={() => onSelect(span.id)}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          onSelect(span.id);
+        }
+      }}
+    >
       <div className="span-label" style={{ paddingLeft: 10 + span.indent * 16 }}>
         <span className={`span-dot kind-${span.type}`} />
         <span className="span-name">{span.name}</span>

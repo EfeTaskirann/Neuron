@@ -115,7 +115,12 @@ export function TerminalSwarmRoute(): JSX.Element {
     return () => window.removeEventListener('keydown', onKey);
   }, [expandedAgent]);
   const { data: personas = [] } = useSwarmTermPersonas();
-  const { data: session } = useSwarmTermSessionStatus();
+  const {
+    data: session,
+    isLoading: sessionLoading,
+    isError: sessionProbeFailed,
+    error: sessionProbeError,
+  } = useSwarmTermSessionStatus();
   const startMut = useStartSwarmTermSession();
   const stopMut = useStopSwarmTermSession();
   const updateMut = useRunClaudeUpdate();
@@ -123,8 +128,14 @@ export function TerminalSwarmRoute(): JSX.Element {
   const writeMut = useTerminalWrite();
 
   const sessionActive = session != null;
+  // `!sessionLoading`: while the status probe is in flight we don't
+  // yet know whether a session exists — launching then would only
+  // bounce off the backend's Conflict guard.
   const canLaunch =
-    projectDir != null && !sessionActive && !startMut.isPending;
+    projectDir != null &&
+    !sessionActive &&
+    !sessionLoading &&
+    !startMut.isPending;
 
   const launch = async () => {
     if (!projectDir) return;
@@ -166,17 +177,12 @@ export function TerminalSwarmRoute(): JSX.Element {
   );
   const orchestratorPaneId = panesByAgent.get('orchestrator') ?? null;
 
+  // Uptime ticking lives in <SessionTimer> (below) so its 1 s interval
+  // re-renders ~20px of text instead of this whole route — which would
+  // otherwise reconcile the 3×3 grid and all 9 SwarmPanes every second.
   const sessionStartMs = session
     ? parseSwarmTermStartMs(session.sessionId)
     : null;
-  const [nowMs, setNowMs] = useState<number>(() => Date.now());
-  useEffect(() => {
-    if (sessionStartMs == null) return;
-    const id = window.setInterval(() => setNowMs(Date.now()), 1000);
-    return () => window.clearInterval(id);
-  }, [sessionStartMs]);
-  const uptimeLabel =
-    sessionStartMs != null ? formatMmSs(nowMs - sessionStartMs) : null;
 
   const sendToOrchestrator = (e: FormEvent) => {
     e.preventDefault();
@@ -309,20 +315,20 @@ export function TerminalSwarmRoute(): JSX.Element {
             </button>
           </>
         )}
-        {uptimeLabel && (
-          <span
-            className="swarm-term-session-timer"
-            title="Session uptime (mm:ss)"
-            aria-label={`Session uptime ${uptimeLabel}`}
-          >
-            {uptimeLabel}
-          </span>
-        )}
+        {sessionStartMs != null && <SessionTimer startMs={sessionStartMs} />}
       </div>
 
       {launchError && (
         <div className="swarm-term-error" role="alert">
           {launchError}
+        </div>
+      )}
+      {sessionProbeFailed && (
+        <div className="swarm-term-error" role="alert">
+          Session status unavailable:{' '}
+          {sessionProbeError instanceof Error
+            ? sessionProbeError.message
+            : String(sessionProbeError)}
         </div>
       )}
 
@@ -517,6 +523,29 @@ export function TerminalSwarmRoute(): JSX.Element {
 }
 
 // ── Subcomponents ──────────────────────────────────────────────────
+
+// Self-contained uptime clock. Owns its own `now` state + 1 s interval
+// so the per-second tick only re-renders this span — not the parent
+// route's 3×3 pane grid. Mounts only while a session is active (parent
+// gates on `sessionStartMs != null`), so the interval is torn down on
+// stop without a guard here.
+function SessionTimer({ startMs }: { startMs: number }): JSX.Element {
+  const [nowMs, setNowMs] = useState<number>(() => Date.now());
+  useEffect(() => {
+    const id = window.setInterval(() => setNowMs(Date.now()), 1000);
+    return () => window.clearInterval(id);
+  }, []);
+  const label = formatMmSs(nowMs - startMs);
+  return (
+    <span
+      className="swarm-term-session-timer"
+      title="Session uptime (mm:ss)"
+      aria-label={`Session uptime ${label}`}
+    >
+      {label}
+    </span>
+  );
+}
 
 interface LifecyclePillProps {
   phase: AgentLifecycle;

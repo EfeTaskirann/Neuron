@@ -1,14 +1,17 @@
-// WP-W2-08 phase A — shell scaffold. Mirrors `Neuron Design/app/shell.jsx`'s
-// DOM and class names verbatim so the moved CSS resolves unchanged.
-// Routes are stubs ("coming soon"); phases B/C/D port real routes
-// in over their respective hooks. User/workspace strings are
-// placeholders until `useMe()` lands in phase B.
-import { useState } from 'react';
+// WP-W2-08 — app shell. Mirrors `Neuron Design/app/shell.jsx`'s DOM
+// and class names verbatim so the moved CSS resolves unchanged. All
+// nine routes are wired to real components in `RouteHost`. The shell
+// itself is gated behind `ProjectPickerRoute` until an active project
+// is picked (folder = cwd for Terminal / Terminal Swarm spawns).
+// User/workspace strings come from `useMe()`.
+import { useEffect, useRef, useState } from 'react';
 import { Brandmark, NIcon, type IconName } from './components/icons';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { useMe } from './hooks/useMe';
 import { useRuns } from './hooks/useRuns';
 import { useRunCreate } from './hooks/mutations';
+import { useActiveProject } from './hooks/useActiveProject';
+import { ProjectPickerRoute } from './routes/ProjectPickerRoute';
 import { AgentsRoute } from './routes/AgentsRoute';
 import { RunsRoute } from './routes/RunsRoute';
 import { MCPRoute } from './routes/MCPRoute';
@@ -73,7 +76,19 @@ function Sidebar({ route, onNavigate, collapsed, onToggle }: SidebarProps): JSX.
   const workspaceCount = me?.workspace.count;
   return (
     <nav className="sidebar" role="navigation">
-      <div className="sb-brand" onClick={onToggle} role="button" title="Toggle sidebar">
+      <div
+        className="sb-brand"
+        onClick={onToggle}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault();
+            onToggle();
+          }
+        }}
+        role="button"
+        tabIndex={0}
+        title="Toggle sidebar"
+      >
         <Brandmark size={28} />
         {!collapsed && <span className="sb-wordmark">Neuron</span>}
       </div>
@@ -94,7 +109,16 @@ function Sidebar({ route, onNavigate, collapsed, onToggle }: SidebarProps): JSX.
           <li
             key={item.id}
             className={`sb-item${route === item.id ? ' active' : ''}`}
+            role="button"
+            tabIndex={0}
+            aria-current={route === item.id ? 'page' : undefined}
             onClick={() => onNavigate(item.id)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault();
+                onNavigate(item.id);
+              }
+            }}
           >
             <NIcon name={item.icon} size={18} />
             {!collapsed && <span>{item.label}</span>}
@@ -121,6 +145,20 @@ function Sidebar({ route, onNavigate, collapsed, onToggle }: SidebarProps): JSX.
 
 function Topbar({ route }: { route: Route }): JSX.Element {
   const runCreate = useRunCreate();
+  const { project, clearProject } = useActiveProject();
+  const searchRef = useRef<HTMLInputElement>(null);
+  // ⌘K / Ctrl+K focuses the search input — the <kbd> hint in the
+  // markup must not advertise a shortcut that doesn't exist.
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
+        e.preventDefault();
+        searchRef.current?.focus();
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, []);
   return (
     <header className="topbar">
       <div className="topbar-l">
@@ -129,16 +167,38 @@ function Topbar({ route }: { route: Route }): JSX.Element {
           <NIcon name="chevronR" size={12} style={{ opacity: 0.4 }} />
           <span>{TOPBAR_TITLE[route]}</span>
         </div>
+        {project && (
+          <div className="topbar-project-chip" title={project.path}>
+            <span className="topbar-project-name">{project.name}</span>
+            <button
+              type="button"
+              className="topbar-project-change"
+              onClick={clearProject}
+              aria-label="Change project"
+            >
+              Change
+            </button>
+          </div>
+        )}
       </div>
 
       <div className="topbar-search">
         <NIcon name="search" size={14} />
-        <input placeholder="Search workflows, agents, servers…" />
+        <input
+          ref={searchRef}
+          aria-label="Search workflows, agents, servers"
+          placeholder="Search workflows, agents, servers…"
+        />
         <kbd>⌘K</kbd>
       </div>
 
       <div className="topbar-r">
-        {route === 'canvas' ? (
+        {/* The topbar primary action is "Run" on the run-oriented routes.
+            Other routes carry their own primary affordance in the route
+            body (Terminal's New-pane form, Agents' New-agent card, MCP
+            install, Swarm chat …), so the topbar omits a redundant — and
+            previously dead — button rather than firing a vague action. */}
+        {route === 'canvas' || route === 'runs' ? (
           <button
             className="btn primary"
             disabled={runCreate.isPending}
@@ -147,23 +207,9 @@ function Topbar({ route }: { route: Route }): JSX.Element {
             <NIcon name="play" size={12} />
             <span>{runCreate.isPending ? 'Starting…' : 'Run'}</span>
           </button>
-        ) : (
-          <button className="btn primary">
-            <NIcon name="plus" size={14} />
-            <span>New</span>
-          </button>
-        )}
+        ) : null}
       </div>
     </header>
-  );
-}
-
-function RouteStub({ route }: { route: Route }): JSX.Element {
-  return (
-    <div className="route-stub" data-testid={`route-stub-${route}`}>
-      <h2>{TOPBAR_TITLE[route]}</h2>
-      <p>{route} — coming soon (WP-W2-08 phase B/C/D)</p>
-    </div>
   );
 }
 
@@ -228,8 +274,13 @@ function RouteHost({ route }: { route: Route }): JSX.Element {
           <SettingsRoute />
         </ErrorBoundary>
       );
-    default:
-      return <RouteStub route={route} />;
+    default: {
+      // Exhaustiveness backstop: the `Route` union is closed, so this
+      // arm is unreachable — adding a new route without a case above
+      // is a compile error here, not a blank screen.
+      const unreachable: never = route;
+      throw new Error(`unhandled route: ${String(unreachable)}`);
+    }
   }
 }
 
@@ -237,11 +288,19 @@ export function App(): JSX.Element {
   const [route, setRoute] = useState<Route>('canvas');
   const [collapsed, setCollapsed] = useState(false);
   const [showInspector, setShowInspector] = useState(true);
+  const { project } = useActiveProject();
   // Pick the most recent run as the inspector's default subject.
   // `runs:list` is already sorted started_at DESC server-side.
   const { data: runs = [] } = useRuns();
   const inspectorRunId = runs[0]?.id ?? null;
   const inspectorOpen = route === 'canvas' && showInspector;
+  // Project gate: until a folder is picked there is no cwd for the
+  // terminal routes to spawn into, so the shell stays hidden. Picking
+  // writes the store; `useSyncExternalStore` re-renders us out of the
+  // gate one tick later.
+  if (!project) {
+    return <ProjectPickerRoute />;
+  }
   return (
     <div
       className={`app-shell${collapsed ? ' collapsed' : ''}${

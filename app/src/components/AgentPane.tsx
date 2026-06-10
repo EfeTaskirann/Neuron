@@ -40,12 +40,14 @@ export function AgentPane({
   const bodyRef = useRef<HTMLDivElement>(null);
 
   // Auto-scroll the transcript to the latest event. Mirrors
-  // OrchestratorChatPanel's history ref pattern.
+  // OrchestratorChatPanel's history ref pattern. Keyed on the array
+  // identity, not its length — once the 200-event ring saturates,
+  // length stays pinned at the cap while content keeps changing.
   useEffect(() => {
     if (bodyRef.current) {
       bodyRef.current.scrollTop = bodyRef.current.scrollHeight;
     }
-  }, [events.length]);
+  }, [events]);
 
   const pillStatus = status?.status ?? 'not_spawned';
   const turnsTaken = status?.turnsTaken ?? 0;

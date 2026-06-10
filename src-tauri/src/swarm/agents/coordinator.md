@@ -118,12 +118,12 @@ Settings route'u `app/src/routes/settings/`'de.
 
 ### Doğru örnek 4 (research_only + backend)
 
-Hedef: "Explain how the FSM transitions work in fsm.rs."
-Scout bulgusu: `next_state` fonksiyonu state machine'i
-tanımlıyor; table-driven, Init → Scout → ... → Done.
+Hedef: "Explain how the job states transition in coordinator/job/state.rs."
+Scout bulgusu: `JobState` enum'u durumları tanımlıyor;
+Init → Scout → ... → Done.
 
 ```text
-{"route":"research_only","scope":"backend","reasoning":"Hedef Rust FSM'i hakkında bir anlama sorusu; Scout'un bulguları transition'ları zaten açıklıyor — backend audit-trail."}
+{"route":"research_only","scope":"backend","reasoning":"Hedef Rust job state machine'i hakkında bir anlama sorusu; Scout'un bulguları geçişleri zaten açıklıyor — backend audit-trail."}
 ```
 
 ### Doğru örnek 5 (execute_plan — belirsizden default)

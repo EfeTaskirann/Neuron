@@ -13,6 +13,9 @@ import {
   type Motion,
   type Theme,
 } from '../hooks/useAppearance';
+import { useSecretHas, useSecretSet, useSecretDelete } from '../hooks/useSecrets';
+import { useMe } from '../hooks/useMe';
+import { useRuns } from '../hooks/useRuns';
 
 interface SettingsSection {
   id: string;
@@ -51,6 +54,29 @@ export function SettingsRoute(): JSX.Element {
       <div className="settings-pane">
         {active === 'appearance' ? (
           <AppearancePane />
+        ) : active === 'keys' ? (
+          <KeysPane />
+        ) : active === 'account' ? (
+          <AccountPane />
+        ) : active === 'data' ? (
+          <DataPane />
+        ) : active === 'models' ? (
+          <ModelsPane />
+        ) : active === 'workflows' ? (
+          <LinkPane
+            label="Workflows"
+            body="Workflows are built visually on the canvas. Open the Workflow tab to create, edit, or run them."
+          />
+        ) : active === 'agents' ? (
+          <LinkPane
+            label="Agents"
+            body="Agents — name, model, temperature, and role — are configured in the Agents tab."
+          />
+        ) : active === 'mcp' ? (
+          <LinkPane
+            label="MCP"
+            body="Browse, install, and uninstall MCP servers from the MCP tab. Per-server API keys live under Keys."
+          />
         ) : (
           <div className="set-empty">
             <h2 className="text-h2" style={{ marginTop: 0 }}>
@@ -173,6 +199,254 @@ function AppearancePane(): JSX.Element {
               </button>
             ))}
           </div>
+        </div>
+      </div>
+    </>
+  );
+}
+
+interface KeySlot {
+  id: string;
+  label: string;
+  placeholder: string;
+}
+
+// API key slots. `id` is the keychain key the backend stores under —
+// the bare provider name, mirroring the secrets:* tests + the
+// `AppError::NoApiKey` consumers (mcp:install, runs:create).
+const KEY_SLOTS: KeySlot[] = [
+  { id: 'anthropic', label: 'Anthropic (Claude)', placeholder: 'sk-ant-…' },
+  { id: 'openai', label: 'OpenAI', placeholder: 'sk-…' },
+  { id: 'gemini', label: 'Google Gemini', placeholder: 'AIza…' },
+];
+
+function KeysPane(): JSX.Element {
+  return (
+    <>
+      <h2 className="text-h2" style={{ marginTop: 0 }}>
+        Keys
+      </h2>
+      <p className="text-muted">
+        API keys live in your OS keychain — never in plaintext or synced.
+        Neuron can tell whether a key is set but never reads the value back.
+      </p>
+      <div className="set-card">
+        {KEY_SLOTS.map((slot) => (
+          <KeyRow key={slot.id} slot={slot} />
+        ))}
+      </div>
+    </>
+  );
+}
+
+function KeyRow({ slot }: { slot: KeySlot }): JSX.Element {
+  const has = useSecretHas(slot.id);
+  const setSecret = useSecretSet();
+  const del = useSecretDelete();
+  const [value, setValue] = useState('');
+  const configured = has.data === true;
+
+  const save = () => {
+    const v = value.trim();
+    if (!v) return;
+    setSecret.mutate(
+      { key: slot.id, value: v },
+      { onSuccess: () => setValue('') },
+    );
+  };
+
+  return (
+    <div className="set-row">
+      <div>
+        <div className="set-row-title">{slot.label}</div>
+        <div className="set-row-sub">
+          {has.isLoading ? (
+            'Checking…'
+          ) : has.isError ? (
+            // Probe failure ≠ "not set" — saying "Not set" here would
+            // hide the Forget affordance for a key that may exist.
+            <>
+              Status unreadable{' '}
+              <button
+                type="button"
+                className="btn ghost sm"
+                onClick={() => void has.refetch()}
+              >
+                Retry
+              </button>
+            </>
+          ) : configured ? (
+            'Configured ✓'
+          ) : (
+            'Not set'
+          )}
+        </div>
+      </div>
+      <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+        <input
+          type="password"
+          value={value}
+          onChange={(e) => setValue(e.target.value)}
+          placeholder={slot.placeholder}
+          aria-label={`${slot.label} API key`}
+        />
+        <button
+          type="button"
+          className="btn primary sm"
+          onClick={save}
+          disabled={!value.trim() || setSecret.isPending}
+        >
+          {setSecret.isPending ? 'Saving…' : 'Save'}
+        </button>
+        {configured && (
+          <button
+            type="button"
+            className="btn ghost sm"
+            onClick={() => del.mutate(slot.id)}
+            disabled={del.isPending}
+            title={`Forget ${slot.label} key`}
+          >
+            {del.isPending ? 'Forgetting…' : 'Forget'}
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// Sections whose primary surface is a dedicated tab — the settings pane
+// is a brief pointer rather than a duplicate of that tab's controls.
+function LinkPane({ label, body }: { label: string; body: string }): JSX.Element {
+  return (
+    <>
+      <h2 className="text-h2" style={{ marginTop: 0 }}>
+        {label}
+      </h2>
+      <p className="text-muted">{body}</p>
+    </>
+  );
+}
+
+interface ModelInfo {
+  id: string;
+  provider: string;
+  note: string;
+}
+
+const MODEL_CATALOG: ModelInfo[] = [
+  { id: 'claude-opus-4', provider: 'Anthropic', note: 'Most capable; drives the swarm agents.' },
+  { id: 'claude-sonnet-4', provider: 'Anthropic', note: 'Balanced cost and quality.' },
+  { id: 'claude-haiku-4', provider: 'Anthropic', note: 'Fastest and cheapest.' },
+  { id: 'gpt-4o', provider: 'OpenAI', note: 'Default model for new agents.' },
+  { id: 'gemini-2.5-pro', provider: 'Google', note: 'Long-context, multimodal.' },
+];
+
+function ModelsPane(): JSX.Element {
+  return (
+    <>
+      <h2 className="text-h2" style={{ marginTop: 0 }}>
+        Models
+      </h2>
+      <p className="text-muted">
+        Models available to agents. Pick a per-agent model in the Agents tab;
+        provider API keys live under Keys.
+      </p>
+      <div className="set-card">
+        {MODEL_CATALOG.map((m) => (
+          <div className="set-row" key={m.id}>
+            <div>
+              <div className="set-row-title">{m.id}</div>
+              <div className="set-row-sub">{m.note}</div>
+            </div>
+            <span className="text-muted">{m.provider}</span>
+          </div>
+        ))}
+      </div>
+    </>
+  );
+}
+
+function AccountPane(): JSX.Element {
+  const me = useMe();
+  const user = me.data?.user;
+  const ws = me.data?.workspace;
+  return (
+    <>
+      <h2 className="text-h2" style={{ marginTop: 0 }}>
+        Account
+      </h2>
+      <p className="text-muted">
+        Neuron runs locally as a single-user desktop app — there is no cloud
+        account or sign-in.
+      </p>
+      <div className="set-card">
+        <div className="set-row">
+          <div>
+            <div className="set-row-title">User</div>
+            <div className="set-row-sub">
+              {me.isLoading
+                ? 'Loading…'
+                : `${user?.name ?? '—'} · ${user?.initials ?? '··'}`}
+            </div>
+          </div>
+        </div>
+        <div className="set-row">
+          <div>
+            <div className="set-row-title">Workspace</div>
+            <div className="set-row-sub">
+              {me.isLoading
+                ? 'Loading…'
+                : `${ws?.name ?? '—'} · ${ws?.count ?? 0} workflows`}
+            </div>
+          </div>
+        </div>
+      </div>
+    </>
+  );
+}
+
+function DataPane(): JSX.Element {
+  const runs = useRuns();
+  const list = runs.data ?? [];
+  const totalCost = list.reduce((sum, r) => sum + r.cost, 0);
+  const exportRuns = (): void => {
+    const blob = new Blob([JSON.stringify(list, null, 2)], {
+      type: 'application/json',
+    });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `neuron-runs-${list.length}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+  return (
+    <>
+      <h2 className="text-h2" style={{ marginTop: 0 }}>
+        Data
+      </h2>
+      <p className="text-muted">
+        Your runs, agents, and settings live in a local SQLite database on
+        this machine — nothing is synced.
+      </p>
+      <div className="set-card">
+        <div className="set-row">
+          <div>
+            <div className="set-row-title">Run history</div>
+            <div className="set-row-sub">
+              {runs.isLoading
+                ? 'Loading…'
+                : `${list.length} runs · $${totalCost.toFixed(4)} total`}
+            </div>
+          </div>
+          <button
+            type="button"
+            className="btn ghost sm"
+            onClick={exportRuns}
+            disabled={runs.isLoading || list.length === 0}
+          >
+            Export JSON
+          </button>
         </div>
       </div>
     </>

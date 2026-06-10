@@ -99,15 +99,6 @@ pub async fn swarm_agents_dispatch_to_agent<R: Runtime>(
     Ok(env.id)
 }
 
-/// Truncate a prompt for the `summary` column of the dispatch row.
-/// 80 chars with ellipsis is enough for the existing mailbox UI to
-/// render a recognisable line without overflowing.
-fn truncate_for_summary(prompt: &str) -> String {
-    const CAP: usize = 80;
-    if prompt.chars().count() <= CAP {
-        prompt.to_string()
-    } else {
-        let truncated: String = prompt.chars().take(CAP).collect();
-        format!("{truncated}…")
-    }
-}
+// Summary truncation lives in `crate::text::truncate_for_summary`
+// (shared with `swarm::brain::prompt`).
+use crate::text::truncate_for_summary;
