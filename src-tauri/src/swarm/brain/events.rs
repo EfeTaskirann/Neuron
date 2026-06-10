@@ -6,6 +6,8 @@
 //! unchanged — the brain's `run_with_max` loop calls
 //! [`wait_for_loop_event`] after every `Dispatch`.
 
+use std::time::Duration;
+
 use tokio::sync::{broadcast, Notify};
 
 use crate::swarm::mailbox_bus::{MailboxEnvelope, MailboxEvent};
@@ -15,6 +17,23 @@ pub(super) enum LoopEventOutcome {
     Event(MailboxEnvelope),
     Cancelled,
     Closed,
+    /// No relevant envelope arrived within [`loop_event_deadline`].
+    /// Covers a dispatcher whose AgentResult emit failed (the emit
+    /// error is swallowed on the dispatcher side) — without a deadline
+    /// the job and its workspace lock would wedge until manual cancel.
+    TimedOut,
+}
+
+/// Ceiling on one loop-event wait, derived from the dispatcher's own
+/// budget: specialist invoke + help-outcome wait + post-help re-invoke,
+/// plus a 60s margin. The dispatcher always gives up (and emits) within
+/// this window, so silence past it means the emit itself was lost.
+pub(super) fn loop_event_deadline() -> Duration {
+    crate::swarm::agent_dispatcher::dispatch_timeout() * 2
+        + Duration::from_secs(
+            crate::swarm::agent_dispatcher::HELP_OUTCOME_TIMEOUT_SECS,
+        )
+        + Duration::from_secs(60)
 }
 
 /// Drain mailbox envelopes until we see one that's relevant to the
@@ -30,10 +49,16 @@ pub(super) async fn wait_for_loop_event(
     job_id: &str,
     cancel: &Notify,
 ) -> LoopEventOutcome {
+    // Fixed deadline across the whole wait — irrelevant envelopes
+    // looping below must not reset it.
+    let deadline = tokio::time::Instant::now() + loop_event_deadline();
     loop {
         tokio::select! {
             biased;
             _ = cancel.notified() => return LoopEventOutcome::Cancelled,
+            _ = tokio::time::sleep_until(deadline) => {
+                return LoopEventOutcome::TimedOut;
+            }
             recv_result = receiver.recv() => {
                 match recv_result {
                     Ok(envelope) => {

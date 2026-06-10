@@ -48,23 +48,27 @@ pub(super) async fn persist_install(
     Ok(updated)
 }
 
-/// Drop a server's tools and flip `installed=0`.
+/// Drop a server's tools and flip `installed=0` in one transaction
+/// (mirrors `persist_install` — a failure between the two statements
+/// must not leave an installed server with no tool rows).
 pub(super) async fn uninstall_server(pool: &DbPool, id: &str) -> Result<Server, AppError> {
+    let mut tx = pool.begin().await?;
     // The FK on server_tools.server_id cascades on delete of `servers`,
     // but we only flip a flag — explicit `DELETE FROM server_tools` is
     // the right shape here.
     sqlx::query("DELETE FROM server_tools WHERE server_id = ?")
         .bind(id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
     let updated = sqlx::query_as::<_, Server>(
         "UPDATE servers SET installed = 0 WHERE id = ? \
          RETURNING id, name, by, description, installs, rating, featured, installed",
     )
     .bind(id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?
     .ok_or_else(|| AppError::NotFound(format!("Server {id} not found")))?;
+    tx.commit().await?;
     Ok(updated)
 }
 

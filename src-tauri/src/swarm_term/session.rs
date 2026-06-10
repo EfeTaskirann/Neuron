@@ -80,6 +80,27 @@ pub struct TerminalSwarmPane {
 #[derive(Default)]
 pub struct TerminalSwarmRegistry {
     inner: Mutex<Option<ActiveSession>>,
+    /// TOCTOU guard for `start()`: the busy-check and the final slot
+    /// insert are separated by a multi-second await window (9 staggered
+    /// pane spawns). A second concurrent `start` passing the `is_some()`
+    /// check in that window would overwrite the first session at insert
+    /// time, leaking its 9 PTY panes and bridge watcher. Set under the
+    /// same lock as the busy-check; cleared by [`StartReservation`] on
+    /// every exit path.
+    starting: std::sync::atomic::AtomicBool,
+}
+
+/// RAII clear for [`TerminalSwarmRegistry::starting`] — dropping it
+/// releases the reservation on success and on every early-error return
+/// of `start()` alike.
+struct StartReservation<'a>(&'a TerminalSwarmRegistry);
+
+impl Drop for StartReservation<'_> {
+    fn drop(&mut self) {
+        self.0
+            .starting
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 pub(crate) struct ActiveSession {
@@ -154,7 +175,7 @@ impl TerminalSwarmRegistry {
                 project_dir.display()
             )));
         }
-        {
+        let _reservation = {
             let guard = self.inner.lock().map_err(|_| {
                 AppError::Internal("swarm-term registry poisoned".into())
             })?;
@@ -164,7 +185,20 @@ impl TerminalSwarmRegistry {
                         .into(),
                 ));
             }
-        }
+            // Reserve the slot while still under the lock — the spawn
+            // sequence below awaits for seconds, and a second start()
+            // racing through this window would otherwise overwrite the
+            // session at the final insert.
+            if self
+                .starting
+                .swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(AppError::Conflict(
+                    "a terminal-swarm session is already starting".into(),
+                ));
+            }
+            StartReservation(self)
+        };
 
         let spawn = resolve_claude_spawn()?;
         let project_str = project_dir.display().to_string();

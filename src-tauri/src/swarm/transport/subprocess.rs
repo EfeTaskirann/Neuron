@@ -120,7 +120,12 @@ impl Transport for SubprocessTransport {
         //    `<app_data_dir>/swarm/tmp/<ulid>.md`. We use ULIDs (already
         //    a workspace dep) so concurrent invokes don't collide and
         //    chronological sorting helps post-mortem grepping.
+        //    The guard removes the file on EVERY exit path below
+        //    (spawn failure, pipe loss, timeout, read error, no-result
+        //    EOF, happy path) — timeout/error exits are ordinary here,
+        //    so per-site cleanup calls would always miss one.
         let tmp_path = write_persona_tmp(app, profile).await?;
+        let _tmp_guard = PersonaTmpGuard(tmp_path.clone());
 
         // 3. Spawn. `kill_on_drop` is the seatbelt — if anything below
         //    panics or returns early, the child gets SIGKILL/TerminateProcess.
@@ -148,11 +153,6 @@ impl Transport for SubprocessTransport {
             .kill_on_drop(true)
             .spawn()
             .map_err(|e| {
-                // Best-effort cleanup of the persona file: leaving it
-                // around when we never even spawned the binary is
-                // pure clutter; the persona is also embedded in the
-                // running registry so we lose nothing.
-                let _ = std::fs::remove_file(&tmp_path);
                 AppError::SwarmInvoke(format!(
                     "spawn failed for `{}`: {e}",
                     binary.path.display()
@@ -342,17 +342,8 @@ impl Transport for SubprocessTransport {
             )));
         }
 
-        // 10. Happy path: clean up the persona tmp file. Errors are
-        //     logged at debug level — leaving a stray file is not
-        //     load-bearing.
-        if let Err(e) = std::fs::remove_file(&tmp_path) {
-            tracing::debug!(
-                path = %tmp_path.display(),
-                error = %e,
-                "could not remove persona tmp file (non-fatal)"
-            );
-        }
-
+        // 10. Happy path: `_tmp_guard` removes the persona tmp file
+        //     when it drops on return.
         Ok(InvokeResult {
             session_id: accum.session_id.unwrap_or_default(),
             assistant_text: accum
@@ -376,6 +367,24 @@ struct InvokeAccum {
     total_cost_usd: f64,
     turn_count: u32,
     completed: bool,
+}
+
+/// RAII cleanup for the one-shot persona tmp file. Never disarmed —
+/// the file is one-shot by construction (the persona is also embedded
+/// in the running registry, so nothing is lost). Removal failures are
+/// logged at debug level; a stray file is not load-bearing.
+struct PersonaTmpGuard(std::path::PathBuf);
+
+impl Drop for PersonaTmpGuard {
+    fn drop(&mut self) {
+        if let Err(e) = std::fs::remove_file(&self.0) {
+            tracing::debug!(
+                path = %self.0.display(),
+                error = %e,
+                "could not remove persona tmp file (non-fatal)"
+            );
+        }
+    }
 }
 
 /// Materialise the persona body to disk so `--append-system-prompt-file`

@@ -39,6 +39,14 @@ use crate::swarm::transport::InvokeResult;
     }
 
     #[test]
+    fn parse_multibyte_char_straddling_scan_cap_does_not_panic() {
+        // 'ü' is 2 bytes: the odd ASCII prefix forces a char to straddle
+        // the 16 KiB scan cap. Must error gracefully, not panic.
+        let huge = format!("x{}", "ü".repeat(32 * 1024));
+        assert!(parse_brain_action(&huge).is_err());
+    }
+
+    #[test]
     fn parse_dispatch_action_with_default_help_loop() {
         // `with_help_loop` omitted — serde default = false.
         let text = r#"{"action":"dispatch","target":"agent:planner","prompt":"plan it"}"#;

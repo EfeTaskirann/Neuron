@@ -30,7 +30,7 @@
 //! - `event` — `TurnStreamEvent`, the local hot-path streaming enum
 //!   handed to W4-03's per-agent channel.
 //! - `session` — the stateful `PersistentSession` (spawn / invoke_turn
-//!   / shutdown / Drop + the `dummy_child_stdin` shutdown helper).
+//!   / shutdown / Drop + the `attach_stderr_tail` helper).
 //! - `read` — the stdout read loop (`read_until_result`), the
 //!   post-cancel drain, and the local `InvokeAccum` running state.
 //!

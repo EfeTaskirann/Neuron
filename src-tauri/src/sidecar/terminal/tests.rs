@@ -174,6 +174,33 @@ fn strip_csi_removes_color_and_cursor_codes() {
 
     // Multibyte UTF-8 stays intact.
     assert_eq!(strip_csi("süßer Hund 🐶"), "süßer Hund 🐶");
+
+    // Stray ESC directly before a multibyte char must not panic
+    // (used to slice mid-char): ESC is dropped, the char survives.
+    assert_eq!(strip_csi("\x1bü"), "ü");
+    assert_eq!(strip_csi("a\x1b\u{fffd}b"), "a\u{fffd}b");
+}
+
+#[test]
+fn utf8_safe_prefix_len_holds_back_split_chars() {
+    use super::text::utf8_safe_prefix_len;
+
+    // Pure ASCII: nothing held back.
+    assert_eq!(utf8_safe_prefix_len(b"abc"), 3);
+    // Complete multibyte tail: nothing held back.
+    assert_eq!(utf8_safe_prefix_len("aü".as_bytes()), 3);
+    assert_eq!(utf8_safe_prefix_len("a😀".as_bytes()), 5);
+    // Split tail: the partial char's bytes are held back.
+    let euro = "€".as_bytes(); // 3 bytes
+    let mut buf = b"ab".to_vec();
+    buf.extend_from_slice(&euro[..2]);
+    assert_eq!(utf8_safe_prefix_len(&buf), 2);
+    let smile = "😀".as_bytes(); // 4 bytes
+    let mut buf = b"x".to_vec();
+    buf.extend_from_slice(&smile[..3]);
+    assert_eq!(utf8_safe_prefix_len(&buf), 1);
+    // Garbage continuation bytes only: flushed as-is (lossy decode).
+    assert_eq!(utf8_safe_prefix_len(&[0x80, 0x80, 0x80, 0x80, 0x80]), 5);
 }
 
 /// Acceptance: awaiting-approval regex matches each canonical agent

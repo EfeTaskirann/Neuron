@@ -34,6 +34,7 @@ pub mod sidecar;
 pub mod swarm;
 pub mod swarm_term;
 pub mod telemetry;
+pub mod text;
 pub mod time;
 pub mod tuning;
 

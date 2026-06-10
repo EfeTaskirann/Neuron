@@ -105,11 +105,11 @@ pub enum BrainAction {
 pub fn parse_brain_action(
     assistant_text: &str,
 ) -> Result<BrainAction, AppError> {
-    let truncated = if assistant_text.len() > BRAIN_ACTION_SCAN_CAP {
-        &assistant_text[..BRAIN_ACTION_SCAN_CAP]
-    } else {
-        assistant_text
-    };
+    // char-boundary-safe: the brain runs inline in the IPC future, so a
+    // mid-char slice panic would skip finalise_run_job and wedge the
+    // workspace lock for the rest of the session.
+    let truncated =
+        crate::text::truncate_to_char_boundary(assistant_text, BRAIN_ACTION_SCAN_CAP);
 
     // 1. Whole-text JSON.
     if let Some(action) = try_parse_brain_action(truncated.trim()) {

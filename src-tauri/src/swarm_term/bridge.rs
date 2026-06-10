@@ -182,7 +182,11 @@ pub fn install<R: Runtime>(
 /// Stop the watcher task started by [`install`]. The bridge root is
 /// kept; the caller (session lifecycle) is responsible for deletion.
 pub fn uninstall(handle: BridgeHandle) {
-    handle.cancel.notify_waiters();
+    // notify_one stores a permit: the watcher spends most of its time
+    // inside process_pending (multi-second write timeouts), not parked
+    // in notified() — notify_waiters fired in that window would be
+    // lost and the watcher would poll the deleted root forever.
+    handle.cancel.notify_one();
 }
 
 // --------------------------------------------------------------------- //

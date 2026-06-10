@@ -1,7 +1,7 @@
 //! The stateful `PersistentSession` — a single long-lived `claude`
 //! child wired up to drive multi-turn stream-json conversations.
-//! Spawn / invoke_turn / shutdown / Drop, plus the `dummy_child_stdin`
-//! shutdown helper and the `attach_stderr_tail` error-context helper.
+//! Spawn / invoke_turn / shutdown / Drop, plus the
+//! `attach_stderr_tail` error-context helper.
 
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -38,7 +38,11 @@ pub struct PersistentSession {
     profile_id: String,
     persona_tmp_path: PathBuf,
     child: Child,
-    stdin: ChildStdin,
+    /// `None` only after `shutdown()` has taken the pipe — `Option`
+    /// purely so shutdown can move it out of `self` (`ChildStdin` has
+    /// no `Default`; the previous dummy-process placeholder hack
+    /// panicked on spawn failure inside the shutdown path).
+    stdin: Option<ChildStdin>,
     stdout: BufReader<ChildStdout>,
     stderr_ring: Arc<Mutex<RingBuffer>>,
     /// Stderr-drain task handle. Joined on `shutdown`. We hold the
@@ -134,7 +138,7 @@ impl PersistentSession {
             profile_id: profile.id.clone(),
             persona_tmp_path: tmp_path,
             child,
-            stdin,
+            stdin: Some(stdin),
             stdout: BufReader::new(stdout),
             stderr_ring,
             stderr_task: Some(stderr_task),
@@ -166,17 +170,22 @@ impl PersistentSession {
                 "content": user_message,
             }
         }))?;
-        self.stdin.write_all(line.as_bytes()).await.map_err(|e| {
+        let stdin = self.stdin.as_mut().ok_or_else(|| {
+            AppError::SwarmInvoke(
+                "session stdin already closed by shutdown".into(),
+            )
+        })?;
+        stdin.write_all(line.as_bytes()).await.map_err(|e| {
             AppError::SwarmInvoke(format!(
                 "write user message to claude stdin failed: {e}"
             ))
         })?;
-        self.stdin.write_all(b"\n").await.map_err(|e| {
+        stdin.write_all(b"\n").await.map_err(|e| {
             AppError::SwarmInvoke(format!(
                 "write newline to claude stdin failed: {e}"
             ))
         })?;
-        self.stdin.flush().await.map_err(|e| {
+        stdin.flush().await.map_err(|e| {
             AppError::SwarmInvoke(format!(
                 "flush claude stdin failed: {e}"
             ))
@@ -241,10 +250,8 @@ impl PersistentSession {
     /// file and `kill_on_drop(true)` reaps the child.
     pub async fn shutdown(mut self) -> Result<(), AppError> {
         // 1. Drop stdin. The destructor closes the pipe → claude
-        //    sees EOF and exits its read loop. Move out of `self` so
-        //    the rest of `self` is still well-typed.
-        let stdin = std::mem::replace(&mut self.stdin, dummy_child_stdin());
-        drop(stdin);
+        //    sees EOF and exits its read loop.
+        drop(self.stdin.take());
 
         // 2. Grace window. If claude exits cleanly within the budget
         //    we skip the explicit kill. On Windows the AV layer can
@@ -284,35 +291,6 @@ impl Drop for PersistentSession {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.persona_tmp_path);
     }
-}
-
-/// Construct a placeholder `ChildStdin` for the `mem::replace` swap
-/// in `shutdown()`. The placeholder is immediately dropped; we never
-/// write to it. This dance is needed because `ChildStdin` doesn't
-/// implement `Default` and we can't move out of `self.stdin` directly
-/// while `self` is still in scope.
-///
-/// Implementation: spawn a dummy `cmd /c rem` (Windows) / `true`
-/// (Unix) just to harvest its stdin pipe, then drop the child. The
-/// cost is one short-lived process per shutdown, which is fine.
-fn dummy_child_stdin() -> ChildStdin {
-    // PANICS: only on platforms where the standard `true` /
-    // `cmd /c rem` no-op is missing, which is none of our supported
-    // targets. Guarded by the test suite (`shutdown_kills_child`).
-    #[cfg(windows)]
-    let cmd = ("cmd", &["/c", "rem"][..]);
-    #[cfg(not(windows))]
-    let cmd = ("true", &[][..]);
-
-    let mut child = Command::new(cmd.0)
-        .args(cmd.1)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-        .expect("dummy noop process spawns");
-    child.stdin.take().expect("dummy stdin pipe present")
 }
 
 /// Attach the most recent stderr tail to a `SwarmInvoke` error

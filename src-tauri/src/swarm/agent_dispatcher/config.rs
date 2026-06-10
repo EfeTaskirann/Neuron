@@ -24,9 +24,9 @@ pub(super) const MAX_HELP_ROUNDS: u32 = 3;
 /// to render its help-decision turn; 120s is generous. Past the
 /// timeout the dispatcher emits the prior assistant_text as the
 /// AgentResult so the projector/UI never sees an indefinite hang.
-pub(super) const HELP_OUTCOME_TIMEOUT_SECS: u64 = 120;
+pub(crate) const HELP_OUTCOME_TIMEOUT_SECS: u64 = 120;
 
-pub(super) fn dispatch_timeout() -> Duration {
+pub(crate) fn dispatch_timeout() -> Duration {
     match std::env::var(STAGE_TIMEOUT_ENV) {
         Ok(raw) if !raw.trim().is_empty() => match raw.trim().parse::<u64>()
         {

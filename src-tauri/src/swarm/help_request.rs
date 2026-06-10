@@ -77,11 +77,10 @@ const HELP_REQUEST_SCAN_CAP: usize = 16 * 1024;
 /// at the top level are considered. Bare JSON (no `neuron_help`
 /// key) is not a help request.
 pub fn parse_help_request(assistant_text: &str) -> Option<HelpRequest> {
-    let truncated = if assistant_text.len() > HELP_REQUEST_SCAN_CAP {
-        &assistant_text[..HELP_REQUEST_SCAN_CAP]
-    } else {
-        assistant_text
-    };
+    // char-boundary-safe: a multibyte char straddling the cap must not
+    // panic the dispatcher's invoke task (raw LLM output is often Turkish).
+    let truncated =
+        crate::text::truncate_to_char_boundary(assistant_text, HELP_REQUEST_SCAN_CAP);
 
     // 1. Whole-text JSON.
     if let Some(req) = try_extract_help_request(truncated.trim()) {
@@ -112,11 +111,8 @@ pub fn parse_help_request(assistant_text: &str) -> Option<HelpRequest> {
 pub fn parse_coordinator_help_outcome(
     assistant_text: &str,
 ) -> Result<CoordinatorHelpOutcome, AppError> {
-    let truncated = if assistant_text.len() > HELP_REQUEST_SCAN_CAP {
-        &assistant_text[..HELP_REQUEST_SCAN_CAP]
-    } else {
-        assistant_text
-    };
+    let truncated =
+        crate::text::truncate_to_char_boundary(assistant_text, HELP_REQUEST_SCAN_CAP);
     if let Some(out) = try_parse_outcome(truncated.trim()) {
         return Ok(out);
     }
@@ -282,6 +278,15 @@ mod tests {
         let huge = "x".repeat(50 * 1024);
         // Just ensure we don't panic on > scan cap. Result irrelevant.
         let _ = parse_help_request(&huge);
+    }
+
+    #[test]
+    fn multibyte_char_straddling_scan_cap_does_not_panic() {
+        // 'ü' is 2 bytes: an odd-length ASCII prefix forces every later
+        // char to straddle even byte offsets, including the 16 KiB cap.
+        let huge = format!("x{}", "ü".repeat(32 * 1024));
+        let _ = parse_help_request(&huge);
+        let _ = parse_coordinator_help_outcome(&huge);
     }
 
     // -- parse_coordinator_help_outcome --

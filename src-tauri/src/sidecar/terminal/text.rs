@@ -32,6 +32,37 @@ pub(super) fn extract_dsr_cpr_queries(buf: &mut Vec<u8>) -> usize {
     count
 }
 
+/// Length of the longest prefix of `bytes` that does not end mid-way
+/// through a UTF-8 sequence. At most 3 trailing bytes are held back
+/// (the head of a split char); invalid sequences are passed through
+/// whole for the lossy decoder to deal with.
+///
+/// Used by the reader's forced flush at `MAX_PENDING_BYTES` — slicing
+/// at the raw cap would decode U+FFFD on both sides of a split char.
+pub(super) fn utf8_safe_prefix_len(bytes: &[u8]) -> usize {
+    let len = bytes.len();
+    let scan_start = len.saturating_sub(4);
+    for i in (scan_start..len).rev() {
+        let b = bytes[i];
+        if b & 0xC0 != 0x80 {
+            // `i` holds an ASCII or lead byte — how wide is its char?
+            let width = if b < 0x80 {
+                1
+            } else if b & 0xE0 == 0xC0 {
+                2
+            } else if b & 0xF0 == 0xE0 {
+                3
+            } else if b & 0xF8 == 0xF0 {
+                4
+            } else {
+                1 // invalid lead — flush as-is
+            };
+            return if i + width <= len { len } else { i };
+        }
+    }
+    len
+}
+
 /// Strip trailing `\r` / `\n` from a raw byte buffer and decode the
 /// remainder as lossy UTF-8. Embedded `\r` (carriage-return progress
 /// bars) and any control chars within the line are preserved — only
@@ -92,9 +123,16 @@ pub(super) fn strip_csi(s: &str) -> String {
                         i += 1;
                     }
                     continue;
-                } else {
+                } else if n < 0x80 {
                     // Single-byte ESC sequence (e.g. `ESC c`).
                     i += 2;
+                    continue;
+                } else {
+                    // ESC followed by a multibyte char (stray ESC in lossy
+                    // output): `i += 2` would land mid-char and the
+                    // `&s[i..]` slice below would panic. Drop only the ESC
+                    // and let the char be copied normally.
+                    i += 1;
                     continue;
                 }
             } else {

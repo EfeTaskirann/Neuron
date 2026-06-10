@@ -73,10 +73,10 @@ impl SwarmAgentRegistry {
     /// Acquire (or lazy-spawn) the session for one
     /// (workspace, agent) and run one turn against it.
     ///
-    /// Caller is the FSM (W4-06) for specialists, the chat IPC for
-    /// Orchestrator. Failure paths leave the slot in `Crashed`
-    /// state with `session: None`; the next call respawns
-    /// transparently.
+    /// Callers are the mailbox dispatcher (`agent_dispatcher::invoker`)
+    /// and the coordinator brain (`brain::invoker`). Failure paths
+    /// leave the slot in `Crashed` state with `session: None`; the
+    /// next call respawns transparently.
     ///
     /// Cancel: forwarded to `PersistentSession::invoke_turn`.
     /// Cancel returns `AppError::Cancelled` and leaves the session
@@ -135,6 +135,17 @@ impl SwarmAgentRegistry {
         let needs_spawn = slot.session.is_none()
             || slot.turns_taken >= self.turn_cap;
         if needs_spawn {
+            // Resolve the profile BEFORE flipping status — a missing
+            // profile must error out without leaving the slot parked
+            // in `Spawning` (the contract says failures end Crashed).
+            let profile = self
+                .profiles
+                .get(agent_id)
+                .ok_or_else(|| {
+                    AppError::NotFound(format!(
+                        "swarm profile `{agent_id}`"
+                    ))
+                })?;
             if let Some(old_session) = slot.session.take() {
                 tracing::info!(
                     workspace_id = %workspace_id,
@@ -150,14 +161,6 @@ impl SwarmAgentRegistry {
             slot.status = AgentStatus::Spawning;
             slot.last_activity_ms = Some(now_millis());
 
-            let profile = self
-                .profiles
-                .get(agent_id)
-                .ok_or_else(|| {
-                    AppError::NotFound(format!(
-                        "swarm profile `{agent_id}`"
-                    ))
-                })?;
             let session =
                 PersistentSession::spawn(app, profile).await.map_err(|e| {
                     slot.status = AgentStatus::Crashed;

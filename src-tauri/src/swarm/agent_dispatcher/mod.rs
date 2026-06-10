@@ -91,6 +91,9 @@ mod tests;
 
 pub use invoker::{AgentInvoker, SwarmAgentRegistryInvoker};
 pub use routing::parse_agent_target;
+// Budget inputs for the brain's loop-event deadline (brain/events.rs):
+// the brain must never out-wait a dispatcher that has already given up.
+pub(crate) use config::{dispatch_timeout, HELP_OUTCOME_TIMEOUT_SECS};
 
 use routing::run_loop;
 

@@ -26,7 +26,9 @@ use crate::tuning::{
 };
 
 use super::approval::{extract_approval_blob, matches_awaiting_approval};
-use super::text::{extract_dsr_cpr_queries, strip_csi, trim_terminal_line_end};
+use super::text::{
+    extract_dsr_cpr_queries, strip_csi, trim_terminal_line_end, utf8_safe_prefix_len,
+};
 use super::{status, PaneState, RingLine, TerminalRegistry};
 
 // --------------------------------------------------------------------- //
@@ -117,9 +119,13 @@ pub(super) fn run_reader<R: Runtime>(
 
         // L8: cap unflushed pending so a child emitting megabytes
         // without a newline cannot exhaust memory. Force-flush as a
-        // partial line and continue.
+        // partial line and continue. The flush stops at a UTF-8
+        // boundary — a char split by the cap keeps its head bytes in
+        // `pending` (flushed by the next newline / cap / EOF path)
+        // instead of decoding U+FFFD on both sides of the cut.
         if pending.len() > MAX_PENDING_BYTES {
-            let forced = std::mem::take(&mut pending);
+            let cut = utf8_safe_prefix_len(&pending);
+            let forced: Vec<u8> = pending.drain(..cut).collect();
             let trimmed = trim_terminal_line_end(&forced);
             emit_decoded_line(
                 &app, &state, &pool, &pane_id, &agent_kind, trimmed, /* maybe_transition */ true,
@@ -507,8 +513,11 @@ pub(super) async fn flush_ring_to_db(
     }
     let mut tx = pool.begin().await?;
     for line in lines {
+        // OR IGNORE + the UNIQUE(pane_id, seq) index (migration 0012)
+        // make the flush idempotent — the waiter finalise and app-exit
+        // shutdown_all can both snapshot the same ring on a close race.
         sqlx::query(
-            "INSERT INTO pane_lines (pane_id, seq, k, text) VALUES (?, ?, ?, ?)",
+            "INSERT OR IGNORE INTO pane_lines (pane_id, seq, k, text) VALUES (?, ?, ?, ?)",
         )
         .bind(pane_id)
         .bind(line.seq)

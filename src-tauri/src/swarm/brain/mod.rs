@@ -451,6 +451,17 @@ impl CoordinatorBrain {
                     )
                     .await;
                 }
+                LoopEventOutcome::TimedOut => {
+                    return finish_with_failure(
+                        &app,
+                        &bus,
+                        &workspace_id,
+                        &job_id,
+                        "no agent result within the dispatch budget — \
+                         releasing the workspace instead of waiting forever",
+                    )
+                    .await;
+                }
             };
 
             last_envelope_id = Some(envelope.id);
