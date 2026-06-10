@@ -1,4 +1,10 @@
-import { useEffect, useMemo, useState } from 'react';
+import {
+  useEffect,
+  useMemo,
+  useState,
+  useSyncExternalStore,
+} from 'react';
+import { listen } from '@tauri-apps/api/event';
 import { useTauriEvent } from './useTauriEvent';
 
 // Shared event-collection hook for the swarm-term routing event
@@ -15,9 +21,12 @@ import { useTauriEvent } from './useTauriEvent';
 //   target_write_timeout — write_to_pane exceeded the 2 s cap (bridge.rs)
 //   lifecycle_fanout     — bridge-synthesised autonomy follow-up
 //
-// Hook lifetime is the consumer component's lifetime; the listener
-// is cleaned up on unmount via the unlisten function the Tauri SDK
-// returns from `listen()`.
+// Collection is a MODULE-LEVEL store (mirrors lib/toast.ts): one
+// app-lifetime listener starts on the first consumer mount and the
+// event array survives unmounts, so the Routing Log keeps its history
+// across tab navigation instead of restarting empty. Consumers read
+// it via useSyncExternalStore. The backend tracing log remains the
+// forensic source of truth; this buffer is display-grade (capped).
 
 export type RouteOutcome =
   | 'ok'
@@ -72,35 +81,85 @@ function coerceOutcome(raw: string): RouteOutcome {
     : 'unknown_target';
 }
 
-// Module-level so ids stay unique across remounts of the hook.
+// ── Module-level event store ───────────────────────────────────────
+// Newest-first, capped. Array identity changes on every push so
+// useSyncExternalStore consumers re-render; ids stay unique for the
+// app lifetime (stable React keys).
+const ROUTE_EVENT_CAP = 500;
 let nextRouteEventId = 0;
+let routeEvents: RouteEvent[] = [];
+const routeStoreListeners = new Set<() => void>();
+let routeListenerStarted = false;
 
-export function useRoutingEvents(maxRows = 500): {
+function emitRouteStore(): void {
+  for (const l of routeStoreListeners) l();
+}
+
+function pushRouteEvent(p: RawPayload): void {
+  const next: RouteEvent = {
+    id: nextRouteEventId++,
+    source: p.source,
+    target: p.target,
+    body: typeof p.body === 'string' ? p.body : '',
+    outcome: coerceOutcome(p.outcome),
+    reason: typeof p.reason === 'string' ? p.reason : undefined,
+    ts: Date.now(),
+  };
+  const out = [next, ...routeEvents];
+  if (out.length > ROUTE_EVENT_CAP) out.length = ROUTE_EVENT_CAP;
+  routeEvents = out;
+  emitRouteStore();
+}
+
+export function clearRoutingEvents(): void {
+  routeEvents = [];
+  emitRouteStore();
+}
+
+// Lazy app-lifetime subscription — started by the first consumer,
+// never torn down (the whole point: history outlives any one tab).
+// Registration is best-effort, same as useTauriEvent: jsdom has no
+// Tauri bridge, so a rejected listen() is logged, not thrown.
+function ensureRouteListener(): void {
+  if (routeListenerStarted) return;
+  routeListenerStarted = true;
+  listen<RawPayload>('swarm-term:route', (event) => {
+    pushRouteEvent(event.payload);
+  }).catch((err) => {
+    console.warn('[useRoutingEvents] subscribe failed', err);
+  });
+}
+
+function subscribeRouteStore(cb: () => void): () => void {
+  routeStoreListeners.add(cb);
+  return () => {
+    routeStoreListeners.delete(cb);
+  };
+}
+
+function routeStoreSnapshot(): RouteEvent[] {
+  return routeEvents;
+}
+
+export function useRoutingEvents(maxRows = ROUTE_EVENT_CAP): {
   events: RouteEvent[];
   clear: () => void;
 } {
-  const [events, setEvents] = useState<RouteEvent[]>([]);
-
-  useTauriEvent<RawPayload>('swarm-term:route', (p) => {
-    const next: RouteEvent = {
-      id: nextRouteEventId++,
-      source: p.source,
-      target: p.target,
-      body: typeof p.body === 'string' ? p.body : '',
-      outcome: coerceOutcome(p.outcome),
-      reason: typeof p.reason === 'string' ? p.reason : undefined,
-      ts: Date.now(),
-    };
-    setEvents((prev) => {
-      const out = [next, ...prev];
-      if (out.length > maxRows) out.length = maxRows;
-      return out;
-    });
-  });
-
+  ensureRouteListener();
+  const all = useSyncExternalStore(
+    subscribeRouteStore,
+    routeStoreSnapshot,
+    routeStoreSnapshot,
+  );
+  // The store caps at ROUTE_EVENT_CAP; a consumer asking for fewer
+  // rows gets a memoized slice so its identity is stable per push.
+  const events = useMemo(
+    () => (all.length > maxRows ? all.slice(0, maxRows) : all),
+    [all, maxRows],
+  );
   return {
     events,
-    clear: () => setEvents([]),
+    clear: clearRoutingEvents,
   };
 }
 
