@@ -131,21 +131,6 @@ fn tail_keep(buf: &str, limit: usize) -> String {
     buf[i..].to_string()
 }
 
-/// Update the host's `claude` CLI to the latest version. Rejects while a
-/// swarm-term session is running so the binary on disk isn't swapped
-/// out from under the spawned REPLs.
-///
-/// Resolution strategy:
-/// 1. Resolve the active claude binary via `resolve_claude_spawn()`.
-/// 2. If the resolved path looks like an npm install (under `\npm\` or
-///    `node_modules\@anthropic-ai\claude-code`), run
-///    `npm install -g @anthropic-ai/claude-code@latest`.
-/// 3. Otherwise, invoke `claude update` directly — the v2.x native
-///    installer supports this subcommand.
-///
-/// Stdout / stderr are streamed line-by-line as `swarm-term:update:log`
-/// events. The final result carries the exit code plus the last 4KB of
-/// each stream for a post-mortem display.
 /// In-flight guard for [`swarm_term_run_update`]: two concurrent
 /// `npm install -g` runs corrupt the global claude install. The
 /// frontend disables the button on `isPending`, but a hung updater
@@ -167,6 +152,21 @@ impl Drop for UpdateGuard {
     }
 }
 
+/// Update the host's `claude` CLI to the latest version. Rejects while a
+/// swarm-term session is running so the binary on disk isn't swapped
+/// out from under the spawned REPLs.
+///
+/// Resolution strategy:
+/// 1. Resolve the active claude binary via `resolve_claude_spawn()`.
+/// 2. If the resolved path looks like an npm install (under `\npm\` or
+///    `node_modules\@anthropic-ai\claude-code`), run
+///    `npm install -g @anthropic-ai/claude-code@latest`.
+/// 3. Otherwise, invoke `claude update` directly — the v2.x native
+///    installer supports this subcommand.
+///
+/// Stdout / stderr are streamed line-by-line as `swarm-term:update:log`
+/// events. The final result carries the exit code plus the last 4KB of
+/// each stream for a post-mortem display.
 #[tauri::command]
 #[specta::specta]
 pub async fn swarm_term_run_update<R: Runtime>(

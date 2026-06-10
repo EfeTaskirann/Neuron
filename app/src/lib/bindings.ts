@@ -1032,10 +1032,9 @@ export type MailboxEvent =
  */
 { kind: "job_cancel"; job_id: string } | 
 /**
- *  Legacy free-form note. The default kind for back-compat
- *  emitters (`mailbox::emit_internal` / `mailbox_emit` IPCs
- *  keep emitting `kind='note'` implicitly via the migration
- *  0010 column default).
+ *  Legacy free-form note. The default kind for the back-compat
+ *  `mailbox_emit` IPC, which keeps emitting `kind='note'`
+ *  implicitly via the migration 0010 column default.
  */
 { kind: "note" };
 
@@ -1490,7 +1489,7 @@ export type SwarmAgentEvent =
  *  Claude is using a tool. `name` is the tool name (Read, Edit,
  *  Glob, etc.); `input_summary` is a one-line truncation of the
  *  tool input (capped via `TOOL_USE_INPUT_SUMMARY_CAP` in
- *  `transport.rs`). The W4-04 pane shows "Scout is reading
+ *  `transport::classify`). The W4-04 pane shows "Scout is reading
  *  SwarmJobList.tsx" badges.
  */
 { kind: "tool_use"; name: string; input_summary: string } | 
