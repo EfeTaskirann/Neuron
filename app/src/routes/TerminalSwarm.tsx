@@ -115,7 +115,12 @@ export function TerminalSwarmRoute(): JSX.Element {
     return () => window.removeEventListener('keydown', onKey);
   }, [expandedAgent]);
   const { data: personas = [] } = useSwarmTermPersonas();
-  const { data: session } = useSwarmTermSessionStatus();
+  const {
+    data: session,
+    isLoading: sessionLoading,
+    isError: sessionProbeFailed,
+    error: sessionProbeError,
+  } = useSwarmTermSessionStatus();
   const startMut = useStartSwarmTermSession();
   const stopMut = useStopSwarmTermSession();
   const updateMut = useRunClaudeUpdate();
@@ -123,8 +128,14 @@ export function TerminalSwarmRoute(): JSX.Element {
   const writeMut = useTerminalWrite();
 
   const sessionActive = session != null;
+  // `!sessionLoading`: while the status probe is in flight we don't
+  // yet know whether a session exists — launching then would only
+  // bounce off the backend's Conflict guard.
   const canLaunch =
-    projectDir != null && !sessionActive && !startMut.isPending;
+    projectDir != null &&
+    !sessionActive &&
+    !sessionLoading &&
+    !startMut.isPending;
 
   const launch = async () => {
     if (!projectDir) return;
@@ -310,6 +321,14 @@ export function TerminalSwarmRoute(): JSX.Element {
       {launchError && (
         <div className="swarm-term-error" role="alert">
           {launchError}
+        </div>
+      )}
+      {sessionProbeFailed && (
+        <div className="swarm-term-error" role="alert">
+          Session status unavailable:{' '}
+          {sessionProbeError instanceof Error
+            ? sessionProbeError.message
+            : String(sessionProbeError)}
         </div>
       )}
 
