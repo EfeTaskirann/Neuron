@@ -1467,7 +1467,7 @@ html[data-motion="off"] *::after {
 /* Filter chips reuse the global `.chip` / `.chip-row` baseline. Per-outcome
    tint only overrides background / border-color / color on the active
    state, so the palette mirrors the row tags below and is visible in the
-   default-all-active state (all 8 outcomes enabled). */
+   default-all-active state (all 11 outcomes enabled). */
 .route-routing-log .chip.chip-outcome-ok.active {
   background: color-mix(in oklch, oklch(0.72 0.16 145) 18%, transparent);
   border-color: oklch(0.72 0.16 145);
@@ -1477,12 +1477,15 @@ html[data-motion="off"] *::after {
 .route-routing-log .chip.chip-outcome-denied.active,
 .route-routing-log .chip.chip-outcome-unknown_target.active,
 .route-routing-log .chip.chip-outcome-target_locked.active,
-.route-routing-log .chip.chip-outcome-target_write_timeout.active {
+.route-routing-log .chip.chip-outcome-target_write_timeout.active,
+.route-routing-log .chip.chip-outcome-rejected.active {
   background: color-mix(in oklch, oklch(0.62 0.18 25) 18%, transparent);
   border-color: oklch(0.62 0.18 25);
   color: oklch(0.92 0.18 25);
 }
-.route-routing-log .chip.chip-outcome-target_not_ready.active {
+.route-routing-log .chip.chip-outcome-target_not_ready.active,
+.route-routing-log .chip.chip-outcome-notice.active,
+.route-routing-log .chip.chip-outcome-reminder.active {
   background: color-mix(in oklch, oklch(0.7 0.16 80) 18%, transparent);
   border-color: oklch(0.7 0.16 80);
   color: oklch(0.93 0.16 80);
@@ -1571,12 +1574,15 @@ html[data-motion="off"] *::after {
 .routing-log-tag-denied,
 .routing-log-tag-unknown_target,
 .routing-log-tag-target_locked,
-.routing-log-tag-target_write_timeout {
+.routing-log-tag-target_write_timeout,
+.routing-log-tag-rejected {
   background: color-mix(in oklch, var(--syn-error) 18%, transparent);
   border-color: var(--syn-error);
   color: color-mix(in oklch, var(--syn-error) 70%, white);
 }
-.routing-log-tag-target_not_ready {
+.routing-log-tag-target_not_ready,
+.routing-log-tag-notice,
+.routing-log-tag-reminder {
   background: color-mix(in oklch, var(--syn-warning) 18%, transparent);
   border-color: var(--syn-warning);
   color: color-mix(in oklch, var(--syn-warning) 70%, white);

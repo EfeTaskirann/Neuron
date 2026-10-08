@@ -19,6 +19,9 @@ const OUTCOME_LABEL: Record<RouteOutcome, string> = {
   target_locked: 'locked',
   target_write_timeout: 'timeout',
   lifecycle_fanout: 'auto-fanout',
+  rejected: 'rejected',
+  notice: 'notice',
+  reminder: 'reminder',
 };
 
 function formatTs(ts: number): string {

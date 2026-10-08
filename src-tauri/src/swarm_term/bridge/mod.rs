@@ -74,6 +74,7 @@ pub(crate) use delivery::paste_then_submit;
 pub use envelope::Envelope;
 pub use fsops::{
     archive_rejected, drop_envelope, ensure_gitignore, prepare_layout,
+    sweep_orphan_sessions,
 };
 
 /// Subdirectory of the project root where the per-session bridge tree

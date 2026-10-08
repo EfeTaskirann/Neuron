@@ -95,6 +95,45 @@ pub fn archive_rejected(session_root: &Path) -> io::Result<Option<PathBuf>> {
     Ok(Some(dest))
 }
 
+/// Remove `swarm-term-*` session trees left under `bridge_parent` by a
+/// session that never ran `stop()` (app killed by a `tauri dev` rebuild,
+/// a crash, a forced quit). Their `rejected/` evidence is archived first,
+/// exactly as `stop()` would. Only call when no session is running —
+/// every such tree is then an orphan. Returns how many were removed.
+pub fn sweep_orphan_sessions(bridge_parent: &Path) -> usize {
+    let Ok(entries) = fs::read_dir(bridge_parent) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_session = path.is_dir()
+            && path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("swarm-term-"));
+        if !is_session {
+            continue;
+        }
+        if let Err(e) = archive_rejected(&path) {
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "swarm-term: orphan session — rejected-archive failed"
+            );
+        }
+        match fs::remove_dir_all(&path) {
+            Ok(()) => removed += 1,
+            Err(e) => tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "swarm-term: orphan session cleanup failed"
+            ),
+        }
+    }
+    removed
+}
+
 /// Atomically write an envelope to `inbox/<env.to>/<ulid>.json` using
 /// the `.tmp` + rename pattern. Used by the lifecycle fanout and the
 /// integration-test scaffolding.

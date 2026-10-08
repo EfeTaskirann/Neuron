@@ -25,6 +25,22 @@ const REVIEW_STALL_AFTER: Duration = Duration::from_secs(10 * 60);
 /// `Building` longer than this → remind the builder.
 const BUILD_STALL_AFTER: Duration = Duration::from_secs(20 * 60);
 
+/// Test override: `NEURON_TERM_STALL_SECS=<n>` sets BOTH thresholds to
+/// `n` seconds so the reminder path can be exercised live without a
+/// 10-minute wait. Unset / unparsable / 0 → the production defaults.
+const STALL_OVERRIDE_ENV: &str = "NEURON_TERM_STALL_SECS";
+
+fn stall_thresholds() -> (Duration, Duration) {
+    match std::env::var(STALL_OVERRIDE_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|n| *n > 0)
+    {
+        Some(n) => (Duration::from_secs(n), Duration::from_secs(n)),
+        None => (REVIEW_STALL_AFTER, BUILD_STALL_AFTER),
+    }
+}
+
 /// Scan for stalled tasks and send the due reminders.
 pub(super) async fn check_stalls<R: Runtime>(
     app: &AppHandle<R>,
@@ -32,8 +48,8 @@ pub(super) async fn check_stalls<R: Runtime>(
     panes_by_agent: &HashMap<String, String>,
     lifecycle: &LifecycleStore,
 ) {
-    let stalls =
-        lifecycle.take_stalls(Instant::now(), REVIEW_STALL_AFTER, BUILD_STALL_AFTER);
+    let (review_after, build_after) = stall_thresholds();
+    let stalls = lifecycle.take_stalls(Instant::now(), review_after, build_after);
     for stall in stalls {
         let Some(source_agent) = panes_by_agent
             .iter()
@@ -67,10 +83,10 @@ fn emit_reminder<R: Runtime>(app: &AppHandle<R>, target: &str, text: &str) {
     let _ = app.emit(
         crate::events::SWARM_TERM_ROUTE,
         json!({
-            "source": "coordinator",
+            "source": "neuron",
             "target": target,
             "body": format!("[Neuron] {text}"),
-            "outcome": "lifecycle_fanout",
+            "outcome": "reminder",
             "reason": "stalled task reminder",
         }),
     );

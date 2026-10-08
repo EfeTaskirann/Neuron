@@ -168,7 +168,8 @@ fn should_emit_retry_event(attempts: u32) -> bool {
 /// notice is gated on the move so a file that could not be moved (and
 /// will be re-processed next tick) does not notify twice.
 #[allow(clippy::too_many_arguments)]
-async fn reject_and_notify(
+async fn reject_and_notify<R: Runtime>(
+    app: &AppHandle<R>,
     registry: &TerminalRegistry,
     root: &Path,
     path: &Path,
@@ -191,6 +192,21 @@ async fn reject_and_notify(
     };
     let text = rejection_notice(sender, target, reason, body);
     notify_agent(registry, panes_by_agent, sender, &text).await;
+    emit_notice(app, sender, &text, reason);
+}
+
+/// Routing Log row for a `[Neuron]` notice pasted into `recipient`'s pane.
+fn emit_notice<R: Runtime>(app: &AppHandle<R>, recipient: &str, text: &str, reason: &str) {
+    let _ = app.emit(
+        crate::events::SWARM_TERM_ROUTE,
+        json!({
+            "source": "neuron",
+            "target": recipient,
+            "body": format!("[Neuron] {text}"),
+            "outcome": "notice",
+            "reason": reason,
+        }),
+    );
 }
 
 /// Process a single inbox file. Reads, validates, gates, delivers, and
@@ -249,6 +265,7 @@ async fn process_one<R: Runtime>(
                     }),
                 );
                 reject_and_notify(
+                    app,
                     registry,
                     root,
                     path,
@@ -297,6 +314,7 @@ async fn process_one<R: Runtime>(
             }),
         );
         reject_and_notify(
+            app,
             registry,
             root,
             path,
@@ -329,6 +347,7 @@ async fn process_one<R: Runtime>(
             }),
         );
         reject_and_notify(
+            app,
             registry,
             root,
             path,
@@ -360,6 +379,7 @@ async fn process_one<R: Runtime>(
                 }),
             );
             reject_and_notify(
+                app,
                 registry,
                 root,
                 path,
@@ -394,7 +414,11 @@ async fn process_one<R: Runtime>(
                 "attempts": attempts,
             });
             if expired {
-                ev["reason"] = json!("target never became ready; rejected");
+                ev["outcome"] = json!("rejected");
+                ev["reason"] = json!(format!(
+                    "target never became ready ({}s)",
+                    NOT_READY_GRACE.as_secs()
+                ));
             }
             let _ = app.emit(crate::events::SWARM_TERM_ROUTE, ev);
         }
@@ -404,6 +428,7 @@ async fn process_one<R: Runtime>(
                 NOT_READY_GRACE.as_secs()
             );
             reject_and_notify(
+                app,
                 registry,
                 root,
                 path,
@@ -439,7 +464,11 @@ async fn process_one<R: Runtime>(
                 "attempts": attempts,
             });
             if expired {
-                ev["reason"] = json!(format!("target stayed {s}; rejected"));
+                ev["outcome"] = json!("rejected");
+                ev["reason"] = json!(format!(
+                    "target stayed {s} for {}s",
+                    LOCKED_GRACE.as_secs()
+                ));
             }
             let _ = app.emit(crate::events::SWARM_TERM_ROUTE, ev);
         }
@@ -449,6 +478,7 @@ async fn process_one<R: Runtime>(
                 LOCKED_GRACE.as_secs()
             );
             reject_and_notify(
+                app,
                 registry,
                 root,
                 path,
@@ -524,19 +554,14 @@ async fn process_one<R: Runtime>(
                         source = %from_agent,
                         "swarm-term bridge: lifecycle-shaped body not recognised"
                     );
-                    let _ = app.emit(
-                        crate::events::SWARM_TERM_ROUTE,
-                        json!({
-                            "source": from_agent,
-                            "target": to_agent,
-                            "body": body,
-                            "outcome": "malformed",
-                            "reason": "lifecycle signal not recognised; \
-                                       no auto-fanout (sender notified)",
-                        }),
-                    );
                     notify_agent(registry, panes_by_agent, &from_agent, &text)
                         .await;
+                    emit_notice(
+                        app,
+                        &from_agent,
+                        &text,
+                        "lifecycle signal not recognised; no auto-fanout",
+                    );
                 }
             }
         }
@@ -548,7 +573,18 @@ async fn process_one<R: Runtime>(
                     RouteWriteOutcome::Err => "write error x5",
                     _ => unreachable!(),
                 };
+                let _ = app.emit(
+                    crate::events::SWARM_TERM_ROUTE,
+                    json!({
+                        "source": from_agent,
+                        "target": to_agent,
+                        "body": body,
+                        "outcome": "rejected",
+                        "reason": reason,
+                    }),
+                );
                 reject_and_notify(
+                    app,
                     registry,
                     root,
                     path,

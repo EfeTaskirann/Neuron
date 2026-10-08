@@ -68,6 +68,24 @@ describe('RoutingLogRoute', () => {
     expect(screen.getByText('denied edge body')).toBeInTheDocument();
   });
 
+  it('renders bridge notices / rejections / reminders as their own outcomes', () => {
+    // Previously these arrived as unknown outcomes and were coerced to
+    // "no target" / "malformed", hiding what the bridge actually did.
+    mockEvents([
+      { id: 3, source: 'neuron', target: 'scout', body: '[Neuron] not delivered', outcome: 'notice', ts: 1 },
+      { id: 4, source: 'coordinator', target: 'planner', body: 'plan-07', outcome: 'rejected', ts: 2 },
+      { id: 5, source: 'neuron', target: 'frontend-reviewer', body: '[Neuron] hatırlatma', outcome: 'reminder', ts: 3 },
+    ]);
+    const { container } = render(<RoutingLogRoute />);
+    expect(container.querySelector('.routing-log-tag-notice')).toHaveTextContent('notice');
+    expect(container.querySelector('.routing-log-tag-rejected')).toHaveTextContent('rejected');
+    expect(container.querySelector('.routing-log-tag-reminder')).toHaveTextContent('reminder');
+    // Each has its own filter chip.
+    fireEvent.click(screen.getByRole('button', { name: 'notice' }));
+    expect(screen.queryByText('[Neuron] not delivered')).not.toBeInTheDocument();
+    expect(screen.getByText('plan-07')).toBeInTheDocument();
+  });
+
   it('calls clear when the Clear button is pressed with events present', () => {
     const { clear } = mockEvents([OK_EVENT]);
     render(<RoutingLogRoute />);

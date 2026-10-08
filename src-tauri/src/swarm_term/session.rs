@@ -40,7 +40,8 @@ use crate::swarm_term::bridge::{
 };
 use crate::swarm_term::hierarchy::AGENT_IDS;
 use crate::swarm_term::home_isolation::{
-    prepare_isolated_homes_root, seed_pane_home, sync_credentials,
+    prepare_isolated_homes_root, seed_pane_home, sweep_orphan_homes,
+    sync_credentials,
 };
 use crate::swarm_term::lifecycle::LifecycleStore;
 use crate::swarm_term::persona::{
@@ -269,6 +270,21 @@ impl TerminalSwarmRegistry {
             ))
         })?;
         let _ = bridge::ensure_gitignore(&bridge_parent);
+        // No session is running (the reservation above guarantees it),
+        // so every leftover session tree / pane-HOME is an orphan of a
+        // session that never reached `stop()`. Sweep them BEFORE seeding
+        // the new panes: the homes sweep also syncs a possibly fresher,
+        // rotated token back into the user's real credentials file,
+        // which the new panes then copy.
+        let orphan_sessions = bridge::sweep_orphan_sessions(&bridge_parent);
+        let orphan_homes = sweep_orphan_homes(&app);
+        if orphan_sessions + orphan_homes > 0 {
+            tracing::info!(
+                orphan_sessions,
+                orphan_homes,
+                "swarm-term: swept leftovers of sessions that never stopped"
+            );
+        }
         let bridgespace_root = bridge_parent.join(&session_id);
         bridge::prepare_layout(&bridgespace_root)?;
 

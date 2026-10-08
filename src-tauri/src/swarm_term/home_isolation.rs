@@ -36,6 +36,45 @@ pub(crate) fn prepare_isolated_homes_root<R: Runtime>(
     Ok(root)
 }
 
+/// Delete pane-HOME trees left by sessions that never ran `stop()` (app
+/// killed by a `tauri dev` rebuild, a crash). Each holds a copy of the
+/// user's credentials, so they must not accumulate — and one of them may
+/// hold the only fresh, rotated refresh token, so credentials are synced
+/// out of each tree before it goes. Only call when no session is
+/// running. Returns how many trees were removed.
+pub(crate) fn sweep_orphan_homes<R: Runtime>(app: &AppHandle<R>) -> usize {
+    let Ok(app_data) = app.path().app_data_dir() else {
+        return 0;
+    };
+    sweep_orphan_homes_in(
+        &app_data.join("swarm-term").join("homes"),
+        real_credentials_path().as_deref(),
+    )
+}
+
+fn sweep_orphan_homes_in(homes_base: &Path, real_credentials: Option<&Path>) -> usize {
+    let Ok(entries) = std::fs::read_dir(homes_base) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        sync_credentials_with(real_credentials, &path);
+        match std::fs::remove_dir_all(&path) {
+            Ok(()) => removed += 1,
+            Err(e) => tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "swarm-term: orphan pane-homes cleanup failed"
+            ),
+        }
+    }
+    removed
+}
+
 /// Seed a per-pane HOME directory by copying the user's real
 /// `~/.claude.json` + `~/.claude/.credentials.json` into the pane's
 /// isolated home.
@@ -159,10 +198,20 @@ const OAUTH_KEY: &str = "claudeAiOauth";
 /// claude processes share one file and pick up each other's refreshes;
 /// syncing restores that.
 pub(crate) fn sync_credentials(homes_root: &Path) -> usize {
-    let mut paths: Vec<PathBuf> = Vec::new();
-    if let Ok(home) = real_user_home() {
-        paths.push(home.join(".claude").join(".credentials.json"));
-    }
+    sync_credentials_with(real_credentials_path().as_deref(), homes_root)
+}
+
+fn real_credentials_path() -> Option<PathBuf> {
+    real_user_home()
+        .ok()
+        .map(|home| home.join(".claude").join(".credentials.json"))
+}
+
+/// [`sync_credentials`] with the user's real credentials file passed in
+/// explicitly — tests pass `None` / a temp file so they can never touch
+/// the developer's real `~/.claude/.credentials.json`.
+fn sync_credentials_with(real: Option<&Path>, homes_root: &Path) -> usize {
+    let mut paths: Vec<PathBuf> = real.map(Path::to_path_buf).into_iter().collect();
     if let Ok(panes) = std::fs::read_dir(homes_root) {
         for pane in panes.flatten() {
             paths.push(pane.path().join(".claude").join(".credentials.json"));
@@ -327,6 +376,32 @@ mod tests {
         );
         assert_eq!(oauth_of(&stale)["refreshToken"], "old");
         assert!(!missing.exists(), "missing files are not created");
+    }
+
+    #[test]
+    fn sweep_rescues_the_fresh_token_then_removes_orphan_homes() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let real = tmp.path().join("real-credentials.json");
+        std::fs::write(&real, creds(100, "dead", "")).unwrap();
+        let base = tmp.path().join("homes");
+        // Orphan session A: one pane refreshed (rotated) its token.
+        let a = base.join("swarm-term-A").join("orchestrator").join(".claude");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::write(a.join(".credentials.json"), creds(900, "rotated", "")).unwrap();
+        // Orphan session B: stale copy only.
+        let b = base.join("swarm-term-B").join("scout").join(".claude");
+        std::fs::create_dir_all(&b).unwrap();
+        std::fs::write(b.join(".credentials.json"), creds(100, "dead", "")).unwrap();
+
+        let removed = sweep_orphan_homes_in(&base, Some(&real));
+
+        assert_eq!(removed, 2);
+        assert_eq!(std::fs::read_dir(&base).unwrap().count(), 0);
+        assert_eq!(
+            oauth_of(&real)["refreshToken"],
+            "rotated",
+            "the only live refresh token must survive the sweep"
+        );
     }
 
     #[test]

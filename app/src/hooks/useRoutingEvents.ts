@@ -13,17 +13,21 @@ import { useTauriEvent } from './useTauriEvent';
 // `outcome` discriminant:
 //
 //   ok                   — message delivered to target pane
-//   malformed            — envelope failed JSON parse / validation,
-//                          or unrecognised lifecycle signal reaching the
-//                          coordinator (e.g. "tamam —" instead of "DONE")
+//   malformed            — envelope failed JSON parse / validation
 //   denied               — hierarchy graph forbids the edge
 //   unknown_target       — target agent has no pane in the session
 //   target_not_ready     — target pane hasn't answered the kickoff with "@<id> hazır."
 //   target_locked        — target pane is in error state (wedged / no stdin)
 //   target_write_timeout — write_to_pane exceeded the 2 s cap (delivery.rs)
 //   lifecycle_fanout     — bridge-synthesised autonomy follow-up (review /
-//                          TASK_DONE fanout) or stalled-task reminder
-//                          (body: `[Neuron] …`, reason: "stalled task reminder")
+//                          TASK_DONE fanout)
+//   rejected             — a waiting message gave up (target never ready,
+//                          stayed locked, or 5 failed writes); moved to rejected/
+//   notice               — `[Neuron]` notice pasted into an agent's pane
+//                          (source "neuron"): its message was not delivered,
+//                          or its lifecycle signal (e.g. "tamam —" instead of
+//                          "DONE") was not recognised
+//   reminder             — `[Neuron]` stalled-task reminder (source "neuron")
 //
 // Collection is a MODULE-LEVEL store (mirrors lib/toast.ts): one
 // app-lifetime listener starts on the first consumer mount and the
@@ -40,7 +44,10 @@ export type RouteOutcome =
   | 'target_not_ready'
   | 'target_locked'
   | 'target_write_timeout'
-  | 'lifecycle_fanout';
+  | 'lifecycle_fanout'
+  | 'rejected'
+  | 'notice'
+  | 'reminder';
 
 export interface RouteEvent {
   /** Client-minted monotonic id — a stable React list key (rows
@@ -77,6 +84,9 @@ export const ALL_OUTCOMES: readonly RouteOutcome[] = [
   'target_locked',
   'target_write_timeout',
   'lifecycle_fanout',
+  'rejected',
+  'notice',
+  'reminder',
 ];
 
 function coerceOutcome(raw: string): RouteOutcome {

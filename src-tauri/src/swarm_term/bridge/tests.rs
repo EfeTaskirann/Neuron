@@ -211,6 +211,32 @@ fn archive_rejected_moves_evidence_out_of_the_session() {
 }
 
 #[test]
+fn sweep_orphan_sessions_archives_evidence_and_keeps_other_entries() {
+    let parent = tempdir().expect("tempdir");
+    let orphan = parent.path().join("swarm-term-01OLD");
+    prepare_layout(&orphan).expect("layout");
+    fs::write(orphan.join("rejected/planner/x.json"), "{}").unwrap();
+    let clean = parent.path().join("swarm-term-01CLEAN");
+    prepare_layout(&clean).expect("layout");
+    // Not ours: other swarm system dirs, the gitignore, the archive.
+    fs::create_dir_all(parent.path().join("swarms/abc")).unwrap();
+    fs::write(parent.path().join(".gitignore"), "*").unwrap();
+
+    assert_eq!(super::fsops::sweep_orphan_sessions(parent.path()), 2);
+
+    assert!(!orphan.exists() && !clean.exists());
+    assert!(parent
+        .path()
+        .join("_archive/swarm-term-01OLD/rejected/planner/x.json")
+        .is_file());
+    assert!(parent.path().join("swarms/abc").is_dir());
+    assert!(parent.path().join(".gitignore").is_file());
+    // The archive itself is never swept.
+    assert_eq!(super::fsops::sweep_orphan_sessions(parent.path()), 0);
+    assert!(parent.path().join("_archive").is_dir());
+}
+
+#[test]
 fn archive_rejected_is_noop_without_rejections_and_prunes_old() {
     let parent = tempdir().expect("tempdir");
     let empty = parent.path().join("swarm-term-00");
