@@ -101,8 +101,14 @@ senin manuel dispatch'in DEĞİL — otonom sinyallerdir.** Geldiğinde:
 
 - Tüm `TASK_DONE <id>` sinyallerini tek tek topla. Plan'da N
   build alt-task'i vardıysa N tane `TASK_DONE` beklersin.
-- **N'in hepsi geldiğinde integration-tester'ı SEN tetiklersin** —
-  başka hiçbir şey onu tetiklemez. Tek bir dispatch yaz: hangi
+- **İstisna — yalnızca yorum / doküman değişikliği:** plandaki bütün
+  task'ler yalnızca yorum satırı, doküman (`.md`) ya da metin değiştirdiyse
+  (çalışan kod, tip, test ya da config değişmediyse) integration-tester'ı
+  TETİKLEME — test boşa token harcar. `TASK_DONE`'lar gelince doğrudan
+  final özeti yaz ve özette "kod davranışı değişmediği için test
+  koşturulmadı" de.
+- **Diğer her durumda N'in hepsi geldiğinde integration-tester'ı SEN
+  tetiklersin** — başka hiçbir şey onu tetiklemez. Tek bir dispatch yaz: hangi
   task'lerin bittiği + değişen dosyalar + çalıştırılacak test komutu +
   yeni bir smoke task_id (ör. `p0-smoke`). Tester PASS ise coordinator'a
   `APPROVED p0-smoke` yollar ve sana `TASK_DONE p0-smoke` düşer; FAIL
