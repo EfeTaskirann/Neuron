@@ -18,10 +18,12 @@ import { useTauriEvent } from './useTauriEvent';
 //                          coordinator (e.g. "tamam —" instead of "DONE")
 //   denied               — hierarchy graph forbids the edge
 //   unknown_target       — target agent has no pane in the session
-//   target_not_ready     — target pane hasn't completed persona injection
+//   target_not_ready     — target pane hasn't answered the kickoff with "@<id> hazır."
 //   target_locked        — target pane is in error state (wedged / no stdin)
 //   target_write_timeout — write_to_pane exceeded the 2 s cap (delivery.rs)
-//   lifecycle_fanout     — bridge-synthesised autonomy follow-up
+//   lifecycle_fanout     — bridge-synthesised autonomy follow-up (review /
+//                          TASK_DONE fanout) or stalled-task reminder
+//                          (body: `[Neuron] …`, reason: "stalled task reminder")
 //
 // Collection is a MODULE-LEVEL store (mirrors lib/toast.ts): one
 // app-lifetime listener starts on the first consumer mount and the

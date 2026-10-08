@@ -141,6 +141,14 @@ async fn bridge_end_to_end_with_fake_agents() {
         .filter(|(a, _)| a.as_str() != "planner")
         .map(|(_, p)| p.clone())
         .collect();
+    // FIFO by write time, not by name: dropped BEFORE the watcher
+    // starts so both are in the same first scan. The name-wise first
+    // file is the newer one.
+    drop_raw(&root, "scout", "aa-newer",
+        r#"{"from":"coordinator","to":"scout","body":"order-second"}"#, None);
+    drop_raw(&root, "scout", "zz-older",
+        r#"{"from":"coordinator","to":"scout","body":"order-first"}"#,
+        Some(Duration::from_secs(20)));
     let handle = install(
         app.handle().clone(),
         root.clone(),
@@ -183,7 +191,8 @@ async fn bridge_end_to_end_with_fake_agents() {
 
     // ---- Assertions (polled) ----------------------------------------- //
     let r = |p: &str| root.join(p);
-    let checks: Vec<(&str, Box<dyn Fn() -> bool + '_>)> = vec![
+    type Check<'a> = (&'a str, Box<dyn Fn() -> bool + 'a>);
+    let checks: Vec<Check<'_>> = vec![
         ("01 denied → rejected/planner", Box::new(|| r("rejected/planner/01.json").is_file())),
         ("01 .reason names hierarchy", Box::new(|| read(&r("rejected/planner/01.reason")).contains("hierarchy denies"))),
         ("01 sender frontend-reviewer got [Neuron] notice", Box::new(|| { let l = log("frontend-reviewer"); l.contains("[Neuron]") && l.contains("hierarchy denies") })),
@@ -201,6 +210,10 @@ async fn bridge_end_to_end_with_fake_agents() {
         ("06 awaiting_approval pane still received", Box::new(|| log("integration-tester").contains("smoke-run-06"))),
         ("07 expired not-ready → rejected/planner", Box::new(|| r("rejected/planner/07.json").is_file())),
         ("07 sender coordinator got [Neuron] notice", Box::new(|| log("coordinator").contains("never became ready"))),
+        ("FIFO by mtime: older file delivered first", Box::new(|| {
+            let l = log("scout");
+            matches!((l.find("order-first"), l.find("order-second")), (Some(a), Some(b)) if a < b)
+        })),
         ("planner received nothing", Box::new(|| !log("planner").contains("plan-0"))),
     ];
     let deadline = Instant::now() + Duration::from_secs(20);

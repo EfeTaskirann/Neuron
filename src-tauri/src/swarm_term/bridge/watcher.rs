@@ -12,7 +12,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::json;
 use tauri::{AppHandle, Emitter, Runtime};
@@ -29,6 +29,7 @@ use super::delivery::{
 use super::envelope::{sniff_from, Envelope};
 use super::fsops::{bump_attempts, move_to_processed, move_to_rejected};
 use super::notify::{notify_agent, rejection_notice};
+use super::stall::{check_stalls, STALL_CHECK_EVERY};
 use super::synth::lifecycle_synthesise;
 
 /// Polling cadence for [`watcher_loop`]. Each tick scans every inbox
@@ -72,6 +73,7 @@ pub(super) async fn watcher_loop<R: Runtime>(
         poll_ms = WATCH_POLL_MS,
         "swarm-term bridge: watcher start"
     );
+    let mut last_stall_check = Instant::now();
     loop {
         process_pending(
             &app,
@@ -82,6 +84,10 @@ pub(super) async fn watcher_loop<R: Runtime>(
             &lifecycle,
         )
         .await;
+        if last_stall_check.elapsed() >= STALL_CHECK_EVERY {
+            check_stalls(&app, &registry, &panes_by_agent, &lifecycle).await;
+            last_stall_check = Instant::now();
+        }
         tokio::select! {
             _ = cancel.notified() => {
                 tracing::info!("swarm-term bridge: watcher cancelled");
@@ -115,9 +121,14 @@ async fn process_pending<R: Runtime>(
                 .collect(),
             Err(_) => continue,
         };
-        // ULIDs / timestamp filenames sort lexicographically into
-        // chronological order — FIFO delivery without a separate index.
-        entries.sort();
+        // FIFO by write time (mtime; renames preserve it), name as the
+        // tie-break. Sorting by name alone assumed chronological ids,
+        // but agents pick their own filenames (and were seen copying
+        // the persona's example id verbatim).
+        entries.sort_by_cached_key(|p| {
+            let mtime = fs::metadata(p).and_then(|m| m.modified()).ok();
+            (mtime, p.clone())
+        });
         for path in entries {
             process_one(
                 app,

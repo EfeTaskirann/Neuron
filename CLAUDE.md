@@ -11,6 +11,7 @@ Bu repo'daki kaynak dosyalara (`app/`, `src-tauri/`, config dosyaları, `src-tau
 **Neden:** Kullanıcı dev build'i aktif olarak çalıştırıyor. Edit'ler restart tetikliyor ve devam eden oturum/iş yarım kalıyor.
 
 **Uygulanmaz:**
+- Neuron'un swarm-term ajanları — sistem prompt'unda "Mesajlaşma protokolü" bulunan ve `.bridgespace` üzerinden mesajlaşan Claude oturumları. Onlar kendi persona kurallarına uyar; bu bölüm yalnızca kullanıcıyla doğrudan çalışan oturumlar içindir.
 - Salt-okur işlemler (`Read`, `Grep`, `Glob`, `git status`/`git diff` gibi inceleme komutları) — bunlar restart tetiklemiyor, ön bildirim gerekmez.
 - Kullanıcının çalıştırmadığı saf not/dökümantasyon dosyaları (kullanıcı zaten istemişse).
 

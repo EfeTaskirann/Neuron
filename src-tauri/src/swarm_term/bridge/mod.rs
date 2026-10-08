@@ -44,6 +44,8 @@
 //!                     deliveries.
 //!   * [`notify`]    — `[Neuron]` notices pasted into a sender's pane
 //!                     (rejections, unrecognised lifecycle signals).
+//!   * [`stall`]     — reminders for tasks stuck in `Building` /
+//!                     `AwaitingReview` (escalated to the coordinator).
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -59,6 +61,7 @@ mod delivery;
 mod envelope;
 mod fsops;
 mod notify;
+mod stall;
 mod synth;
 mod watcher;
 

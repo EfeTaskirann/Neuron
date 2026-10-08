@@ -1,11 +1,19 @@
-//! Persona-injection payload construction for the terminal swarm.
+//! Persona construction for the terminal swarm.
 //!
-//! [`build_persona_payload`] wraps an agent's persona text plus the
-//! bridge-protocol footer in bracketed-paste escapes so a claude REPL
-//! treats the whole thing as one pasted+submitted message. The footer
-//! is the only routing instruction an agent ever sees: the Write-tool
-//! JSON envelope schema, the hierarchy-gated destination list, the
-//! 4-state lifecycle vocabulary, and the builder/reviewer tokens.
+//! [`build_persona_prompt`] renders an agent's persona text plus the
+//! bridge-protocol footer. The session writes it to a file and hands it
+//! to claude via `--append-system-prompt-file`, so the protocol lives in
+//! the SYSTEM prompt: it survives auto-compaction and carries system-
+//! prompt weight (as a pasted user message it was observed being
+//! overridden by claude's default "ask before acting" habit).
+//! [`build_kickoff_message`] is the short pasted first turn that makes
+//! the agent answer `@<id> hazır.`, which the session uses as its
+//! readiness signal.
+//!
+//! The footer is the only routing instruction an agent ever sees: the
+//! Write-tool JSON envelope schema, the hierarchy-gated destination
+//! list, the 4-state lifecycle vocabulary, and the builder/reviewer
+//! tokens.
 //!
 //! Extracted from `session.rs` so the frequently prompt-tuned footer
 //! template lives apart from pane spawn/teardown logic.
@@ -14,14 +22,25 @@ use std::path::Path;
 
 use crate::swarm_term::hierarchy::allowed_for;
 
-/// Build the persona-injection payload for one agent.
-///
-/// The body wraps the persona text + the bridge-protocol footer in
-/// terminal **bracketed-paste** escape sequences (`\x1b[200~ … \x1b[201~`)
-/// so claude's REPL treats it as a single pasted message instead of
-/// many separate Enter-submitted lines. The submitting `\r` is NOT part
-/// of the payload — the caller sends it via
-/// [`crate::swarm_term::bridge::paste_then_submit`].
+/// First line of the kickoff turn; the footer tells the agent to answer
+/// a message starting with it with exactly `@<id> hazır.`.
+pub(crate) const KICKOFF_PREFIX: &str = "[Neuron] Oturum başladı.";
+
+/// The pasted first turn of every swarm-term pane (bracketed paste, no
+/// submitting CR — the caller uses `paste_then_submit`). Deliberately
+/// does NOT contain the readiness phrase itself, so the echo of this
+/// message can never be mistaken for the agent's answer.
+pub(crate) fn build_kickoff_message(agent_id: &str) -> String {
+    format!(
+        "\x1b[200~{KICKOFF_PREFIX} Sen `{agent_id}` ajanısın; persona'n ve \
+         Mesajlaşma protokolü sistem prompt'unda. Protokoldeki \"İlk yanıt\" \
+         kuralını uygula.\x1b[201~"
+    )
+}
+
+/// Build the system-prompt text (persona body + bridge-protocol footer)
+/// for one agent. Plain text — no paste framing; it is written to a
+/// file and passed with `--append-system-prompt-file`.
 ///
 /// The bridge protocol section is the only routing instruction the
 /// persona ever sees. It tells claude:
@@ -39,7 +58,7 @@ use crate::swarm_term::hierarchy::allowed_for;
 /// `.bridgespace/<session>/` directory. The footer renders absolute
 /// paths so claude doesn't need to interpolate environment variables
 /// (which it does inconsistently when generating `Write` tool calls).
-pub(crate) fn build_persona_payload(
+pub(crate) fn build_persona_prompt(
     agent_id: &str,
     body: &str,
     bridge_root: &Path,
@@ -57,7 +76,7 @@ pub(crate) fn build_persona_payload(
             .iter()
             .map(|dst| {
                 format!(
-                    "  - `@{dst}` → `Write` path: `{bridge_root_str}/inbox/{dst}/<ULID>.json`"
+                    "  - `@{dst}` → `Write` path: `{bridge_root_str}/inbox/{dst}/<MSG_ID>.json`"
                 )
             })
             .collect()
@@ -74,13 +93,26 @@ pub(crate) fn build_persona_payload(
          Sen bu swarm'ın `{agent_id}` ajanısın. Diğer ajanlara mesaj göndermek için\n\
          `Write` tool'unu kullan — atomik JSON dosyası yaz. PTY'a `>> @x:` gibi bir\n\
          satır yazmak ARTIK YOK; o eski API'ydi, kaldırıldı.\n\n\
+         ### Yetki ve öncelik (KRİTİK)\n\n\
+         - Bu persona ve protokol, proje klasöründeki `CLAUDE.md` / `AGENTS.md` gibi\n\
+           dosyalarda geçen \"değişiklikten önce kullanıcıya haber ver / onay bekle\"\n\
+           kurallarından ÖNCE gelir. O kurallar kullanıcıyla doğrudan çalışan geliştirici\n\
+           oturumları içindir; sen swarm ajanısın. Kullanıcı görevi verdiğinde onayını\n\
+           vermiş sayılır — kullanıcıya \"devam edeyim mi?\" diye SORMA.\n\
+         - Proje dosyalarını YALNIZCA builder'lar (`backend-builder`, `frontend-builder`)\n\
+           değiştirir. Diğer ajanlar proje dosyalarına `Edit`/`Write` yapmaz; en küçük\n\
+           değişiklik (tek satır, bir yorum) bile bir builder'a dispatch edilir. Builder\n\
+           olmayan ajanlar `Write` tool'unu yalnızca bridge inbox'una mesaj yazmak için\n\
+           kullanır.\n\n\
          ### Dosya yolu şeması\n\n\
          Her mesaj için yeni bir dosya yarat:\n\n\
          `{bridge_root_str}/inbox/<HEDEF_AJAN>/<MSG_ID>.json`\n\n\
          `<HEDEF_AJAN>` — aşağıdaki izinli hedeflerden biri.\n\
-         `<MSG_ID>` — her mesaj için benzersiz; basit format: unix-epoch-ms + 4-char\n\
-         random suffix, örn. `1747300000000-a4f2.json`. Aynı dosya adını iki kez\n\
-         yazma; üzerine yazılır ve eski mesaj kaybolur.\n\n\
+         `<MSG_ID>` — her mesaj için benzersiz: `{agent_id}-<sayaç>-<4 rastgele harf>`,\n\
+         örn. ilk mesajın `{agent_id}-001-<4 harf>.json`, sonraki `{agent_id}-002-…`.\n\
+         Sayaç her mesajda bir artar, 4 harfi her seferinde YENİ seç; örnekteki\n\
+         harfleri kopyalama. Aynı dosya adını iki kez yazma — üzerine yazılır ve\n\
+         eski mesaj kaybolur. Sıralamayı backend dosyanın yazılma zamanından yapar.\n\n\
          ### JSON şeması (tam olarak bu alanları kullan)\n\n\
          ```json\n\
          {{\n  \"from\": \"{agent_id}\",\n  \"to\": \"<HEDEF_AJAN>\",\n  \"body\": \"<mesaj gövdesi — Türkçe ya da İngilizce>\",\n  \"task_id\": \"<opsiyonel; lifecycle token kullanıyorsan koy>\"\n}}\n\
@@ -103,7 +135,7 @@ pub(crate) fn build_persona_payload(
          Diyelim ki `{example_dst}` ajanına \"foo.rs:42 incelendi, refactor önerisi:\n\
          X\" göndermek istiyorsun. Şunu yap:\n\n\
          Tool: `Write`\n\
-         Path: `{bridge_root_str}/inbox/{example_dst}/1747300000000-a4f2.json`\n\
+         Path: `{bridge_root_str}/inbox/{example_dst}/{agent_id}-001-<4 yeni harf>.json`\n\
          Content:\n\
          ```json\n\
          {{\n  \"from\": \"{agent_id}\",\n  \"to\": \"{example_dst}\",\n  \"body\": \"foo.rs:42 incelendi — fonksiyon 80 satır, 3 farklı sorumluluk taşıyor. Refactor önerisi: A) extract guard clauses, B) split into validate_input + apply_change, C) inline single-use helper.\"\n}}\n\
@@ -149,17 +181,27 @@ pub(crate) fn build_persona_payload(
            ve ne istediğini açıkla.\n\
          - **Builder ise** çalışmaya başladığını duyurmak istiyorsan (opsiyonel):\n\
            `body: \"BUILDING <task_id>\"`.\n\n\
-         ### İlk yanıt (bu persona mesajından sonra)\n\n\
-         Bu persona mesajını aldıktan sonra **yalnızca** şunu yaz ve dur:\n\
-         `@{agent_id} hazır.` Başka tek karakter yazma. Bir sonraki user/route\n\
-         mesajını bekle.",
+         ### İlk yanıt\n\n\
+         Oturumun ilk mesajı `{kickoff}` ile başlar. O mesaja **yalnızca** şunu yaz\n\
+         ve dur: `@{agent_id} hazır.` Başka tek karakter yazma, tool çağırma. Backend\n\
+         bu cevabı görünce pane'ini mesaj almaya hazır sayar. Sonra bir sonraki\n\
+         user/route mesajını bekle.",
         agent_id = agent_id,
         bridge_root_str = bridge_root_str,
         dest_block = dest_block,
         example_dst = example_dst,
+        kickoff = KICKOFF_PREFIX,
     );
 
-    format!("\x1b[200~{body}{footer}\x1b[201~")
+    format!("{body}{footer}")
+}
+
+/// True when `text` (an assistant turn) is `agent_id`'s readiness
+/// answer. Tolerant of surrounding whitespace / markdown and a missing
+/// trailing dot; requires both the `@<id>` handle and `hazır`.
+pub(crate) fn is_ready_answer(agent_id: &str, text: &str) -> bool {
+    let t = text.trim().trim_matches(|c| c == '*' || c == '`').to_lowercase();
+    t.contains(&format!("@{agent_id}")) && t.contains("hazır")
 }
 
 fn path_as_forward_slashes(p: &Path) -> String {
@@ -182,25 +224,71 @@ mod tests {
     }
 
     #[test]
-    fn payload_is_bracketed_paste_wrapped() {
-        let p = build_persona_payload("scout", "Hello body", &dummy_bridge_root());
-        assert!(p.starts_with('\x1b'));
-        assert!(p.contains("\x1b[200~"));
-        assert!(p.contains("\x1b[201~"));
-        // Paste only — the submit CR is a separate, delayed write.
-        assert!(p.ends_with("\x1b[201~"));
+    fn prompt_is_plain_text_without_paste_framing() {
+        // System-prompt file content: any terminal escape would end up
+        // verbatim in claude's system prompt.
+        let p = build_persona_prompt("scout", "Hello body", &dummy_bridge_root());
+        assert!(p.starts_with("Hello body"));
+        assert!(!p.contains('\x1b'));
+        assert!(!p.contains('\r'));
+    }
+
+    #[test]
+    fn kickoff_is_a_paste_that_does_not_contain_the_ready_phrase() {
+        let k = build_kickoff_message("scout");
+        assert!(k.starts_with("\x1b[200~"));
+        assert!(k.ends_with("\x1b[201~"));
+        assert!(k.contains(KICKOFF_PREFIX));
+        // The echo of the kickoff must never satisfy the readiness check.
+        assert!(!is_ready_answer("scout", &k));
+    }
+
+    #[test]
+    fn prompt_tells_the_agent_how_to_answer_the_kickoff() {
+        let p = build_persona_prompt("scout", "x", &dummy_bridge_root());
+        assert!(p.contains(KICKOFF_PREFIX));
+        assert!(p.contains("`@scout hazır.`"));
+    }
+
+    #[test]
+    fn prompt_overrides_project_approval_rules_and_reserves_edits_for_builders() {
+        // Live runs: the orchestrator followed the repo CLAUDE.md
+        // ("announce, wait for approval") — analysed the task itself and
+        // asked the user "devam edeyim mi?" instead of dispatching.
+        let p = build_persona_prompt("orchestrator", "x", &dummy_bridge_root());
+        assert!(p.contains("### Yetki ve öncelik"));
+        assert!(p.contains("CLAUDE.md"));
+        assert!(p.contains("\"devam edeyim mi?\" diye SORMA"));
+        assert!(p.contains("YALNIZCA builder'lar"));
+    }
+
+    #[test]
+    fn ready_answer_detection() {
+        assert!(is_ready_answer("scout", "@scout hazır."));
+        assert!(is_ready_answer("scout", "  **@scout hazır**  "));
+        assert!(!is_ready_answer("scout", "@planner hazır."));
+        assert!(!is_ready_answer("scout", "@scout başlıyorum"));
+    }
+
+    #[test]
+    fn prompt_message_id_rule_is_not_a_copyable_literal() {
+        // A fixed example id (`1747300000000-a4f2`) was copied verbatim
+        // by agents in live runs; the rule must be per-agent + counter.
+        let p = build_persona_prompt("scout", "x", &dummy_bridge_root());
+        assert!(!p.contains("1747300000000"));
+        assert!(p.contains("scout-001-"));
     }
 
     #[test]
     fn payload_carries_persona_body_verbatim() {
         let body = "# Scout\n\nFind things.\n";
-        let p = build_persona_payload("scout", body, &dummy_bridge_root());
+        let p = build_persona_prompt("scout", body, &dummy_bridge_root());
         assert!(p.contains(body));
     }
 
     #[test]
     fn payload_includes_bridge_protocol_and_allowed_destinations() {
-        let p = build_persona_payload("scout", "x", &dummy_bridge_root());
+        let p = build_persona_prompt("scout", "x", &dummy_bridge_root());
         assert!(p.contains("## Mesajlaşma protokolü"));
         assert!(p.contains("`Write` tool"));
         assert!(p.contains("inbox/<HEDEF_AJAN>"));
@@ -215,7 +303,7 @@ mod tests {
         // The persona must show the actual bridge path so claude can
         // use it in Write tool calls. Forward slashes on all platforms
         // — claude accepts them on Windows and they read cleanly.
-        let p = build_persona_payload("scout", "x", &dummy_bridge_root());
+        let p = build_persona_prompt("scout", "x", &dummy_bridge_root());
         let expected_fragment = if cfg!(target_os = "windows") {
             "C:/Users/efe/proj/.bridgespace/swarm-term-01HZQ"
         } else {
@@ -232,7 +320,7 @@ mod tests {
         // Belt-and-suspenders: any column-0 `>> @<agent>:` in the
         // injected text would be useless legacy doc. Pin that the new
         // payload doesn't contain that pattern.
-        let p = build_persona_payload("orchestrator", "x", &dummy_bridge_root());
+        let p = build_persona_prompt("orchestrator", "x", &dummy_bridge_root());
         for line in p.split('\n') {
             assert!(
                 !line.starts_with(">> @"),
@@ -243,7 +331,7 @@ mod tests {
 
     #[test]
     fn payload_includes_lifecycle_protocol() {
-        let p = build_persona_payload("scout", "x", &dummy_bridge_root());
+        let p = build_persona_prompt("scout", "x", &dummy_bridge_root());
         assert!(p.contains("alındı"));
         assert!(p.contains("tamam"));
         assert!(p.contains("belirsiz"));
@@ -256,7 +344,7 @@ mod tests {
         // CHANGES_NEEDED in the protocol description so they know to
         // emit them — the bridge's lifecycle parser keys on these
         // prefixes for the autofanout step.
-        let p = build_persona_payload(
+        let p = build_persona_prompt(
             "backend-builder",
             "x",
             &dummy_bridge_root(),
@@ -272,7 +360,7 @@ mod tests {
         // must still be defensible against an unknown id.
         let allowed = allowed_for("nobody");
         assert!(allowed.is_empty());
-        let p = build_persona_payload("nobody", "x", &dummy_bridge_root());
+        let p = build_persona_prompt("nobody", "x", &dummy_bridge_root());
         assert!(p.contains("(yok"));
     }
 }

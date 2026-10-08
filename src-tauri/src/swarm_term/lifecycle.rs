@@ -23,6 +23,7 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use crate::swarm_term::hierarchy::{
     is_allowed, is_builder, is_reviewer, reviewer_for_builder,
@@ -368,9 +369,39 @@ pub fn apply_transition(
 /// Reads and writes are guarded by a single `Mutex` — the call rate is
 /// bounded by the route emit rate (~1 Hz worst case), so contention is
 /// not a concern.
+///
+/// Each entry also remembers WHEN it entered its state and how many
+/// stall reminders it has produced, so [`LifecycleStore::take_stalls`]
+/// can flag a task stuck in `Building` / `AwaitingReview`.
 #[derive(Default)]
 pub struct LifecycleStore {
-    inner: Mutex<HashMap<(String, String), LifecycleState>>,
+    inner: Mutex<HashMap<(String, String), Entry>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Entry {
+    state: LifecycleState,
+    since: Instant,
+    /// Highest stall level already reported for this stay in `state`.
+    reminders: u8,
+}
+
+impl Entry {
+    fn new(state: LifecycleState, now: Instant) -> Self {
+        Self { state, since: now, reminders: 0 }
+    }
+}
+
+/// One in-flight task that crossed a stall threshold — output of
+/// [`LifecycleStore::take_stalls`]. `level` is 1 at the threshold and 2
+/// at twice the threshold (escalation).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Stall {
+    pub source_pane: String,
+    pub task_id: String,
+    pub state: LifecycleState,
+    pub age: Duration,
+    pub level: u8,
 }
 
 impl LifecycleStore {
@@ -384,6 +415,15 @@ impl LifecycleStore {
         &self,
         source_pane: &str,
         transition: &Transition,
+    ) -> LifecycleState {
+        self.record_at(source_pane, transition, Instant::now())
+    }
+
+    fn record_at(
+        &self,
+        source_pane: &str,
+        transition: &Transition,
+        now: Instant,
     ) -> LifecycleState {
         let key = (source_pane.to_string(), transition.task_id.clone());
         // CONC-01: recover the guard on poison instead of panicking on
@@ -401,19 +441,82 @@ impl LifecycleStore {
         // (Approved / Failed / Done are closed; they only linger for a
         // brief badge), keeping in-flight (Building / AwaitingReview).
         if g.len() >= MAX_LIFECYCLE_ENTRIES && !g.contains_key(&key) {
-            g.retain(|_, st| {
+            g.retain(|_, e| {
                 !matches!(
-                    st,
+                    e.state,
                     LifecycleState::Approved
                         | LifecycleState::Failed
                         | LifecycleState::Done
                 )
             });
         }
-        let prev = g.get(&key).copied();
+        let prev = g.get(&key).map(|e| e.state);
         let next = apply_transition(prev, transition);
-        g.insert(key, next);
+        g.insert(key.clone(), Entry::new(next, now));
+        // A verdict is recorded under the REVIEWER's pane, but the task
+        // it judges sits under the builder's pane in `AwaitingReview`.
+        // Close that entry too — otherwise every reviewed task would
+        // look stalled forever.
+        let builder_next = match transition.kind {
+            TransitionKind::Approved => Some(LifecycleState::Done),
+            TransitionKind::ChangesNeeded => Some(LifecycleState::Failed),
+            TransitionKind::Building | TransitionKind::Done => None,
+        };
+        if let Some(builder_next) = builder_next {
+            for (k, e) in g.iter_mut() {
+                if k != &key
+                    && k.1 == transition.task_id
+                    && e.state == LifecycleState::AwaitingReview
+                {
+                    *e = Entry::new(builder_next, now);
+                }
+            }
+        }
         next
+    }
+
+    /// Report in-flight tasks that crossed a stall threshold since the
+    /// last call: `AwaitingReview` older than `review_after`, `Building`
+    /// older than `build_after`. Each entry reports level 1 once at the
+    /// threshold and level 2 once at twice the threshold; a new
+    /// transition resets the clock.
+    pub fn take_stalls(
+        &self,
+        now: Instant,
+        review_after: Duration,
+        build_after: Duration,
+    ) -> Vec<Stall> {
+        let Ok(mut g) = self.inner.lock() else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for ((pane, task_id), e) in g.iter_mut() {
+            let threshold = match e.state {
+                LifecycleState::AwaitingReview => review_after,
+                LifecycleState::Building => build_after,
+                _ => continue,
+            };
+            let age = now.saturating_duration_since(e.since);
+            let level: u8 = if age >= threshold * 2 {
+                2
+            } else if age >= threshold {
+                1
+            } else {
+                0
+            };
+            if level > e.reminders {
+                e.reminders = level;
+                out.push(Stall {
+                    source_pane: pane.clone(),
+                    task_id: task_id.clone(),
+                    state: e.state,
+                    age,
+                    level,
+                });
+            }
+        }
+        out.sort_by(|a, b| a.task_id.cmp(&b.task_id));
+        out
     }
 
     /// Look up the current state without mutating. Returns `None`
@@ -431,7 +534,7 @@ impl LifecycleStore {
     ) -> Option<LifecycleState> {
         let g = self.inner.lock().ok()?;
         g.get(&(source_pane.to_string(), task_id.to_string()))
-            .copied()
+            .map(|e| e.state)
     }
 
     /// Number of distinct `(source_pane, task_id)` entries currently
@@ -457,7 +560,7 @@ impl LifecycleStore {
     pub fn mark_done(&self, source_pane: &str, task_id: &str) {
         let key = (source_pane.to_string(), task_id.to_string());
         if let Ok(mut g) = self.inner.lock() {
-            g.insert(key, LifecycleState::Done);
+            g.insert(key, Entry::new(LifecycleState::Done, Instant::now()));
         }
     }
 }
@@ -838,6 +941,73 @@ mod tests {
         assert_eq!(
             s.state_of("p-backend-builder", "42"),
             Some(LifecycleState::Done)
+        );
+    }
+
+    // -- take_stalls ------------------------------------------------- //
+
+    const MIN: Duration = Duration::from_secs(60);
+
+    fn tr(kind: TransitionKind, id: &str) -> Transition {
+        Transition { kind, task_id: id.into() }
+    }
+
+    #[test]
+    fn stalls_fire_once_per_level_and_reset_on_transition() {
+        let s = LifecycleStore::new();
+        let t0 = Instant::now();
+        s.record_at("p-builder", &tr(TransitionKind::Done, "T1"), t0);
+
+        assert!(s.take_stalls(t0 + 9 * MIN, 10 * MIN, 20 * MIN).is_empty());
+        let l1 = s.take_stalls(t0 + 10 * MIN, 10 * MIN, 20 * MIN);
+        assert_eq!(l1.len(), 1);
+        assert_eq!(l1[0].level, 1);
+        assert_eq!(l1[0].state, LifecycleState::AwaitingReview);
+        // Same level is not reported twice.
+        assert!(s.take_stalls(t0 + 15 * MIN, 10 * MIN, 20 * MIN).is_empty());
+        let l2 = s.take_stalls(t0 + 20 * MIN, 10 * MIN, 20 * MIN);
+        assert_eq!(l2[0].level, 2);
+        assert!(s.take_stalls(t0 + 60 * MIN, 10 * MIN, 20 * MIN).is_empty());
+
+        // A new transition restarts the clock.
+        s.record_at("p-builder", &tr(TransitionKind::Done, "T1"), t0 + 61 * MIN);
+        assert!(s.take_stalls(t0 + 65 * MIN, 10 * MIN, 20 * MIN).is_empty());
+    }
+
+    #[test]
+    fn building_uses_its_own_threshold_and_terminal_states_never_stall() {
+        let s = LifecycleStore::new();
+        let t0 = Instant::now();
+        s.record_at("p-b", &tr(TransitionKind::Building, "T2"), t0);
+        s.record_at("p-r", &tr(TransitionKind::Approved, "T3"), t0);
+        assert!(s.take_stalls(t0 + 15 * MIN, 10 * MIN, 20 * MIN).is_empty());
+        let st = s.take_stalls(t0 + 20 * MIN, 10 * MIN, 20 * MIN);
+        assert_eq!(st.len(), 1);
+        assert_eq!(st[0].task_id, "T2");
+        assert_eq!(st[0].state, LifecycleState::Building);
+    }
+
+    #[test]
+    fn reviewer_verdict_closes_the_builders_awaiting_entry() {
+        // DONE is keyed by the builder pane, APPROVED by the reviewer
+        // pane — the verdict must still settle the builder's entry, or
+        // every reviewed task would be reported stalled.
+        let s = LifecycleStore::new();
+        let t0 = Instant::now();
+        s.record_at("p-builder", &tr(TransitionKind::Done, "T4"), t0);
+        s.record_at("p-reviewer", &tr(TransitionKind::Approved, "T4"), t0 + MIN);
+        assert_eq!(s.state_of("p-builder", "T4"), Some(LifecycleState::Done));
+        assert!(s.take_stalls(t0 + 90 * MIN, 10 * MIN, 20 * MIN).is_empty());
+
+        s.record_at("p-builder", &tr(TransitionKind::Done, "T5"), t0);
+        s.record_at("p-reviewer", &tr(TransitionKind::ChangesNeeded, "T5"), t0);
+        assert_eq!(s.state_of("p-builder", "T5"), Some(LifecycleState::Failed));
+        // Other tasks are untouched.
+        s.record_at("p-builder", &tr(TransitionKind::Done, "T6"), t0);
+        s.record_at("p-reviewer", &tr(TransitionKind::Approved, "T7"), t0);
+        assert_eq!(
+            s.state_of("p-builder", "T6"),
+            Some(LifecycleState::AwaitingReview)
         );
     }
 

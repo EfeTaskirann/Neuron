@@ -9,6 +9,8 @@ use super::delivery::{
 };
 use super::envelope::{sniff_from, Envelope};
 use super::notify::rejection_notice;
+use super::stall::{escalation_for, reminder_for};
+use crate::swarm_term::lifecycle::{LifecycleState, Stall};
 use super::fsops::{
     archive_rejected, attempts_sidecar, bump_attempts, drop_envelope,
     ensure_gitignore, move_to_processed, move_to_rejected, prepare_layout,
@@ -143,6 +145,49 @@ fn system_notice_is_bracketed_paste_and_cannot_close_early() {
     assert!(s.starts_with("\x1b[200~[Neuron] "));
     assert!(s.ends_with("\x1b[201~"));
     assert_eq!(s.matches("\x1b[201~").count(), 1);
+}
+
+// ---- stall reminders -------------------------------------------- //
+
+fn stall(state: LifecycleState, mins: u64, level: u8) -> Stall {
+    Stall {
+        source_pane: "p-x".into(),
+        task_id: "T9".into(),
+        state,
+        age: std::time::Duration::from_secs(mins * 60),
+        level,
+    }
+}
+
+#[test]
+fn awaiting_review_reminds_the_paired_reviewer() {
+    let (who, text) =
+        reminder_for("frontend-builder", &stall(LifecycleState::AwaitingReview, 12, 1))
+            .expect("reminder");
+    assert_eq!(who, "frontend-reviewer");
+    assert!(text.contains("review T9"));
+    assert!(text.contains("12 dakika"));
+    assert!(text.contains("APPROVED T9"));
+}
+
+#[test]
+fn building_reminds_the_builder_and_terminal_states_are_silent() {
+    let (who, text) =
+        reminder_for("backend-builder", &stall(LifecycleState::Building, 25, 1))
+            .expect("reminder");
+    assert_eq!(who, "backend-builder");
+    assert!(text.contains("DONE T9"));
+    assert!(reminder_for("backend-builder", &stall(LifecycleState::Done, 99, 2)).is_none());
+    // AwaitingReview from a non-builder has no paired reviewer.
+    assert!(reminder_for("scout", &stall(LifecycleState::AwaitingReview, 12, 1)).is_none());
+}
+
+#[test]
+fn escalation_names_task_agent_and_age() {
+    let e = escalation_for("backend-reviewer", &stall(LifecycleState::AwaitingReview, 21, 2));
+    assert!(e.contains("T9"));
+    assert!(e.contains("@backend-reviewer"));
+    assert!(e.contains("21 dakika"));
 }
 
 // ---- archive_rejected ------------------------------------------- //
