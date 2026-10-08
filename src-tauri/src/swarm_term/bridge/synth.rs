@@ -12,9 +12,9 @@ use tauri::{AppHandle, Emitter, Runtime};
 
 use crate::swarm_term::hierarchy::{is_allowed, is_builder, is_reviewer};
 use crate::swarm_term::lifecycle::{
-    followup_for_coordinator_inbound, lifecycle_note,
+    followup_for_coordinator_inbound, is_error_report, lifecycle_note,
     looks_like_unparsed_signal, parse_lifecycle_token_with_fallback,
-    LifecycleStore, TransitionKind,
+    LifecycleState, LifecycleStore, TransitionKind,
 };
 
 use super::envelope::Envelope;
@@ -39,6 +39,31 @@ pub(super) fn lifecycle_synthesise<R: Runtime>(
     panes_by_agent: &Arc<HashMap<String, String>>,
     lifecycle: &Arc<LifecycleStore>,
 ) -> Option<String> {
+    // `hata — …` with a structured task_id: the responsible agent gave
+    // up on that task. Close it so the stall timer stops reminding and
+    // escalating something the coordinator already knows failed.
+    if let Some(id) = task_id.filter(|_| is_error_report(body)) {
+        if let Some(pane) = panes_by_agent.get(from_agent) {
+            if lifecycle.abandon(pane, id) {
+                tracing::info!(
+                    source = %from_agent,
+                    task_id = %id,
+                    "swarm-term bridge: task reported failed (hata) — closed"
+                );
+                let _ = app.emit(
+                    crate::events::SWARM_TERM_LIFECYCLE,
+                    json!({
+                        "source": from_agent,
+                        "source_pane": pane,
+                        "task_id": id,
+                        "transition": "Abandoned",
+                        "state": format!("{:?}", LifecycleState::Failed),
+                    }),
+                );
+            }
+        }
+        return None;
+    }
     let Some(transition) = parse_lifecycle_token_with_fallback(body, task_id)
     else {
         return unparsed_signal_notice(from_agent, body, task_id.is_some());

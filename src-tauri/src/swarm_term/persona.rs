@@ -143,7 +143,10 @@ pub(crate) fn build_persona_prompt(
          ### Sana gelen mesajlar\n\n\
          Senin pane'ine bracketed-paste olarak gelir. Alt kısımda `— from @<gönderen>\n\
          [routed by Neuron]` imzası bulunur — bu imzaya bakarak kime cevap vereceğini\n\
-         (genelde gönderene) bil. Mesajı verbatim alıntılama; paraphrase et.\n\
+         (genelde gönderene) bil. Gönderen envelope'a `task_id` koyduysa imza\n\
+         `— from @<gönderen> [task <id>] [routed by Neuron]` olur: cevabında ve\n\
+         lifecycle token'larında AYNI `task_id`'yi kullan. Mesajı verbatim\n\
+         alıntılama; paraphrase et.\n\
          `[Neuron]` ile başlayan mesajlar bir ajandan değil, backend'in kendisinden\n\
          gelir; onlara envelope ile cevap yazma, söylediğini uygula.\n\n\
          ### 4-state lifecycle contract (zorunlu)\n\n\
@@ -159,7 +162,10 @@ pub(crate) fn build_persona_prompt(
          3. **belirsiz** (dispatch net değilse): `body: \"belirsiz — <spesifik sorun:\n\
             hangi dosya / hangi tür değişiklik / kabul kriteri ne>\"` ve DUR.\n\
             Tahmin yapma; tahminle çalışırsan reviewer reject eder.\n\
-         4. **hata** (yapamadıysan): `body: \"hata — <somut sebep>\"` ve dur.\n\n\
+         4. **hata** (yapamadıysan): `body: \"hata — <somut sebep>\"` ve dur.\n\
+            `task_id`'li bir görevse envelope'un `task_id` alanını doldurup\n\
+            coordinator'a yolla — backend görevi başarısız sayar ve o görev için\n\
+            hatırlatma göndermeyi bırakır.\n\n\
          **Gönderen tarafsan, ALDIĞIN state'e göre:**\n\
          - `alındı —` → SUS. Specialist çalışıyor; ikinci dispatch atma, polling yapma.\n\
          - `tamam —` → completion'ı kabul et, bir sonraki faza geç.\n\

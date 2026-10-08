@@ -494,7 +494,8 @@ async fn process_one<R: Runtime>(
     }
 
     // ---- Deliver ---------------------------------------------------- //
-    let signed = format_routed_message(&body, &from_agent);
+    let signed =
+        format_routed_message(&body, &from_agent, envelope_task_id.as_deref());
     let registry_inner = registry.clone();
     let target_pane_for_write = target_pane.clone();
     let signed_bytes = signed.into_bytes();

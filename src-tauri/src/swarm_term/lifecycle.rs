@@ -302,6 +302,16 @@ pub fn lifecycle_note(body: &str, task_id: &str) -> Option<String> {
     })
 }
 
+/// Pure: true when a body is the 4-state contract's failure report
+/// (`hata — <sebep>`, any case / leading markdown). Paired with the
+/// envelope's `task_id` it closes that task (see
+/// [`LifecycleStore::abandon`]).
+pub fn is_error_report(body: &str) -> bool {
+    let head = body.trim().trim_start_matches(is_decoration);
+    head.get(..4).is_some_and(|w| w.eq_ignore_ascii_case("hata"))
+        && !head[4..].chars().next().is_some_and(char::is_alphanumeric)
+}
+
 /// Pure: true when a coordinator-bound body LOOKS like a lifecycle
 /// signal (starts with `done` / `approved` / `changes needed` / …, or —
 /// when the envelope carries a `task_id` — the Turkish completion word
@@ -473,6 +483,37 @@ impl LifecycleStore {
             }
         }
         next
+    }
+
+    /// The responsible agent gave up on `task_id` (`hata — …` with the
+    /// envelope's `task_id`): mark its own in-flight entry and any
+    /// `AwaitingReview` entry for the same task as `Failed`, so the stall
+    /// timer stops reminding / escalating a task already reported as
+    /// failed. Never creates entries. Returns whether anything closed.
+    pub fn abandon(&self, source_pane: &str, task_id: &str) -> bool {
+        self.abandon_at(source_pane, task_id, Instant::now())
+    }
+
+    fn abandon_at(&self, source_pane: &str, task_id: &str, now: Instant) -> bool {
+        let Ok(mut g) = self.inner.lock() else {
+            return false;
+        };
+        let mut closed = false;
+        for ((pane, id), e) in g.iter_mut() {
+            if id != task_id {
+                continue;
+            }
+            let in_flight = match e.state {
+                LifecycleState::Building => pane == source_pane,
+                LifecycleState::AwaitingReview => true,
+                _ => false,
+            };
+            if in_flight {
+                *e = Entry::new(LifecycleState::Failed, now);
+                closed = true;
+            }
+        }
+        closed
     }
 
     /// Report in-flight tasks that crossed a stall threshold since the
@@ -985,6 +1026,40 @@ mod tests {
         assert_eq!(st.len(), 1);
         assert_eq!(st[0].task_id, "T2");
         assert_eq!(st[0].state, LifecycleState::Building);
+    }
+
+    #[test]
+    fn error_report_closes_the_stalled_task_and_stops_reminders() {
+        let s = LifecycleStore::new();
+        let t0 = Instant::now();
+        s.record_at("p-fb", &tr(TransitionKind::Building, "stall-1"), t0);
+        // Builder reports `hata —` for its own task.
+        assert!(s.abandon_at("p-fb", "stall-1", t0 + MIN));
+        assert_eq!(s.state_of("p-fb", "stall-1"), Some(LifecycleState::Failed));
+        assert!(s.take_stalls(t0 + 90 * MIN, 10 * MIN, 20 * MIN).is_empty());
+
+        // A reviewer's `hata —` settles the builder's AwaitingReview entry.
+        s.record_at("p-bb", &tr(TransitionKind::Done, "T8"), t0);
+        assert!(s.abandon_at("p-br", "T8", t0));
+        assert_eq!(s.state_of("p-bb", "T8"), Some(LifecycleState::Failed));
+
+        // Another agent's Building entry is not someone else's to close,
+        // unknown ids create nothing, closed tasks stay closed.
+        s.record_at("p-x", &tr(TransitionKind::Building, "T9"), t0);
+        assert!(!s.abandon_at("p-y", "T9", t0));
+        assert_eq!(s.state_of("p-x", "T9"), Some(LifecycleState::Building));
+        assert!(!s.abandon_at("p-fb", "nope", t0));
+        assert_eq!(s.state_of("p-fb", "nope"), None);
+    }
+
+    #[test]
+    fn error_report_detection() {
+        for body in ["hata — yapamadım", "Hata: dosya yok", "**HATA** — x", "hata"] {
+            assert!(is_error_report(body), "{body}");
+        }
+        for body in ["hatalı satır düzeltildi", "tamam — hata yok", "", "hat"] {
+            assert!(!is_error_report(body), "{body}");
+        }
     }
 
     #[test]

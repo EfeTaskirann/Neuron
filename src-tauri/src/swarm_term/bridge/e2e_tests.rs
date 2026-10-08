@@ -200,6 +200,7 @@ async fn bridge_end_to_end_with_fake_agents() {
         ("10 scout→builder reply delivered", Box::new(|| log("frontend-builder").contains("reply-10"))),
         ("02 lenient envelope delivered", Box::new(|| r("processed/backend-builder/02.json").is_file())),
         ("02 builder received both lines from @coordinator", Box::new(|| { let l = log("backend-builder"); l.contains("satir-bir") && l.contains("satir-iki") && l.contains("from @coordinator") })),
+        ("02 signature carries the numeric task_id", Box::new(|| log("backend-builder").contains("from @coordinator [task 42] [routed by Neuron]"))),
         ("03 invalid envelope → rejected/coordinator", Box::new(|| r("rejected/coordinator/03.json").is_file())),
         ("03 sender scout got [Neuron] notice", Box::new(|| { let l = log("scout"); l.contains("[Neuron]") && l.contains("missing field `body`") })),
         ("04 DONE delivered to coordinator", Box::new(|| log("coordinator").contains("**DONE** T4"))),

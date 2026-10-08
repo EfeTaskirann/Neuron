@@ -315,7 +315,7 @@ fn drop_envelope_lands_in_target_inbox() {
 
 #[test]
 fn format_routed_message_wraps_in_bracketed_paste() {
-    let s = format_routed_message("hello", "scout");
+    let s = format_routed_message("hello", "scout", None);
     assert!(s.starts_with("\x1b[200~"));
     // Paste only — the submit CR is a separate, delayed write
     // (`paste_then_submit`).
@@ -324,15 +324,30 @@ fn format_routed_message_wraps_in_bracketed_paste() {
 }
 
 #[test]
+fn format_routed_message_shows_the_envelope_task_id_in_the_signature() {
+    let s = format_routed_message("DONE?", "coordinator", Some("test-7"));
+    assert!(s.contains("— from @coordinator [task test-7] [routed by Neuron]"));
+    // Absent / blank ids keep the old signature.
+    for id in [None, Some(""), Some("   ")] {
+        let s = format_routed_message("x", "coordinator", id);
+        assert!(s.contains("— from @coordinator [routed by Neuron]"), "{id:?}");
+    }
+    // A hostile id can neither close the paste nor inject control bytes.
+    let s = format_routed_message("x", "scout", Some("a\x1b[201~\rb"));
+    assert_eq!(s.matches("\x1b[201~").count(), 1);
+    assert!(s.contains("[task a[201~b]"));
+}
+
+#[test]
 fn format_routed_message_neutralises_embedded_cr_and_paste_end() {
     // \r inside the body would visually overstrike on xterm.js — and,
     // with the submit CR now sent separately, any CR left in the paste
     // would be a stray early submit.
-    let with_cr = format_routed_message("line1\rline2", "scout");
+    let with_cr = format_routed_message("line1\rline2", "scout", None);
     assert!(!with_cr.contains('\r'));
     // \x1b[201~ inside body would close the bracketed paste early
     // and the trailing signature would become a second submit.
-    let with_end = format_routed_message("foo\x1b[201~bar", "scout");
+    let with_end = format_routed_message("foo\x1b[201~bar", "scout", None);
     assert!(!with_end.contains("\x1b[201~bar"));
     assert!(with_end.contains("[201~bar"));
 }

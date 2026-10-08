@@ -116,14 +116,36 @@ where
 ///   * `\r` inside body → `\n` (CR inside paste = visual overstrike).
 ///   * Embedded `\x1b[201~` → `[201~` (ESC byte dropped) so the
 ///     bracketed paste isn't prematurely closed by the body content.
-pub(crate) fn format_routed_message(body: &str, source_agent: &str) -> String {
+///   * The envelope's structured `task_id`, when present, is shown in
+///     the signature (`— from @x [task T1] [routed by Neuron]`). Only the
+///     body used to be pasted, so a receiver could not see the id the
+///     sender had filled in (observed: a coordinator concluding a
+///     message had "no task_id").
+pub(crate) fn format_routed_message(
+    body: &str,
+    source_agent: &str,
+    task_id: Option<&str>,
+) -> String {
     let safe = body
         .replace('\r', "\n")
         .replace("\x1b[201~", "[201~");
+    let task = task_id
+        .map(|id| {
+            id.chars()
+                .filter(|c| !c.is_control())
+                .take(MAX_SIGNATURE_TASK_ID_CHARS)
+                .collect::<String>()
+        })
+        .filter(|id| !id.trim().is_empty())
+        .map(|id| format!(" [task {id}]"))
+        .unwrap_or_default();
     format!(
-        "\x1b[200~{safe}\n\n— from @{source_agent} [routed by Neuron]\x1b[201~"
+        "\x1b[200~{safe}\n\n— from @{source_agent}{task} [routed by Neuron]\x1b[201~"
     )
 }
+
+/// Cap on the task id echoed in the routed signature.
+const MAX_SIGNATURE_TASK_ID_CHARS: usize = 64;
 
 /// Wire-format a Neuron-originated notice (delivery failure, unparsed
 /// lifecycle signal) pasted into an agent's pane. Same bracketed-paste
