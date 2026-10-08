@@ -92,7 +92,8 @@ export function useTerminalKill() {
 
 // `terminal:write` is a hot-path command — every keystroke hits it.
 // Skip the cache invalidation hop and rely on the live
-// `panes:{id}:line` event to surface echoed output.
+// `panes:{id}:data` raw stream to surface echoed output (the PTY
+// echoes each keystroke; the reader forwards those bytes verbatim).
 export function useTerminalWrite() {
   return useMutation<null, Error, { paneId: string; data: string }>({
     mutationFn: ({ paneId, data }) =>

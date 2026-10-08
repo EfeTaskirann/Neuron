@@ -42,6 +42,19 @@ pub fn pane_line(pane_id: &str) -> String {
     format!("panes:{pane_id}:line")
 }
 
+/// `panes:{id}:data` — raw PTY byte stream for the given pane, decoded
+/// as (UTF-8-boundary-safe) text and emitted verbatim per read chunk.
+/// This is the *interactive* channel: xterm.js writes it as-is, so
+/// keystroke echo, cursor moves, and ANSI colour render live — unlike
+/// the line-buffered `pane_line` events, which only surface on `\n`
+/// and are line-oriented (used for the ring / DB scrollback + approval
+/// detection). DSR-CPR queries are stripped before emit (the reader
+/// answers them on the PTY's behalf), so xterm never sees them.
+#[inline]
+pub fn pane_data(pane_id: &str) -> String {
+    format!("panes:{pane_id}:data")
+}
+
 /// `swarm:job:{id}:event` — per-job streaming lifecycle event for
 /// the swarm coordinator FSM (WP-W3-12c). Payload is a tagged
 /// `SwarmJobEvent` enum with a `kind` discriminator covering
@@ -89,6 +102,7 @@ mod tests {
     fn parametric_event_names_interpolate_id() {
         assert_eq!(run_span("r-01ABC"), "runs:r-01ABC:span");
         assert_eq!(pane_line("p-01XYZ"), "panes:p-01XYZ:line");
+        assert_eq!(pane_data("p-01XYZ"), "panes:p-01XYZ:data");
         assert_eq!(swarm_job_event("j-01ABC"), "swarm:job:j-01ABC:event");
     }
 
@@ -111,9 +125,11 @@ mod tests {
         }
         let dyn_run = run_span("r-1");
         let dyn_pane = pane_line("p-1");
+        let dyn_pane_data = pane_data("p-1");
         let dyn_swarm = swarm_job_event("j-1");
         assert!(!dyn_run.contains('.'));
         assert!(!dyn_pane.contains('.'));
+        assert!(!dyn_pane_data.contains('.'));
         assert!(!dyn_swarm.contains('.'));
     }
 }

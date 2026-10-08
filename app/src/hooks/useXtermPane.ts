@@ -12,7 +12,7 @@ export interface UseXtermPaneOptions {
   fontSize?: number;
   /**
    * `false` for dead PTYs (closed/error/success): skips the
-   * `panes:{id}:line` subscription AND the `terminal:resize` IPC —
+   * `panes:{id}:data` subscription AND the `terminal:resize` IPC —
    * no events will ever fire and the PTY behind the resize is gone.
    */
   live?: boolean;
@@ -27,15 +27,23 @@ export interface UseXtermPaneOptions {
  * - xterm mount/teardown keyed on `paneId`
  * - keystrokes → `terminal:write`
  * - ResizeObserver → inline `fit()` + trailing-debounced `terminal:resize`
- * - snapshot hydration (`terminal:lines`, watermarked so line events
- *   don't re-scan the whole scrollback)
- * - live `panes:{id}:line` subscription via `useTauriEvent`
+ * - snapshot hydration (`terminal:lines`, watermarked so the initial
+ *   scrollback isn't re-scanned per render)
+ * - live `panes:{id}:data` raw-stream subscription via `useTauriEvent`
  *
- * Ordering contract: live events that arrive BEFORE the snapshot has
- * hydrated are parked in a buffer and flushed right after it — writing
- * them immediately would render them above older scrollback (the
- * snapshot/live race). After hydration a monotonic seq watermark drops
- * late duplicates without the previous unbounded written-seq Set.
+ * Two channels, one PTY: the snapshot rehydrates prior scrollback as
+ * discrete (CSI-stripped) lines, then the live `:data` stream takes
+ * over from the mount point and is written to xterm *verbatim* — so
+ * keystroke echo, cursor moves, and ANSI colour render as bytes arrive
+ * rather than only on `\n`. The line-based `panes:{id}:line` events
+ * still drive the backend ring / DB / approval detection but are not
+ * consumed here.
+ *
+ * Ordering contract: raw chunks that arrive BEFORE the snapshot has
+ * hydrated are parked in a buffer and flushed (in arrival order) right
+ * after it — writing them immediately would render live output above
+ * older scrollback (the snapshot/live race). The seq watermark on the
+ * snapshot path drops re-seen lines on a cache refetch.
  *
  * Returns the ref to attach to the container `<div>`.
  */
@@ -52,7 +60,10 @@ export function useXtermPane(
   // Highest seq written to xterm; anything at or below is a duplicate.
   const maxWrittenSeqRef = useRef(Number.NEGATIVE_INFINITY);
   const snapshotAppliedRef = useRef(false);
-  const pendingLiveRef = useRef<PaneLine[]>([]);
+  // Raw `:data` chunks that arrived before the scrollback snapshot was
+  // applied are parked here and flushed right after it, so live output
+  // never renders above older history (the snapshot/live race).
+  const pendingRawRef = useRef<string[]>([]);
   // `live: false` — the snapshot hydrates xterm once; the live stream
   // is owned by this hook's own subscription below. Letting
   // usePaneLines also subscribe would duplicate the listener and grow
@@ -108,7 +119,7 @@ export function useXtermPane(
       seenSnapshotLenRef.current = 0;
       maxWrittenSeqRef.current = Number.NEGATIVE_INFINITY;
       snapshotAppliedRef.current = false;
-      pendingLiveRef.current = [];
+      pendingRawRef.current = [];
     };
     // pane id is the only useful dep — fontSize/clearRef are stable for
     // a pane's lifetime and the mutations are stable TanStack refs.
@@ -176,27 +187,31 @@ export function useXtermPane(
     seenSnapshotLenRef.current = lines.length;
     if (!snapshotAppliedRef.current) {
       snapshotAppliedRef.current = true;
-      const parked = pendingLiveRef.current;
-      pendingLiveRef.current = [];
-      for (const line of parked) {
-        writeIfNew(term, line);
+      const parked = pendingRawRef.current;
+      pendingRawRef.current = [];
+      for (const chunk of parked) {
+        term.write(chunk);
       }
     }
   }, [snapshot, snapshotFailed, writeIfNew]);
 
-  // Live subscription — write each event payload as a single line.
-  useTauriEvent<PaneLine>(
-    live ? `panes:${paneId}:line` : null,
-    (incoming) => {
+  // Live subscription — the raw interactive PTY stream. Written to
+  // xterm verbatim (no appended newline): keystroke echo, cursor moves,
+  // and ANSI colour render as bytes arrive instead of only on `\n`.
+  // Scrollback history still hydrates from the line snapshot above; this
+  // stream takes over from the mount point on.
+  useTauriEvent<string>(
+    live ? `panes:${paneId}:data` : null,
+    (chunk) => {
       const term = xtermRef.current;
       if (!term) return;
       if (!snapshotAppliedRef.current) {
-        // Snapshot still in flight — park the event (see contract in
-        // the hook docs). Flushed by the snapshot effect.
-        pendingLiveRef.current.push(incoming);
+        // Snapshot still in flight — park the chunk (see contract in
+        // the hook docs). Flushed in arrival order by the snapshot effect.
+        pendingRawRef.current.push(chunk);
         return;
       }
-      writeIfNew(term, incoming);
+      term.write(chunk);
     },
   );
 

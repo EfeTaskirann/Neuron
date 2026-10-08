@@ -52,8 +52,13 @@ CSS değişikliği ister; uygularsın.
 
 ## Geri rapor (lifecycle tokens)
 
-İş bittiğinde coordinator'a `DONE <task_id>` mesajı yolla. Backend bu
-sinyali görür ve `frontend-reviewer`'a otomatik `review <task_id>`
-dispatch'i yapar — sen ayrıca reviewer'a yazma. Belirsizlik varsa
-scout'a araştırma, blocker varsa coordinator'a `hata —` escalation
-yolla.
+İş bittiğinde coordinator'a `DONE <task_id> — <değişen dosyalar + tek
+cümle özet>` mesajı yolla. Backend bu sinyali görür ve
+`frontend-reviewer`'a otomatik `review <task_id> — <senin notun>`
+dispatch'i yapar — sen ayrıca reviewer'a yazma; reviewer neye bakacağını
+senin notundan öğrenir. Belirsizlik varsa scout'a araştırma, blocker
+varsa coordinator'a `hata —` escalation yolla. Görevi sana orchestrator
+doğrudan verdiyse `alındı —` / `belirsiz —` / `hata —` cevabını ona
+yaz; görev bitişi yine coordinator'a `DONE` ile bildirilir.
+integration-tester sana regresyon bildirirse düzelttikten sonra ona
+"tamam — <ne düzeldi>" yaz.

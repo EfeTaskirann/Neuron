@@ -9,7 +9,9 @@
 use tauri::{AppHandle, Runtime};
 
 use crate::error::AppError;
-use crate::swarm::mailbox_bus::{MailboxBus, MailboxEvent};
+use crate::swarm::mailbox_bus::{
+    MailboxBus, MailboxEvent, COORDINATOR_PANE, USER_PANE,
+};
 
 use super::BrainRunResult;
 
@@ -27,8 +29,8 @@ pub(super) async fn finish_with_cancel<R: Runtime>(
     bus.emit_typed(
         app,
         workspace_id,
-        "agent:coordinator",
-        "agent:user",
+        COORDINATOR_PANE,
+        USER_PANE,
         &format!("job finished (failed): {summary}"),
         None,
         MailboxEvent::JobFinished {
@@ -58,8 +60,8 @@ pub(super) async fn finish_with_failure<R: Runtime>(
     bus.emit_typed(
         app,
         workspace_id,
-        "agent:coordinator",
-        "agent:user",
+        COORDINATOR_PANE,
+        USER_PANE,
         &format!("job finished (failed): {summary}"),
         None,
         MailboxEvent::JobFinished {

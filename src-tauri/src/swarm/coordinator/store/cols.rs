@@ -81,7 +81,8 @@ pub(super) fn deserialize_decision(
     }
 }
 
-// Re-export the shared char-bounded truncation so sibling submodules
-// (`read.rs`, `tests.rs`) keep their `super::cols::truncate_chars`
-// path; the implementation lives in `crate::text`.
+// Re-export the shared char-bounded truncation so the sibling
+// `read.rs` keeps its `super::cols::truncate_chars` path (the
+// `tests/cols.rs` suite reaches it via `super::super::cols`); the
+// implementation lives in `crate::text`.
 pub(super) use crate::text::truncate_chars;

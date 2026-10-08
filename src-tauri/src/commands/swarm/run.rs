@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use tauri::{AppHandle, Manager, Runtime};
 
+use crate::commands::util::require_state;
 use crate::error::AppError;
 // `JobRegistry` is referenced via the fully-qualified
 // `crate::swarm::JobRegistry` path inside `finalise_run_job`'s
@@ -78,39 +79,13 @@ pub async fn swarm_run_job<R: Runtime>(
         ));
     }
 
-    let job_registry = app
-        .try_state::<Arc<crate::swarm::JobRegistry>>()
-        .ok_or_else(|| {
-            AppError::Internal(
-                "swarm JobRegistry missing from app state — \
-                 lib.rs::setup did not call app.manage()"
-                    .into(),
-            )
-        })?
-        .inner()
-        .clone();
-    let agent_registry = app
-        .try_state::<Arc<SwarmAgentRegistry>>()
-        .ok_or_else(|| {
-            AppError::Internal(
-                "SwarmAgentRegistry missing from app state — \
-                 lib.rs::setup did not call app.manage()"
-                    .into(),
-            )
-        })?
-        .inner()
-        .clone();
-    let bus = app
-        .try_state::<Arc<MailboxBus>>()
-        .ok_or_else(|| {
-            AppError::Internal(
-                "MailboxBus missing from app state — \
-                 lib.rs::setup did not call app.manage()"
-                    .into(),
-            )
-        })?
-        .inner()
-        .clone();
+    let job_registry = require_state::<_, Arc<crate::swarm::JobRegistry>>(
+        &app,
+        "swarm JobRegistry",
+    )?;
+    let agent_registry =
+        require_state::<_, Arc<SwarmAgentRegistry>>(&app, "SwarmAgentRegistry")?;
+    let bus = require_state::<_, Arc<MailboxBus>>(&app, "MailboxBus")?;
 
     // Mint job + acquire workspace lock. Reuse the existing
     // `try_acquire_workspace` for compatibility (W5-05 migrates
@@ -320,39 +295,13 @@ where
             "goal must not be empty".into(),
         ));
     }
-    let job_registry = app
-        .try_state::<Arc<crate::swarm::JobRegistry>>()
-        .ok_or_else(|| {
-            AppError::Internal(
-                "swarm JobRegistry missing from app state — \
-                 lib.rs::setup did not call app.manage()"
-                    .into(),
-            )
-        })?
-        .inner()
-        .clone();
-    let agent_registry = app
-        .try_state::<Arc<SwarmAgentRegistry>>()
-        .ok_or_else(|| {
-            AppError::Internal(
-                "SwarmAgentRegistry missing from app state — \
-                 lib.rs::setup did not call app.manage()"
-                    .into(),
-            )
-        })?
-        .inner()
-        .clone();
-    let bus = app
-        .try_state::<Arc<MailboxBus>>()
-        .ok_or_else(|| {
-            AppError::Internal(
-                "MailboxBus missing from app state — \
-                 lib.rs::setup did not call app.manage()"
-                    .into(),
-            )
-        })?
-        .inner()
-        .clone();
+    let job_registry = require_state::<_, Arc<crate::swarm::JobRegistry>>(
+        &app,
+        "swarm JobRegistry",
+    )?;
+    let agent_registry =
+        require_state::<_, Arc<SwarmAgentRegistry>>(&app, "SwarmAgentRegistry")?;
+    let bus = require_state::<_, Arc<MailboxBus>>(&app, "MailboxBus")?;
 
     let job_id = format!("j-{}", ulid::Ulid::new());
     let now_ms = crate::time::now_millis();

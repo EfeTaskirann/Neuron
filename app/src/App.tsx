@@ -5,6 +5,7 @@
 // is picked (folder = cwd for Terminal / Terminal Swarm spawns).
 // User/workspace strings come from `useMe()`.
 import { useEffect, useRef, useState } from 'react';
+import { open } from '@tauri-apps/plugin-dialog';
 import { Brandmark, NIcon, type IconName } from './components/icons';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { useMe } from './hooks/useMe';
@@ -145,8 +146,23 @@ function Sidebar({ route, onNavigate, collapsed, onToggle }: SidebarProps): JSX.
 
 function Topbar({ route }: { route: Route }): JSX.Element {
   const runCreate = useRunCreate();
-  const { project, clearProject } = useActiveProject();
+  const { project, setProject } = useActiveProject();
   const searchRef = useRef<HTMLInputElement>(null);
+  // "Change" opens the native folder picker directly instead of clearing
+  // the active project and dropping the user onto the full-screen
+  // ProjectPickerRoute gate. Cancelling the OS dialog (returns null) is
+  // a no-op, so the current project is preserved — the user can back out
+  // of a project switch without ending up projectless and stuck.
+  const changeProject = async () => {
+    try {
+      const selected = await open({ directory: true, multiple: false });
+      if (typeof selected === 'string' && selected.length > 0) {
+        setProject(selected);
+      }
+    } catch {
+      // Dialog plugin errors are non-fatal — keep the current project.
+    }
+  };
   // ⌘K / Ctrl+K focuses the search input — the <kbd> hint in the
   // markup must not advertise a shortcut that doesn't exist.
   useEffect(() => {
@@ -173,7 +189,7 @@ function Topbar({ route }: { route: Route }): JSX.Element {
             <button
               type="button"
               className="topbar-project-change"
-              onClick={clearProject}
+              onClick={changeProject}
               aria-label="Change project"
             >
               Change

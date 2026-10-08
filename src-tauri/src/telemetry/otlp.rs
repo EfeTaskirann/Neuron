@@ -183,12 +183,14 @@ fn span_to_otlp(s: &StoredSpan, opts: ExportOptions) -> Result<Value, AppError> 
         .duration_ms
         .map(|d| (s.t0_ms as i128 + d as i128) * 1_000_000);
 
-    // Parse the stored `attrs_json` into a flat OTLP attribute list.
-    // Bad JSON falls back to an empty list rather than aborting the
-    // whole batch — we want the export sweep to be lossy-but-running
-    // over malformed historical rows, not stuck.
-    let mut attrs = json_object_to_attrs(&s.attrs_json);
-    let status_code = if attrs_indicate_error(&s.attrs_json) {
+    // Parse the stored `attrs_json` **once** into its object map, then
+    // derive both the attribute list and the error status from it. Bad
+    // JSON / non-object input falls back to `None` (empty attrs, OK
+    // status) rather than aborting the whole batch — we want the export
+    // sweep to be lossy-but-running over malformed historical rows.
+    let attrs_obj = parse_attrs_object(&s.attrs_json);
+    let mut attrs = attrs_obj.as_ref().map(object_to_attrs).unwrap_or_default();
+    let status_code = if attrs_indicate_error(attrs_obj.as_ref()) {
         STATUS_ERROR
     } else {
         STATUS_OK
@@ -272,17 +274,20 @@ fn bool_attr(key: &str, value: bool) -> Value {
     })
 }
 
-/// Convert one `attrs_json` blob into a Vec of OTLP attributes.
-/// Non-object inputs and parse errors yield an empty Vec — see
-/// note above about "lossy-but-running".
-fn json_object_to_attrs(raw: &str) -> Vec<Value> {
-    let parsed: Value = match serde_json::from_str(raw) {
-        Ok(v) => v,
-        Err(_) => return Vec::new(),
-    };
-    let Some(obj) = parsed.as_object() else {
-        return Vec::new();
-    };
+/// Parse a stored `attrs_json` blob into its top-level object map, or
+/// `None` when the input is malformed or not a JSON object. Parsed
+/// once per span and shared by [`object_to_attrs`] and
+/// [`attrs_indicate_error`] — see the "lossy-but-running" note in
+/// [`span_to_otlp`].
+fn parse_attrs_object(raw: &str) -> Option<Map<String, Value>> {
+    match serde_json::from_str::<Value>(raw) {
+        Ok(Value::Object(obj)) => Some(obj),
+        _ => None,
+    }
+}
+
+/// Convert a parsed `attrs_json` object into a Vec of OTLP attributes.
+fn object_to_attrs(obj: &Map<String, Value>) -> Vec<Value> {
     let mut out = Vec::with_capacity(obj.len());
     for (k, v) in obj {
         match v {
@@ -310,15 +315,11 @@ fn json_object_to_attrs(raw: &str) -> Vec<Value> {
     out
 }
 
-/// Heuristic: a span is "errored" if its attrs_json carries a
+/// Heuristic: a span is "errored" if its attrs object carries a
 /// non-empty `error` field (any type) or `status` equals `"error"`.
-/// Conservative: missing fields default to OK.
-fn attrs_indicate_error(raw: &str) -> bool {
-    let parsed: Value = match serde_json::from_str(raw) {
-        Ok(v) => v,
-        Err(_) => return false,
-    };
-    let Some(obj) = parsed.as_object() else {
+/// Conservative: a missing object / missing fields default to OK.
+fn attrs_indicate_error(obj: Option<&Map<String, Value>>) -> bool {
+    let Some(obj) = obj else {
         return false;
     };
     if let Some(err) = obj.get("error") {

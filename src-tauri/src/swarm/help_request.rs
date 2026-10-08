@@ -78,25 +78,40 @@ const HELP_REQUEST_SCAN_CAP: usize = 16 * 1024;
 /// at the top level are considered. Bare JSON (no `neuron_help`
 /// key) is not a help request.
 pub fn parse_help_request(assistant_text: &str) -> Option<HelpRequest> {
-    // char-boundary-safe: a multibyte char straddling the cap must not
-    // panic the dispatcher's invoke task (raw LLM output is often Turkish).
+    extract_capped(assistant_text, try_extract_help_request)
+}
+
+/// Walk the shared defense-in-depth recipe over a size-capped,
+/// char-boundary-safe view of `assistant_text`, handing each
+/// candidate fragment to `parse`:
+///   1. whole trimmed text  2. fence-stripped  3. first balanced {...}
+/// Returns the first `Some`, or `None` if every step misses.
+///
+/// Both help-contract parsers share this exact walk; only the inner
+/// parse and the terminal bail differ (request → `None`, outcome →
+/// a structured error — see each caller). The 16 KiB cap keeps the
+/// scan O(1) per turn against an adversarial assistant_text; it is
+/// char-boundary-safe because a multibyte char straddling the cap
+/// must not panic the dispatcher's invoke task (raw LLM output is
+/// often Turkish).
+fn extract_capped<T>(assistant_text: &str, parse: impl Fn(&str) -> Option<T>) -> Option<T> {
     let truncated =
         crate::text::truncate_to_char_boundary(assistant_text, HELP_REQUEST_SCAN_CAP);
 
     // 1. Whole-text JSON.
-    if let Some(req) = try_extract_help_request(truncated.trim()) {
-        return Some(req);
+    if let Some(v) = parse(truncated.trim()) {
+        return Some(v);
     }
     // 2. ```json fence strip.
     if let Some(fenced) = strip_fence(truncated) {
-        if let Some(req) = try_extract_help_request(fenced.trim()) {
-            return Some(req);
+        if let Some(v) = parse(fenced.trim()) {
+            return Some(v);
         }
     }
     // 3. First balanced {...}.
     if let Some(balanced) = first_balanced_object(truncated) {
-        if let Some(req) = try_extract_help_request(balanced) {
-            return Some(req);
+        if let Some(v) = parse(balanced) {
+            return Some(v);
         }
     }
     // 4. Bail.
@@ -112,25 +127,15 @@ pub fn parse_help_request(assistant_text: &str) -> Option<HelpRequest> {
 pub fn parse_coordinator_help_outcome(
     assistant_text: &str,
 ) -> Result<CoordinatorHelpOutcome, AppError> {
-    let truncated =
-        crate::text::truncate_to_char_boundary(assistant_text, HELP_REQUEST_SCAN_CAP);
-    if let Some(out) = try_parse_outcome(truncated.trim()) {
-        return Ok(out);
-    }
-    if let Some(fenced) = strip_fence(truncated) {
-        if let Some(out) = try_parse_outcome(fenced.trim()) {
-            return Ok(out);
-        }
-    }
-    if let Some(balanced) = first_balanced_object(truncated) {
-        if let Some(out) = try_parse_outcome(balanced) {
-            return Ok(out);
-        }
-    }
-    Err(AppError::SwarmInvoke(format!(
-        "coordinator help outcome JSON not found in reply (first 200 chars: {})",
-        truncated.chars().take(200).collect::<String>()
-    )))
+    extract_capped(assistant_text, try_parse_outcome).ok_or_else(|| {
+        // Cold path only: re-cap the (same) view to build the preview.
+        let truncated =
+            crate::text::truncate_to_char_boundary(assistant_text, HELP_REQUEST_SCAN_CAP);
+        AppError::SwarmInvoke(format!(
+            "coordinator help outcome JSON not found in reply (first 200 chars: {})",
+            truncated.chars().take(200).collect::<String>()
+        ))
+    })
 }
 
 /// Helper: inner parse step that interprets a candidate JSON

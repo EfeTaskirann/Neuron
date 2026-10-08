@@ -92,21 +92,60 @@ const ALLOWED: &[(&str, &[&str])] = &[
     // coordinator. Asymmetric was the v1 default; v2 makes it
     // symmetric so the most common research-research handoff stops
     // emitting `route denied` noise and stops adding a hop's latency.
-    ("scout", &["coordinator", "orchestrator", "planner"]),
+    //
+    // Reply edges: every agent that can RECEIVE a dispatch can answer
+    // its sender. The orchestrator persona dispatches builders,
+    // reviewers and the tester directly, builders ask scout, and the
+    // tester reports regressions to builders — without the reverse
+    // edges those agents could not send `alındı` / `belirsiz` / `hata`
+    // back and the sender waited forever.
+    (
+        "scout",
+        &[
+            "coordinator",
+            "orchestrator",
+            "planner",
+            "backend-builder",
+            "frontend-builder",
+        ],
+    ),
     ("planner", &["coordinator", "scout", "orchestrator"]),
     (
         "backend-builder",
-        &["scout", "backend-reviewer", "coordinator"],
+        &[
+            "scout",
+            "backend-reviewer",
+            "coordinator",
+            "orchestrator",
+            "integration-tester",
+        ],
     ),
     (
         "frontend-builder",
-        &["scout", "frontend-reviewer", "coordinator"],
+        &[
+            "scout",
+            "frontend-reviewer",
+            "coordinator",
+            "orchestrator",
+            "integration-tester",
+        ],
     ),
-    ("backend-reviewer", &["backend-builder", "coordinator"]),
-    ("frontend-reviewer", &["frontend-builder", "coordinator"]),
+    (
+        "backend-reviewer",
+        &["backend-builder", "coordinator", "orchestrator"],
+    ),
+    (
+        "frontend-reviewer",
+        &["frontend-builder", "coordinator", "orchestrator"],
+    ),
     (
         "integration-tester",
-        &["backend-builder", "frontend-builder", "coordinator"],
+        &[
+            "backend-builder",
+            "frontend-builder",
+            "coordinator",
+            "orchestrator",
+        ],
     ),
 ];
 
@@ -231,17 +270,36 @@ mod tests {
     }
 
     #[test]
-    fn scout_cannot_reach_builders() {
-        assert!(!is_allowed("scout", "backend-builder"));
-        assert!(!is_allowed("scout", "frontend-builder"));
+    fn every_edge_has_a_reply_edge() {
+        // The H2 regression: a one-way edge lets a message in but no
+        // answer out, and the sender waits forever.
+        for &(src, dsts) in ALLOWED {
+            for &dst in dsts {
+                assert!(
+                    is_allowed(dst, src),
+                    "{src}→{dst} is allowed but {dst} cannot reply"
+                );
+            }
+        }
     }
 
     #[test]
-    fn reviewers_only_talk_to_their_builder_and_coordinator() {
+    fn scout_cannot_reach_reviewers() {
+        // Scout answers builders' questions but has no business
+        // steering a review.
+        assert!(!is_allowed("scout", "backend-reviewer"));
+        assert!(!is_allowed("scout", "frontend-reviewer"));
+        assert!(!is_allowed("scout", "integration-tester"));
+    }
+
+    #[test]
+    fn reviewers_stay_in_their_domain() {
         assert!(is_allowed("backend-reviewer", "backend-builder"));
         assert!(is_allowed("backend-reviewer", "coordinator"));
+        assert!(is_allowed("backend-reviewer", "orchestrator"));
         assert!(!is_allowed("backend-reviewer", "frontend-builder"));
-        assert!(!is_allowed("backend-reviewer", "orchestrator"));
+        assert!(!is_allowed("frontend-reviewer", "backend-builder"));
+        assert!(!is_allowed("backend-reviewer", "planner"));
     }
 
     #[test]
@@ -262,7 +320,9 @@ mod tests {
         assert!(scout_allowed.contains(&"coordinator"));
         assert!(scout_allowed.contains(&"orchestrator"));
         assert!(scout_allowed.contains(&"planner"));
-        assert_eq!(scout_allowed.len(), 3);
+        assert!(scout_allowed.contains(&"backend-builder"));
+        assert!(scout_allowed.contains(&"frontend-builder"));
+        assert_eq!(scout_allowed.len(), 5);
     }
 
     #[test]

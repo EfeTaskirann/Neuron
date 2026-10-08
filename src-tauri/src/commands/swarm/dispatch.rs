@@ -6,7 +6,10 @@ use std::sync::Arc;
 use tauri::{AppHandle, Runtime, State};
 
 use crate::error::AppError;
-use crate::swarm::{MailboxBus, MailboxEvent, SwarmAgentRegistry};
+use crate::swarm::{
+    agent_pane, MailboxBus, MailboxEvent, SwarmAgentRegistry,
+    COORDINATOR_PANE,
+};
 
 /// Dispatch a task to a named agent via the W5-01 mailbox event-bus
 /// (WP-W5-02). Spawns the agent's `MailboxAgentDispatcher` if it
@@ -66,7 +69,7 @@ pub async fn swarm_agents_dispatch_to_agent<R: Runtime>(
         .filter(|id| !id.trim().is_empty())
         .unwrap_or_else(|| format!("j-{}", ulid::Ulid::new()));
     let with_help_loop = with_help_loop.unwrap_or(false);
-    let target = format!("agent:{agent_id}");
+    let target = agent_pane(&agent_id);
     let summary = format!(
         "dispatch {agent_id} for job {job_id}: {}",
         truncate_for_summary(&prompt)
@@ -84,7 +87,7 @@ pub async fn swarm_agents_dispatch_to_agent<R: Runtime>(
         .emit_typed(
             &app,
             &workspace_id,
-            "agent:coordinator",
+            COORDINATOR_PANE,
             &target,
             &summary,
             None,

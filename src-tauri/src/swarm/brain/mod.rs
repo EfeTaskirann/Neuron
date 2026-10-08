@@ -78,7 +78,9 @@ use tauri::{AppHandle, Runtime};
 use tokio::sync::Notify;
 
 use crate::error::AppError;
-use crate::swarm::mailbox_bus::{MailboxBus, MailboxEvent};
+use crate::swarm::mailbox_bus::{
+    MailboxBus, MailboxEvent, COORDINATOR_PANE, USER_PANE,
+};
 
 mod action;
 mod events;
@@ -205,8 +207,8 @@ impl CoordinatorBrain {
         bus.emit_typed(
             &app,
             &workspace_id,
-            "agent:user",
-            "agent:coordinator",
+            USER_PANE,
+            COORDINATOR_PANE,
             &format!("job started: {}", truncate_for_summary(&goal)),
             None,
             MailboxEvent::JobStarted {
@@ -315,7 +317,7 @@ impl CoordinatorBrain {
                         .emit_typed(
                             &app,
                             &workspace_id,
-                            "agent:coordinator",
+                            COORDINATOR_PANE,
                             &target,
                             &summary,
                             last_envelope_id,
@@ -339,8 +341,8 @@ impl CoordinatorBrain {
                     bus.emit_typed(
                         &app,
                         &workspace_id,
-                        "agent:coordinator",
-                        "agent:user",
+                        COORDINATOR_PANE,
+                        USER_PANE,
                         &format!("job finished ({normalised}): {}", truncate_for_summary(&summary)),
                         last_envelope_id,
                         MailboxEvent::JobFinished {
@@ -360,8 +362,8 @@ impl CoordinatorBrain {
                     bus.emit_typed(
                         &app,
                         &workspace_id,
-                        "agent:coordinator",
-                        "agent:user",
+                        COORDINATOR_PANE,
+                        USER_PANE,
                         &format!(
                             "job ask_user: {}",
                             truncate_for_summary(&question)
@@ -399,7 +401,7 @@ impl CoordinatorBrain {
                         .emit_typed(
                             &app,
                             &workspace_id,
-                            "agent:coordinator",
+                            COORDINATOR_PANE,
                             &target,
                             &summary,
                             last_envelope_id,

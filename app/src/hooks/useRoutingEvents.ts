@@ -8,17 +8,19 @@ import { listen } from '@tauri-apps/api/event';
 import { useTauriEvent } from './useTauriEvent';
 
 // Shared event-collection hook for the swarm-term routing event
-// stream. The backend (`src-tauri/src/swarm_term/bridge.rs`) emits
+// stream. The backend (`src-tauri/src/swarm_term/bridge/`) emits
 // one `swarm-term:route` event per routing attempt with an
 // `outcome` discriminant:
 //
 //   ok                   — message delivered to target pane
-//   malformed            — envelope failed JSON parse / validation
+//   malformed            — envelope failed JSON parse / validation,
+//                          or unrecognised lifecycle signal reaching the
+//                          coordinator (e.g. "tamam —" instead of "DONE")
 //   denied               — hierarchy graph forbids the edge
 //   unknown_target       — target agent has no pane in the session
 //   target_not_ready     — target pane hasn't completed persona injection
-//   target_locked        — target pane is in awaiting_approval/error
-//   target_write_timeout — write_to_pane exceeded the 2 s cap (bridge.rs)
+//   target_locked        — target pane is in error state (wedged / no stdin)
+//   target_write_timeout — write_to_pane exceeded the 2 s cap (delivery.rs)
 //   lifecycle_fanout     — bridge-synthesised autonomy follow-up
 //
 // Collection is a MODULE-LEVEL store (mirrors lib/toast.ts): one

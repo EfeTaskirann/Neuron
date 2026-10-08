@@ -70,7 +70,11 @@
 //! - [`bus`] — the stateful `MailboxBus` (per-workspace broadcast
 //!   channels + persist/broadcast/Tauri-emit surface +
 //!   workspace-busy guard + shutdown cancel fan-out).
+//! - [`address`] — the `from_pane`/`to_pane` routing vocabulary
+//!   (`COORDINATOR_PANE`, `USER_PANE`, `agent_pane`), centralised so
+//!   the swarm's pane addresses have a single source of truth.
 
+mod address;
 mod bus;
 mod envelope;
 mod event;
@@ -78,6 +82,7 @@ mod event;
 #[cfg(test)]
 mod tests;
 
+pub use address::{agent_pane, COORDINATOR_PANE, USER_PANE};
 pub use bus::MailboxBus;
 pub use envelope::MailboxEnvelope;
 pub use event::MailboxEvent;

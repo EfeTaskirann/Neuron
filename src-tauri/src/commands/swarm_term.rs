@@ -118,6 +118,30 @@ struct UpdateLogLine {
     line: String,
 }
 
+/// Pump one child pipe line-by-line: emit each line as a
+/// `swarm-term:update:log` event tagged with `stream` and accumulate the
+/// full text (trailing-newline per line) for the post-mortem tail. Spawned
+/// once per stream (stdout / stderr), which otherwise differ only in the tag.
+fn spawn_log_pump<R: Runtime>(
+    app: AppHandle<R>,
+    pipe: impl tokio::io::AsyncRead + Unpin + Send + 'static,
+    stream: &'static str,
+) -> tokio::task::JoinHandle<String> {
+    tokio::spawn(async move {
+        let mut buf = String::new();
+        let mut reader = BufReader::new(pipe).lines();
+        while let Ok(Some(line)) = reader.next_line().await {
+            let _ = app.emit(
+                UPDATE_LOG_EVENT,
+                UpdateLogLine { stream, line: line.clone() },
+            );
+            buf.push_str(&line);
+            buf.push('\n');
+        }
+        buf
+    })
+}
+
 fn tail_keep(buf: &str, limit: usize) -> String {
     if buf.len() <= limit {
         return buf.to_string();
@@ -246,35 +270,8 @@ pub async fn swarm_term_run_update<R: Runtime>(
         .take()
         .ok_or_else(|| AppError::Internal("updater stderr pipe missing".into()))?;
 
-    let app_out = app.clone();
-    let stdout_task = tokio::spawn(async move {
-        let mut buf = String::new();
-        let mut reader = BufReader::new(stdout).lines();
-        while let Ok(Some(line)) = reader.next_line().await {
-            let _ = app_out.emit(
-                UPDATE_LOG_EVENT,
-                UpdateLogLine { stream: "stdout", line: line.clone() },
-            );
-            buf.push_str(&line);
-            buf.push('\n');
-        }
-        buf
-    });
-
-    let app_err = app.clone();
-    let stderr_task = tokio::spawn(async move {
-        let mut buf = String::new();
-        let mut reader = BufReader::new(stderr).lines();
-        while let Ok(Some(line)) = reader.next_line().await {
-            let _ = app_err.emit(
-                UPDATE_LOG_EVENT,
-                UpdateLogLine { stream: "stderr", line: line.clone() },
-            );
-            buf.push_str(&line);
-            buf.push('\n');
-        }
-        buf
-    });
+    let stdout_task = spawn_log_pump(app.clone(), stdout, "stdout");
+    let stderr_task = spawn_log_pump(app.clone(), stderr, "stderr");
 
     let status = match tokio::time::timeout(UPDATE_WAIT_BUDGET, child.wait())
         .await

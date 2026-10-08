@@ -13,6 +13,7 @@ use crate::events;
 use crate::models::MailboxEntry;
 use crate::time::now_seconds;
 
+use super::address::{COORDINATOR_PANE, USER_PANE};
 use super::{MailboxEnvelope, MailboxEvent};
 
 /// Capacity of each per-workspace broadcast channel. `64` is well
@@ -349,8 +350,8 @@ impl MailboxBus {
                 .emit_typed(
                     app,
                     &ws,
-                    "agent:user",
-                    "agent:coordinator",
+                    USER_PANE,
+                    COORDINATOR_PANE,
                     &format!("shutdown cancel: {job_id}"),
                     None,
                     MailboxEvent::JobCancel { job_id },

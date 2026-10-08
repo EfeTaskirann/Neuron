@@ -7,7 +7,7 @@
 //! rejected}/<agent>/` and passes per-pane environment variables
 //! (`NEURON_BRIDGE`, `NEURON_AGENT_ID`, `NEURON_INBOX`) so each claude
 //! REPL knows where to drop outbound messages. The
-//! [`bridge::watcher_loop`] picks up the JSON envelopes those drops
+//! [`bridge::watcher::watcher_loop`] picks up the JSON envelopes those drops
 //! create and delivers their body into the appropriate target pane via
 //! bracketed paste.
 //!
@@ -123,7 +123,7 @@ pub(crate) struct ActiveSession {
     /// Pane ids that have completed persona injection and are safe
     /// targets for inter-agent routes. Populated by the persona-inject
     /// async task as each `write_to_pane` call returns Ok; read by
-    /// `bridge::process_one` to short-circuit routes destined for
+    /// `bridge::watcher::process_one` to short-circuit routes destined for
     /// panes that are still warming up (the claude REPL may not have
     /// enabled bracketed-paste mode yet, in which case the routed
     /// body is dumped into the prompt as raw text and submitted with
@@ -344,7 +344,7 @@ impl TerminalSwarmRegistry {
         // Per-session "ready" tracker — populated as each pane's
         // persona injection write completes. Routes to a not-yet-ready
         // pane short-circuit with `target_not_ready` in
-        // `bridge::process_one` so the pre-bracketed-paste-mode window
+        // `bridge::watcher::process_one` so the pre-bracketed-paste-mode window
         // doesn't corrupt the first inter-agent dispatch.
         let ready_panes: Arc<Mutex<HashSet<String>>> =
             Arc::new(Mutex::new(HashSet::new()));
@@ -422,9 +422,12 @@ impl TerminalSwarmRegistry {
                     &profile.body,
                     &bridge_root_for_inject,
                 );
-                match registry_for_inject
-                    .write_to_pane(pane_id, body.as_bytes())
-                    .await
+                match bridge::paste_then_submit(
+                    &registry_for_inject,
+                    pane_id,
+                    body.as_bytes(),
+                )
+                .await
                 {
                     Ok(()) => {
                         if let Ok(mut g) = ready_panes_for_inject.lock() {
@@ -446,12 +449,13 @@ impl TerminalSwarmRegistry {
                 if !trimmed.is_empty() {
                     tokio::time::sleep(Duration::from_millis(AUTO_PROMPT_DELAY_MS)).await;
                     if let Some(orch_pane) = panes_by_agent.get("orchestrator") {
-                        let payload = format!(
-                            "\x1b[200~{trimmed}\x1b[201~\r"
-                        );
-                        if let Err(e) = registry_for_inject
-                            .write_to_pane(orch_pane, payload.as_bytes())
-                            .await
+                        let payload = format!("\x1b[200~{trimmed}\x1b[201~");
+                        if let Err(e) = bridge::paste_then_submit(
+                            &registry_for_inject,
+                            orch_pane,
+                            payload.as_bytes(),
+                        )
+                        .await
                         {
                             tracing::warn!(
                                 error = %e,
@@ -526,6 +530,20 @@ impl TerminalSwarmRegistry {
             }
         }
         if let Some(root) = bridgespace_root {
+            // Keep the rejection evidence (envelopes + `.reason`) —
+            // the rest of the session tree is disposable.
+            match bridge::archive_rejected(&root) {
+                Ok(Some(dest)) => tracing::info!(
+                    path = %dest.display(),
+                    "swarm-term: rejected messages archived"
+                ),
+                Ok(None) => {}
+                Err(e) => tracing::warn!(
+                    path = %root.display(),
+                    error = %e,
+                    "swarm-term: rejected-archive failed; deleting with session"
+                ),
+            }
             if let Err(e) = std::fs::remove_dir_all(&root) {
                 tracing::warn!(
                     path = %root.display(),

@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, beforeEach } from 'vitest';
-import { render, screen, waitFor } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import type { ReactNode } from 'react';
 
@@ -136,6 +136,31 @@ describe('TerminalSwarmRoute', () => {
     expect(
       screen.getAllByText(/idle — pick a project and launch/i),
     ).toHaveLength(7);
+  });
+
+  it('sends a chat message as a bracketed paste followed by a separate CR', async () => {
+    // Regression: `${message}\r` in one write left multi-line tasks
+    // unsent in claude's input box (the CR was absorbed into the paste).
+    const { commands } = await import('../lib/bindings');
+    vi.mocked(commands.swarmTermSessionStatus).mockResolvedValue({
+      status: 'ok',
+      data: SESSION,
+    });
+    renderRoute();
+    const input = await screen.findByLabelText(/message to orchestrator/i);
+    fireEvent.change(input, { target: { value: 'refactor the bridge' } });
+    fireEvent.submit(input.closest('form')!);
+
+    await waitFor(() => {
+      const orchWrites = vi
+        .mocked(commands.terminalWrite)
+        .mock.calls.filter(([paneId]) => paneId === 'p-orch')
+        .map(([, data]) => data);
+      expect(orchWrites).toEqual([
+        '\x1b[200~refactor the bridge\x1b[201~',
+        '\r',
+      ]);
+    });
   });
 
   it('surfaces a session-status probe failure instead of silently showing the idle grid', async () => {

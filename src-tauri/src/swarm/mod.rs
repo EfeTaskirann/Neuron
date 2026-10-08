@@ -71,7 +71,10 @@ pub use help_request::{
     parse_coordinator_help_outcome, parse_help_request,
     CoordinatorHelpOutcome, HelpRequest,
 };
-pub use mailbox_bus::{MailboxBus, MailboxEnvelope, MailboxEvent};
+pub use mailbox_bus::{
+    agent_pane, MailboxBus, MailboxEnvelope, MailboxEvent,
+    COORDINATOR_PANE, USER_PANE,
+};
 pub use persistent_session::PersistentSession;
 pub use profile::{
     PermissionMode, Profile, ProfileRegistry, ProfileSource,

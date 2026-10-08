@@ -17,8 +17,9 @@
 //! Shared helpers that more than one submodule needs live here —
 //! currently only [`workspace_agents_dir`], which `profiles` and
 //! `orchestrator` both consume to locate `<app_data_dir>/agents`.
-//! The `#[cfg(test)] mod tests` block (in `tests.rs`) exercises
-//! every command through the re-exported symbols.
+//! The `#[cfg(test)] mod tests` package (in `tests/`) exercises
+//! every command through the re-exported symbols, split per command
+//! area to mirror the production submodules.
 
 use tauri::{AppHandle, Manager, Runtime};
 
@@ -71,12 +72,13 @@ pub(super) fn workspace_agents_dir<R: Runtime>(
 // Tests                                                                  //
 // --------------------------------------------------------------------- //
 //
-// The command + acceptance tests live in `tests.rs` as one `mod tests`
-// block: they share scaffolding helpers (`mock_app_with_w5_state`,
-// `mock_app_with_brain_state`, `BrainScriptedInvoker`, `seed_swarm_job_row`)
-// so fanning them out per submodule would duplicate that wiring. Every
-// command is reachable via the `pub use` re-exports above, so the tests'
-// `use super::*;` resolves the same as the pre-split single-file version.
+// The command + acceptance tests live in the `tests/` package, split per
+// command area to mirror the production submodules. Each area's local
+// scaffolding lives with its tests (none turns out to be shared across
+// areas): `seed_swarm_job_row` (jobs), `mock_app_with_w5_state`
+// (dispatch), `mock_app_with_brain_state` + `BrainScriptedInvoker` (run).
+// Every command is reachable via the `pub use` re-exports above, so each
+// test reaches its command through `crate::commands::swarm::*`.
 
 #[cfg(test)]
 mod tests;

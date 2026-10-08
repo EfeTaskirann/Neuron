@@ -19,7 +19,9 @@ use crate::swarm_term::hierarchy::allowed_for;
 /// The body wraps the persona text + the bridge-protocol footer in
 /// terminal **bracketed-paste** escape sequences (`\x1b[200~ … \x1b[201~`)
 /// so claude's REPL treats it as a single pasted message instead of
-/// many separate Enter-submitted lines, then submits with a final `\r`.
+/// many separate Enter-submitted lines. The submitting `\r` is NOT part
+/// of the payload — the caller sends it via
+/// [`crate::swarm_term::bridge::paste_then_submit`].
 ///
 /// The bridge protocol section is the only routing instruction the
 /// persona ever sees. It tells claude:
@@ -87,7 +89,10 @@ pub(crate) fn build_persona_payload(
          JSON içinde `\\n` olarak escape edilir; uzun mesajlarda korkma, sınır yok.\n\n\
          ### İzinli hedeflerin\n\n{dest_block}\n\n\
          Listede olmayan hedefe yazarsan backend `rejected/` klasörüne taşır ve\n\
-         Routing Log panelinde `denied` etiketiyle gösterir; mesaj iletilmez.\n\n\
+         Routing Log panelinde `denied` etiketiyle gösterir; mesaj iletilmez.\n\
+         İletilemeyen her mesaj için (izinsiz hedef, bozuk JSON, hedef pane hazır\n\
+         değil) pane'ine `[Neuron] … İLETİLEMEDİ` ile başlayan bir not gelir —\n\
+         o notu görürsen mesajın GİTMEDİ demektir; cevap bekleme, düzeltip tekrar gönder.\n\n\
          ### Çalışma akışı (her dispatch için)\n\n\
          1. Mesajını planla. Hangi hedef ajan? Hangi spesifik talimat?\n\
          2. `Write` tool'unu çağır: path = yukarıdaki şablon, content = JSON.\n\
@@ -106,13 +111,19 @@ pub(crate) fn build_persona_payload(
          ### Sana gelen mesajlar\n\n\
          Senin pane'ine bracketed-paste olarak gelir. Alt kısımda `— from @<gönderen>\n\
          [routed by Neuron]` imzası bulunur — bu imzaya bakarak kime cevap vereceğini\n\
-         (genelde gönderene) bil. Mesajı verbatim alıntılama; paraphrase et.\n\n\
+         (genelde gönderene) bil. Mesajı verbatim alıntılama; paraphrase et.\n\
+         `[Neuron]` ile başlayan mesajlar bir ajandan değil, backend'in kendisinden\n\
+         gelir; onlara envelope ile cevap yazma, söylediğini uygula.\n\n\
          ### 4-state lifecycle contract (zorunlu)\n\n\
          Sana bir dispatch gelirse SUS KALMA; 4 durumdan birini gönderene yolla:\n\n\
          1. **alındı** (≤5sn içinde): `body: \"alındı — <bir cümlelik anlayışın>\"`.\n\
             Acknowledgement. Sender bilgi sahibi olur, polling yapmaz.\n\
          2. **tamam** (iş bitince): `body: \"tamam — <somut sonuç, dosya yolları>\"`.\n\
             Completion. Sender bir sonraki faza geçer.\n\
+            **İstisna:** `task_id`'li bir görevde builder/reviewer isen işin sonunu\n\
+            `tamam —` ile DEĞİL, aşağıdaki lifecycle token'ıyla (`DONE` / `APPROVED` /\n\
+            `CHANGES_NEEDED`) bildir — otomatik review / TASK_DONE zinciri yalnızca\n\
+            token'ı tanır; `tamam —` yazarsan zincir durur.\n\
          3. **belirsiz** (dispatch net değilse): `body: \"belirsiz — <spesifik sorun:\n\
             hangi dosya / hangi tür değişiklik / kabul kriteri ne>\"` ve DUR.\n\
             Tahmin yapma; tahminle çalışırsan reviewer reject eder.\n\
@@ -128,7 +139,11 @@ pub(crate) fn build_persona_payload(
          Bunlar `body` içindeki özel prefix'ler — `task_id` alanını da doldur. Backend\n\
          bunları görür, lifecycle state machine'i ilerletir, gerekiyorsa otomatik\n\
          fanout yapar (örn. builder DONE → reviewer'a otomatik `review <id>` dispatch).\n\n\
-         - **Builder ise** iş bitince: `body: \"DONE <task_id>\"` (coordinator'e gönder).\n\
+         Token body'nin EN BAŞINDA, BÜYÜK harfle, markdown süsü (`**`, `:`) olmadan\n\
+         yazılır; ardından bir boşluk ve task_id gelir.\n\n\
+         - **Builder ise** iş bitince: `body: \"DONE <task_id> — <ne değişti, hangi dosyalar>\"`\n\
+           (coordinator'e gönder). `—` sonrasındaki not reviewer'a otomatik iletilir;\n\
+           reviewer neye bakacağını oradan öğrenir, o yüzden dosya yollarını yaz.\n\
          - **Reviewer ise** onay verince: `body: \"APPROVED <task_id>\"` (coordinator'e).\n\
          - **Reviewer ise** değişiklik istiyorsa: `body: \"CHANGES_NEEDED <task_id>\"`\n\
            ve ne istediğini açıkla.\n\
@@ -144,7 +159,7 @@ pub(crate) fn build_persona_payload(
         example_dst = example_dst,
     );
 
-    format!("\x1b[200~{body}{footer}\x1b[201~\r")
+    format!("\x1b[200~{body}{footer}\x1b[201~")
 }
 
 fn path_as_forward_slashes(p: &Path) -> String {
@@ -172,7 +187,8 @@ mod tests {
         assert!(p.starts_with('\x1b'));
         assert!(p.contains("\x1b[200~"));
         assert!(p.contains("\x1b[201~"));
-        assert!(p.ends_with('\r'));
+        // Paste only — the submit CR is a separate, delayed write.
+        assert!(p.ends_with("\x1b[201~"));
     }
 
     #[test]

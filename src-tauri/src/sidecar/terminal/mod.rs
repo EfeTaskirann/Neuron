@@ -404,7 +404,7 @@ impl TerminalRegistry {
     /// `running`, `awaiting_approval`, `success`, `error`) or `None`
     /// if no such pane is registered.
     ///
-    /// Used by `swarm_term::bridge::process_one`'s pane-status gate to
+    /// Used by `swarm_term::bridge::watcher::process_one`'s pane-status gate to
     /// skip writes to panes that are in `awaiting_approval` (the
     /// receiver is blocked on a safety prompt and would silently
     /// swallow the route) or `error` (the receiver is already dead —

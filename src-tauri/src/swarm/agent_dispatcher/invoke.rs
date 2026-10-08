@@ -16,7 +16,8 @@ use tokio::sync::{broadcast, Mutex, Notify};
 
 use crate::error::AppError;
 use crate::swarm::mailbox_bus::{
-    MailboxBus, MailboxEnvelope, MailboxEvent,
+    agent_pane, MailboxBus, MailboxEnvelope, MailboxEvent,
+    COORDINATOR_PANE,
 };
 use crate::swarm::transport::InvokeResult;
 
@@ -135,8 +136,8 @@ pub(super) async fn drive_invoke<R: Runtime, I: AgentInvoker>(
         "agent {agent_id} result for job {job_id} \
          ({turn_count} turns, ${total_cost_usd:.4})"
     );
-    let from_pane = format!("agent:{agent_id}");
-    let to_pane = "agent:coordinator".to_string();
+    let from_pane = agent_pane(&agent_id);
+    let to_pane = COORDINATOR_PANE.to_string();
     let event_emit = MailboxEvent::AgentResult {
         job_id: job_id.clone(),
         agent_id: agent_id.clone(),
@@ -216,8 +217,8 @@ async fn run_invoke_with_help_loop<R: Runtime, I: AgentInvoker>(
         // Emit AgentHelpRequest. parent_id chains to the dispatch
         // row's autoincrement id so the projector's reply-to
         // chain stays uniform.
-        let from_pane = format!("agent:{agent_id}");
-        let to_pane = "agent:coordinator".to_string();
+        let from_pane = agent_pane(agent_id);
+        let to_pane = COORDINATOR_PANE.to_string();
         let summary = format!(
             "help request from {agent_id}: {} ({})",
             help.question, help.reason

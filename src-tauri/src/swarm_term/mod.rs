@@ -10,7 +10,7 @@
 //! agent B, A uses its `Write` tool to atomically create
 //! `<NEURON_BRIDGE>/inbox/<B>/<id>.json` with a small JSON envelope
 //! (`{from, to, body, task_id?}`). A background poll loop in
-//! [`bridge::watcher_loop`] reads every inbox directory once every
+//! [`bridge::watcher::watcher_loop`] reads every inbox directory once every
 //! 250 ms, validates the envelope, applies the hierarchy gate from
 //! [`hierarchy`], delivers the body to the target pane's PTY via
 //! bracketed paste, and migrates the file to `processed/<B>/`. Denied
