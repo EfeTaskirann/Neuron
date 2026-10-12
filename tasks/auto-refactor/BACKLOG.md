@@ -1,5 +1,12 @@
 # Neuron — Otonom İyileştirme Backlog'u
 
+> **ARŞİV — otonom döngü 2026-10-12'de kaldırıldı.** "Neuron Auto-Refactor"
+> zamanlanmış görevi silindi ve çalıştırma araçları (`run.ps1`,
+> `install-task.ps1`, `PLAYBOOK.md`, `PROMPT.md`, …) repo'dan çıkarıldı;
+> kullanıcı kararıyla bir daha kurulmayacak. Bu dosya yalnızca geçmiş
+> refactor turlarının kaydı olarak duruyor; araçlar gerekirse git
+> geçmişinden (`git log -- tasks/auto-refactor`) okunabilir.
+
 **Tohumlama:** 2026-05-31 (ilk inceleme). Her tur bu dosyayı okur, çözdüğünü işaretler, yeni doğanı ekler.
 **Statü kodları:** ☐ açık · ◐ kısmen · ☑ çözüldü · ⏸ bloklu (büyük/parçalı PR) · 🔥 hot-zone (audit-only, W6 aktif)
 
