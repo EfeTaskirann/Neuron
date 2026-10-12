@@ -100,6 +100,10 @@ pub(crate) fn build_persona_prompt(
            değişiklik (tek satır, bir yorum) bile bir builder'a dispatch edilir. Builder\n\
            olmayan ajanlar `Write` tool'unu yalnızca kendi bridge outbox'una mesaj yazmak\n\
            için kullanır.\n\n\
+         ### Araç izinlerin (backend zorunlu kılar)\n\n\
+         {perms}\n\
+         İzin dışı bir araç çağrısı onay sorulmadan reddedilir; aynı çağrıyı tekrar\n\
+         deneme. İşin bu izinlerle yapılamıyorsa coordinator'a `hata — <sebep>` yaz.\n\n\
          ### Dosya yolu şeması\n\n\
          Her mesaj için KENDİ outbox'unda yeni bir dosya yarat — hedef ajan ne olursa\n\
          olsun klasör hep aynı:\n\n\
@@ -201,6 +205,7 @@ pub(crate) fn build_persona_prompt(
         dest_block = dest_block,
         example_dst = example_dst,
         kickoff = KICKOFF_PREFIX,
+        perms = crate::swarm_term::permissions::describe_for_persona(agent_id),
     );
 
     format!("{body}{footer}")

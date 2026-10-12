@@ -34,6 +34,7 @@ pub(crate) mod heartbeat;
 pub mod hierarchy;
 pub mod home_isolation;
 pub mod lifecycle;
+pub(crate) mod permissions;
 pub mod persona;
 pub mod session;
 

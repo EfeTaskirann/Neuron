@@ -65,8 +65,10 @@ pub(crate) async fn submit_pasted(
 /// lifecycle fanouts to just-finished reviewer/orchestrator panes.
 ///
 /// `awaiting_approval` is deliberately NOT blocking: swarm-term panes
-/// run with `--permission-mode bypassPermissions`, so claude never shows
-/// a real approval prompt there. The status can only come from the
+/// run with `--permission-mode dontAsk` (or `bypassPermissions` when
+/// opted out — see `swarm_term::permissions`); neither ever shows a real
+/// approval prompt — a non-allowed tool is denied, not asked. The status
+/// can only come from the
 /// generic `Approve.*?` regex matching the agent's own output, and it
 /// is never cleared — blocking on it froze the pane's inbox for good.
 pub(super) fn is_delivery_blocked(status: Option<&str>) -> bool {

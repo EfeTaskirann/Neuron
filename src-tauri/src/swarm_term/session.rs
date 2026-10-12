@@ -45,6 +45,7 @@ use crate::swarm_term::home_isolation::{
     sync_credentials,
 };
 use crate::swarm_term::lifecycle::LifecycleStore;
+use crate::swarm_term::permissions;
 use crate::swarm_term::persona::{
     build_kickoff_message, build_persona_prompt, is_ready_answer,
 };
@@ -196,7 +197,8 @@ impl TerminalSwarmRegistry {
     ) -> Result<TerminalSwarmSessionHandle, AppError> {
         // PATH-01: reject parent-dir traversal segments so a crafted
         // project_dir cannot walk out of wherever the caller intended
-        // (the 9 REPLs spawn with bypassPermissions and cwd = this dir).
+        // (the 9 REPLs spawn with cwd = this dir and may read — builders
+        // also write — everything under it; see `permissions`).
         if project_dir
             .components()
             .any(|c| matches!(c, std::path::Component::ParentDir))
@@ -243,8 +245,8 @@ impl TerminalSwarmRegistry {
         for a in &spawn.prefix_args {
             parts.push(format!("\"{}\"", a));
         }
-        parts.push("--permission-mode".to_string());
-        parts.push("bypassPermissions".to_string());
+        // Permission flags are per agent (see `permissions`), appended in
+        // the spawn loop.
         let _ = project_str.clone(); // kept for log diagnostics
         let cmd = parts.join(" ");
         tracing::info!(
@@ -252,6 +254,13 @@ impl TerminalSwarmRegistry {
             cmd = %cmd,
             "swarm-term: spawning 9 claude REPLs"
         );
+        if permissions::bypass_active() {
+            tracing::warn!(
+                "swarm-term: {}=bypass — all panes run with bypassPermissions \
+                 (unrestricted shell + file access)",
+                permissions::PERMISSIONS_ENV
+            );
+        }
 
         let registry =
             app.state::<TerminalRegistry>().inner().clone();
@@ -370,7 +379,11 @@ impl TerminalSwarmRegistry {
                 )));
             }
             let agent_cmd = format!(
-                "{cmd} --append-system-prompt-file \"{}\"",
+                "{cmd} {} --append-system-prompt-file \"{}\"",
+                permissions::join_quoted(&permissions::claude_permission_args(
+                    agent_id,
+                    &session_id,
+                )),
                 persona_file.display()
             );
             pane_homes.insert(agent_id.to_string(), pane_home.clone());
