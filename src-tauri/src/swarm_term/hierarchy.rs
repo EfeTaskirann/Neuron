@@ -46,42 +46,6 @@
 //! graph — the lifecycle helpers do NOT relax the hierarchy, they
 //! just remove a typing step.
 
-use serde::{Deserialize, Serialize};
-use specta::Type;
-
-/// Wire-stable alias for the agent's kebab-case id. Kept as `String`
-/// on the wire so the JSON shape stays trivially interoperable with
-/// the frontend.
-pub type AgentId = String;
-
-/// Static dump of the routing graph used by the Workflow tab. Captures
-/// the full set of agents and every (`from` → `to`) edge present in
-/// [`ALLOWED`]. The function [`topology`] builds a fresh snapshot per
-/// call; the value is small (9 nodes / 35 edges) so we don't bother
-/// caching it.
-#[derive(Debug, Clone, Serialize, Deserialize, Type)]
-#[serde(rename_all = "camelCase")]
-pub struct Topology {
-    pub nodes: Vec<AgentId>,
-    pub edges: Vec<(AgentId, AgentId)>,
-}
-
-/// Build a fresh [`Topology`] snapshot from the compile-time tables.
-/// Order is stable: nodes follow [`AGENT_IDS`]; edges iterate
-/// [`ALLOWED`] in declaration order so consumers can rely on a
-/// deterministic shape without sorting.
-pub fn topology() -> Topology {
-    let nodes: Vec<AgentId> =
-        AGENT_IDS.iter().map(|s| (*s).to_string()).collect();
-    let mut edges: Vec<(AgentId, AgentId)> = Vec::new();
-    for (src, dsts) in ALLOWED {
-        for dst in *dsts {
-            edges.push(((*src).to_string(), (*dst).to_string()));
-        }
-    }
-    Topology { nodes, edges }
-}
-
 pub const AGENT_IDS: &[&str] = &[
     "orchestrator",
     "coordinator",
@@ -128,21 +92,60 @@ const ALLOWED: &[(&str, &[&str])] = &[
     // coordinator. Asymmetric was the v1 default; v2 makes it
     // symmetric so the most common research-research handoff stops
     // emitting `route denied` noise and stops adding a hop's latency.
-    ("scout", &["coordinator", "orchestrator", "planner"]),
+    //
+    // Reply edges: every agent that can RECEIVE a dispatch can answer
+    // its sender. The orchestrator persona dispatches builders,
+    // reviewers and the tester directly, builders ask scout, and the
+    // tester reports regressions to builders — without the reverse
+    // edges those agents could not send `alındı` / `belirsiz` / `hata`
+    // back and the sender waited forever.
+    (
+        "scout",
+        &[
+            "coordinator",
+            "orchestrator",
+            "planner",
+            "backend-builder",
+            "frontend-builder",
+        ],
+    ),
     ("planner", &["coordinator", "scout", "orchestrator"]),
     (
         "backend-builder",
-        &["scout", "backend-reviewer", "coordinator"],
+        &[
+            "scout",
+            "backend-reviewer",
+            "coordinator",
+            "orchestrator",
+            "integration-tester",
+        ],
     ),
     (
         "frontend-builder",
-        &["scout", "frontend-reviewer", "coordinator"],
+        &[
+            "scout",
+            "frontend-reviewer",
+            "coordinator",
+            "orchestrator",
+            "integration-tester",
+        ],
     ),
-    ("backend-reviewer", &["backend-builder", "coordinator"]),
-    ("frontend-reviewer", &["frontend-builder", "coordinator"]),
+    (
+        "backend-reviewer",
+        &["backend-builder", "coordinator", "orchestrator"],
+    ),
+    (
+        "frontend-reviewer",
+        &["frontend-builder", "coordinator", "orchestrator"],
+    ),
     (
         "integration-tester",
-        &["backend-builder", "frontend-builder", "coordinator"],
+        &[
+            "backend-builder",
+            "frontend-builder",
+            "coordinator",
+            "orchestrator",
+        ],
     ),
 ];
 
@@ -197,18 +200,6 @@ pub const TIERS: &[(&str, &[&str])] = &[
         ],
     ),
 ];
-
-/// Look up the tier name for an agent id. Returns `None` for unknown
-/// ids — callers should treat this as a programming error (every
-/// agent in `AGENT_IDS` is covered by `TIERS`).
-pub fn tier_of(agent: &str) -> Option<&'static str> {
-    for (tier, ids) in TIERS {
-        if ids.contains(&agent) {
-            return Some(*tier);
-        }
-    }
-    None
-}
 
 // --------------------------------------------------------------------- //
 // Pure agent-role classifiers (used by lifecycle + persona helpers).    //
@@ -279,17 +270,36 @@ mod tests {
     }
 
     #[test]
-    fn scout_cannot_reach_builders() {
-        assert!(!is_allowed("scout", "backend-builder"));
-        assert!(!is_allowed("scout", "frontend-builder"));
+    fn every_edge_has_a_reply_edge() {
+        // The H2 regression: a one-way edge lets a message in but no
+        // answer out, and the sender waits forever.
+        for &(src, dsts) in ALLOWED {
+            for &dst in dsts {
+                assert!(
+                    is_allowed(dst, src),
+                    "{src}→{dst} is allowed but {dst} cannot reply"
+                );
+            }
+        }
     }
 
     #[test]
-    fn reviewers_only_talk_to_their_builder_and_coordinator() {
+    fn scout_cannot_reach_reviewers() {
+        // Scout answers builders' questions but has no business
+        // steering a review.
+        assert!(!is_allowed("scout", "backend-reviewer"));
+        assert!(!is_allowed("scout", "frontend-reviewer"));
+        assert!(!is_allowed("scout", "integration-tester"));
+    }
+
+    #[test]
+    fn reviewers_stay_in_their_domain() {
         assert!(is_allowed("backend-reviewer", "backend-builder"));
         assert!(is_allowed("backend-reviewer", "coordinator"));
+        assert!(is_allowed("backend-reviewer", "orchestrator"));
         assert!(!is_allowed("backend-reviewer", "frontend-builder"));
-        assert!(!is_allowed("backend-reviewer", "orchestrator"));
+        assert!(!is_allowed("frontend-reviewer", "backend-builder"));
+        assert!(!is_allowed("backend-reviewer", "planner"));
     }
 
     #[test]
@@ -310,7 +320,9 @@ mod tests {
         assert!(scout_allowed.contains(&"coordinator"));
         assert!(scout_allowed.contains(&"orchestrator"));
         assert!(scout_allowed.contains(&"planner"));
-        assert_eq!(scout_allowed.len(), 3);
+        assert!(scout_allowed.contains(&"backend-builder"));
+        assert!(scout_allowed.contains(&"frontend-builder"));
+        assert_eq!(scout_allowed.len(), 5);
     }
 
     #[test]
@@ -349,20 +361,6 @@ mod tests {
                 "agent `{id}` not assigned to any tier"
             );
         }
-    }
-
-    #[test]
-    fn tier_of_returns_expected_groupings() {
-        assert_eq!(tier_of("orchestrator"), Some("orchestration"));
-        assert_eq!(tier_of("coordinator"), Some("orchestration"));
-        assert_eq!(tier_of("scout"), Some("research"));
-        assert_eq!(tier_of("planner"), Some("research"));
-        assert_eq!(tier_of("backend-builder"), Some("build"));
-        assert_eq!(tier_of("frontend-builder"), Some("build"));
-        assert_eq!(tier_of("backend-reviewer"), Some("review"));
-        assert_eq!(tier_of("frontend-reviewer"), Some("review"));
-        assert_eq!(tier_of("integration-tester"), Some("review"));
-        assert_eq!(tier_of("nobody"), None);
     }
 
     // ----------------------------------------------------------------- //

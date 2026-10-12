@@ -264,11 +264,20 @@ async fn fetch_pending(pool: &DbPool) -> Result<Vec<StoredSpan>, AppError> {
     Ok(out)
 }
 
-/// Flip `exported_at = strftime('%s','now')` on a batch. The IN
-/// clause is built dynamically because sqlx doesn't expand `Vec<&str>`
-/// bindings into a tuple; with batches capped at 200 well under the
-/// 999-default IN-list limit this is safe.
-async fn flag_exported(pool: &DbPool, ids: &[String]) -> Result<(), AppError> {
+/// Flip `exported_at` to `set_expr` for a batch of ids. The IN clause
+/// is built dynamically because sqlx doesn't expand `Vec<&str>`
+/// bindings into a tuple; with batches capped at [`BATCH_SIZE`] (200),
+/// well under SQLite's 999-default IN-list limit, this is safe.
+///
+/// `set_expr` is a trusted, code-supplied SQL fragment (the `strftime`
+/// now-expression or the [`EXPORT_FAILED_SENTINEL`] integer literal) —
+/// never user input, so interpolating it is injection-safe. Only the
+/// `ids` are bound as parameters.
+async fn update_exported_at(
+    pool: &DbPool,
+    ids: &[String],
+    set_expr: &str,
+) -> Result<(), AppError> {
     if ids.is_empty() {
         return Ok(());
     }
@@ -277,9 +286,7 @@ async fn flag_exported(pool: &DbPool, ids: &[String]) -> Result<(), AppError> {
         .collect::<Vec<_>>()
         .join(",");
     let sql = format!(
-        "UPDATE runs_spans \
-         SET exported_at = CAST(strftime('%s','now') AS INTEGER) \
-         WHERE id IN ({placeholders})"
+        "UPDATE runs_spans SET exported_at = {set_expr} WHERE id IN ({placeholders})"
     );
     let mut q = sqlx::query(&sql);
     for id in ids {
@@ -289,25 +296,14 @@ async fn flag_exported(pool: &DbPool, ids: &[String]) -> Result<(), AppError> {
     Ok(())
 }
 
+/// Flip `exported_at = strftime('%s','now')` on a successfully-exported
+/// batch (2xx path).
+async fn flag_exported(pool: &DbPool, ids: &[String]) -> Result<(), AppError> {
+    update_exported_at(pool, ids, "CAST(strftime('%s','now') AS INTEGER)").await
+}
+
 /// Flip `exported_at = -1` (sentinel) on a batch the collector
 /// 4xx-rejected.
 async fn flag_failed(pool: &DbPool, ids: &[String]) -> Result<(), AppError> {
-    if ids.is_empty() {
-        return Ok(());
-    }
-    let placeholders = std::iter::repeat("?")
-        .take(ids.len())
-        .collect::<Vec<_>>()
-        .join(",");
-    let sql = format!(
-        "UPDATE runs_spans \
-         SET exported_at = ? \
-         WHERE id IN ({placeholders})"
-    );
-    let mut q = sqlx::query(&sql).bind(EXPORT_FAILED_SENTINEL);
-    for id in ids {
-        q = q.bind(id);
-    }
-    q.execute(pool).await?;
-    Ok(())
+    update_exported_at(pool, ids, &EXPORT_FAILED_SENTINEL.to_string()).await
 }

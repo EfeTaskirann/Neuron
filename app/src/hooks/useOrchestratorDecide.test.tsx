@@ -59,11 +59,14 @@ describe('useOrchestratorDecide', () => {
     expect(returned).toEqual(OUTCOME_OK);
   });
 
-  it('throws an Error with the backend message when the IPC errors', async () => {
+  it('rejects with the localized AppError copy (raw message kept on .detail) when the IPC errors', async () => {
     const { commands } = await import('../lib/bindings');
+    // The backend `kind` is snake_case (mirrors `AppError::kind()`);
+    // `unwrap` maps it to localized copy via `AppErrorClient` and keeps
+    // the raw backend string on `.detail`.
     vi.mocked(commands.swarmOrchestratorDecide).mockResolvedValue({
       status: 'error',
-      error: { kind: 'SwarmInvoke', message: 'persona did not parse' },
+      error: { kind: 'swarm_invoke', message: 'persona did not parse' },
     });
 
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -73,6 +76,10 @@ describe('useOrchestratorDecide', () => {
 
     await expect(
       result.current.mutateAsync({ workspaceId: 'default', userMessage: 'x' }),
-    ).rejects.toThrow('persona did not parse');
+    ).rejects.toMatchObject({
+      message: 'Ajan çağrısı başarısız oldu.',
+      kind: 'swarm_invoke',
+      detail: 'persona did not parse',
+    });
   });
 });

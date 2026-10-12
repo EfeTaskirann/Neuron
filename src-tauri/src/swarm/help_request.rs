@@ -24,6 +24,7 @@ use serde_json::Value;
 use specta::Type;
 
 use crate::error::AppError;
+use crate::swarm::llm_json::{first_balanced_object, strip_fence};
 
 /// Specialist's structured "I'm blocked" payload. Mirrors the JSON
 /// the persona emits — `reason` is a one-liner explanation,
@@ -77,26 +78,40 @@ const HELP_REQUEST_SCAN_CAP: usize = 16 * 1024;
 /// at the top level are considered. Bare JSON (no `neuron_help`
 /// key) is not a help request.
 pub fn parse_help_request(assistant_text: &str) -> Option<HelpRequest> {
-    let truncated = if assistant_text.len() > HELP_REQUEST_SCAN_CAP {
-        &assistant_text[..HELP_REQUEST_SCAN_CAP]
-    } else {
-        assistant_text
-    };
+    extract_capped(assistant_text, try_extract_help_request)
+}
+
+/// Walk the shared defense-in-depth recipe over a size-capped,
+/// char-boundary-safe view of `assistant_text`, handing each
+/// candidate fragment to `parse`:
+///   1. whole trimmed text  2. fence-stripped  3. first balanced {...}
+/// Returns the first `Some`, or `None` if every step misses.
+///
+/// Both help-contract parsers share this exact walk; only the inner
+/// parse and the terminal bail differ (request → `None`, outcome →
+/// a structured error — see each caller). The 16 KiB cap keeps the
+/// scan O(1) per turn against an adversarial assistant_text; it is
+/// char-boundary-safe because a multibyte char straddling the cap
+/// must not panic the dispatcher's invoke task (raw LLM output is
+/// often Turkish).
+fn extract_capped<T>(assistant_text: &str, parse: impl Fn(&str) -> Option<T>) -> Option<T> {
+    let truncated =
+        crate::text::truncate_to_char_boundary(assistant_text, HELP_REQUEST_SCAN_CAP);
 
     // 1. Whole-text JSON.
-    if let Some(req) = try_extract_help_request(truncated.trim()) {
-        return Some(req);
+    if let Some(v) = parse(truncated.trim()) {
+        return Some(v);
     }
     // 2. ```json fence strip.
     if let Some(fenced) = strip_fence(truncated) {
-        if let Some(req) = try_extract_help_request(fenced.trim()) {
-            return Some(req);
+        if let Some(v) = parse(fenced.trim()) {
+            return Some(v);
         }
     }
     // 3. First balanced {...}.
     if let Some(balanced) = first_balanced_object(truncated) {
-        if let Some(req) = try_extract_help_request(balanced) {
-            return Some(req);
+        if let Some(v) = parse(balanced) {
+            return Some(v);
         }
     }
     // 4. Bail.
@@ -112,28 +127,15 @@ pub fn parse_help_request(assistant_text: &str) -> Option<HelpRequest> {
 pub fn parse_coordinator_help_outcome(
     assistant_text: &str,
 ) -> Result<CoordinatorHelpOutcome, AppError> {
-    let truncated = if assistant_text.len() > HELP_REQUEST_SCAN_CAP {
-        &assistant_text[..HELP_REQUEST_SCAN_CAP]
-    } else {
-        assistant_text
-    };
-    if let Some(out) = try_parse_outcome(truncated.trim()) {
-        return Ok(out);
-    }
-    if let Some(fenced) = strip_fence(truncated) {
-        if let Some(out) = try_parse_outcome(fenced.trim()) {
-            return Ok(out);
-        }
-    }
-    if let Some(balanced) = first_balanced_object(truncated) {
-        if let Some(out) = try_parse_outcome(balanced) {
-            return Ok(out);
-        }
-    }
-    Err(AppError::SwarmInvoke(format!(
-        "coordinator help outcome JSON not found in reply (first 200 chars: {})",
-        truncated.chars().take(200).collect::<String>()
-    )))
+    extract_capped(assistant_text, try_parse_outcome).ok_or_else(|| {
+        // Cold path only: re-cap the (same) view to build the preview.
+        let truncated =
+            crate::text::truncate_to_char_boundary(assistant_text, HELP_REQUEST_SCAN_CAP);
+        AppError::SwarmInvoke(format!(
+            "coordinator help outcome JSON not found in reply (first 200 chars: {})",
+            truncated.chars().take(200).collect::<String>()
+        ))
+    })
 }
 
 /// Helper: inner parse step that interprets a candidate JSON
@@ -156,61 +158,8 @@ fn try_parse_outcome(s: &str) -> Option<CoordinatorHelpOutcome> {
     serde_json::from_str::<CoordinatorHelpOutcome>(s).ok()
 }
 
-/// Strip the FIRST ```json ... ``` (or ```...```) fence in `s` and
-/// return the inner contents. Returns None when no fence is
-/// present.
-fn strip_fence(s: &str) -> Option<&str> {
-    let start_idx = s.find("```")?;
-    let after_open = &s[start_idx + 3..];
-    let after_lang = match after_open.find('\n') {
-        Some(n) => &after_open[n + 1..],
-        None => after_open,
-    };
-    let close_idx = after_lang.find("```")?;
-    Some(&after_lang[..close_idx])
-}
-
-/// Walk `s` and return the FIRST balanced `{...}` substring (count
-/// braces, account for strings). Returns None when no balanced
-/// object is found.
-fn first_balanced_object(s: &str) -> Option<&str> {
-    let bytes = s.as_bytes();
-    let mut start: Option<usize> = None;
-    let mut depth: i32 = 0;
-    let mut in_string = false;
-    let mut escape = false;
-    for (i, &b) in bytes.iter().enumerate() {
-        if in_string {
-            if escape {
-                escape = false;
-            } else if b == b'\\' {
-                escape = true;
-            } else if b == b'"' {
-                in_string = false;
-            }
-            continue;
-        }
-        match b {
-            b'"' => in_string = true,
-            b'{' => {
-                if start.is_none() {
-                    start = Some(i);
-                }
-                depth += 1;
-            }
-            b'}' => {
-                depth -= 1;
-                if depth == 0 {
-                    if let Some(s_idx) = start {
-                        return std::str::from_utf8(&bytes[s_idx..=i]).ok();
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
+// Fence-strip + balanced-object scan live in `swarm::llm_json` —
+// the shared home of the 4-step extraction recipe.
 
 // WP-W5-06 — `process_help_request` and `format_help_message`
 // were the registry-level helpers the FSM (`RegistryTransport`)
@@ -284,6 +233,15 @@ mod tests {
         let _ = parse_help_request(&huge);
     }
 
+    #[test]
+    fn multibyte_char_straddling_scan_cap_does_not_panic() {
+        // 'ü' is 2 bytes: an odd-length ASCII prefix forces every later
+        // char to straddle even byte offsets, including the 16 KiB cap.
+        let huge = format!("x{}", "ü".repeat(32 * 1024));
+        let _ = parse_help_request(&huge);
+        let _ = parse_coordinator_help_outcome(&huge);
+    }
+
     // -- parse_coordinator_help_outcome --
 
     #[test]
@@ -340,25 +298,6 @@ mod tests {
         assert_eq!(err.kind(), "swarm_invoke");
     }
 
-    // -- helpers --
-
-    #[test]
-    fn strip_fence_extracts_inner_content() {
-        let s = "before\n```json\n{\"x\":1}\n```\nafter";
-        assert_eq!(strip_fence(s), Some("{\"x\":1}\n"));
-    }
-
-    #[test]
-    fn strip_fence_returns_none_without_fence() {
-        assert!(strip_fence("no fences here").is_none());
-    }
-
-    #[test]
-    fn first_balanced_object_handles_strings_with_braces() {
-        let s = r#"hi {"key": "value with } inside", "n": 1} bye"#;
-        assert_eq!(
-            first_balanced_object(s),
-            Some(r#"{"key": "value with } inside", "n": 1}"#)
-        );
-    }
+    // Fence/balanced-scan helper tests live in `swarm::llm_json`
+    // alongside the shared implementation.
 }

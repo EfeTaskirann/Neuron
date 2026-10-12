@@ -8,6 +8,7 @@
 //! / `swarm-term:lifecycle` events — not a command.
 
 use std::process::Stdio;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use specta::Type;
@@ -117,6 +118,30 @@ struct UpdateLogLine {
     line: String,
 }
 
+/// Pump one child pipe line-by-line: emit each line as a
+/// `swarm-term:update:log` event tagged with `stream` and accumulate the
+/// full text (trailing-newline per line) for the post-mortem tail. Spawned
+/// once per stream (stdout / stderr), which otherwise differ only in the tag.
+fn spawn_log_pump<R: Runtime>(
+    app: AppHandle<R>,
+    pipe: impl tokio::io::AsyncRead + Unpin + Send + 'static,
+    stream: &'static str,
+) -> tokio::task::JoinHandle<String> {
+    tokio::spawn(async move {
+        let mut buf = String::new();
+        let mut reader = BufReader::new(pipe).lines();
+        while let Ok(Some(line)) = reader.next_line().await {
+            let _ = app.emit(
+                UPDATE_LOG_EVENT,
+                UpdateLogLine { stream, line: line.clone() },
+            );
+            buf.push_str(&line);
+            buf.push('\n');
+        }
+        buf
+    })
+}
+
 fn tail_keep(buf: &str, limit: usize) -> String {
     if buf.len() <= limit {
         return buf.to_string();
@@ -128,6 +153,27 @@ fn tail_keep(buf: &str, limit: usize) -> String {
         i += 1;
     }
     buf[i..].to_string()
+}
+
+/// In-flight guard for [`swarm_term_run_update`]: two concurrent
+/// `npm install -g` runs corrupt the global claude install. The
+/// frontend disables the button on `isPending`, but a hung updater
+/// keeps the mutation pending across remounts — the backend is the
+/// authoritative gate.
+static UPDATE_IN_FLIGHT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Ceiling on the updater subprocess. npm installs finish in well
+/// under a minute on a healthy network; 10 min only catches a wedged
+/// npm/registry hang so the in-flight guard can't stay latched forever.
+const UPDATE_WAIT_BUDGET: Duration = Duration::from_secs(10 * 60);
+
+struct UpdateGuard;
+
+impl Drop for UpdateGuard {
+    fn drop(&mut self) {
+        UPDATE_IN_FLIGHT.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 /// Update the host's `claude` CLI to the latest version. Rejects while a
@@ -150,6 +196,13 @@ fn tail_keep(buf: &str, limit: usize) -> String {
 pub async fn swarm_term_run_update<R: Runtime>(
     app: AppHandle<R>,
 ) -> Result<ClaudeUpdateResult, AppError> {
+    if UPDATE_IN_FLIGHT.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return Err(AppError::Conflict(
+            "a claude update is already in progress".into(),
+        ));
+    }
+    let _guard = UpdateGuard;
+
     // Gate: refuse while a session is live — replacing the binary
     // mid-flight is exactly the failure mode the button exists to avoid.
     {
@@ -217,40 +270,24 @@ pub async fn swarm_term_run_update<R: Runtime>(
         .take()
         .ok_or_else(|| AppError::Internal("updater stderr pipe missing".into()))?;
 
-    let app_out = app.clone();
-    let stdout_task = tokio::spawn(async move {
-        let mut buf = String::new();
-        let mut reader = BufReader::new(stdout).lines();
-        while let Ok(Some(line)) = reader.next_line().await {
-            let _ = app_out.emit(
-                UPDATE_LOG_EVENT,
-                UpdateLogLine { stream: "stdout", line: line.clone() },
-            );
-            buf.push_str(&line);
-            buf.push('\n');
-        }
-        buf
-    });
+    let stdout_task = spawn_log_pump(app.clone(), stdout, "stdout");
+    let stderr_task = spawn_log_pump(app.clone(), stderr, "stderr");
 
-    let app_err = app.clone();
-    let stderr_task = tokio::spawn(async move {
-        let mut buf = String::new();
-        let mut reader = BufReader::new(stderr).lines();
-        while let Ok(Some(line)) = reader.next_line().await {
-            let _ = app_err.emit(
-                UPDATE_LOG_EVENT,
-                UpdateLogLine { stream: "stderr", line: line.clone() },
-            );
-            buf.push_str(&line);
-            buf.push('\n');
-        }
-        buf
-    });
-
-    let status = child
-        .wait()
+    let status = match tokio::time::timeout(UPDATE_WAIT_BUDGET, child.wait())
         .await
-        .map_err(|e| AppError::Internal(format!("wait updater: {e}")))?;
+    {
+        Ok(res) => res
+            .map_err(|e| AppError::Internal(format!("wait updater: {e}")))?,
+        Err(_) => {
+            // Kill the wedged updater so the next attempt starts clean
+            // (kill_on_drop is belt-and-suspenders for the kill failing).
+            let _ = child.kill().await;
+            return Err(AppError::Timeout(format!(
+                "claude updater did not finish within {}s",
+                UPDATE_WAIT_BUDGET.as_secs()
+            )));
+        }
+    };
 
     let stdout_full = stdout_task.await.unwrap_or_default();
     let stderr_full = stderr_task.await.unwrap_or_default();

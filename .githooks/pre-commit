@@ -1,0 +1,33 @@
+#!/bin/sh
+# Neuron pre-commit gate (T3-04/E2) — OPT-IN.
+#
+# Enable with:   git config core.hooksPath .githooks
+# Disable with:  git config --unset core.hooksPath
+# Skip once:     git commit --no-verify
+#
+# Runs the fast frontend gates on every commit; the Rust check is
+# skippable for quick doc-only commits via NEURON_SKIP_RUST_HOOK=1.
+
+set -e
+
+repo_root="$(git rev-parse --show-toplevel)"
+
+# Frontend gates only when app/ files are staged.
+if git diff --cached --name-only | grep -q '^app/'; then
+  echo "[pre-commit] tsc -b --noEmit"
+  (cd "$repo_root/app" && npm run --silent typecheck)
+  echo "[pre-commit] eslint --max-warnings=0"
+  (cd "$repo_root/app" && npm run --silent lint)
+fi
+
+# Rust gate only when src-tauri/ files are staged.
+if git diff --cached --name-only | grep -q '^src-tauri/'; then
+  if [ "${NEURON_SKIP_RUST_HOOK:-0}" = "1" ]; then
+    echo "[pre-commit] NEURON_SKIP_RUST_HOOK=1 — skipping cargo check"
+  else
+    echo "[pre-commit] cargo check --all-targets"
+    cargo check --manifest-path "$repo_root/src-tauri/Cargo.toml" --all-targets
+  fi
+fi
+
+exit 0

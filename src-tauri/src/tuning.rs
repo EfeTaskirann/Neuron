@@ -1,5 +1,5 @@
 //! Centralised tuning constants — one place to adjust timing,
-//! buffer sizes, and timeouts. See `tasks/refactor.md` §4 ("Magic
+//! buffer sizes, and timeouts. See `tasks/refactor-v1.md` §4 ("Magic
 //! timing/ölçek sabitlerinin dağınıklığı") for rationale.
 //!
 //! Constants used to live in their respective modules

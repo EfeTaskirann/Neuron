@@ -1,6 +1,16 @@
 /* Terminal-Hierarchy Swarm route. 3×3 grid of agent panes with a
-   header toolbar (project picker + launch button). Tokens come from
-   colors_and_type.css; spacing mirrors swarm.css. */
+   header toolbar (project readout + launch button). Tokens come from
+   colors_and_type.css / canvas.css; spacing mirrors swarm.css. */
+
+/* Lifecycle phase palette: semantic aliases over the shared status
+   tokens (canvas.css :root --syn-*). Chip/pill backgrounds mix these
+   against --background so contrast holds in dark themes. */
+:root {
+  --phase-assigned: var(--syn-info);
+  --phase-building: var(--syn-warning);
+  --phase-review:   var(--syn-running);
+  --phase-done:     var(--syn-success);
+}
 
 .route-swarm-term {
   display: flex;
@@ -22,29 +32,10 @@
   font-family: var(--font-mono, ui-monospace, monospace);
   font-size: 12px;
   font-variant-numeric: tabular-nums;
-  color: var(--fg-muted);
+  color: var(--muted-foreground);
   padding: 2px 8px;
-  border-left: 1px solid var(--border-subtle, rgba(255, 255, 255, 0.08));
+  border-left: 1px solid var(--border);
   margin-left: 4px;
-}
-
-.swarm-term-picker {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex: 1 1 auto;
-  min-width: 0;
-}
-
-.swarm-term-picker-path {
-  font-family: var(--font-mono, ui-monospace, monospace);
-  font-size: 12px;
-  color: var(--fg-muted);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  flex: 1 1 auto;
-  min-width: 0;
 }
 
 /* Project readout — replaces the inline picker after the App-level
@@ -60,14 +51,14 @@
 }
 .swarm-term-project-label {
   font-size: 11px;
-  color: var(--fg-muted);
+  color: var(--muted-foreground);
   text-transform: uppercase;
   letter-spacing: 0.06em;
 }
 .swarm-term-project-path {
   font-family: var(--font-mono, ui-monospace, monospace);
   font-size: 12px;
-  color: var(--fg-muted);
+  color: var(--muted-foreground);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -85,7 +76,7 @@
 }
 
 .swarm-term-pane {
-  background: var(--bg-elev);
+  background: var(--surface-1);
   border: 1px solid var(--border);
   border-radius: 8px;
   display: flex;
@@ -101,7 +92,7 @@
   gap: 8px;
   padding: 8px 12px;
   border-bottom: 1px solid var(--border);
-  background: var(--bg);
+  background: var(--background);
 }
 
 .swarm-term-pane-id {
@@ -113,7 +104,7 @@
 
 .swarm-term-pane-role {
   font-size: 11px;
-  color: var(--fg-muted);
+  color: var(--muted-foreground);
   flex: 1 1 auto;
 }
 
@@ -127,13 +118,13 @@
   padding: 2px 6px;
   font-size: 13px;
   line-height: 1;
-  color: var(--fg-muted);
+  color: var(--muted-foreground);
   cursor: pointer;
 }
 .swarm-term-pane-expand:hover {
   color: var(--accent);
   border-color: var(--border);
-  background: var(--bg-elev);
+  background: var(--surface-1);
 }
 .swarm-term-pane.expanded .swarm-term-pane-expand {
   color: var(--accent);
@@ -166,9 +157,9 @@
   align-items: center;
   justify-content: center;
   font-size: 12px;
-  color: var(--fg-muted);
+  color: var(--muted-foreground);
   font-style: italic;
-  background: var(--bg-elev);
+  background: var(--surface-1);
 }
 
 .swarm-term-xterm {
@@ -184,8 +175,8 @@
 }
 
 .swarm-term-error {
-  background: var(--err-bg, color-mix(in oklab, var(--bg-elev) 80%, #e07070));
-  color: var(--fg);
+  background: color-mix(in oklab, var(--surface-1) 80%, var(--destructive));
+  color: var(--foreground);
   padding: 8px 12px;
   border-radius: 6px;
   font-size: 12px;
@@ -201,10 +192,10 @@
 .swarm-term-chat input {
   flex: 1 1 auto;
   padding: 8px 12px;
-  background: var(--bg-elev);
+  background: var(--surface-1);
   border: 1px solid var(--border);
   border-radius: 6px;
-  color: var(--fg);
+  color: var(--foreground);
   font-size: 13px;
   font-family: var(--font-mono, ui-monospace, monospace);
 }
@@ -242,7 +233,7 @@
   align-items: stretch;
   gap: 10px;
   padding: 8px 10px;
-  background: var(--bg-elev);
+  background: var(--surface-1);
   border: 1px solid var(--border);
   border-radius: 8px;
   flex-wrap: wrap;
@@ -265,7 +256,7 @@
   font-weight: 600;
   letter-spacing: 0.08em;
   text-transform: uppercase;
-  color: var(--fg-muted);
+  color: var(--muted-foreground);
 }
 
 .swarm-term-hier-row {
@@ -287,8 +278,8 @@
   font-family: var(--font-mono, ui-monospace, monospace);
   font-size: 11px;
   line-height: 1;
-  color: var(--fg);
-  background: var(--bg);
+  color: var(--foreground);
+  background: var(--background);
   border: 1px solid var(--border);
   transition:
     background 180ms ease,
@@ -312,20 +303,20 @@
  * to maintain ≥4.5:1 against the text colour the theme already
  * shipped. */
 .swarm-term-hier-chip[data-phase='assigned'] {
-  background: color-mix(in oklab, var(--bg) 75%, #5a9cff);
-  border-color: color-mix(in oklab, var(--border) 50%, #5a9cff);
+  background: color-mix(in oklab, var(--background) 75%, var(--phase-assigned));
+  border-color: color-mix(in oklab, var(--border) 50%, var(--phase-assigned));
 }
 .swarm-term-hier-chip[data-phase='building'] {
-  background: color-mix(in oklab, var(--bg) 72%, #d6a85a);
-  border-color: color-mix(in oklab, var(--border) 50%, #d6a85a);
+  background: color-mix(in oklab, var(--background) 72%, var(--phase-building));
+  border-color: color-mix(in oklab, var(--border) 50%, var(--phase-building));
 }
 .swarm-term-hier-chip[data-phase='review'] {
-  background: color-mix(in oklab, var(--bg) 72%, #c87fd9);
-  border-color: color-mix(in oklab, var(--border) 50%, #c87fd9);
+  background: color-mix(in oklab, var(--background) 72%, var(--phase-review));
+  border-color: color-mix(in oklab, var(--border) 50%, var(--phase-review));
 }
 .swarm-term-hier-chip[data-phase='done'] {
-  background: color-mix(in oklab, var(--bg) 72%, #5ec77f);
-  border-color: color-mix(in oklab, var(--border) 50%, #5ec77f);
+  background: color-mix(in oklab, var(--background) 72%, var(--phase-done));
+  border-color: color-mix(in oklab, var(--border) 50%, var(--phase-done));
 }
 
 /* Active edge: source and target both glow with a pulsing outline
@@ -377,32 +368,32 @@
   padding: 2px 7px;
   border-radius: 999px;
   border: 1px solid var(--border);
-  background: var(--bg-elev);
-  color: var(--fg-muted);
+  background: var(--surface-1);
+  color: var(--muted-foreground);
   flex: 0 0 auto;
 }
 .swarm-term-pane-phase--idle {
-  color: var(--fg-muted);
+  color: var(--muted-foreground);
 }
 .swarm-term-pane-phase--assigned {
-  background: color-mix(in oklab, var(--bg) 70%, #5a9cff);
-  border-color: color-mix(in oklab, var(--border) 40%, #5a9cff);
-  color: var(--fg);
+  background: color-mix(in oklab, var(--background) 70%, var(--phase-assigned));
+  border-color: color-mix(in oklab, var(--border) 40%, var(--phase-assigned));
+  color: var(--foreground);
 }
 .swarm-term-pane-phase--building {
-  background: color-mix(in oklab, var(--bg) 70%, #d6a85a);
-  border-color: color-mix(in oklab, var(--border) 40%, #d6a85a);
-  color: var(--fg);
+  background: color-mix(in oklab, var(--background) 70%, var(--phase-building));
+  border-color: color-mix(in oklab, var(--border) 40%, var(--phase-building));
+  color: var(--foreground);
 }
 .swarm-term-pane-phase--review {
-  background: color-mix(in oklab, var(--bg) 70%, #c87fd9);
-  border-color: color-mix(in oklab, var(--border) 40%, #c87fd9);
-  color: var(--fg);
+  background: color-mix(in oklab, var(--background) 70%, var(--phase-review));
+  border-color: color-mix(in oklab, var(--border) 40%, var(--phase-review));
+  color: var(--foreground);
 }
 .swarm-term-pane-phase--done {
-  background: color-mix(in oklab, var(--bg) 70%, #5ec77f);
-  border-color: color-mix(in oklab, var(--border) 40%, #5ec77f);
-  color: var(--fg);
+  background: color-mix(in oklab, var(--background) 70%, var(--phase-done));
+  border-color: color-mix(in oklab, var(--border) 40%, var(--phase-done));
+  color: var(--foreground);
 }
 
 /* Active pane outline — visually reinforces the hierarchy chip glow
@@ -423,7 +414,9 @@
 .swarm-term-pane:focus-visible {
   outline: 3px solid var(--accent);
   outline-offset: 2px;
-  box-shadow: 0 0 0 1px #000;
+  /* inner separator stroke: --background reads dark in dark mode and
+     as a white gap ring in light mode — both keep ≥3:1 vs the accent */
+  box-shadow: 0 0 0 1px var(--background);
 }
 
 /* ── Run-autonomously toggle (chat toolbar) ────────────────────────
@@ -455,7 +448,7 @@
   width: 34px;
   height: 18px;
   border-radius: 999px;
-  background: color-mix(in oklab, var(--bg) 70%, var(--fg-muted));
+  background: color-mix(in oklab, var(--background) 70%, var(--muted-foreground));
   border: 1px solid var(--border);
   transition: background 180ms ease;
   flex: 0 0 auto;
@@ -467,7 +460,7 @@
   width: 14px;
   height: 14px;
   border-radius: 50%;
-  background: var(--fg);
+  background: var(--foreground);
   transition: transform 180ms ease;
 }
 .swarm-term-auto-toggle
@@ -487,11 +480,13 @@
   ~ .swarm-term-auto-toggle-track {
   outline: 3px solid var(--accent);
   outline-offset: 2px;
-  box-shadow: 0 0 0 1px #000;
+  /* inner separator stroke: --background reads dark in dark mode and
+     as a white gap ring in light mode — both keep ≥3:1 vs the accent */
+  box-shadow: 0 0 0 1px var(--background);
 }
 .swarm-term-auto-toggle-label {
   font-size: 12px;
-  color: var(--fg);
+  color: var(--foreground);
 }
 
 /* AUTO chip — visible while autonomous mode is ON so the operator
@@ -504,9 +499,9 @@
   letter-spacing: 0.1em;
   padding: 2px 8px;
   border-radius: 999px;
-  background: color-mix(in oklab, var(--bg) 50%, var(--accent));
+  background: color-mix(in oklab, var(--background) 50%, var(--accent));
   border: 1px solid var(--accent);
-  color: var(--fg);
+  color: var(--foreground);
   flex: 0 0 auto;
 }
 
@@ -543,15 +538,16 @@ body[data-swarm-autonomous='1'] [data-suppress-when-autonomous] {
 .swarm-term-update-status {
   font-size: 13px;
   font-weight: 500;
-  color: var(--muted, #a4a4a4);
+  /* --muted is a SURFACE token — as a text color it was dark-on-dark */
+  color: var(--muted-foreground);
 }
 
 .swarm-term-update-status--ok {
-  color: var(--accent, #86efac);
+  color: var(--syn-success);
 }
 
 .swarm-term-update-status--err {
-  color: var(--danger, #fca5a5);
+  color: var(--destructive);
 }
 
 .swarm-term-update-corner .btn:disabled {
@@ -562,7 +558,7 @@ body[data-swarm-autonomous='1'] [data-suppress-when-autonomous] {
 .swarm-term-update-progress {
   font-family: var(--font-mono, ui-monospace, monospace);
   font-size: 12px;
-  color: var(--muted, #888);
+  color: var(--muted-foreground);
   max-width: 50ch;
   white-space: nowrap;
   overflow: hidden;

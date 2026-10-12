@@ -41,7 +41,16 @@ export function SwarmJobList({
             key={job.id}
             className={`swarm-list-row${selectedJobId === job.id ? ' active' : ''}`}
             data-active={selectedJobId === job.id ? 'true' : undefined}
+            role="button"
+            tabIndex={0}
+            aria-current={selectedJobId === job.id ? 'true' : undefined}
             onClick={() => onSelect(job.id)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault();
+                onSelect(job.id);
+              }
+            }}
           >
             <div className="swarm-list-row-head">
               <span className={`pill ${pillClass(job.state)}`}>

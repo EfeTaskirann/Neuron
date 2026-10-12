@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, beforeEach } from 'vitest';
-import { render, screen, waitFor } from '@testing-library/react';
+import { render, screen, waitFor, fireEvent } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import type { ReactNode } from 'react';
 
@@ -64,5 +64,20 @@ describe('AgentsRoute', () => {
     renderRoute();
     await waitFor(() => expect(screen.getByText('New agent')).toBeInTheDocument());
     expect(screen.queryByText('Planner')).not.toBeInTheDocument();
+  });
+
+  it('duplicates an agent via agentsCreate with a "(copy)" name', async () => {
+    const { commands } = await import('../lib/bindings');
+    renderRoute();
+    await waitFor(() => expect(screen.getByText('Planner')).toBeInTheDocument());
+    fireEvent.click(screen.getByRole('button', { name: /duplicate/i }));
+    await waitFor(() =>
+      expect(commands.agentsCreate).toHaveBeenCalledWith({
+        name: 'Planner (copy)',
+        model: 'gpt-4o',
+        temp: 0.2,
+        role: 'Plans the day',
+      }),
+    );
   });
 });

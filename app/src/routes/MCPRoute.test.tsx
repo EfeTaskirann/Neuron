@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, beforeEach } from 'vitest';
-import { render, screen, waitFor } from '@testing-library/react';
+import { render, screen, waitFor, fireEvent } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import type { ReactNode } from 'react';
 
@@ -85,5 +85,28 @@ describe('MCPRoute', () => {
     await waitFor(() =>
       expect(screen.getByPlaceholderText(/search 0 servers/i)).toBeInTheDocument(),
     );
+  });
+
+  it('filters the catalog by the search box', async () => {
+    renderRoute();
+    await waitFor(() => expect(screen.getByText('Git')).toBeInTheDocument());
+    fireEvent.change(screen.getByPlaceholderText(/search 2 servers/i), {
+      target: { value: 'git' },
+    });
+    expect(screen.getByText('Git')).toBeInTheDocument();
+    // Filesystem (featured, no "git" in name/desc/by) drops from both the
+    // featured strip and the list.
+    expect(screen.queryByText('Filesystem')).not.toBeInTheDocument();
+  });
+
+  it('filters the catalog by the official chip', async () => {
+    renderRoute();
+    await waitFor(() => expect(screen.getByText('Git')).toBeInTheDocument());
+    // Filesystem is featured (official); Git is not. ('installed' would
+    // collide with a server's installed/uninstall pill button, so we
+    // assert the chip filter via the unambiguous 'official' chip.)
+    fireEvent.click(screen.getByRole('button', { name: 'official' }));
+    expect(screen.getAllByText('Filesystem').length).toBeGreaterThanOrEqual(1);
+    expect(screen.queryByText('Git')).not.toBeInTheDocument();
   });
 });

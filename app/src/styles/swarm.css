@@ -24,7 +24,7 @@
 
 .swarm-view-seg button[aria-pressed="true"] {
   background: var(--accent);
-  color: var(--bg);
+  color: var(--background);
 }
 
 /* Recent-jobs view inherits the original two-pane grid. Wrapped in
@@ -171,13 +171,13 @@
 }
 
 .agent-pane-cost {
-  color: var(--fg);
+  color: var(--foreground);
 }
 .agent-pane-foot-sep {
-  color: var(--muted);
+  color: var(--muted-foreground);
 }
 .agent-pane-activity {
-  color: var(--muted);
+  color: var(--muted-foreground);
 }
 
 /* Event bubbles — distinct per-kind so the eye can scan a
@@ -504,45 +504,6 @@
     opacity: 1;
     transform: scale(1);
   }
-}
-
-/* ---------- Goal-input form ---------- */
-
-.swarm-goal-form {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  padding: 12px;
-  border-bottom: 1px solid var(--border);
-}
-
-.swarm-goal-input {
-  width: 100%;
-  resize: vertical;
-  min-height: 64px;
-  padding: 8px 10px;
-  font-family: var(--font-sans);
-  font-size: 13px;
-  line-height: 1.4;
-  color: var(--foreground);
-  background: var(--background);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  outline: none;
-}
-
-.swarm-goal-input:focus {
-  border-color: color-mix(in oklch, var(--neuron-violet-500) 45%, var(--border));
-}
-
-.swarm-goal-input:disabled {
-  opacity: 0.6;
-  cursor: not-allowed;
-}
-
-.swarm-goal-actions {
-  display: flex;
-  justify-content: flex-end;
 }
 
 /* ---------- Recent-jobs list ---------- */

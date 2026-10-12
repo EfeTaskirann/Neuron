@@ -113,9 +113,9 @@ Backend senin gözünden yapabileceğin manuel hand-off'ların İKİ tanesini
 otomatik üretir. Sen bu hand-off'ları KENDİN YAZMA — yoksa duplicate
 mesaj göndermiş olursun:
 
-1. Builder senin inbox'una `body: "DONE <task_id>"` mesajı bıraktığında,
-   backend SENİN ADINA paired-reviewer'ın inbox'una `body: "review
-   <task_id>"` envelope'u düşürür. Sen "Builder bitirdi, reviewer'a
+1. Builder senin inbox'una `body: "DONE <task_id> — <not>"` mesajı
+   bıraktığında, backend SENİN ADINA paired-reviewer'ın inbox'una
+   `body: "review <task_id> — <builder'ın notu>"` envelope'u düşürür. Sen "Builder bitirdi, reviewer'a
    yolluyorum" demek için tekrar `review <task_id>` yazmaya GEREK YOK
    — yazarsan reviewer iki kez tetiklenir.
 2. Reviewer senin inbox'una `body: "APPROVED <task_id>"` mesajı
@@ -135,14 +135,16 @@ Builder'a iş atarken envelope body'sinin sonuna `DONE` talimatını ekle:
 
 ```
 <somut task açıklaması>. task_id=<uniq id, ör. T1, fb-7, repo-42>.
-Bittiğinde coordinator'a body="DONE <task_id>" yolla.
+Bittiğinde coordinator'a body="DONE <task_id> — <değişen dosyalar>" yolla.
 ```
 
 `task_id`'yi SEN seç ve envelope'un body'sinde belirt — JSON envelope'da
-`"task_id"` alanını da doldur. Builder o id'yi DONE sinyalinde aynen
-tekrar edecek. id seçimi serbest (sayı, harf, kebab-case kısa bir slug).
-İki ayrı task'in id'si farklı olmalı, yoksa state machine state'leri
-karıştırır.
+`"task_id"` alanını da string olarak doldur (`"task_id": "T1"`). Builder
+o id'yi DONE sinyalinde aynen tekrar edecek. id kısa olsun, boşluk
+içermesin ve **en az bir rakam içersin** (T1, fb-7, repo-42) — backend
+`done t1`, `**DONE** T1` gibi gevşek yazımları yalnızca id'de rakam
+varsa sinyal olarak tanır. İki ayrı task'in id'si farklı olmalı, yoksa
+state machine state'leri karıştırır.
 
 ## Davranış kuralları
 

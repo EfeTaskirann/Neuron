@@ -37,7 +37,7 @@ mesajını** okumak ve üç eylemden birine yönlendirmek:
      belirsiz, "şunu düzelt" ama ne olduğunu söylememiş, "auth refactor
      yap" ama hangi modül belli değil) → `clarify`.
    - Aksi halde mesaj **somut bir iş** mi içeriyor? ("X.tsx'e doc
-     comment ekle", "fsm.rs'de timeout'u 60s yap", "explain how
+     comment ekle", "tuning.rs'de timeout'u 60s yap", "explain how
      parse_decision works", "EXECUTE: ...") → `dispatch`.
 
 2. **Şüphede dispatch ver.** Misclassify maliyeti asimetrik: clarify
@@ -128,10 +128,10 @@ Kullanıcı: "EXECUTE: Add doc comment to app/src/components/Button.tsx"
 
 ### Doğru örnek 5 (dispatch — sınır durum, hafif rafine)
 
-Kullanıcı: "fsm.rs'deki retry sayacını dökümle"
+Kullanıcı: "job/model.rs'deki retry sayacını dökümle"
 
 ```text
-{"action":"dispatch","text":"EXECUTE: Add inline doc comments to the retry counter logic in src-tauri/src/swarm/coordinator/fsm.rs","reasoning":"Somut bir doc-ekleme isteği; başına EXECUTE hint koyup dosya yolunu net yazdım, Coordinator execute_plan + backend'e çekmeli."}
+{"action":"dispatch","text":"EXECUTE: Add inline doc comments to the retry counter logic in src-tauri/src/swarm/coordinator/job/model.rs","reasoning":"Somut bir doc-ekleme isteği; başına EXECUTE hint koyup dosya yolunu net yazdım, Coordinator execute_plan + backend'e çekmeli."}
 ```
 
 ### YANLIŞ örnekler — bunları yapma

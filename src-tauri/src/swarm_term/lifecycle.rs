@@ -1,7 +1,7 @@
 //! Task-lifecycle state machine driving the autonomy contract.
 //!
 //! Per-task state tracking keyed by `(source_pane_id, task_id)`. The
-//! bridge watcher's [`crate::swarm_term::bridge::lifecycle_synthesise`]
+//! bridge watcher's [`crate::swarm_term::bridge::synth::lifecycle_synthesise`]
 //! consults this module on every coordinator-bound delivery so the
 //! swarm can advance through the goal-cycle without requesting human
 //! approval at any intermediate step:
@@ -23,6 +23,7 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use crate::swarm_term::hierarchy::{
     is_allowed, is_builder, is_reviewer, reviewer_for_builder,
@@ -104,74 +105,228 @@ pub struct Transition {
     pub task_id: String,
 }
 
-/// Pure: extract a [`Transition`] from a routed envelope body. Returns
-/// `None` if the body doesn't start with one of the four lifecycle
-/// prefixes or if the post-prefix tail has no first whitespace-
-/// delimited token to use as the task id.
-///
-/// The body is trimmed before prefix-matching, so leading whitespace
-/// in the envelope body does not defeat the match. Anything after the
-/// task id
-/// (extra notes the agent appended) is discarded — the synthesised
-/// follow-up route uses ONLY the id, keeping the routed body short
-/// and stable.
-pub fn parse_lifecycle_token(body: &str) -> Option<Transition> {
-    let body = body.trim();
-    for (prefix, kind) in [
-        (BUILDING_PREFIX, TransitionKind::Building),
-        (DONE_PREFIX, TransitionKind::Done),
-        (APPROVED_PREFIX, TransitionKind::Approved),
-        (CHANGES_NEEDED_PREFIX, TransitionKind::ChangesNeeded),
-    ] {
-        if let Some(rest) = body.strip_prefix(prefix) {
-            let task_id = rest.split_whitespace().next()?;
-            if task_id.is_empty() {
-                return None;
-            }
-            return Some(Transition {
-                kind,
-                task_id: task_id.to_string(),
-            });
+/// Hard cap on a lifecycle task id (VAL-01). A single routed body
+/// cannot grow the store's key arbitrarily — legitimate ids are short
+/// ULIDs / integers, so 128 chars is far above any real id.
+const MAX_TASK_ID_LEN: usize = 128;
+
+/// Soft cap on distinct tracked lifecycle entries (VAL-01). When
+/// exceeded, `record` evicts terminal-state entries (Approved / Failed
+/// / Done) — they only drive a brief UI badge — to bound memory over a
+/// long session that sees many unique task ids.
+const MAX_LIFECYCLE_ENTRIES: usize = 2048;
+
+/// Cap on the free-text note carried from a builder's `DONE` /
+/// reviewer's `APPROVED` body into the synthesised follow-up, so the
+/// reviewer learns WHAT changed without one body flooding a pane.
+const MAX_FOLLOWUP_NOTE_CHARS: usize = 1500;
+
+/// Keyword spellings, matched case-insensitively on the lenient path.
+/// The canonical form of each kind is its `*_PREFIX` constant (see
+/// [`canonical_prefix`]).
+const KEYWORDS: &[(&str, TransitionKind)] = &[
+    ("BUILDING", TransitionKind::Building),
+    ("DONE", TransitionKind::Done),
+    ("APPROVED", TransitionKind::Approved),
+    ("CHANGES_NEEDED", TransitionKind::ChangesNeeded),
+    ("CHANGES-NEEDED", TransitionKind::ChangesNeeded),
+    ("CHANGES NEEDED", TransitionKind::ChangesNeeded),
+];
+
+/// Leading decoration agents wrap a token in (`**DONE** T4`,
+/// `` `DONE` T4 ``, `> DONE T4`), stripped before keyword matching.
+fn is_decoration(c: char) -> bool {
+    c.is_whitespace() || matches!(c, '*' | '_' | '`' | '#' | '>' | '~')
+}
+
+/// Separators between the keyword and the id (`DONE: T3`,
+/// `DONE — T3`, the closing `**` of `**DONE**`).
+fn is_separator(c: char) -> bool {
+    c.is_whitespace()
+        || matches!(c, ':' | '-' | '—' | '–' | '=' | '*' | '_' | '`' | '~')
+}
+
+/// Punctuation trimmed off both ends of an id token (`T5.`, `` `T5` ``).
+fn is_id_trim(c: char) -> bool {
+    matches!(
+        c,
+        '*' | '_' | '`' | ',' | '.' | ':' | ';' | '(' | ')' | '[' | ']' | '"' | '\''
+    )
+}
+
+fn has_digit(s: &str) -> bool {
+    s.bytes().any(|b| b.is_ascii_digit())
+}
+
+/// A body's leading lifecycle keyword. `canonical` is true for the
+/// exact persona-taught form (`DONE <id>`: upper-case, undecorated,
+/// one space) — the only form whose id may be digit-free.
+struct Head<'a> {
+    kind: TransitionKind,
+    canonical: bool,
+    rest: &'a str,
+}
+
+fn split_head(body: &str) -> Option<Head<'_>> {
+    let trimmed = body.trim();
+    let head = trimmed.trim_start_matches(is_decoration);
+    for &(kw, kind) in KEYWORDS {
+        let Some(cand) = head.get(..kw.len()) else {
+            continue;
+        };
+        if !cand.eq_ignore_ascii_case(kw) {
+            continue;
         }
+        let rest = &head[kw.len()..];
+        // Word boundary: `DONEX` / `Donation` are not the keyword.
+        if rest.chars().next().is_some_and(char::is_alphanumeric) {
+            continue;
+        }
+        let canonical = trimmed.starts_with(canonical_prefix(kind));
+        return Some(Head { kind, canonical, rest });
     }
     None
 }
 
-/// Like [`parse_lifecycle_token`] but falls back to the structured
-/// `Envelope.task_id` field when the body carries a bare lifecycle
-/// keyword (e.g. `body: "DONE"`, `task_id: "42"`) with no inline id.
+fn canonical_prefix(kind: TransitionKind) -> &'static str {
+    match kind {
+        TransitionKind::Building => BUILDING_PREFIX,
+        TransitionKind::Done => DONE_PREFIX,
+        TransitionKind::Approved => APPROVED_PREFIX,
+        TransitionKind::ChangesNeeded => CHANGES_NEEDED_PREFIX,
+    }
+}
+
+fn inline_id(rest: &str) -> Option<&str> {
+    let tok = rest
+        .trim_start_matches(is_separator)
+        .split_whitespace()
+        .next()?
+        .trim_matches(is_id_trim);
+    (!tok.is_empty() && tok.len() <= MAX_TASK_ID_LEN).then_some(tok)
+}
+
+/// True when the text right after the keyword reads as "end of signal"
+/// (`DONE`, `DONE — note`, `**DONE**.`) rather than prose that merely
+/// starts with the word (`Done reading the file`).
+fn ends_signal(rest: &str) -> bool {
+    let r = rest.trim_start();
+    r.is_empty()
+        || r.starts_with(|c: char| {
+            matches!(c, ':' | '-' | '—' | '–' | '=' | '*' | '`' | '_' | '~' | '.' | '!')
+        })
+}
+
+/// Pure: extract a [`Transition`] from a routed envelope body. Returns
+/// `None` if the body doesn't start with one of the four lifecycle
+/// keywords or no usable task id follows it.
 ///
-/// The primary path — id embedded in the body (`"DONE 42"`) — is tried
-/// first and is unchanged. The fallback exists because the persona
-/// footer teaches agents to populate BOTH the body token and the
-/// envelope's `task_id`; without honouring `task_id`, an agent that
-/// filled only the structured field would silently fail to fan out
-/// (prefix matched, but the id was dropped).
+/// Matching is lenient about the shapes LLM senders actually produce:
+/// case (`Done T5`), leading markdown (`**DONE** T4`), and separators
+/// (`DONE: T3`, `DONE — T3`). To keep prose like `done so far` from
+/// firing a review, a NON-canonical match only counts when its id
+/// contains a digit (every persona-taught id does: `T1`, `fb-7`, `42`).
+/// Anything after the task id (extra notes) is ignored here — see
+/// [`lifecycle_note`]. Equivalent to
+/// [`parse_lifecycle_token_with_fallback`] without an envelope id.
+pub fn parse_lifecycle_token(body: &str) -> Option<Transition> {
+    parse_lifecycle_token_with_fallback(body, None)
+}
+
+/// Like [`parse_lifecycle_token`] but also consults the structured
+/// `Envelope.task_id` field:
+///
+///   * bare / punctuated keyword (`"DONE"`, `"DONE — implemented X"`)
+///     with no usable inline id → the envelope's `task_id` is the id;
+///   * an inline "id" that is a plain word (`"DONE implemented X"`) is
+///     overridden by the envelope's `task_id`;
+///   * a real inline id (`"DONE 99"`) wins over the field.
+///
+/// The fallback exists because the persona footer teaches agents to
+/// populate BOTH the body token and the envelope's `task_id`; without
+/// honouring `task_id`, an agent that filled only the structured field
+/// would silently fail to fan out.
 pub fn parse_lifecycle_token_with_fallback(
     body: &str,
     fallback_task_id: Option<&str>,
 ) -> Option<Transition> {
-    if let Some(t) = parse_lifecycle_token(body) {
-        return Some(t);
-    }
-    let id = fallback_task_id
+    let fallback = fallback_task_id
         .map(str::trim)
-        .filter(|s| !s.is_empty())?;
-    let trimmed = body.trim();
-    for (prefix, kind) in [
-        (BUILDING_PREFIX, TransitionKind::Building),
-        (DONE_PREFIX, TransitionKind::Done),
-        (APPROVED_PREFIX, TransitionKind::Approved),
-        (CHANGES_NEEDED_PREFIX, TransitionKind::ChangesNeeded),
-    ] {
-        if trimmed == prefix.trim_end() {
-            return Some(Transition {
-                kind,
-                task_id: id.to_string(),
-            });
+        .filter(|s| !s.is_empty() && s.len() <= MAX_TASK_ID_LEN);
+    let head = split_head(body)?;
+    let inline = inline_id(head.rest)
+        .filter(|id| head.canonical || has_digit(id) || Some(*id) == fallback);
+    let task_id = match (inline, fallback) {
+        (Some(id), Some(fb)) if !has_digit(id) => fb,
+        (Some(id), _) => id,
+        (None, Some(fb)) if ends_signal(head.rest) => fb,
+        _ => return None,
+    };
+    Some(Transition {
+        kind: head.kind,
+        task_id: task_id.to_string(),
+    })
+}
+
+/// Pure: the free-text note following the keyword + id of a lifecycle
+/// body (`"DONE T1 — auth.rs: token refresh eklendi"` →
+/// `"auth.rs: token refresh eklendi"`), or `None` when there is none.
+/// Carried into the synthesised follow-up so the reviewer knows what to
+/// look at instead of receiving a bare `review T1`.
+pub fn lifecycle_note(body: &str, task_id: &str) -> Option<String> {
+    let head = split_head(body)?;
+    let mut rest = head.rest.trim_start_matches(is_separator);
+    if let Some(first) = rest.split_whitespace().next() {
+        if first.trim_matches(is_id_trim) == task_id {
+            rest = &rest[first.len()..];
         }
     }
-    None
+    let note = rest
+        .trim_start_matches(|c| is_separator(c) || matches!(c, '.' | ',' | ';'))
+        .trim();
+    if note.is_empty() {
+        return None;
+    }
+    let capped = crate::text::truncate_chars(note, MAX_FOLLOWUP_NOTE_CHARS);
+    Some(if capped.len() < note.len() {
+        format!("{capped}…")
+    } else {
+        capped
+    })
+}
+
+/// Pure: true when a body is the 4-state contract's failure report
+/// (`hata — <sebep>`, any case / leading markdown). Paired with the
+/// envelope's `task_id` it closes that task (see
+/// [`LifecycleStore::abandon`]).
+pub fn is_error_report(body: &str) -> bool {
+    let head = body.trim().trim_start_matches(is_decoration);
+    head.get(..4).is_some_and(|w| w.eq_ignore_ascii_case("hata"))
+        && !head[4..].chars().next().is_some_and(char::is_alphanumeric)
+}
+
+/// Pure: true when a coordinator-bound body LOOKS like a lifecycle
+/// signal (starts with `done` / `approved` / `changes needed` / …, or —
+/// when the envelope carries a `task_id` — the Turkish completion word
+/// `tamam`) but [`parse_lifecycle_token_with_fallback`] rejected it.
+/// The bridge uses this to tell the sender its signal was NOT acted
+/// on, instead of the chain silently stalling.
+pub fn looks_like_unparsed_signal(body: &str, has_task_id: bool) -> bool {
+    let head: String = body
+        .trim()
+        .trim_start_matches(is_decoration)
+        .chars()
+        .take(24)
+        .collect::<String>()
+        .to_lowercase();
+    // Every recognised keyword spelling (from KEYWORDS — the single
+    // source), plus near-misses that are not keywords themselves.
+    const EXTRA_HINTS: &[&str] = &["approve", "lgtm"];
+    KEYWORDS
+        .iter()
+        .any(|(kw, _)| head.starts_with(&kw.to_ascii_lowercase()))
+        || EXTRA_HINTS.iter().any(|h| head.starts_with(h))
+        || (has_task_id && (head.starts_with("tamam") || head.starts_with("onay")))
 }
 
 /// Pure: derive the new lifecycle state after applying `transition`.
@@ -210,13 +365,43 @@ pub fn apply_transition(
 /// collisions.
 ///
 /// The store is owned by the session and read by the bridge watcher
-/// (`bridge::lifecycle_synthesise`) on each coordinator-bound delivery.
+/// (`bridge::synth::lifecycle_synthesise`) on each coordinator-bound delivery.
 /// Reads and writes are guarded by a single `Mutex` — the call rate is
 /// bounded by the route emit rate (~1 Hz worst case), so contention is
 /// not a concern.
+///
+/// Each entry also remembers WHEN it entered its state and how many
+/// stall reminders it has produced, so [`LifecycleStore::take_stalls`]
+/// can flag a task stuck in `Building` / `AwaitingReview`.
 #[derive(Default)]
 pub struct LifecycleStore {
-    inner: Mutex<HashMap<(String, String), LifecycleState>>,
+    inner: Mutex<HashMap<(String, String), Entry>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Entry {
+    state: LifecycleState,
+    since: Instant,
+    /// Highest stall level already reported for this stay in `state`.
+    reminders: u8,
+}
+
+impl Entry {
+    fn new(state: LifecycleState, now: Instant) -> Self {
+        Self { state, since: now, reminders: 0 }
+    }
+}
+
+/// One in-flight task that crossed a stall threshold — output of
+/// [`LifecycleStore::take_stalls`]. `level` is 1 at the threshold and 2
+/// at twice the threshold (escalation).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Stall {
+    pub source_pane: String,
+    pub task_id: String,
+    pub state: LifecycleState,
+    pub age: Duration,
+    pub level: u8,
 }
 
 impl LifecycleStore {
@@ -231,19 +416,148 @@ impl LifecycleStore {
         source_pane: &str,
         transition: &Transition,
     ) -> LifecycleState {
+        self.record_at(source_pane, transition, Instant::now())
+    }
+
+    fn record_at(
+        &self,
+        source_pane: &str,
+        transition: &Transition,
+        now: Instant,
+    ) -> LifecycleState {
         let key = (source_pane.to_string(), transition.task_id.clone());
+        // CONC-01: recover the guard on poison instead of panicking on
+        // this hot path. A poisoned lock only means some *other* holder
+        // panicked; the HashMap itself is intact, and this store is
+        // display-only (not load-bearing for message routing), so it is
+        // always safe to keep using it. `state_of`/`len`/`mark_done`
+        // already degrade gracefully — `record` was the lone panic.
         let mut g = self
             .inner
             .lock()
-            .expect("lifecycle store poisoned");
-        let prev = g.get(&key).copied();
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // VAL-01: bound memory over a long session. If we're at the cap
+        // and about to add a new key, evict terminal-state entries first
+        // (Approved / Failed / Done are closed; they only linger for a
+        // brief badge), keeping in-flight (Building / AwaitingReview).
+        if g.len() >= MAX_LIFECYCLE_ENTRIES && !g.contains_key(&key) {
+            g.retain(|_, e| {
+                !matches!(
+                    e.state,
+                    LifecycleState::Approved
+                        | LifecycleState::Failed
+                        | LifecycleState::Done
+                )
+            });
+        }
+        let prev = g.get(&key).map(|e| e.state);
         let next = apply_transition(prev, transition);
-        g.insert(key, next);
+        g.insert(key.clone(), Entry::new(next, now));
+        // A verdict is recorded under the REVIEWER's pane, but the task
+        // it judges sits under the builder's pane in `AwaitingReview`.
+        // Close that entry too — otherwise every reviewed task would
+        // look stalled forever.
+        let builder_next = match transition.kind {
+            TransitionKind::Approved => Some(LifecycleState::Done),
+            TransitionKind::ChangesNeeded => Some(LifecycleState::Failed),
+            TransitionKind::Building | TransitionKind::Done => None,
+        };
+        if let Some(builder_next) = builder_next {
+            for (k, e) in g.iter_mut() {
+                if k != &key
+                    && k.1 == transition.task_id
+                    && e.state == LifecycleState::AwaitingReview
+                {
+                    *e = Entry::new(builder_next, now);
+                }
+            }
+        }
         next
+    }
+
+    /// The responsible agent gave up on `task_id` (`hata — …` with the
+    /// envelope's `task_id`): mark the in-flight (`Building` /
+    /// `AwaitingReview`) entries for that task as `Failed`, so the stall
+    /// timer stops reminding / escalating a task already reported as
+    /// failed. Only entries under `closable_panes` are touched — the
+    /// reporter's own pane, plus (for a reviewer) the panes of the
+    /// builders it reviews — so an unrelated agent's `hata` about the
+    /// same id cannot end someone else's pending review. Never creates
+    /// entries. Returns whether anything closed.
+    pub fn abandon(&self, closable_panes: &[&str], task_id: &str) -> bool {
+        self.abandon_at(closable_panes, task_id, Instant::now())
+    }
+
+    fn abandon_at(&self, closable_panes: &[&str], task_id: &str, now: Instant) -> bool {
+        let Ok(mut g) = self.inner.lock() else {
+            return false;
+        };
+        let mut closed = false;
+        for ((pane, id), e) in g.iter_mut() {
+            let in_flight = matches!(
+                e.state,
+                LifecycleState::Building | LifecycleState::AwaitingReview
+            );
+            if id == task_id && in_flight && closable_panes.contains(&pane.as_str()) {
+                *e = Entry::new(LifecycleState::Failed, now);
+                closed = true;
+            }
+        }
+        closed
+    }
+
+    /// Report in-flight tasks that crossed a stall threshold since the
+    /// last call: `AwaitingReview` older than `review_after`, `Building`
+    /// older than `build_after`. Each entry reports level 1 once at the
+    /// threshold and level 2 once at twice the threshold; a new
+    /// transition resets the clock.
+    pub fn take_stalls(
+        &self,
+        now: Instant,
+        review_after: Duration,
+        build_after: Duration,
+    ) -> Vec<Stall> {
+        let Ok(mut g) = self.inner.lock() else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for ((pane, task_id), e) in g.iter_mut() {
+            let threshold = match e.state {
+                LifecycleState::AwaitingReview => review_after,
+                LifecycleState::Building => build_after,
+                _ => continue,
+            };
+            let age = now.saturating_duration_since(e.since);
+            let level: u8 = if age >= threshold * 2 {
+                2
+            } else if age >= threshold {
+                1
+            } else {
+                0
+            };
+            if level > e.reminders {
+                e.reminders = level;
+                out.push(Stall {
+                    source_pane: pane.clone(),
+                    task_id: task_id.clone(),
+                    state: e.state,
+                    age,
+                    level,
+                });
+            }
+        }
+        out.sort_by(|a, b| a.task_id.cmp(&b.task_id));
+        out
     }
 
     /// Look up the current state without mutating. Returns `None`
     /// for an unseen `(source_pane, task_id)` pair.
+    ///
+    /// Test seam: production consumers react to the
+    /// `swarm-term:lifecycle` event stream instead of polling the
+    /// store, so this accessor is gated to tests — ungate it if a
+    /// poll-style UI consumer ever appears.
+    #[cfg(test)]
     pub fn state_of(
         &self,
         source_pane: &str,
@@ -251,7 +565,7 @@ impl LifecycleStore {
     ) -> Option<LifecycleState> {
         let g = self.inner.lock().ok()?;
         g.get(&(source_pane.to_string(), task_id.to_string()))
-            .copied()
+            .map(|e| e.state)
     }
 
     /// Number of distinct `(source_pane, task_id)` entries currently
@@ -277,7 +591,7 @@ impl LifecycleStore {
     pub fn mark_done(&self, source_pane: &str, task_id: &str) {
         let key = (source_pane.to_string(), task_id.to_string());
         if let Ok(mut g) = self.inner.lock() {
-            g.insert(key, LifecycleState::Done);
+            g.insert(key, Entry::new(LifecycleState::Done, Instant::now()));
         }
     }
 }
@@ -455,12 +769,99 @@ mod tests {
             "review pending",
             "approval expected",
             "almost DONE 42", // prefix not at start (post-trim)
+            "Done reading the file",
+            "Donation 42",
+            "**done** with step one",
         ] {
             assert!(
                 parse_lifecycle_token(body).is_none(),
                 "body `{body}` must not parse as a lifecycle token"
             );
         }
+    }
+
+    #[test]
+    fn parses_decorated_and_mixed_case_tokens() {
+        // The exact shapes that silently failed in field testing (T3).
+        for (body, kind, id) in [
+            ("DONE: T3", TransitionKind::Done, "T3"),
+            ("**DONE** T4", TransitionKind::Done, "T4"),
+            ("Done T5", TransitionKind::Done, "T5"),
+            ("done — T6 auth.rs bitti", TransitionKind::Done, "T6"),
+            ("`APPROVED` fb-7.", TransitionKind::Approved, "fb-7"),
+            ("Changes needed: T8 — fix x", TransitionKind::ChangesNeeded, "T8"),
+            ("> BUILDING T9", TransitionKind::Building, "T9"),
+        ] {
+            let t = parse_lifecycle_token(body)
+                .unwrap_or_else(|| panic!("`{body}` must parse"));
+            assert_eq!(t.kind, kind, "kind for `{body}`");
+            assert_eq!(t.task_id, id, "id for `{body}`");
+        }
+    }
+
+    #[test]
+    fn canonical_form_still_accepts_digit_free_ids() {
+        let t = parse_lifecycle_token("DONE feat").unwrap();
+        assert_eq!(t.task_id, "feat");
+        // ...but the lenient form does not (prose guard).
+        assert!(parse_lifecycle_token("Done feat").is_none());
+    }
+
+    #[test]
+    fn fallback_uses_envelope_id_for_punctuated_bare_keyword() {
+        let t = parse_lifecycle_token_with_fallback(
+            "**DONE** — auth.rs refresh eklendi",
+            Some("T2"),
+        )
+        .unwrap();
+        assert_eq!(t.kind, TransitionKind::Done);
+        assert_eq!(t.task_id, "T2");
+        // A plain word in the id slot yields to the structured field.
+        let t = parse_lifecycle_token_with_fallback(
+            "DONE implemented the endpoint",
+            Some("T2"),
+        )
+        .unwrap();
+        assert_eq!(t.task_id, "T2");
+        // Prose that merely starts with the word does not fire.
+        assert!(
+            parse_lifecycle_token_with_fallback("Done reading, next up", Some("T2"))
+                .is_none()
+        );
+    }
+
+    // -- lifecycle_note / looks_like_unparsed_signal ----------------- //
+
+    #[test]
+    fn lifecycle_note_extracts_text_after_id() {
+        assert_eq!(
+            lifecycle_note("DONE T1 — auth.rs: refresh eklendi", "T1").as_deref(),
+            Some("auth.rs: refresh eklendi")
+        );
+        assert_eq!(
+            lifecycle_note("**DONE** — src/x.rs", "T1").as_deref(),
+            Some("src/x.rs")
+        );
+        assert_eq!(lifecycle_note("DONE T1", "T1"), None);
+        assert_eq!(lifecycle_note("DONE T1 —  ", "T1"), None);
+    }
+
+    #[test]
+    fn lifecycle_note_is_capped() {
+        let body = format!("DONE T1 — {}", "x".repeat(5000));
+        let note = lifecycle_note(&body, "T1").unwrap();
+        assert!(note.chars().count() <= MAX_FOLLOWUP_NOTE_CHARS + 1);
+    }
+
+    #[test]
+    fn unparsed_signal_detection() {
+        assert!(looks_like_unparsed_signal("DONE", false));
+        assert!(looks_like_unparsed_signal("**Done** with it", false));
+        assert!(looks_like_unparsed_signal("approve edildi", false));
+        assert!(looks_like_unparsed_signal("tamam — bitti", true));
+        // `tamam` without a task context is an ordinary ack.
+        assert!(!looks_like_unparsed_signal("tamam — bitti", false));
+        assert!(!looks_like_unparsed_signal("alındı — başlıyorum", true));
     }
 
     // -- apply_transition -------------------------------------------- //
@@ -571,6 +972,112 @@ mod tests {
         assert_eq!(
             s.state_of("p-backend-builder", "42"),
             Some(LifecycleState::Done)
+        );
+    }
+
+    // -- take_stalls ------------------------------------------------- //
+
+    const MIN: Duration = Duration::from_secs(60);
+
+    fn tr(kind: TransitionKind, id: &str) -> Transition {
+        Transition { kind, task_id: id.into() }
+    }
+
+    #[test]
+    fn stalls_fire_once_per_level_and_reset_on_transition() {
+        let s = LifecycleStore::new();
+        let t0 = Instant::now();
+        s.record_at("p-builder", &tr(TransitionKind::Done, "T1"), t0);
+
+        assert!(s.take_stalls(t0 + 9 * MIN, 10 * MIN, 20 * MIN).is_empty());
+        let l1 = s.take_stalls(t0 + 10 * MIN, 10 * MIN, 20 * MIN);
+        assert_eq!(l1.len(), 1);
+        assert_eq!(l1[0].level, 1);
+        assert_eq!(l1[0].state, LifecycleState::AwaitingReview);
+        // Same level is not reported twice.
+        assert!(s.take_stalls(t0 + 15 * MIN, 10 * MIN, 20 * MIN).is_empty());
+        let l2 = s.take_stalls(t0 + 20 * MIN, 10 * MIN, 20 * MIN);
+        assert_eq!(l2[0].level, 2);
+        assert!(s.take_stalls(t0 + 60 * MIN, 10 * MIN, 20 * MIN).is_empty());
+
+        // A new transition restarts the clock.
+        s.record_at("p-builder", &tr(TransitionKind::Done, "T1"), t0 + 61 * MIN);
+        assert!(s.take_stalls(t0 + 65 * MIN, 10 * MIN, 20 * MIN).is_empty());
+    }
+
+    #[test]
+    fn building_uses_its_own_threshold_and_terminal_states_never_stall() {
+        let s = LifecycleStore::new();
+        let t0 = Instant::now();
+        s.record_at("p-b", &tr(TransitionKind::Building, "T2"), t0);
+        s.record_at("p-r", &tr(TransitionKind::Approved, "T3"), t0);
+        assert!(s.take_stalls(t0 + 15 * MIN, 10 * MIN, 20 * MIN).is_empty());
+        let st = s.take_stalls(t0 + 20 * MIN, 10 * MIN, 20 * MIN);
+        assert_eq!(st.len(), 1);
+        assert_eq!(st[0].task_id, "T2");
+        assert_eq!(st[0].state, LifecycleState::Building);
+    }
+
+    #[test]
+    fn error_report_closes_the_stalled_task_and_stops_reminders() {
+        let s = LifecycleStore::new();
+        let t0 = Instant::now();
+        s.record_at("p-fb", &tr(TransitionKind::Building, "stall-1"), t0);
+        // Builder reports `hata —` for its own task.
+        assert!(s.abandon_at(&["p-fb"], "stall-1", t0 + MIN));
+        assert_eq!(s.state_of("p-fb", "stall-1"), Some(LifecycleState::Failed));
+        assert!(s.take_stalls(t0 + 90 * MIN, 10 * MIN, 20 * MIN).is_empty());
+
+        // The paired reviewer's `hata —` settles the builder's
+        // AwaitingReview entry (the caller passes the builder's pane).
+        s.record_at("p-bb", &tr(TransitionKind::Done, "T8"), t0);
+        assert!(s.abandon_at(&["p-br", "p-bb"], "T8", t0));
+        assert_eq!(s.state_of("p-bb", "T8"), Some(LifecycleState::Failed));
+
+        // An unrelated agent (e.g. scout) reporting `hata` about the same
+        // id can close neither a review wait nor another pane's Building.
+        s.record_at("p-bb", &tr(TransitionKind::Done, "T10"), t0);
+        assert!(!s.abandon_at(&["p-scout"], "T10", t0));
+        assert_eq!(s.state_of("p-bb", "T10"), Some(LifecycleState::AwaitingReview));
+        s.record_at("p-x", &tr(TransitionKind::Building, "T9"), t0);
+        assert!(!s.abandon_at(&["p-y"], "T9", t0));
+        assert_eq!(s.state_of("p-x", "T9"), Some(LifecycleState::Building));
+        // Unknown ids create nothing.
+        assert!(!s.abandon_at(&["p-fb"], "nope", t0));
+        assert_eq!(s.state_of("p-fb", "nope"), None);
+    }
+
+    #[test]
+    fn error_report_detection() {
+        for body in ["hata — yapamadım", "Hata: dosya yok", "**HATA** — x", "hata"] {
+            assert!(is_error_report(body), "{body}");
+        }
+        for body in ["hatalı satır düzeltildi", "tamam — hata yok", "", "hat"] {
+            assert!(!is_error_report(body), "{body}");
+        }
+    }
+
+    #[test]
+    fn reviewer_verdict_closes_the_builders_awaiting_entry() {
+        // DONE is keyed by the builder pane, APPROVED by the reviewer
+        // pane — the verdict must still settle the builder's entry, or
+        // every reviewed task would be reported stalled.
+        let s = LifecycleStore::new();
+        let t0 = Instant::now();
+        s.record_at("p-builder", &tr(TransitionKind::Done, "T4"), t0);
+        s.record_at("p-reviewer", &tr(TransitionKind::Approved, "T4"), t0 + MIN);
+        assert_eq!(s.state_of("p-builder", "T4"), Some(LifecycleState::Done));
+        assert!(s.take_stalls(t0 + 90 * MIN, 10 * MIN, 20 * MIN).is_empty());
+
+        s.record_at("p-builder", &tr(TransitionKind::Done, "T5"), t0);
+        s.record_at("p-reviewer", &tr(TransitionKind::ChangesNeeded, "T5"), t0);
+        assert_eq!(s.state_of("p-builder", "T5"), Some(LifecycleState::Failed));
+        // Other tasks are untouched.
+        s.record_at("p-builder", &tr(TransitionKind::Done, "T6"), t0);
+        s.record_at("p-reviewer", &tr(TransitionKind::Approved, "T7"), t0);
+        assert_eq!(
+            s.state_of("p-builder", "T6"),
+            Some(LifecycleState::AwaitingReview)
         );
     }
 

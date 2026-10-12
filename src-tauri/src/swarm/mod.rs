@@ -32,6 +32,7 @@ pub mod binding;
 pub mod brain;
 pub mod coordinator;
 pub mod help_request;
+pub(crate) mod llm_json;
 pub mod mailbox_bus;
 pub mod persistent_session;
 pub mod profile;
@@ -70,7 +71,10 @@ pub use help_request::{
     parse_coordinator_help_outcome, parse_help_request,
     CoordinatorHelpOutcome, HelpRequest,
 };
-pub use mailbox_bus::{MailboxBus, MailboxEnvelope, MailboxEvent};
+pub use mailbox_bus::{
+    agent_pane, MailboxBus, MailboxEnvelope, MailboxEvent,
+    COORDINATOR_PANE, USER_PANE,
+};
 pub use persistent_session::PersistentSession;
 pub use profile::{
     PermissionMode, Profile, ProfileRegistry, ProfileSource,

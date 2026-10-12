@@ -1,6 +1,10 @@
 //! Shared helpers for the command surface.
 //!
 //! Currently:
+//! - [`require_state`] — pull a managed value out of Tauri app state
+//!   or fail with a uniform `Internal` "… missing from app state"
+//!   error. Centralises the `try_state(...).ok_or_else(...)` prelude
+//!   that every `swarm:*` command repeated verbatim.
 //! - [`finalise_run_with`] — atomic run finalisation. Extracted
 //!   from `runs.rs:runs_create` rollback (refactor.md §4
 //!   "Compensating-action pattern'i inline yazılmış").
@@ -9,9 +13,43 @@
 //!   the run's child spans. Per WP-W2-07 §"Scope" it runs after every
 //!   `span.closed`. Idempotent.
 
+use tauri::{AppHandle, Manager, Runtime};
+
 use crate::db::DbPool;
 use crate::error::AppError;
 use crate::time::now_millis;
+
+/// Clone a managed value out of Tauri app state, or fail with a
+/// uniform `AppError::Internal` when it is absent.
+///
+/// Every `swarm:*` command opens by pulling the `JobRegistry`,
+/// `SwarmAgentRegistry`, `MailboxBus`, or `DbPool` out of app state
+/// with the exact same `try_state::<T>().ok_or_else(|| Internal(
+/// "<name> missing from app state — lib.rs::setup did not call
+/// app.manage()")).inner().clone()` prelude. This collapses that
+/// ~9-line block to a single call while keeping the error message
+/// byte-for-byte identical (pass the same `<name>` as `label`).
+///
+/// `T` is the *managed* type — `Arc<JobRegistry>`, `DbPool`, etc. —
+/// and is returned by clone (an `Arc` bump or a pool handle clone,
+/// same cost as the inline code it replaces). The absence branch is
+/// defensive: `lib.rs::setup` installs all of these on every
+/// production run, so a `None` here means a wiring bug or a test that
+/// deliberately skipped the `manage()` call.
+pub fn require_state<R, T>(app: &AppHandle<R>, label: &str) -> Result<T, AppError>
+where
+    R: Runtime,
+    T: Clone + Send + Sync + 'static,
+{
+    app.try_state::<T>()
+        .map(|state| state.inner().clone())
+        .ok_or_else(|| {
+            AppError::Internal(format!(
+                "{label} missing from app state — \
+                 lib.rs::setup did not call app.manage()"
+            ))
+        })
+}
 
 /// Mark a run as `status` (typically `"error"` for compensating
 /// rollback or `"cancelled"` for user-driven cancel) iff it is
@@ -79,7 +117,37 @@ pub async fn update_run_aggregates(pool: &DbPool, run_id: &str) -> Result<(), Ap
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::fresh_pool;
+    use crate::test_support::{fresh_pool, mock_app_with_pool};
+
+    #[tokio::test]
+    async fn require_state_returns_managed_value() {
+        let (app, _pool, _dir) = mock_app_with_pool().await;
+        // `mock_app_with_pool` manages a `DbPool`; the clone we get
+        // back must be a live handle to the same database.
+        let pool = require_state::<_, DbPool>(app.handle(), "DbPool")
+            .expect("DbPool is managed");
+        let one: i64 = sqlx::query_scalar("SELECT 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(one, 1);
+    }
+
+    #[tokio::test]
+    async fn require_state_missing_type_is_internal_error() {
+        let (app, _pool, _dir) = mock_app_with_pool().await;
+        // `String` is never managed → the absence branch fires with
+        // the uniform message, `label` interpolated verbatim.
+        let err = require_state::<_, String>(app.handle(), "TestString")
+            .expect_err("String is not managed");
+        assert_eq!(err.kind(), "internal");
+        assert!(
+            err.message()
+                .contains("TestString missing from app state"),
+            "message should embed the label: {}",
+            err.message()
+        );
+    }
 
     #[tokio::test]
     async fn finalise_run_with_marks_running_run_as_error() {

@@ -19,6 +19,9 @@ const OUTCOME_LABEL: Record<RouteOutcome, string> = {
   target_locked: 'locked',
   target_write_timeout: 'timeout',
   lifecycle_fanout: 'auto-fanout',
+  rejected: 'rejected',
+  notice: 'notice',
+  reminder: 'reminder',
 };
 
 function formatTs(ts: number): string {
@@ -116,9 +119,9 @@ export function RoutingLogRoute(): JSX.Element {
               </tr>
             </thead>
             <tbody>
-              {filtered.map((e, i) => (
+              {filtered.map((e) => (
                 <tr
-                  key={`${e.ts}-${i}`}
+                  key={e.id}
                   className={`routing-log-row routing-log-row-${e.outcome}`}
                 >
                   <td className="routing-log-time">{formatTs(e.ts)}</td>
@@ -135,16 +138,20 @@ export function RoutingLogRoute(): JSX.Element {
                       {OUTCOME_LABEL[e.outcome]}
                     </span>
                   </td>
-                  <td
-                    className="routing-log-body-text"
-                    title={e.body || '(no body)'}
-                    onClick={() => copyBody(e.body)}
-                  >
-                    {e.body
-                      ? e.body.length > 200
-                        ? `${e.body.slice(0, 200)}…`
-                        : e.body
-                      : '—'}
+                  <td className="routing-log-body-cell">
+                    <button
+                      type="button"
+                      className="routing-log-body-text"
+                      title={e.body || '(no body)'}
+                      aria-label="Copy message body"
+                      onClick={() => copyBody(e.body)}
+                    >
+                      {e.body
+                        ? e.body.length > 200
+                          ? `${e.body.slice(0, 200)}…`
+                          : e.body
+                        : '—'}
+                    </button>
                   </td>
                 </tr>
               ))}

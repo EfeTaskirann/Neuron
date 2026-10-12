@@ -33,6 +33,8 @@ use serde::{Deserialize, Serialize};
 use specta::Type;
 
 use crate::error::AppError;
+use crate::swarm::llm_json::{first_balanced_object, strip_fence};
+use crate::text::truncate_chars;
 
 /// Three-way routing decision the Orchestrator emits per user
 /// message. Wire form is snake_case
@@ -108,7 +110,7 @@ pub fn parse_orchestrator_outcome(
     }
     // Step 2: strip a markdown fence wrapping. Common pattern when
     // the LLM falls back to "render as markdown code block" reflex.
-    if let Some(stripped) = strip_markdown_fence(raw) {
+    if let Some(stripped) = strip_fence(raw) {
         if let Ok(o) = serde_json::from_str::<OrchestratorOutcome>(stripped) {
             return Ok(o);
         }
@@ -117,7 +119,7 @@ pub fn parse_orchestrator_outcome(
     // "Here's my decision: { ... }" and similar conversational
     // preambles. String-aware brace counting so quoted `}` doesn't
     // close the object early.
-    if let Some(sub) = first_balanced_json_object(raw) {
+    if let Some(sub) = first_balanced_object(raw) {
         if let Ok(o) = serde_json::from_str::<OrchestratorOutcome>(sub) {
             return Ok(o);
         }
@@ -131,83 +133,9 @@ pub fn parse_orchestrator_outcome(
     )))
 }
 
-/// Strip a single markdown code fence wrapping. Returns the inner
-/// text (without the fence lines) when the input is a fenced block,
-/// else `None`. Recognises:
-///
-/// - ` ```json\n ... \n``` ` (language-tagged, the canonical form)
-/// - ` ```\n ... \n``` ` (untagged)
-/// - Trailing newline / whitespace before / after the fences is
-///   tolerated so the fence-stripping step is idempotent.
-fn strip_markdown_fence(raw: &str) -> Option<&str> {
-    let trimmed = raw.trim();
-    let after_open = trimmed.strip_prefix("```")?;
-    let after_lang = match after_open.find('\n') {
-        Some(idx) => &after_open[idx + 1..],
-        None => return None,
-    };
-    let close_idx = after_lang.rfind("```")?;
-    let inner = &after_lang[..close_idx];
-    Some(inner.trim_end_matches('\n').trim())
-}
-
-/// Find the first balanced `{...}` substring in `raw`. String-aware:
-/// a `{` or `}` inside a `"..."` literal does not affect the depth
-/// counter, and a backslash-escaped `\"` inside that literal does
-/// not close the string.
-///
-/// Returns `None` if there is no `{` at all, or if the input is
-/// unbalanced (more `}` than `{` at any point).
-fn first_balanced_json_object(raw: &str) -> Option<&str> {
-    let bytes = raw.as_bytes();
-    let start = bytes.iter().position(|&b| b == b'{')?;
-
-    let mut depth: i32 = 0;
-    let mut in_string = false;
-    let mut prev_was_backslash = false;
-    for (idx, ch) in raw[start..].char_indices() {
-        let abs = start + idx;
-        if in_string {
-            if prev_was_backslash {
-                prev_was_backslash = false;
-                continue;
-            }
-            match ch {
-                '\\' => prev_was_backslash = true,
-                '"' => in_string = false,
-                _ => {}
-            }
-            continue;
-        }
-        match ch {
-            '"' => in_string = true,
-            '{' => depth += 1,
-            '}' => {
-                depth -= 1;
-                if depth == 0 {
-                    let end = abs + ch.len_utf8();
-                    return Some(&raw[start..end]);
-                }
-                if depth < 0 {
-                    return None;
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-/// Truncate `s` to at most `max_chars` Unicode characters. Bounded
-/// by `chars()` (not bytes) so multi-byte Turkish text is never
-/// split mid-codepoint in the error message.
-fn truncate_chars(s: &str, max_chars: usize) -> String {
-    if s.chars().count() <= max_chars {
-        s.to_string()
-    } else {
-        s.chars().take(max_chars).collect()
-    }
-}
+// Fence-strip + balanced-object scan live in `swarm::llm_json`;
+// `truncate_chars` in `crate::text` — shared homes of the 4-step
+// extraction recipe.
 
 // --------------------------------------------------------------------- //
 // Tests                                                                  //

@@ -48,11 +48,3 @@ export const APP_ERROR_FALLBACK = 'Bilinmeyen hata, tekrar dene.';
 export function appErrorCopyByKind(kind: string): string {
   return APP_ERROR_COPY[kind] ?? APP_ERROR_FALLBACK;
 }
-
-export function appErrorCopy(err: unknown): string {
-  if (err && typeof err === 'object' && 'kind' in err) {
-    const k = (err as { kind?: unknown }).kind;
-    if (typeof k === 'string') return appErrorCopyByKind(k);
-  }
-  return APP_ERROR_FALLBACK;
-}

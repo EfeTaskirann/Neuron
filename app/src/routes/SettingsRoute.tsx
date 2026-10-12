@@ -1,18 +1,18 @@
-// Ports `Neuron Design/app/routes.jsx::SettingsRoute`. Appearance
-// pane is the only one with backing state today — its controls
-// flow through `useAppearance`, which persists to localStorage and
-// drives the `<html>` element (theme class, density/motion data
-// attributes, accent CSS vars). The other sections still render
-// the placeholder card per the prototype until their panes land.
+// Ports `Neuron Design/app/routes.jsx::SettingsRoute`. This file is the
+// nav + pane-switch shell; each section's body lives in its own
+// component under `components/settings/` (split from the original
+// monolith — behaviour is preserved). Appearance is the only pane with
+// backing state today (via `useAppearance`); Workflows/Agents/MCP are
+// signposts to their dedicated tabs, and the rest render placeholders
+// per the prototype until their panes land.
 import { useState } from 'react';
 import { NIcon, type IconName } from '../components/icons';
-import {
-  ACCENT_SWATCHES,
-  useAppearance,
-  type Density,
-  type Motion,
-  type Theme,
-} from '../hooks/useAppearance';
+import { AppearancePane } from '../components/settings/AppearancePane';
+import { KeysPane } from '../components/settings/KeysPane';
+import { AccountPane } from '../components/settings/AccountPane';
+import { DataPane } from '../components/settings/DataPane';
+import { ModelsPane } from '../components/settings/ModelsPane';
+import { LinkPane } from '../components/settings/LinkPane';
 
 interface SettingsSection {
   id: string;
@@ -51,6 +51,29 @@ export function SettingsRoute(): JSX.Element {
       <div className="settings-pane">
         {active === 'appearance' ? (
           <AppearancePane />
+        ) : active === 'keys' ? (
+          <KeysPane />
+        ) : active === 'account' ? (
+          <AccountPane />
+        ) : active === 'data' ? (
+          <DataPane />
+        ) : active === 'models' ? (
+          <ModelsPane />
+        ) : active === 'workflows' ? (
+          <LinkPane
+            label="Workflows"
+            body="Workflows are built visually on the canvas. Open the Workflow tab to create, edit, or run them."
+          />
+        ) : active === 'agents' ? (
+          <LinkPane
+            label="Agents"
+            body="Agents — name, model, temperature, and role — are configured in the Agents tab."
+          />
+        ) : active === 'mcp' ? (
+          <LinkPane
+            label="MCP"
+            body="Browse, install, and uninstall MCP servers from the MCP tab. Per-server API keys live under Keys."
+          />
         ) : (
           <div className="set-empty">
             <h2 className="text-h2" style={{ marginTop: 0 }}>
@@ -61,120 +84,5 @@ export function SettingsRoute(): JSX.Element {
         )}
       </div>
     </div>
-  );
-}
-
-const THEMES: { value: Theme; label: string }[] = [
-  { value: 'light', label: 'Light' },
-  { value: 'dark', label: 'Dark' },
-  { value: 'system', label: 'System' },
-];
-
-const DENSITIES: { value: Density; label: string }[] = [
-  { value: 'comfortable', label: 'Comfortable' },
-  { value: 'compact', label: 'Compact' },
-];
-
-const MOTIONS: { value: Motion; label: string }[] = [
-  { value: 'full', label: 'Full' },
-  { value: 'reduced', label: 'Reduced' },
-  { value: 'off', label: 'Off' },
-];
-
-function AppearancePane(): JSX.Element {
-  const { theme, accent, density, motion, setTheme, setAccent, setDensity, setMotion } =
-    useAppearance();
-
-  return (
-    <>
-      <h2 className="text-h2" style={{ marginTop: 0 }}>
-        Appearance
-      </h2>
-      <p className="text-muted">Colors, density, and motion. Changes apply instantly.</p>
-
-      <div className="set-card">
-        <div className="set-row">
-          <div>
-            <div className="set-row-title">Theme</div>
-            <div className="set-row-sub">Match the OS or pick one.</div>
-          </div>
-          <div className="seg" role="radiogroup" aria-label="Theme">
-            {THEMES.map((t) => (
-              <button
-                key={t.value}
-                role="radio"
-                aria-checked={theme === t.value}
-                className={theme === t.value ? 'active' : ''}
-                onClick={() => setTheme(t.value)}
-              >
-                {t.label}
-              </button>
-            ))}
-          </div>
-        </div>
-
-        <div className="set-row">
-          <div>
-            <div className="set-row-title">Accent</div>
-            <div className="set-row-sub">
-              Used on selection, focus, and Synapse Violet surfaces.
-            </div>
-          </div>
-          <div className="swatches" role="radiogroup" aria-label="Accent color">
-            {ACCENT_SWATCHES.map((c) => (
-              <button
-                key={c}
-                role="radio"
-                aria-label={c}
-                aria-checked={accent === c}
-                className={`sw${accent === c ? ' active' : ''}`}
-                style={{ background: c }}
-                onClick={() => setAccent(c)}
-              />
-            ))}
-          </div>
-        </div>
-
-        <div className="set-row">
-          <div>
-            <div className="set-row-title">Density</div>
-            <div className="set-row-sub">Comfortable spacing or tighter rows.</div>
-          </div>
-          <div className="seg" role="radiogroup" aria-label="Density">
-            {DENSITIES.map((d) => (
-              <button
-                key={d.value}
-                role="radio"
-                aria-checked={density === d.value}
-                className={density === d.value ? 'active' : ''}
-                onClick={() => setDensity(d.value)}
-              >
-                {d.label}
-              </button>
-            ))}
-          </div>
-        </div>
-
-        <div className="set-row">
-          <div>
-            <div className="set-row-title">Motion</div>
-            <div className="set-row-sub">Edge dataflow, node pulse, glow shimmer.</div>
-          </div>
-          <div className="seg" role="radiogroup" aria-label="Motion">
-            {MOTIONS.map((m) => (
-              <button
-                key={m.value}
-                role="radio"
-                aria-checked={motion === m.value}
-                className={motion === m.value ? 'active' : ''}
-                onClick={() => setMotion(m.value)}
-              >
-                {m.label}
-              </button>
-            ))}
-          </div>
-        </div>
-      </div>
-    </>
   );
 }

@@ -20,6 +20,13 @@ export function AgentsRoute(): JSX.Element {
   }
   return (
     <div className="route route-agents">
+      {agents.length === 0 && !creating && (
+        <div className="agents-empty">
+          <p className="text-muted">
+            No agents yet. Create your first agent to get started.
+          </p>
+        </div>
+      )}
       <div className="route-grid">
         {agents.map((a: Agent) => (
           <AgentCard key={a.id} agent={a} />
@@ -43,6 +50,7 @@ export function AgentsRoute(): JSX.Element {
 
 function AgentCard({ agent }: { agent: Agent }): JSX.Element {
   const del = useAgentDelete();
+  const dup = useAgentCreate();
   return (
     <div className="agent-card">
       <div className="agent-card-head">
@@ -60,9 +68,21 @@ function AgentCard({ agent }: { agent: Agent }): JSX.Element {
       </div>
       <div className="agent-role">{agent.role}</div>
       <div className="agent-foot">
-        <button className="btn ghost sm">
+        <button
+          className="btn ghost sm"
+          disabled={dup.isPending}
+          onClick={() =>
+            dup.mutate({
+              name: `${agent.name} (copy)`,
+              model: agent.model,
+              temp: agent.temp,
+              role: agent.role,
+            })
+          }
+          title="Duplicate agent"
+        >
           <NIcon name="copy" size={12} />
-          <span>Duplicate</span>
+          <span>{dup.isPending ? 'Duplicating…' : 'Duplicate'}</span>
         </button>
         <button
           className="btn ghost sm"

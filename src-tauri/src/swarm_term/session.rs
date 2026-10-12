@@ -6,19 +6,23 @@
 //! loop it prepares `<project>/.bridgespace/<session>/{inbox,processed,
 //! rejected}/<agent>/` and passes per-pane environment variables
 //! (`NEURON_BRIDGE`, `NEURON_AGENT_ID`, `NEURON_INBOX`) so each claude
-//! REPL knows where to drop outbound messages. The
-//! [`bridge::watcher_loop`] picks up the JSON envelopes those drops
+//! REPL knows where to drop outbound messages. Each pane's persona +
+//! bridge protocol is its appended system prompt
+//! (`--append-system-prompt-file`); a short kickoff turn is then pasted
+//! and the pane counts as ready once claude answers `@<id> hazır.`. The
+//! [`bridge::watcher::watcher_loop`] picks up the JSON envelopes those drops
 //! create and delivers their body into the appropriate target pane via
 //! bracketed paste.
 //!
-//! `stop()` kills every pane, uninstalls the bridge watcher, and
-//! deletes the `.bridgespace/<session>/` tree along with the per-pane
-//! HOME isolation directories.
+//! `stop()` kills every pane, uninstalls the bridge watcher, archives
+//! `rejected/`, and deletes the `.bridgespace/<session>/` tree along
+//! with the per-pane HOME isolation directories.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use specta::Type;
@@ -34,22 +38,50 @@ use crate::swarm::profile::ProfileRegistry;
 use crate::swarm_term::bridge::{
     self, BridgeHandle, BRIDGE_DIRNAME,
 };
+use crate::swarm_term::heartbeat;
 use crate::swarm_term::hierarchy::AGENT_IDS;
 use crate::swarm_term::home_isolation::{
-    prepare_isolated_homes_root, seed_pane_home,
+    prepare_isolated_homes_root, seed_pane_home, sweep_orphan_homes,
+    sync_credentials,
 };
 use crate::swarm_term::lifecycle::LifecycleStore;
-use crate::swarm_term::persona::build_persona_payload;
+use crate::swarm_term::persona::{
+    build_kickoff_message, build_persona_prompt, is_ready_answer,
+};
 
 const READY_DELAY_MS: u64 = 1500;
 
-/// Delay after persona injection before the auto-prompt
+/// File (inside each pane's isolated HOME) holding the persona + bridge
+/// protocol, passed to claude with `--append-system-prompt-file`.
+const PERSONA_FILENAME: &str = "neuron-persona.md";
+
+/// How long to wait for a pane's `@<id> hazır.` answer before giving up
+/// on it (logged; the pane stays not-ready so the bridge returns
+/// messages addressed to it to their senders).
+const READY_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// If a pane has not answered by then, the kickoff is pasted once more
+/// (it may have landed before the REPL finished booting).
+const KICKOFF_RESEND_AFTER: Duration = Duration::from_secs(30);
+
+const READY_POLL: Duration = Duration::from_millis(500);
+
+/// Cadence of the in-session credentials sync (see
+/// [`sync_credentials`]). A refresh happens at most every few hours, so
+/// a minute is ample to spread it before another pane needs it.
+const CREDENTIALS_SYNC_EVERY: Duration = Duration::from_secs(60);
+
+/// `remove_dir_all` on the homes root right after killing the panes can
+/// fail with "file in use" (os error 32) while the claude processes are
+/// still exiting; retry this many times, [`CLEANUP_RETRY_DELAY`] apart.
+const CLEANUP_ATTEMPTS: u32 = 10;
+const CLEANUP_RETRY_DELAY: Duration = Duration::from_millis(500);
+
+/// Delay after the readiness wait before the auto-prompt
 /// (`NEURON_TERM_AUTO_PROMPT`) is pasted into the orchestrator pane.
-/// Claude's bracketed-paste render of the persona body + footer +
-/// first `@<id> hazır.` response settles in 5–10 s for short
-/// personas; 10 s is safe headroom. Only consulted when the env
-/// var is set, so production paths pay zero cost.
-const AUTO_PROMPT_DELAY_MS: u64 = 10_000;
+/// Only consulted when the env var is set, so production paths pay
+/// zero cost.
+const AUTO_PROMPT_DELAY_MS: u64 = 2_000;
 
 /// Gap between consecutive `claude.exe` PTY spawns. claude writes
 /// `~/.claude.json` (startup counter, tipsHistory, lastPlanModeUse
@@ -80,6 +112,27 @@ pub struct TerminalSwarmPane {
 #[derive(Default)]
 pub struct TerminalSwarmRegistry {
     inner: Mutex<Option<ActiveSession>>,
+    /// TOCTOU guard for `start()`: the busy-check and the final slot
+    /// insert are separated by a multi-second await window (9 staggered
+    /// pane spawns). A second concurrent `start` passing the `is_some()`
+    /// check in that window would overwrite the first session at insert
+    /// time, leaking its 9 PTY panes and bridge watcher. Set under the
+    /// same lock as the busy-check; cleared by [`StartReservation`] on
+    /// every exit path.
+    starting: std::sync::atomic::AtomicBool,
+}
+
+/// RAII clear for [`TerminalSwarmRegistry::starting`] — dropping it
+/// releases the reservation on success and on every early-error return
+/// of `start()` alike.
+struct StartReservation<'a>(&'a TerminalSwarmRegistry);
+
+impl Drop for StartReservation<'_> {
+    fn drop(&mut self) {
+        self.0
+            .starting
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 pub(crate) struct ActiveSession {
@@ -102,7 +155,7 @@ pub(crate) struct ActiveSession {
     /// Pane ids that have completed persona injection and are safe
     /// targets for inter-agent routes. Populated by the persona-inject
     /// async task as each `write_to_pane` call returns Ok; read by
-    /// `bridge::process_one` to short-circuit routes destined for
+    /// `bridge::watcher::process_one` to short-circuit routes destined for
     /// panes that are still warming up (the claude REPL may not have
     /// enabled bracketed-paste mode yet, in which case the routed
     /// body is dumped into the prompt as raw text and submitted with
@@ -116,6 +169,10 @@ pub(crate) struct ActiveSession {
     /// No external code reads this field directly.
     #[allow(dead_code)]
     pub ready_panes: Arc<Mutex<HashSet<String>>>,
+    /// Cleared by `stop()`. The session's background tasks (kickoff /
+    /// readiness wait, credentials sync) poll it and exit, so a stopped
+    /// session's tasks never act on the panes of the next one.
+    pub alive: Arc<AtomicBool>,
 }
 
 impl TerminalSwarmRegistry {
@@ -137,13 +194,24 @@ impl TerminalSwarmRegistry {
         app: AppHandle<R>,
         project_dir: PathBuf,
     ) -> Result<TerminalSwarmSessionHandle, AppError> {
+        // PATH-01: reject parent-dir traversal segments so a crafted
+        // project_dir cannot walk out of wherever the caller intended
+        // (the 9 REPLs spawn with bypassPermissions and cwd = this dir).
+        if project_dir
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err(AppError::InvalidInput(
+                "project_dir must not contain '..' path segments".into(),
+            ));
+        }
         if !project_dir.is_dir() {
             return Err(AppError::InvalidInput(format!(
                 "project_dir {} does not exist or is not a directory",
                 project_dir.display()
             )));
         }
-        {
+        let _reservation = {
             let guard = self.inner.lock().map_err(|_| {
                 AppError::Internal("swarm-term registry poisoned".into())
             })?;
@@ -153,7 +221,20 @@ impl TerminalSwarmRegistry {
                         .into(),
                 ));
             }
-        }
+            // Reserve the slot while still under the lock — the spawn
+            // sequence below awaits for seconds, and a second start()
+            // racing through this window would otherwise overwrite the
+            // session at the final insert.
+            if self
+                .starting
+                .swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(AppError::Conflict(
+                    "a terminal-swarm session is already starting".into(),
+                ));
+            }
+            StartReservation(self)
+        };
 
         let spawn = resolve_claude_spawn()?;
         let project_str = project_dir.display().to_string();
@@ -190,16 +271,56 @@ impl TerminalSwarmRegistry {
             ))
         })?;
         let _ = bridge::ensure_gitignore(&bridge_parent);
+        // No session is running (the reservation above guarantees it),
+        // so every leftover session tree / pane-HOME is an orphan of a
+        // session that never reached `stop()`. Sweep them BEFORE seeding
+        // the new panes: the homes sweep also syncs a possibly fresher,
+        // rotated token back into the user's real credentials file,
+        // which the new panes then copy.
+        let orphan_sessions = bridge::sweep_orphan_sessions(&bridge_parent);
+        let orphan_homes = sweep_orphan_homes(&app);
+        if orphan_sessions + orphan_homes > 0 {
+            tracing::info!(
+                orphan_sessions,
+                orphan_homes,
+                "swarm-term: swept leftovers of sessions that never stopped"
+            );
+        }
         let bridgespace_root = bridge_parent.join(&session_id);
         bridge::prepare_layout(&bridgespace_root)?;
+        heartbeat::beat(&bridgespace_root);
 
         // Per-session HOME isolation root. Each pane gets a private
         // subdir with copies of `~/.claude.json` + `~/.claude/`
         // top-level files so the 9 claude.exe processes don't race on
         // the user's real `~/.claude.json` and truncate it.
         let homes_root = prepare_isolated_homes_root(&app, &session_id)?;
+        heartbeat::beat(&homes_root);
+
+        // Personas are loaded BEFORE spawning: each pane gets its
+        // persona + bridge protocol as an appended SYSTEM prompt
+        // (`--append-system-prompt-file`), so it must exist on disk
+        // when claude starts.
+        let workspace_agents_dir = app
+            .path()
+            .app_data_dir()
+            .ok()
+            .map(|p| p.join("swarm-term").join("agents"))
+            .filter(|p| p.is_dir());
+        let profiles =
+            match ProfileRegistry::load_term(workspace_agents_dir.as_deref()) {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = std::fs::remove_dir_all(&homes_root);
+                    let _ = std::fs::remove_dir_all(&bridgespace_root);
+                    return Err(AppError::Internal(format!(
+                        "load swarm-term personas: {e}"
+                    )));
+                }
+            };
 
         let mut panes_by_agent: HashMap<String, String> = HashMap::new();
+        let mut pane_homes: HashMap<String, PathBuf> = HashMap::new();
         let mut spawned: Vec<String> = Vec::new();
         for (idx, &agent_id) in AGENT_IDS.iter().enumerate() {
             if idx > 0 {
@@ -223,6 +344,36 @@ impl TerminalSwarmRegistry {
                     )));
                 }
             };
+            // Persona + bridge protocol → system-prompt file inside the
+            // pane's private HOME (deleted with it on stop).
+            let persona_file = pane_home.join(PERSONA_FILENAME);
+            let persona_written = profiles
+                .get(agent_id)
+                .ok_or_else(|| format!("no persona profile for `{agent_id}`"))
+                .and_then(|profile| {
+                    let prompt = build_persona_prompt(
+                        agent_id,
+                        &profile.body,
+                        &bridgespace_root,
+                    );
+                    std::fs::write(&persona_file, prompt)
+                        .map_err(|e| format!("write {}: {e}", persona_file.display()))
+                });
+            if let Err(e) = persona_written {
+                for pid in &spawned {
+                    let _ = registry.kill_pane(pid, &pool).await;
+                }
+                let _ = std::fs::remove_dir_all(&homes_root);
+                let _ = std::fs::remove_dir_all(&bridgespace_root);
+                return Err(AppError::Internal(format!(
+                    "swarm-term persona for `{agent_id}`: {e}"
+                )));
+            }
+            let agent_cmd = format!(
+                "{cmd} --append-system-prompt-file \"{}\"",
+                persona_file.display()
+            );
+            pane_homes.insert(agent_id.to_string(), pane_home.clone());
             let mut extra_env: HashMap<String, String> = HashMap::new();
             let pane_home_str = pane_home.display().to_string();
             extra_env.insert("HOME".to_string(), pane_home_str.clone());
@@ -236,6 +387,14 @@ impl TerminalSwarmRegistry {
             // versions — both are cheap and only one needs to land.
             extra_env.insert("DISABLE_AUTOUPDATER".to_string(), "1".to_string());
             extra_env.insert("CLAUDE_CODE_DISABLE_AUTOUPDATE".to_string(), "1".to_string());
+            // ENV-01: belt-and-suspenders auth isolation. The registry
+            // already env_remove's these for claude-code panes, but if
+            // Neuron itself was launched from a Claude shell the parent's
+            // token could bleed in via inheritance order. Forcing them
+            // empty guarantees each pane authenticates only from its own
+            // seeded ~/.claude/.credentials.json (the isolated HOME).
+            extra_env.insert("CLAUDE_CODE_OAUTH_TOKEN".to_string(), String::new());
+            extra_env.insert("ANTHROPIC_API_KEY".to_string(), String::new());
             // Bridge-related env vars. Each pane's claude REPL reads
             // these from the persona body (interpolated by
             // `build_persona_payload`), so they're informational here
@@ -258,7 +417,7 @@ impl TerminalSwarmRegistry {
             extra_env.insert("NEURON_INBOX".to_string(), inbox_self);
             let input = PaneSpawnInput {
                 cwd: project_str.clone(),
-                cmd: Some(cmd.clone()),
+                cmd: Some(agent_cmd),
                 cols: Some(400),
                 rows: Some(30),
                 agent_kind: Some("claude-code".into()),
@@ -291,7 +450,7 @@ impl TerminalSwarmRegistry {
         // Per-session "ready" tracker — populated as each pane's
         // persona injection write completes. Routes to a not-yet-ready
         // pane short-circuit with `target_not_ready` in
-        // `bridge::process_one` so the pre-bracketed-paste-mode window
+        // `bridge::watcher::process_one` so the pre-bracketed-paste-mode window
         // doesn't corrupt the first inter-agent dispatch.
         let ready_panes: Arc<Mutex<HashSet<String>>> =
             Arc::new(Mutex::new(HashSet::new()));
@@ -313,14 +472,16 @@ impl TerminalSwarmRegistry {
             Arc::clone(&lifecycle),
         );
 
+        let alive = Arc::new(AtomicBool::new(true));
         let session = ActiveSession {
             session_id,
             project_dir: project_dir.clone(),
             panes_by_agent: panes_by_agent.clone(),
             bridge: Some(bridge_handle),
             bridgespace_root: Some(bridgespace_root.clone()),
-            homes_root: Some(homes_root),
+            homes_root: Some(homes_root.clone()),
             ready_panes: Arc::clone(&ready_panes),
+            alive: Arc::clone(&alive),
         };
         let handle = handle_from(&session);
         {
@@ -330,62 +491,38 @@ impl TerminalSwarmRegistry {
             *guard = Some(session);
         }
 
-        // Fire-and-forget persona injection: wait for the claude REPLs
-        // to settle, then paste each persona body + bridge-protocol
-        // section into its pane.
+        // Fire-and-forget kickoff: wait for the claude REPLs to settle,
+        // paste the short kickoff turn into every pane, then mark each
+        // pane ready only once claude has actually ANSWERED it with
+        // `@<id> hazır.` (read from the pane's own transcript — the
+        // terminal echo of the kickoff would be a false positive). A
+        // pane stuck on a first-run screen therefore never becomes a
+        // delivery target; messages to it are returned to their sender.
         let app_for_inject = app.clone();
         let registry_for_inject = registry.clone();
         let ready_panes_for_inject = Arc::clone(&ready_panes);
-        let bridge_root_for_inject = bridgespace_root.clone();
-        let workspace_agents_dir = app
-            .path()
-            .app_data_dir()
-            .ok()
-            .map(|p| p.join("swarm-term").join("agents"))
-            .filter(|p| p.is_dir());
+        let alive_for_inject = Arc::clone(&alive);
+        let pool_for_inject = pool.clone();
         tauri::async_runtime::spawn(async move {
             tokio::time::sleep(Duration::from_millis(READY_DELAY_MS)).await;
-            let profiles =
-                match ProfileRegistry::load_term(workspace_agents_dir.as_deref()) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            "swarm-term: failed to load profiles for injection"
-                        );
-                        return;
-                    }
-                };
+            if !alive_for_inject.load(Ordering::SeqCst) {
+                return;
+            }
             for (agent_id, pane_id) in &panes_by_agent {
-                let Some(profile) = profiles.get(agent_id) else {
-                    tracing::warn!(
-                        agent_id = %agent_id,
-                        "swarm-term: no profile found, skipping injection"
-                    );
-                    continue;
-                };
-                let body = build_persona_payload(
-                    agent_id,
-                    &profile.body,
-                    &bridge_root_for_inject,
-                );
-                match registry_for_inject
-                    .write_to_pane(pane_id, body.as_bytes())
-                    .await
-                {
-                    Ok(()) => {
-                        if let Ok(mut g) = ready_panes_for_inject.lock() {
-                            g.insert(pane_id.clone());
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            agent_id = %agent_id,
-                            error = %e,
-                            "swarm-term: persona injection write failed"
-                        );
-                    }
-                }
+                send_kickoff(&registry_for_inject, &pool_for_inject, agent_id, pane_id)
+                    .await;
+            }
+            wait_for_ready_answers(
+                &registry_for_inject,
+                &pool_for_inject,
+                &panes_by_agent,
+                &pane_homes,
+                &ready_panes_for_inject,
+                &alive_for_inject,
+            )
+            .await;
+            if !alive_for_inject.load(Ordering::SeqCst) {
+                return;
             }
 
             if let Ok(auto_prompt) = std::env::var("NEURON_TERM_AUTO_PROMPT") {
@@ -393,12 +530,13 @@ impl TerminalSwarmRegistry {
                 if !trimmed.is_empty() {
                     tokio::time::sleep(Duration::from_millis(AUTO_PROMPT_DELAY_MS)).await;
                     if let Some(orch_pane) = panes_by_agent.get("orchestrator") {
-                        let payload = format!(
-                            "\x1b[200~{trimmed}\x1b[201~\r"
-                        );
-                        if let Err(e) = registry_for_inject
-                            .write_to_pane(orch_pane, payload.as_bytes())
-                            .await
+                        let payload = format!("\x1b[200~{trimmed}\x1b[201~");
+                        if let Err(e) = bridge::paste_then_submit(
+                            &registry_for_inject,
+                            orch_pane,
+                            payload.as_bytes(),
+                        )
+                        .await
                         {
                             tracing::warn!(
                                 error = %e,
@@ -420,6 +558,32 @@ impl TerminalSwarmRegistry {
             drop(app_for_inject);
         });
 
+        // Session upkeep, ends with the session:
+        //   * heartbeat both on-disk trees so another Neuron instance's
+        //     orphan sweep leaves them alone (see `heartbeat`);
+        //   * credentials sync — spread a pane's token refresh to the
+        //     other panes and back to the user's real file (see
+        //     `home_isolation::sync_credentials`); `stop()` keeps syncing
+        //     until the homes are gone.
+        let alive_for_upkeep = Arc::clone(&alive);
+        let bridge_root_for_upkeep = bridgespace_root.clone();
+        tauri::async_runtime::spawn(async move {
+            let mut since_sync = Duration::ZERO;
+            loop {
+                tokio::time::sleep(heartbeat::HEARTBEAT_EVERY).await;
+                if !alive_for_upkeep.load(Ordering::SeqCst) {
+                    return;
+                }
+                heartbeat::beat(&homes_root);
+                heartbeat::beat(&bridge_root_for_upkeep);
+                since_sync += heartbeat::HEARTBEAT_EVERY;
+                if since_sync >= CREDENTIALS_SYNC_EVERY {
+                    since_sync = Duration::ZERO;
+                    sync_credentials(&homes_root);
+                }
+            }
+        });
+
         Ok(handle)
     }
 
@@ -439,12 +603,15 @@ impl TerminalSwarmRegistry {
                 AppError::Internal("swarm-term registry poisoned".into())
             })?;
             match guard.take() {
-                Some(s) => (
-                    s.panes_by_agent.into_values().collect(),
-                    s.bridge,
-                    s.homes_root,
-                    s.bridgespace_root,
-                ),
+                Some(s) => {
+                    s.alive.store(false, Ordering::SeqCst);
+                    (
+                        s.panes_by_agent.into_values().collect(),
+                        s.bridge,
+                        s.homes_root,
+                        s.bridgespace_root,
+                    )
+                }
                 None => return Ok(()),
             }
         };
@@ -459,20 +626,23 @@ impl TerminalSwarmRegistry {
             let _ = registry.kill_pane(&pid, &pool).await;
         }
         if let Some(root) = homes_root {
-            if let Err(e) = std::fs::remove_dir_all(&root) {
-                tracing::warn!(
-                    path = %root.display(),
-                    error = %e,
-                    "swarm-term: isolated homes cleanup failed"
-                );
-            } else {
-                tracing::info!(
-                    path = %root.display(),
-                    "swarm-term: isolated homes cleaned up"
-                );
-            }
+            remove_homes_with_retry(&root).await;
         }
         if let Some(root) = bridgespace_root {
+            // Keep the rejection evidence (envelopes + `.reason`) —
+            // the rest of the session tree is disposable.
+            match bridge::archive_rejected(&root) {
+                Ok(Some(dest)) => tracing::info!(
+                    path = %dest.display(),
+                    "swarm-term: rejected messages archived"
+                ),
+                Ok(None) => {}
+                Err(e) => tracing::warn!(
+                    path = %root.display(),
+                    error = %e,
+                    "swarm-term: rejected-archive failed; deleting with session"
+                ),
+            }
             if let Err(e) = std::fs::remove_dir_all(&root) {
                 tracing::warn!(
                     path = %root.display(),
@@ -487,6 +657,216 @@ impl TerminalSwarmRegistry {
             }
         }
         Ok(())
+    }
+}
+
+/// Delete a stopped session's homes root, retrying while the just-killed
+/// claude processes still hold files open (os error 32 on Windows).
+///
+/// Credentials are synced out of the homes before EVERY attempt: a pane
+/// still exiting can write a refreshed (rotated) token after a single
+/// up-front sync, and deleting the homes would then destroy the only
+/// live refresh token — the next session would start in `/login`.
+async fn remove_homes_with_retry(root: &Path) {
+    for attempt in 1..=CLEANUP_ATTEMPTS {
+        sync_credentials(root);
+        match std::fs::remove_dir_all(root) {
+            Ok(()) => {
+                tracing::info!(
+                    path = %root.display(),
+                    attempt,
+                    "swarm-term: isolated homes cleaned up"
+                );
+                return;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(e) if attempt == CLEANUP_ATTEMPTS => {
+                tracing::warn!(
+                    path = %root.display(),
+                    error = %e,
+                    attempts = CLEANUP_ATTEMPTS,
+                    "swarm-term: isolated homes cleanup failed"
+                );
+            }
+            Err(_) => tokio::time::sleep(CLEANUP_RETRY_DELAY).await,
+        }
+    }
+}
+
+/// Lower-case fragments of claude screens that are NOT the REPL prompt —
+/// login method picker, first-run theme / trust / onboarding screens,
+/// the expired-credentials banner. Pasting the kickoff + Enter there
+/// would pick a menu option (e.g. start an OAuth browser flow) instead
+/// of reaching the model.
+const BLOCKING_SCREEN_MARKERS: &[&str] = &[
+    "select login method",
+    "choose the text style",
+    "trust the files",
+    "press enter to continue",
+    "please run /login",
+];
+
+/// How many trailing pane lines are inspected for those markers.
+const SCREEN_TAIL_LINES: usize = 60;
+
+fn screen_is_blocking(screen_tail: &str) -> bool {
+    let lower = screen_tail.to_lowercase();
+    BLOCKING_SCREEN_MARKERS.iter().any(|m| lower.contains(m))
+}
+
+/// True when the pane's recent output shows a login / first-run screen.
+async fn pane_on_blocking_screen(
+    registry: &TerminalRegistry,
+    pool: &DbPool,
+    pane_id: &str,
+) -> bool {
+    let Ok(lines) = registry.pane_lines(pane_id, None, pool).await else {
+        return false;
+    };
+    let tail: Vec<&str> = lines
+        .iter()
+        .rev()
+        .take(SCREEN_TAIL_LINES)
+        .map(|l| l.text.as_str())
+        .collect();
+    screen_is_blocking(&tail.join("\n"))
+}
+
+/// Paste the kickoff turn into one pane (best-effort, logged) — unless
+/// the pane is on a login / first-run screen, where it is withheld and
+/// the pane simply stays not-ready until the user resolves the screen.
+async fn send_kickoff(
+    registry: &TerminalRegistry,
+    pool: &DbPool,
+    agent_id: &str,
+    pane_id: &str,
+) {
+    if pane_on_blocking_screen(registry, pool, pane_id).await {
+        tracing::warn!(
+            agent_id = %agent_id,
+            "swarm-term: kickoff withheld — pane is on a login / first-run \
+             screen; resolve it in the pane"
+        );
+        return;
+    }
+    let kickoff = build_kickoff_message(agent_id);
+    if let Err(e) =
+        bridge::paste_then_submit(registry, pane_id, kickoff.as_bytes()).await
+    {
+        tracing::warn!(
+            agent_id = %agent_id,
+            error = %e,
+            "swarm-term: kickoff write failed"
+        );
+    }
+}
+
+/// Poll each pane's claude transcript until it has answered the
+/// kickoff, marking it ready as soon as it does. Re-sends the kickoff
+/// once to stragglers after [`KICKOFF_RESEND_AFTER`]; gives up (warn,
+/// pane stays not-ready) after [`READY_TIMEOUT`]. Returns silently as
+/// soon as the session is stopped (`alive` cleared).
+async fn wait_for_ready_answers(
+    registry: &TerminalRegistry,
+    pool: &DbPool,
+    panes_by_agent: &HashMap<String, String>,
+    pane_homes: &HashMap<String, PathBuf>,
+    ready: &Arc<Mutex<HashSet<String>>>,
+    alive: &AtomicBool,
+) {
+    let started = Instant::now();
+    let mut pending: HashSet<&str> =
+        panes_by_agent.keys().map(String::as_str).collect();
+    let mut resent = false;
+    loop {
+        if !alive.load(Ordering::SeqCst) {
+            return;
+        }
+        let answered: Vec<&str> = pending
+            .iter()
+            .copied()
+            .filter(|agent| {
+                pane_homes
+                    .get(*agent)
+                    .is_some_and(|home| transcript_has_ready_answer(home, agent))
+            })
+            .collect();
+        for agent in answered {
+            pending.remove(agent);
+            if let (Some(pane), Ok(mut g)) = (panes_by_agent.get(agent), ready.lock()) {
+                g.insert(pane.clone());
+            }
+            tracing::info!(
+                agent_id = %agent,
+                waited_ms = started.elapsed().as_millis() as u64,
+                "swarm-term: pane answered kickoff — ready"
+            );
+        }
+        if pending.is_empty() {
+            return;
+        }
+        let waited = started.elapsed();
+        if waited >= READY_TIMEOUT {
+            tracing::warn!(
+                agents = ?pending,
+                "swarm-term: panes never answered the kickoff; left not-ready \
+                 (messages to them are returned to the sender)"
+            );
+            return;
+        }
+        if !resent && waited >= KICKOFF_RESEND_AFTER {
+            resent = true;
+            for agent in &pending {
+                tracing::warn!(
+                    agent_id = %agent,
+                    "swarm-term: no kickoff answer yet — re-sending once"
+                );
+                if let Some(pane) = panes_by_agent.get(*agent) {
+                    send_kickoff(registry, pool, agent, pane).await;
+                }
+            }
+        }
+        tokio::time::sleep(READY_POLL).await;
+    }
+}
+
+/// True when a claude transcript under `pane_home`
+/// (`.claude/projects/<cwd-slug>/<session>.jsonl`) holds an assistant
+/// turn that is `agent_id`'s readiness answer.
+fn transcript_has_ready_answer(pane_home: &Path, agent_id: &str) -> bool {
+    let Ok(project_dirs) = std::fs::read_dir(pane_home.join(".claude").join("projects"))
+    else {
+        return false;
+    };
+    project_dirs.flatten().any(|dir| {
+        std::fs::read_dir(dir.path()).into_iter().flatten().flatten().any(|f| {
+            let p = f.path();
+            p.extension().and_then(|e| e.to_str()) == Some("jsonl")
+                && std::fs::read_to_string(&p).is_ok_and(|text| {
+                    text.lines().any(|l| line_is_ready_answer(l, agent_id))
+                })
+        })
+    })
+}
+
+fn line_is_ready_answer(line: &str, agent_id: &str) -> bool {
+    use serde_json::Value;
+    let Ok(v) = serde_json::from_str::<Value>(line) else {
+        return false;
+    };
+    if v.get("type").and_then(Value::as_str) != Some("assistant") {
+        return false;
+    }
+    match v.pointer("/message/content") {
+        Some(Value::String(s)) => is_ready_answer(agent_id, s),
+        Some(Value::Array(parts)) => parts.iter().any(|p| {
+            p.get("type").and_then(Value::as_str) == Some("text")
+                && p
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .is_some_and(|t| is_ready_answer(agent_id, t))
+        }),
+        _ => false,
     }
 }
 
@@ -507,3 +887,48 @@ fn handle_from(s: &ActiveSession) -> TerminalSwarmSessionHandle {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const READY_LINE: &str = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"@scout hazır."}]}}"#;
+    const KICKOFF_ECHO: &str = r#"{"type":"user","message":{"role":"user","content":"[Neuron] Oturum başladı. @scout hazır."}}"#;
+
+    #[test]
+    fn login_and_first_run_screens_block_the_kickoff() {
+        for screen in [
+            "Select login method:\n❯ 1. Claude account with subscription",
+            "Choose the text style that looks best with your terminal",
+            "Do you trust the files in this folder?",
+            "OAuth token has expired. Please run /login",
+        ] {
+            assert!(screen_is_blocking(screen), "{screen}");
+        }
+        // The ordinary REPL welcome / prompt is not blocking.
+        assert!(!screen_is_blocking("✻ Welcome to Claude Code!\n> "));
+        assert!(!screen_is_blocking(""));
+    }
+
+    #[test]
+    fn ready_answer_is_read_from_assistant_turns_only() {
+        assert!(line_is_ready_answer(READY_LINE, "scout"));
+        assert!(!line_is_ready_answer(READY_LINE, "planner"));
+        // A user turn (e.g. the kickoff echo) never counts.
+        assert!(!line_is_ready_answer(KICKOFF_ECHO, "scout"));
+        assert!(!line_is_ready_answer("not json", "scout"));
+    }
+
+    #[test]
+    fn transcript_scan_finds_the_answer_in_the_pane_home() {
+        let home = tempfile::tempdir().expect("tempdir");
+        assert!(!transcript_has_ready_answer(home.path(), "scout"));
+        let dir = home.path().join(".claude/projects/C--proj");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("abc.jsonl");
+        std::fs::write(&file, format!("{KICKOFF_ECHO}\n")).unwrap();
+        assert!(!transcript_has_ready_answer(home.path(), "scout"));
+        std::fs::write(&file, format!("{KICKOFF_ECHO}\n{READY_LINE}\n")).unwrap();
+        assert!(transcript_has_ready_answer(home.path(), "scout"));
+    }
+}

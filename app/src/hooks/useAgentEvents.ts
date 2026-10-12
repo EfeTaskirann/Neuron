@@ -2,19 +2,17 @@
 // per-(workspace, agent) Tauri event channel
 // `swarm:agent:{ws}:{agent}:event` (WP-W4-03 §5).
 //
-// Returns a ring-buffered tail of recent events (cap 200) so the
-// W4-04 grid pane can render a scrollable transcript without OOMing
-// the renderer on a long-running session. Resubscribes when
-// `workspaceId` or `agentId` changes — the W4-04 grid renders 9 panes
-// from a fixed slot mapping, so in practice each hook instance keys
-// to one (workspace, agent) for its lifetime.
+// Returns a ring-buffered tail of recent events (cap 200) so the W4-04
+// grid pane can render a scrollable transcript without OOMing the
+// renderer on a long-running session. The shared `useTauriEvent`
+// resubscribes when the channel (workspace/agent) changes.
 //
-// Side-channel pattern matches `useSwarmJob`'s W3-12c subscription:
-// best-effort listen, no throw on listener registration failure
-// (jsdom test runtime has no real Tauri bridge).
-import { useEffect, useState } from 'react';
-import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+// We deliberately do NOT reset `events` on (workspace, agent) change —
+// the W4-04 grid wraps each pane in `key={ws + agent}` so React remounts
+// the component (re-initialising this state to `[]`) on key change.
+import { useState } from 'react';
 import type { SwarmAgentEvent } from '../lib/bindings';
+import { useTauriEvent } from './useTauriEvent';
 
 const TAIL_CAP = 200;
 
@@ -23,41 +21,14 @@ export function useAgentEvents(
   agentId: string,
 ): SwarmAgentEvent[] {
   const [events, setEvents] = useState<SwarmAgentEvent[]>([]);
-
-  useEffect(() => {
-    let unlisten: UnlistenFn | undefined;
-    let cancelled = false;
-    const channel = `swarm:agent:${workspaceId}:${agentId}:event`;
-    // Note: we deliberately do NOT call `setEvents([])` here on
-    // (workspace, agent) change. Synchronous setState in an effect
-    // triggers `react-hooks/set-state-in-effect` and causes a
-    // cascading render. The W4-04 grid is expected to wrap each
-    // pane in `key={workspaceId + agentId}` so React remounts the
-    // component (and therefore re-initialises this hook's state to
-    // `[]`) on key change — that's the reset path.
-    listen<SwarmAgentEvent>(channel, (event) => {
+  useTauriEvent<SwarmAgentEvent>(
+    `swarm:agent:${workspaceId}:${agentId}:event`,
+    (payload) => {
       setEvents((prev) => {
-        const next = [...prev, event.payload];
+        const next = [...prev, payload];
         return next.length > TAIL_CAP ? next.slice(-TAIL_CAP) : next;
       });
-    })
-      .then((fn) => {
-        if (cancelled) {
-          fn();
-        } else {
-          unlisten = fn;
-        }
-      })
-      .catch((err) => {
-        // Listener registration is best-effort — Tauri rejects
-        // when the runtime is not initialised (jsdom tests).
-        console.warn('[useAgentEvents] failed to subscribe to', channel, err);
-      });
-    return () => {
-      cancelled = true;
-      unlisten?.();
-    };
-  }, [workspaceId, agentId]);
-
+    },
+  );
   return events;
 }

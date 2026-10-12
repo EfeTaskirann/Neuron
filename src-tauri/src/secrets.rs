@@ -17,7 +17,7 @@
 //!    `cargo test` and developer escape hatches; never advertised
 //!    in user docs. An empty value is treated as absent (matches
 //!    the `Ok(v) if !v.is_empty()` guard previously inlined in
-//!    `mcp::registry::resolve_env`).
+//!    `mcp::registry::resolve_env`, now `registry::spawn::resolve_env`).
 //! 2. **OS keychain** via `keyring::Entry::new("neuron", key)?
 //!    .get_password()`. The service name `"neuron"` is the same
 //!    string the Python sidecar uses (`SERVICE = "neuron"` in
@@ -36,7 +36,7 @@
 //! ## Why not call `keyring` from `commands/secrets.rs` directly
 //!
 //! Keeping the keyring boundary in one module:
-//! - lets `mcp::registry::resolve_env` reuse the same env-override
+//! - lets `mcp::registry::spawn::resolve_env` reuse the same env-override
 //!   path without duplicating the precedence rules (the existing
 //!   `requires_secret: "GITHUB_PERSONAL_ACCESS_TOKEN"` flow keeps
 //!   working from a developer's shell);

@@ -3,8 +3,9 @@
 
 use std::sync::Arc;
 
-use tauri::{AppHandle, Manager, Runtime};
+use tauri::{AppHandle, Runtime};
 
+use crate::commands::util::require_state;
 use crate::error::AppError;
 use crate::swarm::{AgentStatusRow, SwarmAgentRegistry};
 
@@ -27,17 +28,8 @@ pub async fn swarm_agents_list_status<R: Runtime>(
             "workspaceId must not be empty".into(),
         ));
     }
-    let registry = app
-        .try_state::<Arc<SwarmAgentRegistry>>()
-        .ok_or_else(|| {
-            AppError::Internal(
-                "SwarmAgentRegistry missing from app state — \
-                 lib.rs::setup did not call app.manage()"
-                    .into(),
-            )
-        })?
-        .inner()
-        .clone();
+    let registry =
+        require_state::<_, Arc<SwarmAgentRegistry>>(&app, "SwarmAgentRegistry")?;
     Ok(registry.list_status(&workspace_id).await)
 }
 
@@ -58,16 +50,7 @@ pub async fn swarm_agents_shutdown_workspace<R: Runtime>(
             "workspaceId must not be empty".into(),
         ));
     }
-    let registry = app
-        .try_state::<Arc<SwarmAgentRegistry>>()
-        .ok_or_else(|| {
-            AppError::Internal(
-                "SwarmAgentRegistry missing from app state — \
-                 lib.rs::setup did not call app.manage()"
-                    .into(),
-            )
-        })?
-        .inner()
-        .clone();
+    let registry =
+        require_state::<_, Arc<SwarmAgentRegistry>>(&app, "SwarmAgentRegistry")?;
     registry.shutdown_workspace(&workspace_id).await
 }

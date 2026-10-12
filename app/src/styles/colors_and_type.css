@@ -3,8 +3,12 @@
    Single source of truth for tokens. OKLCH only.
    ============================================================ */
 
-/* ---------- Fonts (Geist self-hosted; Inter / JetBrains Mono fallback) ---------- */
+/* ---------- Fonts (Geist self-hosted; Inter / JetBrains Mono fallback) ----------
+   Both imports are load-bearing: Inter covers body/UI weights, the
+   Geist import (consolidated here from the former canvas.css duplicate
+   token sheet) covers display weights 400-900. */
 @import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap");
+@import url("https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700;900&family=JetBrains+Mono:wght@400;500&display=swap");
 
 @font-face {
   font-family: "Geist";
@@ -44,12 +48,45 @@
   --neuron-midnight-900: oklch(0.190 0.046 258);
   --neuron-midnight-950: oklch(0.135 0.032 258);
 
-  /* Status helpers */
+  /* Status & accent ramps — full 50/200/300/400/500/700 scales.
+     Values consolidated from the former canvas.css duplicate sheet,
+     which loaded later and therefore WAS the live source (note
+     --neuron-sky-500 drifted there to hue 240; that live value wins
+     here so rendering stays identical). */
+  --neuron-emerald-50:  oklch(0.965 0.022 158);
+  --neuron-emerald-200: oklch(0.870 0.075 158);
+  --neuron-emerald-300: oklch(0.795 0.115 158);
+  --neuron-emerald-400: oklch(0.748 0.150 158);
   --neuron-emerald-500: oklch(0.700 0.170 158);
-  --neuron-amber-500:   oklch(0.795 0.165 78);
-  --neuron-rose-500:    oklch(0.640 0.230 18);
-  --neuron-sky-500:     oklch(0.715 0.145 232);
-  --neuron-slate-500:   oklch(0.555 0.020 258);
+  --neuron-emerald-700: oklch(0.500 0.135 158);
+
+  --neuron-amber-50:  oklch(0.975 0.022 78);
+  --neuron-amber-200: oklch(0.905 0.075 78);
+  --neuron-amber-300: oklch(0.855 0.115 78);
+  --neuron-amber-400: oklch(0.825 0.150 78);
+  --neuron-amber-500: oklch(0.795 0.165 78);
+  --neuron-amber-700: oklch(0.595 0.135 78);
+
+  --neuron-rose-50:  oklch(0.965 0.024 18);
+  --neuron-rose-200: oklch(0.880 0.085 18);
+  --neuron-rose-300: oklch(0.795 0.135 18);
+  --neuron-rose-400: oklch(0.715 0.190 18);
+  --neuron-rose-500: oklch(0.640 0.230 18);
+  --neuron-rose-700: oklch(0.470 0.180 18);
+
+  --neuron-sky-50:  oklch(0.970 0.020 232);
+  --neuron-sky-200: oklch(0.895 0.060 232);
+  --neuron-sky-300: oklch(0.778 0.130 222);
+  --neuron-sky-400: oklch(0.715 0.145 232);
+  --neuron-sky-500: oklch(0.640 0.150 240);
+  --neuron-sky-700: oklch(0.470 0.125 240);
+
+  --neuron-slate-50:  oklch(0.965 0.010 258);
+  --neuron-slate-200: oklch(0.870 0.025 258);
+  --neuron-slate-300: oklch(0.700 0.030 258);
+  --neuron-slate-400: oklch(0.660 0.020 258);
+  --neuron-slate-500: oklch(0.555 0.020 258);
+  --neuron-slate-700: oklch(0.350 0.094 258);
 
   /* ---------- Typography ----------
      Geist-Black (900) self-hosted is used for display surfaces.
@@ -199,6 +236,38 @@
   --chart-3:              oklch(0.700 0.170 158);
   --chart-4:              oklch(0.795 0.165 78);
   --chart-5:              oklch(0.555 0.020 258);
+
+  /* Surface elevation tiers — sidebar / cards / nested */
+  --surface-1: oklch(0.165 0.038 258);   /* sidebar, elevated panels */
+  --surface-2: oklch(0.225 0.052 258);   /* cards, hover surfaces */
+  --surface-3: oklch(0.265 0.068 258);   /* nested elevated, button bg */
+
+  /* Shadow aliases used by app.css / terminal.css */
+  --shadow-card:       var(--shadow-sm);
+  --shadow-card-hover: var(--shadow-md);
+  --shadow-pop:        var(--shadow-lg);
+
+  /* Synaptic semantic aliases — protect status colors from accent swap */
+  --syn-running: var(--neuron-violet-400);
+  --syn-success: var(--neuron-emerald-500);
+  --syn-error:   var(--neuron-rose-500);
+  --syn-warning: var(--neuron-amber-500);
+  --syn-info:    var(--neuron-sky-400);
+}
+
+/* Light-mode mirror so the same component code works either way */
+:root:not(.dark):not([data-theme="dark"]) {
+  --surface-1: oklch(0.985 0.006 258);
+  --surface-2: oklch(0.965 0.012 258);
+  --surface-3: oklch(0.935 0.024 258);
+  --shadow-card:       var(--shadow-sm);
+  --shadow-card-hover: var(--shadow-md);
+  --shadow-pop:        var(--shadow-lg);
+  --syn-running: var(--neuron-violet-500);
+  --syn-success: var(--neuron-emerald-500);
+  --syn-error:   var(--neuron-rose-500);
+  --syn-warning: var(--neuron-amber-500);
+  --syn-info:    var(--neuron-sky-500);
 }
 
 /* ============================================================

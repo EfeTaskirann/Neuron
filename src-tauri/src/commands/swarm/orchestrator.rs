@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use tauri::{AppHandle, Manager, Runtime};
 
+use crate::commands::util::require_state;
 use crate::db::DbPool;
 use crate::error::AppError;
 use crate::swarm::coordinator::orchestrator_session::{
@@ -215,17 +216,7 @@ pub async fn swarm_orchestrator_history<R: Runtime>(
             "workspaceId must not be empty".into(),
         ));
     }
-    let pool = app
-        .try_state::<DbPool>()
-        .ok_or_else(|| {
-            AppError::Internal(
-                "DbPool missing from app state — \
-                 lib.rs::setup did not call app.manage()"
-                    .into(),
-            )
-        })?
-        .inner()
-        .clone();
+    let pool = require_state::<_, DbPool>(&app, "DbPool")?;
     let effective_limit = limit
         .unwrap_or(SWARM_ORCHESTRATOR_HISTORY_DEFAULT_LIMIT)
         .min(SWARM_ORCHESTRATOR_HISTORY_MAX_LIMIT);
@@ -249,17 +240,7 @@ pub async fn swarm_orchestrator_clear_history<R: Runtime>(
             "workspaceId must not be empty".into(),
         ));
     }
-    let pool = app
-        .try_state::<DbPool>()
-        .ok_or_else(|| {
-            AppError::Internal(
-                "DbPool missing from app state — \
-                 lib.rs::setup did not call app.manage()"
-                    .into(),
-            )
-        })?
-        .inner()
-        .clone();
+    let pool = require_state::<_, DbPool>(&app, "DbPool")?;
     clear_messages(&pool, &workspace_id).await
 }
 
@@ -295,17 +276,7 @@ pub async fn swarm_orchestrator_log_job<R: Runtime>(
             "goal must not be empty".into(),
         ));
     }
-    let pool = app
-        .try_state::<DbPool>()
-        .ok_or_else(|| {
-            AppError::Internal(
-                "DbPool missing from app state — \
-                 lib.rs::setup did not call app.manage()"
-                    .into(),
-            )
-        })?
-        .inner()
-        .clone();
+    let pool = require_state::<_, DbPool>(&app, "DbPool")?;
     let now_ms = crate::time::now_millis();
     append_job_message(&pool, &workspace_id, &job_id, &goal, now_ms).await?;
     Ok(())

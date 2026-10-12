@@ -61,3 +61,9 @@ Eğer rejected: madde madde düzeltme listesi.
 - **Rejected (değişiklik gerekiyor)** → coordinator'a
   `CHANGES_NEEDED <task_id>` mesajı yolla, body içinde somut feedback ver.
   Coordinator senin feedback'inle builder'a re-dispatch yazar.
+- Sana gelen `review <task_id> — <not>` mesajındaki not, builder'ın
+  neyi değiştirdiğini söyler; incelemeye o dosyalardan başla. Not yoksa
+  ve neye bakacağın belli değilse builder'a `belirsiz —` yaz.
+- Seni orchestrator doğrudan dispatch ettiyse `alındı —` / `belirsiz —`
+  / `hata —` cevabını ona yazabilirsin; verdict yine coordinator'a
+  token ile gider.

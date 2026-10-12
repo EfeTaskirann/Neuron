@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use tauri::{AppHandle, Manager, Runtime};
 
+use crate::commands::util::require_state;
 use crate::error::AppError;
 use crate::swarm::coordinator::{JobDetail, JobState, JobSummary};
 use crate::swarm::{JobRegistry, MailboxBus, MailboxEvent};
@@ -71,17 +72,8 @@ pub async fn swarm_cancel_job<R: Runtime>(
         ));
     }
 
-    let registry = app
-        .try_state::<Arc<JobRegistry>>()
-        .ok_or_else(|| {
-            AppError::Internal(
-                "swarm JobRegistry missing from app state — \
-                 lib.rs::setup did not call app.manage()"
-                    .into(),
-            )
-        })?
-        .inner()
-        .clone();
+    let registry =
+        require_state::<_, Arc<JobRegistry>>(&app, "swarm JobRegistry")?;
 
     // WP-W5-05 — discriminate on `swarm_jobs.source`. Tests in the
     // FSM cancel suite use a `JobRegistry::new()` (no pool) so the
@@ -106,34 +98,16 @@ pub async fn swarm_cancel_job<R: Runtime>(
             // the right per-workspace broadcast channel. The
             // brain + dispatcher subscribers filter by job_id,
             // but the channel routing is per-workspace.
-            let pool = app
-                .try_state::<crate::db::DbPool>()
-                .ok_or_else(|| {
-                    AppError::Internal(
-                        "DbPool missing from app state — \
-                         lib.rs::setup did not call app.manage()"
-                            .into(),
-                    )
-                })?
-                .inner()
-                .clone();
+            let pool =
+                require_state::<_, crate::db::DbPool>(&app, "DbPool")?;
             let workspace_id: String = sqlx::query_scalar(
                 "SELECT workspace_id FROM swarm_jobs WHERE id = ?",
             )
             .bind(&job_id)
             .fetch_one(&pool)
             .await?;
-            let bus = app
-                .try_state::<Arc<MailboxBus>>()
-                .ok_or_else(|| {
-                    AppError::Internal(
-                        "MailboxBus missing from app state — \
-                         lib.rs::setup did not call app.manage()"
-                            .into(),
-                    )
-                })?
-                .inner()
-                .clone();
+            let bus =
+                require_state::<_, Arc<MailboxBus>>(&app, "MailboxBus")?;
             bus.emit_typed(
                 &app,
                 &workspace_id,
@@ -193,17 +167,8 @@ pub async fn swarm_list_jobs<R: Runtime>(
     workspace_id: Option<String>,
     limit: Option<u32>,
 ) -> Result<Vec<JobSummary>, AppError> {
-    let registry = app
-        .try_state::<Arc<JobRegistry>>()
-        .ok_or_else(|| {
-            AppError::Internal(
-                "swarm JobRegistry missing from app state — \
-                 lib.rs::setup did not call app.manage()"
-                    .into(),
-            )
-        })?
-        .inner()
-        .clone();
+    let registry =
+        require_state::<_, Arc<JobRegistry>>(&app, "swarm JobRegistry")?;
     let effective_limit = limit
         .unwrap_or(SWARM_LIST_JOBS_DEFAULT_LIMIT)
         .min(SWARM_LIST_JOBS_MAX_LIMIT);
@@ -225,17 +190,8 @@ pub async fn swarm_get_job<R: Runtime>(
             "jobId must not be empty".into(),
         ));
     }
-    let registry = app
-        .try_state::<Arc<JobRegistry>>()
-        .ok_or_else(|| {
-            AppError::Internal(
-                "swarm JobRegistry missing from app state — \
-                 lib.rs::setup did not call app.manage()"
-                    .into(),
-            )
-        })?
-        .inner()
-        .clone();
+    let registry =
+        require_state::<_, Arc<JobRegistry>>(&app, "swarm JobRegistry")?;
     match registry.get_job_detail(&job_id).await? {
         Some(detail) => Ok(detail),
         None => Err(AppError::NotFound(format!("swarm job {job_id}"))),

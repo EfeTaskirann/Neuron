@@ -35,12 +35,17 @@ WP-W2-03 (commands) ──┬──► WP-W2-04 (agents) ──► WP-W2-07 (tra
                                             (also needs 04,05,06)
 ```
 
-## Week 3 — MCP & telemetry hardening (active)
+## Week 3 — MCP & telemetry hardening (historical)
 
 Detailed scope rationale, dependency narrative, and open questions
 in [`WP-W3-overview.md`](./WP-W3-overview.md).
 
 ### Status
+
+> **Not (2026-06-10):** Bu tablo W3 planlandığı andaki snapshot'tır ve
+> güncel tutulmuyor — repo W6'ya ilerledi; örn. W3-01 (keychain →
+> `secrets.rs`) ve W3-06 (OTel → `telemetry/`) çoktan ship oldu. Güncel
+> iş takibi `tasks/auto-refactor/BACKLOG.md`'de.
 
 | ID | Title | Status | Blocked by | Size |
 |---|---|---|---|---|

@@ -207,7 +207,10 @@ impl ProjectorHandle {
     /// double-call panics on the second `await` because tokio's
     /// JoinHandle is not Clone, but the Notify wake is harmless).
     pub async fn shutdown(self) {
-        self.shutdown.notify_waiters();
+        // notify_one stores a permit: if the loop is mid-handle_envelope
+        // (not parked in notified()), notify_waiters would be lost and
+        // the join below would hang app exit on the next recv().
+        self.shutdown.notify_one();
         let _ = self.handle.await;
     }
 
