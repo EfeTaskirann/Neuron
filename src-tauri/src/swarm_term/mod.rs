@@ -28,6 +28,7 @@
 //! repaint dedupe.
 
 pub mod bridge;
+pub(crate) mod heartbeat;
 pub mod hierarchy;
 pub mod home_isolation;
 pub mod lifecycle;

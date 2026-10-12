@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Manager, Runtime};
 
 use crate::error::AppError;
+use crate::swarm_term::heartbeat;
 
 /// Create the per-session HOME isolation root under
 /// `app_data_dir/swarm-term/homes/<session_id>/`. The directory is
@@ -40,8 +41,10 @@ pub(crate) fn prepare_isolated_homes_root<R: Runtime>(
 /// killed by a `tauri dev` rebuild, a crash). Each holds a copy of the
 /// user's credentials, so they must not accumulate — and one of them may
 /// hold the only fresh, rotated refresh token, so credentials are synced
-/// out of each tree before it goes. Only call when no session is
-/// running. Returns how many trees were removed.
+/// out of each tree before it goes. Trees still beating (a session of
+/// ANOTHER Neuron instance sharing this app-data dir — see
+/// [`crate::swarm_term::heartbeat`]) are skipped. Call only when this
+/// process runs no session. Returns how many trees were removed.
 pub(crate) fn sweep_orphan_homes<R: Runtime>(app: &AppHandle<R>) -> usize {
     let Ok(app_data) = app.path().app_data_dir() else {
         return 0;
@@ -59,7 +62,7 @@ fn sweep_orphan_homes_in(homes_base: &Path, real_credentials: Option<&Path>) -> 
     let mut removed = 0;
     for entry in entries.flatten() {
         let path = entry.path();
-        if !path.is_dir() {
+        if !path.is_dir() || heartbeat::is_live(&path) {
             continue;
         }
         sync_credentials_with(real_credentials, &path);
@@ -393,9 +396,16 @@ mod tests {
         std::fs::create_dir_all(&b).unwrap();
         std::fs::write(b.join(".credentials.json"), creds(100, "dead", "")).unwrap();
 
+        // A live session of another Neuron instance must be left alone.
+        let live = base.join("swarm-term-LIVE");
+        std::fs::create_dir_all(live.join("scout")).unwrap();
+        crate::swarm_term::heartbeat::beat(&live);
+
         let removed = sweep_orphan_homes_in(&base, Some(&real));
 
         assert_eq!(removed, 2);
+        assert!(live.is_dir(), "a beating session tree must not be swept");
+        std::fs::remove_dir_all(&live).unwrap();
         assert_eq!(std::fs::read_dir(&base).unwrap().count(), 0);
         assert_eq!(
             oauth_of(&real)["refreshToken"],

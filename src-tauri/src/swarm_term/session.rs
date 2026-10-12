@@ -38,6 +38,7 @@ use crate::swarm::profile::ProfileRegistry;
 use crate::swarm_term::bridge::{
     self, BridgeHandle, BRIDGE_DIRNAME,
 };
+use crate::swarm_term::heartbeat;
 use crate::swarm_term::hierarchy::AGENT_IDS;
 use crate::swarm_term::home_isolation::{
     prepare_isolated_homes_root, seed_pane_home, sweep_orphan_homes,
@@ -287,12 +288,14 @@ impl TerminalSwarmRegistry {
         }
         let bridgespace_root = bridge_parent.join(&session_id);
         bridge::prepare_layout(&bridgespace_root)?;
+        heartbeat::beat(&bridgespace_root);
 
         // Per-session HOME isolation root. Each pane gets a private
         // subdir with copies of `~/.claude.json` + `~/.claude/`
         // top-level files so the 9 claude.exe processes don't race on
         // the user's real `~/.claude.json` and truncate it.
         let homes_root = prepare_isolated_homes_root(&app, &session_id)?;
+        heartbeat::beat(&homes_root);
 
         // Personas are loaded BEFORE spawning: each pane gets its
         // persona + bridge protocol as an appended SYSTEM prompt
@@ -499,16 +502,19 @@ impl TerminalSwarmRegistry {
         let registry_for_inject = registry.clone();
         let ready_panes_for_inject = Arc::clone(&ready_panes);
         let alive_for_inject = Arc::clone(&alive);
+        let pool_for_inject = pool.clone();
         tauri::async_runtime::spawn(async move {
             tokio::time::sleep(Duration::from_millis(READY_DELAY_MS)).await;
             if !alive_for_inject.load(Ordering::SeqCst) {
                 return;
             }
             for (agent_id, pane_id) in &panes_by_agent {
-                send_kickoff(&registry_for_inject, agent_id, pane_id).await;
+                send_kickoff(&registry_for_inject, &pool_for_inject, agent_id, pane_id)
+                    .await;
             }
             wait_for_ready_answers(
                 &registry_for_inject,
+                &pool_for_inject,
                 &panes_by_agent,
                 &pane_homes,
                 &ready_panes_for_inject,
@@ -552,18 +558,29 @@ impl TerminalSwarmRegistry {
             drop(app_for_inject);
         });
 
-        // In-session credentials sync: spread a pane's token refresh to
-        // the other panes and back to the user's real file (see
-        // `home_isolation::sync_credentials`). Ends with the session;
-        // `stop()` runs one final pass.
-        let alive_for_sync = Arc::clone(&alive);
+        // Session upkeep, ends with the session:
+        //   * heartbeat both on-disk trees so another Neuron instance's
+        //     orphan sweep leaves them alone (see `heartbeat`);
+        //   * credentials sync — spread a pane's token refresh to the
+        //     other panes and back to the user's real file (see
+        //     `home_isolation::sync_credentials`); `stop()` keeps syncing
+        //     until the homes are gone.
+        let alive_for_upkeep = Arc::clone(&alive);
+        let bridge_root_for_upkeep = bridgespace_root.clone();
         tauri::async_runtime::spawn(async move {
+            let mut since_sync = Duration::ZERO;
             loop {
-                tokio::time::sleep(CREDENTIALS_SYNC_EVERY).await;
-                if !alive_for_sync.load(Ordering::SeqCst) {
+                tokio::time::sleep(heartbeat::HEARTBEAT_EVERY).await;
+                if !alive_for_upkeep.load(Ordering::SeqCst) {
                     return;
                 }
-                sync_credentials(&homes_root);
+                heartbeat::beat(&homes_root);
+                heartbeat::beat(&bridge_root_for_upkeep);
+                since_sync += heartbeat::HEARTBEAT_EVERY;
+                if since_sync >= CREDENTIALS_SYNC_EVERY {
+                    since_sync = Duration::ZERO;
+                    sync_credentials(&homes_root);
+                }
             }
         });
 
@@ -609,11 +626,7 @@ impl TerminalSwarmRegistry {
             let _ = registry.kill_pane(&pid, &pool).await;
         }
         if let Some(root) = homes_root {
-            // Final pass BEFORE deleting the pane homes: a token refreshed
-            // in a pane must reach the user's real credentials file, or
-            // the next session starts with a rotated-away refresh token.
-            sync_credentials(&root);
-            remove_dir_with_retry(&root).await;
+            remove_homes_with_retry(&root).await;
         }
         if let Some(root) = bridgespace_root {
             // Keep the rejection evidence (envelopes + `.reason`) —
@@ -649,8 +662,14 @@ impl TerminalSwarmRegistry {
 
 /// Delete a stopped session's homes root, retrying while the just-killed
 /// claude processes still hold files open (os error 32 on Windows).
-async fn remove_dir_with_retry(root: &Path) {
+///
+/// Credentials are synced out of the homes before EVERY attempt: a pane
+/// still exiting can write a refreshed (rotated) token after a single
+/// up-front sync, and deleting the homes would then destroy the only
+/// live refresh token — the next session would start in `/login`.
+async fn remove_homes_with_retry(root: &Path) {
     for attempt in 1..=CLEANUP_ATTEMPTS {
+        sync_credentials(root);
         match std::fs::remove_dir_all(root) {
             Ok(()) => {
                 tracing::info!(
@@ -674,8 +693,62 @@ async fn remove_dir_with_retry(root: &Path) {
     }
 }
 
-/// Paste the kickoff turn into one pane (best-effort, logged).
-async fn send_kickoff(registry: &TerminalRegistry, agent_id: &str, pane_id: &str) {
+/// Lower-case fragments of claude screens that are NOT the REPL prompt —
+/// login method picker, first-run theme / trust / onboarding screens,
+/// the expired-credentials banner. Pasting the kickoff + Enter there
+/// would pick a menu option (e.g. start an OAuth browser flow) instead
+/// of reaching the model.
+const BLOCKING_SCREEN_MARKERS: &[&str] = &[
+    "select login method",
+    "choose the text style",
+    "trust the files",
+    "press enter to continue",
+    "please run /login",
+];
+
+/// How many trailing pane lines are inspected for those markers.
+const SCREEN_TAIL_LINES: usize = 60;
+
+fn screen_is_blocking(screen_tail: &str) -> bool {
+    let lower = screen_tail.to_lowercase();
+    BLOCKING_SCREEN_MARKERS.iter().any(|m| lower.contains(m))
+}
+
+/// True when the pane's recent output shows a login / first-run screen.
+async fn pane_on_blocking_screen(
+    registry: &TerminalRegistry,
+    pool: &DbPool,
+    pane_id: &str,
+) -> bool {
+    let Ok(lines) = registry.pane_lines(pane_id, None, pool).await else {
+        return false;
+    };
+    let tail: Vec<&str> = lines
+        .iter()
+        .rev()
+        .take(SCREEN_TAIL_LINES)
+        .map(|l| l.text.as_str())
+        .collect();
+    screen_is_blocking(&tail.join("\n"))
+}
+
+/// Paste the kickoff turn into one pane (best-effort, logged) — unless
+/// the pane is on a login / first-run screen, where it is withheld and
+/// the pane simply stays not-ready until the user resolves the screen.
+async fn send_kickoff(
+    registry: &TerminalRegistry,
+    pool: &DbPool,
+    agent_id: &str,
+    pane_id: &str,
+) {
+    if pane_on_blocking_screen(registry, pool, pane_id).await {
+        tracing::warn!(
+            agent_id = %agent_id,
+            "swarm-term: kickoff withheld — pane is on a login / first-run \
+             screen; resolve it in the pane"
+        );
+        return;
+    }
     let kickoff = build_kickoff_message(agent_id);
     if let Err(e) =
         bridge::paste_then_submit(registry, pane_id, kickoff.as_bytes()).await
@@ -695,6 +768,7 @@ async fn send_kickoff(registry: &TerminalRegistry, agent_id: &str, pane_id: &str
 /// soon as the session is stopped (`alive` cleared).
 async fn wait_for_ready_answers(
     registry: &TerminalRegistry,
+    pool: &DbPool,
     panes_by_agent: &HashMap<String, String>,
     pane_homes: &HashMap<String, PathBuf>,
     ready: &Arc<Mutex<HashSet<String>>>,
@@ -748,7 +822,7 @@ async fn wait_for_ready_answers(
                     "swarm-term: no kickoff answer yet — re-sending once"
                 );
                 if let Some(pane) = panes_by_agent.get(*agent) {
-                    send_kickoff(registry, agent, pane).await;
+                    send_kickoff(registry, pool, agent, pane).await;
                 }
             }
         }
@@ -820,6 +894,21 @@ mod tests {
 
     const READY_LINE: &str = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"@scout hazır."}]}}"#;
     const KICKOFF_ECHO: &str = r#"{"type":"user","message":{"role":"user","content":"[Neuron] Oturum başladı. @scout hazır."}}"#;
+
+    #[test]
+    fn login_and_first_run_screens_block_the_kickoff() {
+        for screen in [
+            "Select login method:\n❯ 1. Claude account with subscription",
+            "Choose the text style that looks best with your terminal",
+            "Do you trust the files in this folder?",
+            "OAuth token has expired. Please run /login",
+        ] {
+            assert!(screen_is_blocking(screen), "{screen}");
+        }
+        // The ordinary REPL welcome / prompt is not blocking.
+        assert!(!screen_is_blocking("✻ Welcome to Claude Code!\n> "));
+        assert!(!screen_is_blocking(""));
+    }
 
     #[test]
     fn ready_answer_is_read_from_assistant_turns_only() {

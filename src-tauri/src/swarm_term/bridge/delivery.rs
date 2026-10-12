@@ -9,8 +9,8 @@ use tauri::{AppHandle, Emitter, Runtime};
 use crate::error::AppError;
 use crate::sidecar::terminal::TerminalRegistry;
 
-/// Hard cap on one paste-then-submit (both PTY writes + the submit
-/// delay). claude's bracketed-paste accept is sub-ms in healthy
+/// Hard cap on a single PTY write (the routed paste, or its submitting
+/// CR). claude's bracketed-paste accept is sub-ms in healthy
 /// conditions; a 2 s cap surfaces stuck panes within one tick of the
 /// user noticing nothing happens.
 pub(super) const WRITE_TIMEOUT_SECS: u64 = 2;
@@ -32,8 +32,30 @@ pub(crate) async fn paste_then_submit(
     paste: &[u8],
 ) -> Result<(), AppError> {
     registry.write_to_pane(pane, paste).await?;
+    submit_pasted(registry, pane).await
+}
+
+/// Second half of [`paste_then_submit`]: wait [`SUBMIT_DELAY_MS`], then
+/// send the lone `\r` (bounded by [`WRITE_TIMEOUT_SECS`]). Exposed so a
+/// caller that retries on failure can retry the PASTE alone — once the
+/// paste has landed, re-running the whole sequence would paste the same
+/// text into the input box a second time.
+pub(crate) async fn submit_pasted(
+    registry: &TerminalRegistry,
+    pane: &str,
+) -> Result<(), AppError> {
     tokio::time::sleep(Duration::from_millis(SUBMIT_DELAY_MS)).await;
-    registry.write_to_pane(pane, b"\r").await
+    match tokio::time::timeout(
+        Duration::from_secs(WRITE_TIMEOUT_SECS),
+        registry.write_to_pane(pane, b"\r"),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(AppError::Internal(format!(
+            "submit CR to pane {pane} timed out"
+        ))),
+    }
 }
 
 /// True when a pane's status means a routed message must NOT be
@@ -131,10 +153,8 @@ pub(crate) fn format_routed_message(
         .replace("\x1b[201~", "[201~");
     let task = task_id
         .map(|id| {
-            id.chars()
-                .filter(|c| !c.is_control())
-                .take(MAX_SIGNATURE_TASK_ID_CHARS)
-                .collect::<String>()
+            let printable: String = id.chars().filter(|c| !c.is_control()).collect();
+            crate::text::truncate_chars(&printable, MAX_SIGNATURE_TASK_ID_CHARS)
         })
         .filter(|id| !id.trim().is_empty())
         .map(|id| format!(" [task {id}]"))
@@ -159,13 +179,12 @@ pub(crate) fn format_system_notice(text: &str) -> String {
     format!("\x1b[200~[Neuron] {safe}\x1b[201~")
 }
 
+/// `s` capped at `max` bytes (on a char boundary), with `…` when cut.
 pub(super) fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        return s.to_string();
+    let cut = crate::text::truncate_to_char_boundary(s, max);
+    if cut.len() == s.len() {
+        s.to_string()
+    } else {
+        format!("{cut}…")
     }
-    let mut end = max;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}…", &s[..end])
 }

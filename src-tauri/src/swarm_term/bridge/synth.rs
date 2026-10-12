@@ -10,7 +10,9 @@ use std::sync::Arc;
 use serde_json::json;
 use tauri::{AppHandle, Emitter, Runtime};
 
-use crate::swarm_term::hierarchy::{is_allowed, is_builder, is_reviewer};
+use crate::swarm_term::hierarchy::{
+    is_allowed, is_builder, is_reviewer, reviewer_for_builder,
+};
 use crate::swarm_term::lifecycle::{
     followup_for_coordinator_inbound, is_error_report, lifecycle_note,
     looks_like_unparsed_signal, parse_lifecycle_token_with_fallback,
@@ -44,7 +46,17 @@ pub(super) fn lifecycle_synthesise<R: Runtime>(
     // escalating something the coordinator already knows failed.
     if let Some(id) = task_id.filter(|_| is_error_report(body)) {
         if let Some(pane) = panes_by_agent.get(from_agent) {
-            if lifecycle.abandon(pane, id) {
+            // The reporter may close its own entries, and — when it is a
+            // reviewer — the review waits of the builders it is paired
+            // with. Anyone else's `hata` about the same id closes nothing.
+            let mut closable: Vec<&str> = vec![pane.as_str()];
+            closable.extend(
+                panes_by_agent
+                    .iter()
+                    .filter(|(agent, _)| reviewer_for_builder(agent) == Some(from_agent))
+                    .map(|(_, builder_pane)| builder_pane.as_str()),
+            );
+            if lifecycle.abandon(&closable, id) {
                 tracing::info!(
                     source = %from_agent,
                     task_id = %id,

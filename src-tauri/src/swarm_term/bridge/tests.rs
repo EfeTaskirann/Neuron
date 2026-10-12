@@ -221,8 +221,13 @@ fn sweep_orphan_sessions_archives_evidence_and_keeps_other_entries() {
     // Not ours: other swarm system dirs, the gitignore, the archive.
     fs::create_dir_all(parent.path().join("swarms/abc")).unwrap();
     fs::write(parent.path().join(".gitignore"), "*").unwrap();
+    // A live session of another Neuron instance on the same project.
+    let live = parent.path().join("swarm-term-01LIVE");
+    prepare_layout(&live).expect("layout");
+    crate::swarm_term::heartbeat::beat(&live);
 
     assert_eq!(super::fsops::sweep_orphan_sessions(parent.path()), 2);
+    assert!(live.is_dir(), "a beating session tree must not be swept");
 
     assert!(!orphan.exists() && !clean.exists());
     assert!(parent
@@ -234,6 +239,19 @@ fn sweep_orphan_sessions_archives_evidence_and_keeps_other_entries() {
     // The archive itself is never swept.
     assert_eq!(super::fsops::sweep_orphan_sessions(parent.path()), 0);
     assert!(parent.path().join("_archive").is_dir());
+}
+
+#[test]
+fn archive_rejected_twice_for_one_session_keeps_both() {
+    let parent = tempdir().expect("tempdir");
+    let session = parent.path().join("swarm-term-01TWICE");
+    for body in ["first", "second"] {
+        prepare_layout(&session).expect("layout");
+        fs::write(session.join("rejected/scout/x.json"), body).unwrap();
+        archive_rejected(&session).expect("archive must not fail").expect("moved");
+    }
+    let dest = parent.path().join("_archive/swarm-term-01TWICE");
+    assert_eq!(fs::read_dir(&dest).unwrap().count(), 2);
 }
 
 #[test]

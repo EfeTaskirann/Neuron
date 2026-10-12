@@ -163,6 +163,36 @@ describe('TerminalSwarmRoute', () => {
     });
   });
 
+  it('serialises quick consecutive sends so paste/CR pairs never interleave', async () => {
+    const { commands } = await import('../lib/bindings');
+    vi.mocked(commands.swarmTermSessionStatus).mockResolvedValue({
+      status: 'ok',
+      data: SESSION,
+    });
+    renderRoute();
+    const input = await screen.findByLabelText(/message to orchestrator/i);
+    for (const text of ['first task', 'second task']) {
+      fireEvent.change(input, { target: { value: text } });
+      fireEvent.submit(input.closest('form')!);
+    }
+
+    await waitFor(
+      () => {
+        const orchWrites = vi
+          .mocked(commands.terminalWrite)
+          .mock.calls.filter(([paneId]) => paneId === 'p-orch')
+          .map(([, data]) => data);
+        expect(orchWrites).toEqual([
+          '\x1b[200~first task\x1b[201~',
+          '\r',
+          '\x1b[200~second task\x1b[201~',
+          '\r',
+        ]);
+      },
+      { timeout: 2000 },
+    );
+  });
+
   it('surfaces a session-status probe failure instead of silently showing the idle grid', async () => {
     const { commands } = await import('../lib/bindings');
     vi.mocked(commands.swarmTermSessionStatus).mockRejectedValue(

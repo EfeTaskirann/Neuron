@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use ulid::Ulid;
 
 use crate::error::AppError;
+use crate::swarm_term::heartbeat;
 use crate::swarm_term::hierarchy::AGENT_IDS;
 
 use super::envelope::Envelope;
@@ -79,7 +80,13 @@ pub fn archive_rejected(session_root: &Path) -> io::Result<Option<PathBuf>> {
     let archive = parent.join(ARCHIVE_DIRNAME);
     let dest_session = archive.join(session);
     fs::create_dir_all(&dest_session)?;
-    let dest = dest_session.join("rejected");
+    // A second archive of the same session (stop() raced a sweep, or a
+    // retried stop) must not fail on the existing directory — that
+    // failure would otherwise cost the evidence.
+    let mut dest = dest_session.join("rejected");
+    if dest.exists() {
+        dest = dest_session.join(format!("rejected-{}", Ulid::new()));
+    }
     fs::rename(&rejected, &dest)?;
 
     let mut sessions: Vec<PathBuf> = fs::read_dir(&archive)?
@@ -98,8 +105,12 @@ pub fn archive_rejected(session_root: &Path) -> io::Result<Option<PathBuf>> {
 /// Remove `swarm-term-*` session trees left under `bridge_parent` by a
 /// session that never ran `stop()` (app killed by a `tauri dev` rebuild,
 /// a crash, a forced quit). Their `rejected/` evidence is archived first,
-/// exactly as `stop()` would. Only call when no session is running —
-/// every such tree is then an orphan. Returns how many were removed.
+/// exactly as `stop()` would; a tree whose evidence could not be
+/// archived is kept (retried by the next sweep) rather than deleted.
+/// Trees still beating — a session of ANOTHER Neuron instance on the
+/// same project, see [`crate::swarm_term::heartbeat`] — are skipped.
+/// Call only when this process runs no session. Returns how many were
+/// removed.
 pub fn sweep_orphan_sessions(bridge_parent: &Path) -> usize {
     let Ok(entries) = fs::read_dir(bridge_parent) else {
         return 0;
@@ -112,15 +123,16 @@ pub fn sweep_orphan_sessions(bridge_parent: &Path) -> usize {
                 .file_name()
                 .and_then(|n| n.to_str())
                 .is_some_and(|n| n.starts_with("swarm-term-"));
-        if !is_session {
+        if !is_session || heartbeat::is_live(&path) {
             continue;
         }
         if let Err(e) = archive_rejected(&path) {
             tracing::warn!(
                 path = %path.display(),
                 error = %e,
-                "swarm-term: orphan session — rejected-archive failed"
+                "swarm-term: orphan session kept — rejected-archive failed"
             );
+            continue;
         }
         match fs::remove_dir_all(&path) {
             Ok(()) => removed += 1,

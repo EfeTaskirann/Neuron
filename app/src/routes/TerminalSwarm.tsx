@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useMemo, useRef, useState } from 'react';
 import { HierarchyDiagram } from '../components/SwarmHierarchy';
 import { ClaudeUpdateCorner } from '../components/swarm-term/ClaudeUpdateCorner';
 import { OrchestratorChatBar } from '../components/swarm-term/OrchestratorChatBar';
@@ -111,6 +111,10 @@ export function TerminalSwarmRoute(): JSX.Element {
   // (mirrors the backend's `paste_then_submit`). A CR in the same write
   // as a long / multi-line message is absorbed by claude's TUI as part
   // of the paste, leaving the task sitting unsent in the input box.
+  // Sends are chained so a quick second message can't interleave its
+  // paste between the first one's paste and CR (which would merge both
+  // texts into one prompt and submit an empty line).
+  const sendChainRef = useRef<Promise<void>>(Promise.resolve());
   const sendToOrchestrator = (message: string) => {
     if (!orchestratorPaneId) return;
     const paneId = orchestratorPaneId;
@@ -118,7 +122,7 @@ export function TerminalSwarmRoute(): JSX.Element {
       .replace(/\r\n?/g, '\n')
       .split('\x1b[201~')
       .join('[201~');
-    void (async () => {
+    sendChainRef.current = sendChainRef.current.then(async () => {
       try {
         await writeMut.mutateAsync({ paneId, data: `\x1b[200~${safe}\x1b[201~` });
         await new Promise((resolve) => setTimeout(resolve, SUBMIT_DELAY_MS));
@@ -126,7 +130,7 @@ export function TerminalSwarmRoute(): JSX.Element {
       } catch (err) {
         setLaunchError(err instanceof Error ? err.message : String(err));
       }
-    })();
+    });
   };
 
   return (

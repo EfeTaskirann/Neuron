@@ -23,7 +23,7 @@ use crate::swarm_term::hierarchy::{allowed_for, is_allowed, AGENT_IDS};
 use crate::swarm_term::lifecycle::LifecycleStore;
 
 use super::delivery::{
-    format_routed_message, is_delivery_blocked, paste_then_submit,
+    format_routed_message, is_delivery_blocked, submit_pasted,
     perform_route_write_with_timeout, truncate, RouteWriteOutcome,
 };
 use super::envelope::{sniff_from, Envelope};
@@ -499,8 +499,12 @@ async fn process_one<R: Runtime>(
     let registry_inner = registry.clone();
     let target_pane_for_write = target_pane.clone();
     let signed_bytes = signed.into_bytes();
+    // Only the PASTE is the retried unit. The submitting CR is sent
+    // afterwards and never causes a retry: once the text has landed,
+    // re-delivering would paste it into the input box a second time.
     let write_fut = async move {
-        paste_then_submit(&registry_inner, &target_pane_for_write, &signed_bytes)
+        registry_inner
+            .write_to_pane(&target_pane_for_write, &signed_bytes)
             .await
     };
     let outcome = perform_route_write_with_timeout(
@@ -514,6 +518,14 @@ async fn process_one<R: Runtime>(
 
     match outcome {
         RouteWriteOutcome::Ok => {
+            if let Err(e) = submit_pasted(registry, &target_pane).await {
+                tracing::warn!(
+                    target = %to_agent,
+                    error = %e,
+                    "swarm-term bridge: message pasted but submit CR failed; \
+                     not re-pasting (text stays in the target's input box)"
+                );
+            }
             tracing::info!(
                 source = %from_agent,
                 target = %to_agent,

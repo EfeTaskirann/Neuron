@@ -227,17 +227,10 @@ fn ends_signal(rest: &str) -> bool {
 /// firing a review, a NON-canonical match only counts when its id
 /// contains a digit (every persona-taught id does: `T1`, `fb-7`, `42`).
 /// Anything after the task id (extra notes) is ignored here — see
-/// [`lifecycle_note`].
+/// [`lifecycle_note`]. Equivalent to
+/// [`parse_lifecycle_token_with_fallback`] without an envelope id.
 pub fn parse_lifecycle_token(body: &str) -> Option<Transition> {
-    let head = split_head(body)?;
-    let id = inline_id(head.rest)?;
-    if !head.canonical && !has_digit(id) {
-        return None;
-    }
-    Some(Transition {
-        kind: head.kind,
-        task_id: id.to_string(),
-    })
+    parse_lifecycle_token_with_fallback(body, None)
 }
 
 /// Like [`parse_lifecycle_token`] but also consults the structured
@@ -294,11 +287,11 @@ pub fn lifecycle_note(body: &str, task_id: &str) -> Option<String> {
     if note.is_empty() {
         return None;
     }
-    Some(if note.chars().count() > MAX_FOLLOWUP_NOTE_CHARS {
-        let cut: String = note.chars().take(MAX_FOLLOWUP_NOTE_CHARS).collect();
-        format!("{cut}…")
+    let capped = crate::text::truncate_chars(note, MAX_FOLLOWUP_NOTE_CHARS);
+    Some(if capped.len() < note.len() {
+        format!("{capped}…")
     } else {
-        note.to_string()
+        capped
     })
 }
 
@@ -326,16 +319,13 @@ pub fn looks_like_unparsed_signal(body: &str, has_task_id: bool) -> bool {
         .take(24)
         .collect::<String>()
         .to_lowercase();
-    const HINTS: &[&str] = &[
-        "done",
-        "approve",
-        "building",
-        "changes_needed",
-        "changes needed",
-        "changes-needed",
-        "lgtm",
-    ];
-    HINTS.iter().any(|h| head.starts_with(h))
+    // Every recognised keyword spelling (from KEYWORDS — the single
+    // source), plus near-misses that are not keywords themselves.
+    const EXTRA_HINTS: &[&str] = &["approve", "lgtm"];
+    KEYWORDS
+        .iter()
+        .any(|(kw, _)| head.starts_with(&kw.to_ascii_lowercase()))
+        || EXTRA_HINTS.iter().any(|h| head.starts_with(h))
         || (has_task_id && (head.starts_with("tamam") || head.starts_with("onay")))
 }
 
@@ -486,29 +476,29 @@ impl LifecycleStore {
     }
 
     /// The responsible agent gave up on `task_id` (`hata — …` with the
-    /// envelope's `task_id`): mark its own in-flight entry and any
-    /// `AwaitingReview` entry for the same task as `Failed`, so the stall
+    /// envelope's `task_id`): mark the in-flight (`Building` /
+    /// `AwaitingReview`) entries for that task as `Failed`, so the stall
     /// timer stops reminding / escalating a task already reported as
-    /// failed. Never creates entries. Returns whether anything closed.
-    pub fn abandon(&self, source_pane: &str, task_id: &str) -> bool {
-        self.abandon_at(source_pane, task_id, Instant::now())
+    /// failed. Only entries under `closable_panes` are touched — the
+    /// reporter's own pane, plus (for a reviewer) the panes of the
+    /// builders it reviews — so an unrelated agent's `hata` about the
+    /// same id cannot end someone else's pending review. Never creates
+    /// entries. Returns whether anything closed.
+    pub fn abandon(&self, closable_panes: &[&str], task_id: &str) -> bool {
+        self.abandon_at(closable_panes, task_id, Instant::now())
     }
 
-    fn abandon_at(&self, source_pane: &str, task_id: &str, now: Instant) -> bool {
+    fn abandon_at(&self, closable_panes: &[&str], task_id: &str, now: Instant) -> bool {
         let Ok(mut g) = self.inner.lock() else {
             return false;
         };
         let mut closed = false;
         for ((pane, id), e) in g.iter_mut() {
-            if id != task_id {
-                continue;
-            }
-            let in_flight = match e.state {
-                LifecycleState::Building => pane == source_pane,
-                LifecycleState::AwaitingReview => true,
-                _ => false,
-            };
-            if in_flight {
+            let in_flight = matches!(
+                e.state,
+                LifecycleState::Building | LifecycleState::AwaitingReview
+            );
+            if id == task_id && in_flight && closable_panes.contains(&pane.as_str()) {
                 *e = Entry::new(LifecycleState::Failed, now);
                 closed = true;
             }
@@ -1034,21 +1024,26 @@ mod tests {
         let t0 = Instant::now();
         s.record_at("p-fb", &tr(TransitionKind::Building, "stall-1"), t0);
         // Builder reports `hata —` for its own task.
-        assert!(s.abandon_at("p-fb", "stall-1", t0 + MIN));
+        assert!(s.abandon_at(&["p-fb"], "stall-1", t0 + MIN));
         assert_eq!(s.state_of("p-fb", "stall-1"), Some(LifecycleState::Failed));
         assert!(s.take_stalls(t0 + 90 * MIN, 10 * MIN, 20 * MIN).is_empty());
 
-        // A reviewer's `hata —` settles the builder's AwaitingReview entry.
+        // The paired reviewer's `hata —` settles the builder's
+        // AwaitingReview entry (the caller passes the builder's pane).
         s.record_at("p-bb", &tr(TransitionKind::Done, "T8"), t0);
-        assert!(s.abandon_at("p-br", "T8", t0));
+        assert!(s.abandon_at(&["p-br", "p-bb"], "T8", t0));
         assert_eq!(s.state_of("p-bb", "T8"), Some(LifecycleState::Failed));
 
-        // Another agent's Building entry is not someone else's to close,
-        // unknown ids create nothing, closed tasks stay closed.
+        // An unrelated agent (e.g. scout) reporting `hata` about the same
+        // id can close neither a review wait nor another pane's Building.
+        s.record_at("p-bb", &tr(TransitionKind::Done, "T10"), t0);
+        assert!(!s.abandon_at(&["p-scout"], "T10", t0));
+        assert_eq!(s.state_of("p-bb", "T10"), Some(LifecycleState::AwaitingReview));
         s.record_at("p-x", &tr(TransitionKind::Building, "T9"), t0);
-        assert!(!s.abandon_at("p-y", "T9", t0));
+        assert!(!s.abandon_at(&["p-y"], "T9", t0));
         assert_eq!(s.state_of("p-x", "T9"), Some(LifecycleState::Building));
-        assert!(!s.abandon_at("p-fb", "nope", t0));
+        // Unknown ids create nothing.
+        assert!(!s.abandon_at(&["p-fb"], "nope", t0));
         assert_eq!(s.state_of("p-fb", "nope"), None);
     }
 
