@@ -5,16 +5,18 @@
 //! ## How inter-agent messaging works
 //!
 //! Each pane is started with `NEURON_BRIDGE`, `NEURON_AGENT_ID`, and
-//! `NEURON_INBOX` environment variables that pin the per-session
+//! `NEURON_OUTBOX` environment variables that pin the per-session
 //! `.bridgespace/<session>/` directory. When agent A wants to message
 //! agent B, A uses its `Write` tool to atomically create
-//! `<NEURON_BRIDGE>/inbox/<B>/<id>.json` with a small JSON envelope
-//! (`{from, to, body, task_id?}`). A background poll loop in
-//! [`bridge::watcher::watcher_loop`] reads every inbox directory once every
-//! 250 ms, validates the envelope, applies the hierarchy gate from
-//! [`hierarchy`], delivers the body to the target pane's PTY via
-//! bracketed paste, and migrates the file to `processed/<B>/`. Denied
-//! or malformed files go to `rejected/<B>/` with a `.reason` sidecar.
+//! `<NEURON_BRIDGE>/outbox/<A>/<id>.json` with a small JSON envelope
+//! (`{to, body, task_id?, from?}` — the sender is the outbox directory).
+//! A background poll loop in [`bridge::watcher::watcher_loop`] reads every
+//! outbox once every 250 ms, validates the envelope, applies the
+//! hierarchy gate from [`hierarchy`], delivers the body to the target
+//! pane's PTY via bracketed paste, and migrates the file to
+//! `processed/<B>/`. Denied or malformed files go to `rejected/<B>/` with
+//! a `.reason` sidecar. The hierarchy keeps the swarm orderly; it is not
+//! a security boundary (see `bridge` § Trust model).
 //!
 //! ## Why files instead of `>> @target:` PTY markers
 //!

@@ -1,18 +1,19 @@
 //! File-system based inter-agent IPC.
 //!
 //! Each pane is an isolated `claude` REPL. When agent A wants to message
-//! agent B, A uses its `Write` tool to atomically create
-//! `.bridgespace/<session>/inbox/<B>/<id>.json` with shape:
+//! agent B, A uses its `Write` tool to atomically create a file in its
+//! OWN outbox, `.bridgespace/<session>/outbox/<A>/<id>.json`:
 //!
 //! ```json
-//! {"from":"scout","to":"orchestrator",
+//! {"to":"orchestrator",
 //!  "body":"tamam — foo.rs:42",
 //!  "task_id":"t-1"}
 //! ```
 //!
-//! A background poll loop ([`watcher::watcher_loop`]) reads every inbox
-//! directory once every [`watcher::WATCH_POLL_MS`] ms, validates each
-//! file (parse + hierarchy gate), and delivers the body to the target
+//! The sender is the outbox directory; an optional `from` must match it.
+//! A background poll loop ([`watcher::watcher_loop`]) reads every outbox
+//! once every [`watcher::WATCH_POLL_MS`] ms, validates each
+//! file (file gate + parse + hierarchy gate), and delivers the body to the target
 //! pane's PTY via bracketed paste. After successful delivery the file
 //! moves to `processed/<B>/`; denied / malformed files move to
 //! `rejected/<B>/` with a `.reason` sidecar, and the SENDER gets a
@@ -27,6 +28,18 @@
 //! retried — file-system as durable queue. Atomic-rename file moves
 //! preserve the invariant "inbox = not yet delivered, processed =
 //! delivered".
+//!
+//! ## Trust model
+//!
+//! The outbox-derived sender and the hierarchy gate keep the swarm
+//! ORDERLY — they stop accidental and simple impersonation — but they are
+//! not a security boundary: all nine panes run as the same OS user with
+//! the same file access, so an agent can always write into another
+//! agent's outbox. Hostile content is contained instead at the paste
+//! layer: bodies are stripped of every control character and the
+//! bridge's own markers are defused before delivery (see
+//! [`delivery::sanitize_for_paste`]), and inbox entries pass a file gate
+//! (regular file, ≤ 256 KB) before they are read.
 //!
 //! ## Layout
 //!
@@ -70,7 +83,7 @@ mod e2e_tests;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use delivery::paste_then_submit;
+pub(crate) use delivery::{paste_then_submit, sanitize_for_paste};
 pub use envelope::Envelope;
 pub use fsops::{
     archive_rejected, drop_envelope, ensure_gitignore, prepare_layout,

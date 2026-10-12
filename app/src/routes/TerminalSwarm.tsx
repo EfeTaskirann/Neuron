@@ -25,6 +25,23 @@ import {
 /** Gap between the pasted chat message and its submitting CR. */
 const SUBMIT_DELAY_MS = 200;
 
+/**
+ * Make chat text safe inside a bracketed paste (mirrors the backend's
+ * `sanitize_for_paste`): CR/CRLF → LF and every control character except
+ * LF/TAB — C0 incl. ESC, DEL, C1 — removed. Dropping ESC itself is what
+ * stops `\x1b\x1b[201~` from re-forming the paste-end sequence after a
+ * one-pass replace and leaking the rest as keystrokes.
+ */
+export function sanitizeForPaste(text: string): string {
+  return Array.from(text.replace(/\r\n?/g, '\n'))
+    .filter((ch) => {
+      const code = ch.codePointAt(0) ?? 0;
+      const control = code < 0x20 || (code >= 0x7f && code <= 0x9f);
+      return ch === '\n' || ch === '\t' || !control;
+    })
+    .join('');
+}
+
 export function TerminalSwarmRoute(): JSX.Element {
   // Project comes from the App-level gate — the route is never
   // rendered with `project == null` because <ProjectPickerRoute />
@@ -118,10 +135,7 @@ export function TerminalSwarmRoute(): JSX.Element {
   const sendToOrchestrator = (message: string) => {
     if (!orchestratorPaneId) return;
     const paneId = orchestratorPaneId;
-    const safe = message
-      .replace(/\r\n?/g, '\n')
-      .split('\x1b[201~')
-      .join('[201~');
+    const safe = sanitizeForPaste(message);
     sendChainRef.current = sendChainRef.current.then(async () => {
       try {
         await writeMut.mutateAsync({ paneId, data: `\x1b[200~${safe}\x1b[201~` });

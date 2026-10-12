@@ -163,6 +163,12 @@ describe('TerminalSwarmRoute', () => {
     });
   });
 
+  it('strips control characters so a message cannot close the paste early', async () => {
+    const { sanitizeForPaste } = await import('./TerminalSwarm');
+    expect(sanitizeForPaste('a\x1b\x1b[201~\x03\x03b')).toBe('a[201~b');
+    expect(sanitizeForPaste('ç\r\nş\rı\tğ\u007f\u009b')).toBe('ç\nş\nı\tğ');
+  });
+
   it('serialises quick consecutive sends so paste/CR pairs never interleave', async () => {
     const { commands } = await import('../lib/bindings');
     vi.mocked(commands.swarmTermSessionStatus).mockResolvedValue({

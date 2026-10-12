@@ -204,7 +204,7 @@ async fn integration_filesystem_install_and_call() {
         &npx_executable(),
         &[
             "-y".to_string(),
-            "@modelcontextprotocol/server-filesystem".to_string(),
+            "@modelcontextprotocol/server-filesystem@2026.8.31".to_string(),
             tmp.path().to_string_lossy().into_owned(),
         ],
         &env,

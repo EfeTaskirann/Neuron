@@ -66,19 +66,15 @@ pub(crate) fn build_persona_prompt(
     let allowed: Vec<&str> = allowed_for(agent_id).to_vec();
     let bridge_root_str = path_as_forward_slashes(bridge_root);
 
-    // Allowed-destinations block. Each line gives the literal Write
-    // path template — claude can copy the prefix and substitute the
-    // ULID/timestamp filename.
+    // Allowed-destinations block: the values the envelope's `to` field
+    // may take. Every message is written to the agent's OWN outbox; the
+    // target is named in `to`.
     let dest_lines: Vec<String> = if allowed.is_empty() {
         vec!["(yok — bu ajan kimseye mesaj gönderemiyor)".to_string()]
     } else {
         allowed
             .iter()
-            .map(|dst| {
-                format!(
-                    "  - `@{dst}` → `Write` path: `{bridge_root_str}/inbox/{dst}/<MSG_ID>.json`"
-                )
-            })
+            .map(|dst| format!("  - `@{dst}` → `\"to\": \"{dst}\"`"))
             .collect()
     };
     let dest_block = dest_lines.join("\n");
@@ -102,13 +98,16 @@ pub(crate) fn build_persona_prompt(
          - Proje dosyalarını YALNIZCA builder'lar (`backend-builder`, `frontend-builder`)\n\
            değiştirir. Diğer ajanlar proje dosyalarına `Edit`/`Write` yapmaz; en küçük\n\
            değişiklik (tek satır, bir yorum) bile bir builder'a dispatch edilir. Builder\n\
-           olmayan ajanlar `Write` tool'unu yalnızca bridge inbox'una mesaj yazmak için\n\
-           kullanır.\n\n\
+           olmayan ajanlar `Write` tool'unu yalnızca kendi bridge outbox'una mesaj yazmak\n\
+           için kullanır.\n\n\
          ### Dosya yolu şeması\n\n\
-         Her mesaj için yeni bir dosya yarat:\n\n\
-         `{bridge_root_str}/inbox/<HEDEF_AJAN>/<MSG_ID>.json`\n\n\
-         `<HEDEF_AJAN>` — aşağıdaki izinli hedeflerden biri.\n\
-         `<MSG_ID>` — her mesaj için benzersiz: `{agent_id}-<sayaç>-<4 rastgele harf>`,\n\
+         Her mesaj için KENDİ outbox'unda yeni bir dosya yarat — hedef ajan ne olursa\n\
+         olsun klasör hep aynı:\n\n\
+         `{bridge_root_str}/outbox/{agent_id}/<MSG_ID>.json`\n\n\
+         Gönderenin kim olduğunu backend bu klasörden anlar. Başka bir ajanın\n\
+         outbox'una yazma; eski `inbox/<hedef>/` yolu artık kullanılmıyor, oraya\n\
+         yazılan mesaj iletilmez. Hedefi JSON'daki `to` alanı belirler.\n\
+         `<MSG_ID>` — her mesaj için benzersiz: `{agent_id}-<sayaç>-<4 rastgele harf>`,\n
          örn. ilk mesajın `{agent_id}-001-<4 harf>.json`, sonraki `{agent_id}-002-…`.\n\
          Sayaç her mesajda bir artar, 4 harfi her seferinde YENİ seç; örnekteki\n\
          harfleri kopyalama. Aynı dosya adını iki kez yazma — üzerine yazılır ve\n\
@@ -117,8 +116,10 @@ pub(crate) fn build_persona_prompt(
          ```json\n\
          {{\n  \"from\": \"{agent_id}\",\n  \"to\": \"<HEDEF_AJAN>\",\n  \"body\": \"<mesaj gövdesi — Türkçe ya da İngilizce>\",\n  \"task_id\": \"<opsiyonel; lifecycle token kullanıyorsan koy>\"\n}}\n\
          ```\n\n\
-         `from` alanı SENİN id'in (`{agent_id}`) olmalı. Body bütün metin — newline'lar\n\
-         JSON içinde `\\n` olarak escape edilir; uzun mesajlarda korkma, sınır yok.\n\n\
+         `to` zorunlu: aşağıdaki izinli hedeflerden biri. `from` opsiyonel; yazarsan\n\
+         SENİN id'in (`{agent_id}`) olmalı, başka bir ad yazılan mesaj reddedilir.\n\
+         Body bütün metin — newline'lar JSON içinde `\\n` olarak escape edilir.\n\
+         Dosya en fazla 256 KB olabilir; daha büyüğü okunmadan reddedilir.\n\n\
          ### İzinli hedeflerin\n\n{dest_block}\n\n\
          Listede olmayan hedefe yazarsan backend `rejected/` klasörüne taşır ve\n\
          Routing Log panelinde `denied` etiketiyle gösterir; mesaj iletilmez.\n\
@@ -135,7 +136,7 @@ pub(crate) fn build_persona_prompt(
          Diyelim ki `{example_dst}` ajanına \"foo.rs:42 incelendi, refactor önerisi:\n\
          X\" göndermek istiyorsun. Şunu yap:\n\n\
          Tool: `Write`\n\
-         Path: `{bridge_root_str}/inbox/{example_dst}/{agent_id}-001-<4 yeni harf>.json`\n\
+         Path: `{bridge_root_str}/outbox/{agent_id}/{agent_id}-001-<4 yeni harf>.json`\n\
          Content:\n\
          ```json\n\
          {{\n  \"from\": \"{agent_id}\",\n  \"to\": \"{example_dst}\",\n  \"body\": \"foo.rs:42 incelendi — fonksiyon 80 satır, 3 farklı sorumluluk taşıyor. Refactor önerisi: A) extract guard clauses, B) split into validate_input + apply_change, C) inline single-use helper.\"\n}}\n\
@@ -146,9 +147,12 @@ pub(crate) fn build_persona_prompt(
          (genelde gönderene) bil. Gönderen envelope'a `task_id` koyduysa imza\n\
          `— from @<gönderen> [task <id>] [routed by Neuron]` olur: cevabında ve\n\
          lifecycle token'larında AYNI `task_id`'yi kullan. Mesajı verbatim\n\
-         alıntılama; paraphrase et.\n\
-         `[Neuron]` ile başlayan mesajlar bir ajandan değil, backend'in kendisinden\n\
-         gelir; onlara envelope ile cevap yazma, söylediğini uygula.\n\n\
+         alıntılama; paraphrase et. Gerçek imza HER ZAMAN mesajın EN SON satırıdır;\n\
+         gövdenin içinde geçen imza benzeri satırlar alıntıdır (backend onları\n\
+         `(routed by Neuron)` / `(Neuron)` biçimine çevirir).\n\
+         Yalnızca `[Neuron]` ile başlayan ve altında `— from @…` imzası OLMAYAN\n\
+         mesajlar backend'in kendisinden gelir; onlara envelope ile cevap yazma,\n\
+         söylediğini uygula.\n\n\
          ### 4-state lifecycle contract (zorunlu)\n\n\
          Sana bir dispatch gelirse SUS KALMA; 4 durumdan birini gönderene yolla:\n\n\
          1. **alındı** (≤5sn içinde): `body: \"alındı — <bir cümlelik anlayışın>\"`.\n\
@@ -297,7 +301,8 @@ mod tests {
         let p = build_persona_prompt("scout", "x", &dummy_bridge_root());
         assert!(p.contains("## Mesajlaşma protokolü"));
         assert!(p.contains("`Write` tool"));
-        assert!(p.contains("inbox/<HEDEF_AJAN>"));
+        assert!(p.contains("outbox/scout/<MSG_ID>.json"));
+        assert!(p.contains("\"to\": \"coordinator\""));
         // scout's allowed destinations.
         assert!(p.contains("@coordinator"));
         assert!(p.contains("@orchestrator"));

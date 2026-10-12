@@ -6,6 +6,13 @@
 //! `<app_data_dir>/swarm-term/hierarchy.toml`; v1 ships the table
 //! hardcoded.
 //!
+//! **Not a security boundary.** The graph keeps conversations orderly
+//! (who reports to whom); it does not contain a hostile agent. All panes
+//! share one OS user and file access, so an agent can always write into
+//! another agent's outbox and be routed as that agent. Containment lives
+//! in the per-role tool permissions (`swarm_term::permissions`) and the
+//! paste sanitising in the bridge.
+//!
 //! # Task lifecycle (autonomy contract)
 //!
 //! Every user-given goal flows through this fixed cycle of agent

@@ -1,10 +1,12 @@
 //! Filesystem layout + durable-queue operations for the bridge tree.
 //!
-//! The bridge uses the file system itself as the queue: `inbox/` holds
-//! not-yet-delivered envelopes, `processed/` holds delivered ones, and
-//! `rejected/` holds permanently failed ones (with a `.reason`
-//! sidecar). Atomic `.tmp`+rename writes and renames keep those
-//! invariants crash-safe. A per-file `.attempts` sidecar bounds retries.
+//! The bridge uses the file system itself as the queue: `outbox/<sender>/`
+//! holds not-yet-delivered envelopes (the directory IS the sender),
+//! `processed/<target>/` holds delivered ones, and `rejected/<target>/`
+//! permanently failed ones (with a `.reason` sidecar). Atomic
+//! `.tmp`+rename writes and renames keep those invariants crash-safe. A
+//! per-file `.attempts` sidecar bounds retries. `inbox/` is the legacy
+//! drop path: no longer created, only swept for stray files to reject.
 
 use std::fs;
 use std::io;
@@ -19,10 +21,10 @@ use crate::swarm_term::hierarchy::AGENT_IDS;
 use super::envelope::Envelope;
 
 /// Initialise the per-session directory tree at `root`. The directory
-/// is empty after this call; senders populate `inbox/`, watcher
-/// migrates files into `processed/` or `rejected/`.
+/// is empty after this call; each sender populates its own `outbox/`,
+/// the watcher migrates files into `processed/` or `rejected/`.
 pub fn prepare_layout(root: &Path) -> Result<(), AppError> {
-    for subdir in ["inbox", "processed", "rejected"] {
+    for subdir in ["outbox", "processed", "rejected"] {
         for agent in AGENT_IDS {
             let p = root.join(subdir).join(agent);
             fs::create_dir_all(&p).map_err(|e| {
@@ -146,12 +148,16 @@ pub fn sweep_orphan_sessions(bridge_parent: &Path) -> usize {
     removed
 }
 
-/// Atomically write an envelope to `inbox/<env.to>/<ulid>.json` using
-/// the `.tmp` + rename pattern. Used by the lifecycle fanout and the
-/// integration-test scaffolding.
+/// Atomically write an envelope to the SENDER's outbox,
+/// `outbox/<env.from>/<ulid>.json`, using the `.tmp` + rename pattern.
+/// Used by the lifecycle fanout (sender `coordinator`) and tests.
+/// `env.from` must be a known agent id — it becomes a directory name.
 pub fn drop_envelope(root: &Path, env: &Envelope) -> io::Result<PathBuf> {
+    if !AGENT_IDS.contains(&env.from.as_str()) {
+        return Err(io::Error::other(format!("unknown sender `{}`", env.from)));
+    }
     let id = Ulid::new().to_string();
-    let dir = root.join("inbox").join(&env.to);
+    let dir = root.join("outbox").join(&env.from);
     fs::create_dir_all(&dir)?;
     let tmp = dir.join(format!("{id}.json.tmp"));
     let final_path = dir.join(format!("{id}.json"));

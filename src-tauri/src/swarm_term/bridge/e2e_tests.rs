@@ -2,7 +2,7 @@
 //!
 //! Each of the 9 agents is a real pane running a tiny fake agent (a
 //! python script that appends every character it receives on stdin to
-//! a per-agent log file). Envelopes are dropped into the inbox exactly
+//! a per-agent log file). Envelopes are dropped into the sender outbox exactly
 //! as a claude `Write` call would, the real watcher delivers them, and
 //! the test asserts on the filesystem queue + what each pane received.
 //!
@@ -52,10 +52,10 @@ fn fwd(p: &Path) -> String {
     p.display().to_string().replace('\\', "/")
 }
 
-/// Atomic inbox drop (`.tmp` + rename), optionally back-dating the
+/// Atomic outbox drop (`.tmp` + rename), optionally back-dating the
 /// file so time-based retry expiry can be exercised without waiting.
-fn drop_raw(root: &Path, target: &str, name: &str, content: &str, age: Option<Duration>) {
-    let dir = root.join("inbox").join(target);
+fn drop_raw(root: &Path, sender: &str, name: &str, content: &str, age: Option<Duration>) {
+    let dir = root.join("outbox").join(sender);
     let tmp = dir.join(format!("{name}.tmp"));
     fs::write(&tmp, content).expect("write tmp");
     if let Some(age) = age {
@@ -144,9 +144,9 @@ async fn bridge_end_to_end_with_fake_agents() {
     // FIFO by write time, not by name: dropped BEFORE the watcher
     // starts so both are in the same first scan. The name-wise first
     // file is the newer one.
-    drop_raw(&root, "scout", "aa-newer",
+    drop_raw(&root, "coordinator", "aa-newer",
         r#"{"from":"coordinator","to":"scout","body":"order-second"}"#, None);
-    drop_raw(&root, "scout", "zz-older",
+    drop_raw(&root, "coordinator", "zz-older",
         r#"{"from":"coordinator","to":"scout","body":"order-first"}"#,
         Some(Duration::from_secs(20)));
     let handle = install(
@@ -158,35 +158,65 @@ async fn bridge_end_to_end_with_fake_agents() {
     );
 
     // H1: hierarchy denial → sender must be told.
-    drop_raw(&root, "planner", "01",
+    drop_raw(&root, "frontend-reviewer", "01",
         r#"{"from":"frontend-reviewer","to":"planner","body":"plan-review-01"}"#, None);
     // H2: reply edges added in wave 2 — reviewer and tester can answer
     // the orchestrator, scout can answer a builder.
-    drop_raw(&root, "orchestrator", "09",
+    drop_raw(&root, "backend-reviewer", "09",
         r#"{"from":"backend-reviewer","to":"orchestrator","body":"reply-09"}"#, None);
-    drop_raw(&root, "frontend-builder", "10",
+    drop_raw(&root, "scout", "10",
         r#"{"from":"scout","to":"frontend-builder","body":"reply-10"}"#, None);
+    // Security: an oversized envelope is rejected unread.
+    let huge = format!(
+        r#"{{"from":"coordinator","to":"scout","body":"HUGE-{}"}}"#,
+        "x".repeat(300 * 1024)
+    );
+    drop_raw(&root, "coordinator", "11", &huge, None);
+    // Security: a symlink in an outbox is rejected without following it
+    // (skipped when the OS refuses to create symlinks, e.g. Windows
+    // without Developer Mode).
+    let secret = work.path().join("secret.txt");
+    fs::write(&secret, "TOP-SECRET-12").expect("secret");
+    #[cfg(windows)]
+    let linked = std::os::windows::fs::symlink_file(&secret, root.join("outbox/coordinator/12.json")).is_ok();
+    #[cfg(unix)]
+    let linked = std::os::unix::fs::symlink(&secret, root.join("outbox/coordinator/12.json")).is_ok();
+    println!("symlink scenario active: {linked}");
+    // The same non-regular-file gate, exercisable on every platform: a
+    // directory named like an envelope.
+    fs::create_dir_all(root.join("outbox/coordinator/13.json/inner")).expect("dir entry");
+    // Security: scout claims to be the orchestrator → refused, scout told.
+    drop_raw(&root, "scout", "14",
+        r#"{"from":"orchestrator","to":"planner","body":"spoof-14"}"#, None);
+    // Legacy protocol: a drop into inbox/<target>/ is never delivered;
+    // the claimed sender is pointed at its outbox.
+    fs::create_dir_all(root.join("inbox/coordinator")).expect("legacy inbox");
+    fs::write(
+        root.join("inbox/coordinator/15.json"),
+        r#"{"from":"scout","to":"coordinator","body":"legacy-15"}"#,
+    )
+    .expect("legacy drop");
     // H5: capitalised sender, numeric task_id, raw newline in body.
-    drop_raw(&root, "backend-builder", "02",
+    drop_raw(&root, "coordinator", "02",
         "{\"from\":\"Coordinator\",\"to\":\"backend-builder\",\"body\":\"satir-bir\nsatir-iki\",\"task_id\":42}", None);
     // Structurally invalid (no body) → rejected after retries, sender told.
-    drop_raw(&root, "coordinator", "03",
+    drop_raw(&root, "scout", "03",
         r#"{"from":"scout","to":"coordinator"}"#, None);
     // H3 + H7: decorated DONE with a note → review fanout carrying it.
-    drop_raw(&root, "coordinator", "04",
+    drop_raw(&root, "backend-builder", "04",
         r#"{"from":"backend-builder","to":"coordinator","body":"**DONE** T4 — auth.rs: refresh eklendi","task_id":"T4"}"#, None);
     // H3: "tamam —" completion with a task_id → sender told it was ignored.
-    drop_raw(&root, "coordinator", "05",
+    drop_raw(&root, "frontend-builder", "05",
         r#"{"from":"frontend-builder","to":"coordinator","body":"tamam — login sayfasi bitti","task_id":"T5"}"#, None);
     // H4: target pane stuck in awaiting_approval must still receive.
-    drop_raw(&root, "integration-tester", "06",
+    drop_raw(&root, "coordinator", "06",
         r#"{"from":"coordinator","to":"integration-tester","body":"smoke-run-06"}"#, None);
     // H6: not-ready target, message already older than the grace → rejected + sender told.
-    drop_raw(&root, "planner", "07",
+    drop_raw(&root, "coordinator", "07",
         r#"{"from":"coordinator","to":"planner","body":"plan-07"}"#,
         Some(Duration::from_secs(120)));
     // H6: not-ready target, fresh message → must stay queued (old code dropped it after ~1 s).
-    drop_raw(&root, "planner", "08",
+    drop_raw(&root, "coordinator", "08",
         r#"{"from":"coordinator","to":"planner","body":"plan-08"}"#, None);
 
     // ---- Assertions (polled) ----------------------------------------- //
@@ -201,7 +231,8 @@ async fn bridge_end_to_end_with_fake_agents() {
         ("02 lenient envelope delivered", Box::new(|| r("processed/backend-builder/02.json").is_file())),
         ("02 builder received both lines from @coordinator", Box::new(|| { let l = log("backend-builder"); l.contains("satir-bir") && l.contains("satir-iki") && l.contains("from @coordinator") })),
         ("02 signature carries the numeric task_id", Box::new(|| log("backend-builder").contains("from @coordinator [task 42] [routed by Neuron]"))),
-        ("03 invalid envelope → rejected/coordinator", Box::new(|| r("rejected/coordinator/03.json").is_file())),
+        // Unparseable → target unknown → filed under the (path) sender.
+        ("03 invalid envelope → rejected/scout", Box::new(|| r("rejected/scout/03.json").is_file())),
         ("03 sender scout got [Neuron] notice", Box::new(|| { let l = log("scout"); l.contains("[Neuron]") && l.contains("missing field `body`") })),
         ("04 DONE delivered to coordinator", Box::new(|| log("coordinator").contains("**DONE** T4"))),
         // The fake agent's console input drops `—` (python msvcrt), so the
@@ -211,6 +242,24 @@ async fn bridge_end_to_end_with_fake_agents() {
         ("06 awaiting_approval pane still received", Box::new(|| log("integration-tester").contains("smoke-run-06"))),
         ("07 expired not-ready → rejected/planner", Box::new(|| r("rejected/planner/07.json").is_file())),
         ("07 sender coordinator got [Neuron] notice", Box::new(|| log("coordinator").contains("never became ready"))),
+        ("11 oversized envelope rejected unread", Box::new(|| {
+            read(&r("rejected/coordinator/11.reason")).contains("too large") && !log("scout").contains("HUGE-")
+        })),
+        ("12 outbox symlink rejected without being followed", Box::new(move || {
+            !linked || (read(&r("rejected/coordinator/12.reason")).contains("not a regular file")
+                && !log("planner").contains("TOP-SECRET"))
+        })),
+        ("13 non-regular outbox entry rejected unread", Box::new(|| {
+            read(&r("rejected/coordinator/13.reason")).contains("not a regular file")
+        })),
+        ("14 spoofed `from` refused, never delivered", Box::new(|| {
+            read(&r("rejected/planner/14.reason")).contains("outbox/scout") && !log("planner").contains("spoof-14")
+        })),
+        ("14 spoofing sender scout got [Neuron] notice", Box::new(|| log("scout").contains("outbox/scout"))),
+        ("15 legacy inbox drop rejected, never delivered", Box::new(|| {
+            read(&r("rejected/coordinator/15.reason")).contains("legacy inbox") && !log("coordinator").contains("legacy-15")
+        })),
+        ("15 claimed sender scout pointed at its outbox", Box::new(|| log("scout").contains("legacy inbox"))),
         ("FIFO by mtime: older file delivered first", Box::new(|| {
             let l = log("scout");
             matches!((l.find("order-first"), l.find("order-second")), (Some(a), Some(b)) if a < b)
@@ -227,7 +276,7 @@ async fn bridge_end_to_end_with_fake_agents() {
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
     // Checked after the others settled: 08 must still be queued.
-    let fresh_still_queued = r("inbox/planner/08.json").is_file();
+    let fresh_still_queued = r("outbox/coordinator/08.json").is_file();
 
     uninstall(handle);
     for pid in panes_by_agent.values() {
@@ -237,6 +286,6 @@ async fn bridge_end_to_end_with_fake_agents() {
     for &a in AGENT_IDS {
         println!("===== {a}.log =====\n{}", log(a).replace('\x1b', "<ESC>"));
     }
-    assert!(fresh_still_queued, "08 fresh message to not-ready planner must stay in inbox");
+    assert!(fresh_still_queued, "08 fresh message to not-ready planner must stay queued");
     assert!(failing.is_empty(), "failing checks: {failing:#?}");
 }

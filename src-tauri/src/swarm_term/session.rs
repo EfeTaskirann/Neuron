@@ -3,9 +3,9 @@
 //! `start()` spawns 9 PTY panes (one per agent in `hierarchy::AGENT_IDS`)
 //! through `TerminalRegistry::spawn_pane`, each running interactive
 //! `claude` with the user-selected project as `cwd`. Before the spawn
-//! loop it prepares `<project>/.bridgespace/<session>/{inbox,processed,
+//! loop it prepares `<project>/.bridgespace/<session>/{outbox,processed,
 //! rejected}/<agent>/` and passes per-pane environment variables
-//! (`NEURON_BRIDGE`, `NEURON_AGENT_ID`, `NEURON_INBOX`) so each claude
+//! (`NEURON_BRIDGE`, `NEURON_AGENT_ID`, `NEURON_OUTBOX`) so each claude
 //! REPL knows where to drop outbound messages. Each pane's persona +
 //! bridge protocol is its appended system prompt
 //! (`--append-system-prompt-file`); a short kickoff turn is then pasted
@@ -401,8 +401,8 @@ impl TerminalSwarmRegistry {
             // — but exporting them lets the user `echo $NEURON_BRIDGE`
             // in the pane to verify the path during debugging.
             let bridge_root_str = bridgespace_root.display().to_string();
-            let inbox_self = bridgespace_root
-                .join("inbox")
+            let outbox_self = bridgespace_root
+                .join("outbox")
                 .join(agent_id)
                 .display()
                 .to_string();
@@ -414,7 +414,7 @@ impl TerminalSwarmRegistry {
                 "NEURON_AGENT_ID".to_string(),
                 agent_id.to_string(),
             );
-            extra_env.insert("NEURON_INBOX".to_string(), inbox_self);
+            extra_env.insert("NEURON_OUTBOX".to_string(), outbox_self);
             let input = PaneSpawnInput {
                 cwd: project_str.clone(),
                 cmd: Some(agent_cmd),
@@ -530,7 +530,10 @@ impl TerminalSwarmRegistry {
                 if !trimmed.is_empty() {
                     tokio::time::sleep(Duration::from_millis(AUTO_PROMPT_DELAY_MS)).await;
                     if let Some(orch_pane) = panes_by_agent.get("orchestrator") {
-                        let payload = format!("\x1b[200~{trimmed}\x1b[201~");
+                        let payload = format!(
+                            "\x1b[200~{}\x1b[201~",
+                            bridge::sanitize_for_paste(trimmed)
+                        );
                         if let Err(e) = bridge::paste_then_submit(
                             &registry_for_inject,
                             orch_pane,

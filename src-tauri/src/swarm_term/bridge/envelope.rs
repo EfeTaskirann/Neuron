@@ -5,16 +5,20 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::swarm_term::hierarchy::AGENT_IDS;
 
-/// One inter-agent message. Agents create one of these via the `Write`
-/// tool; the watcher reads it.
+/// One inter-agent message. An agent creates one with its `Write` tool
+/// under `outbox/<its-own-id>/`; the watcher reads it.
 ///
-/// `from` is trust-based: a misbehaving persona could spoof it, but all
-/// 9 personas are our own and the cost of path-derived sender attribution
-/// (an outbox staging step) is not worth the added complexity in v1.
-/// The watcher does cross-check `envelope.to` against the path's target
-/// directory and uses the path when they disagree.
+/// The SENDER is the outbox directory, not `from`: `from` is optional and,
+/// when present, must name that same agent or the envelope is refused.
+/// This stops accidental and simple spoofing (an agent — or a stray
+/// script — claiming to be the orchestrator to get past the hierarchy or
+/// borrow its signature). It is NOT authentication: every pane runs with
+/// the same OS user and file access, so an agent that deliberately writes
+/// into another agent's outbox is indistinguishable from it. The
+/// hierarchy is an organisational guide, not a security boundary.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Envelope {
+    #[serde(default)]
     pub from: String,
     pub to: String,
     pub body: String,

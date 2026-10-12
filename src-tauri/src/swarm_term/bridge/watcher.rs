@@ -54,6 +54,10 @@ pub(super) const NOT_READY_GRACE: Duration = Duration::from_secs(60);
 /// (see [`is_delivery_blocked`]) before it is rejected.
 pub(super) const LOCKED_GRACE: Duration = Duration::from_secs(180);
 
+/// Largest inbox file the bridge will read. Real envelopes are a few
+/// KB; anything bigger is rejected unread.
+pub(super) const MAX_ENVELOPE_BYTES: u64 = 256 * 1024;
+
 /// While a message waits, re-emit its routing event only on the first
 /// attempt and every Nth after it (~5 s at the poll cadence), instead
 /// of flooding the Routing Log with one row per 250 ms tick.
@@ -106,42 +110,121 @@ async fn process_pending<R: Runtime>(
     ready_panes: &Arc<Mutex<HashSet<String>>>,
     lifecycle: &Arc<LifecycleStore>,
 ) {
-    let inbox_root = root.join("inbox");
-    // Iterate targets in canonical order so the user sees a stable
-    // delivery order during multi-source bursts.
-    for &target in AGENT_IDS {
-        let dir = inbox_root.join(target);
-        let mut entries: Vec<PathBuf> = match fs::read_dir(&dir) {
-            Ok(rd) => rd
-                .filter_map(|e| e.ok())
-                .map(|e| e.path())
-                .filter(|p| {
-                    p.extension().and_then(|s| s.to_str()) == Some("json")
-                })
-                .collect(),
-            Err(_) => continue,
-        };
-        // FIFO by write time (mtime; renames preserve it), name as the
-        // tie-break. Sorting by name alone assumed chronological ids,
-        // but agents pick their own filenames (and were seen copying
-        // the persona's example id verbatim).
-        entries.sort_by_cached_key(|p| {
-            let mtime = fs::metadata(p).and_then(|m| m.modified()).ok();
-            (mtime, p.clone())
-        });
-        for path in entries {
-            process_one(
-                app,
-                registry,
-                root,
-                &path,
-                target,
-                panes_by_agent,
-                ready_panes,
-                lifecycle,
-            )
-            .await;
+    // Legacy `inbox/<target>/` drops (the pre-outbox protocol, where the
+    // sender was taken from the file's own `from` field): never
+    // delivered — rejected with a pointer to the sender's outbox.
+    for &dir_agent in AGENT_IDS {
+        for path in json_entries(&root.join("inbox").join(dir_agent)) {
+            reject_legacy_inbox(app, registry, root, &path, dir_agent, panes_by_agent)
+                .await;
         }
+    }
+
+    // Outboxes: the SENDER is the directory the file was written to.
+    // One FIFO across all senders by write time (mtime; renames preserve
+    // it), path as the tie-break — agents pick their own filenames, so
+    // name order is not chronological.
+    let mut entries: Vec<(Option<SystemTime>, PathBuf, &'static str)> = AGENT_IDS
+        .iter()
+        .flat_map(|&sender| {
+            json_entries(&root.join("outbox").join(sender))
+                .into_iter()
+                .map(move |p| {
+                    let mtime = fs::metadata(&p).and_then(|m| m.modified()).ok();
+                    (mtime, p, sender)
+                })
+        })
+        .collect();
+    entries.sort();
+    for (_, path, sender) in entries {
+        process_one(
+            app,
+            registry,
+            root,
+            &path,
+            sender,
+            panes_by_agent,
+            ready_panes,
+            lifecycle,
+        )
+        .await;
+    }
+}
+
+/// `*.json` entries of `dir` (empty when it does not exist).
+fn json_entries(dir: &Path) -> Vec<PathBuf> {
+    fs::read_dir(dir)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("json"))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Reject a file dropped under the legacy `inbox/<dir_agent>/` path and,
+/// when its claimed sender can be read, tell that agent to use its
+/// outbox. The claimed `from` is unverifiable here — it only selects who
+/// receives the (harmless) notice.
+async fn reject_legacy_inbox<R: Runtime>(
+    app: &AppHandle<R>,
+    registry: &TerminalRegistry,
+    root: &Path,
+    path: &Path,
+    dir_agent: &str,
+    panes_by_agent: &HashMap<String, String>,
+) {
+    if let Err(reason) = file_gate(path) {
+        reject_unread(app, root, path, dir_agent, &reason);
+        return;
+    }
+    let raw = fs::read_to_string(path).unwrap_or_default();
+    let sender = sniff_from(&raw);
+    let reason = format!(
+        "legacy inbox path — write messages to {}/outbox/<your-id>/ (sender is taken from that directory)",
+        root.display()
+    );
+    let _ = app.emit(
+        crate::events::SWARM_TERM_ROUTE,
+        json!({
+            "source": sender.as_deref().unwrap_or("?"),
+            "target": dir_agent,
+            "body": truncate(&raw, 200),
+            "outcome": "rejected",
+            "reason": reason,
+        }),
+    );
+    reject_and_notify(
+        app,
+        registry,
+        root,
+        path,
+        panes_by_agent,
+        sender.as_deref(),
+        dir_agent,
+        &reason,
+        &raw,
+    )
+    .await;
+}
+
+/// Only a regular file of bounded size is ever read. `symlink_metadata`
+/// does not follow links, so an entry pointing at e.g. ~/.ssh/id_rsa is
+/// rejected unread instead of having its first bytes echoed into the
+/// Routing Log; the size cap keeps a huge file from being loaded into
+/// memory and then pasted into a pane. A missing file passes (the
+/// following read reports the concurrent move).
+fn file_gate(path: &Path) -> Result<(), String> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if !meta.file_type().is_file() => {
+            Err("not a regular file (symlink?)".into())
+        }
+        Ok(meta) if meta.len() > MAX_ENVELOPE_BYTES => Err(format!(
+            "envelope too large ({} bytes > {MAX_ENVELOPE_BYTES})",
+            meta.len()
+        )),
+        _ => Ok(()),
     }
 }
 
@@ -179,7 +262,15 @@ async fn reject_and_notify<R: Runtime>(
     reason: &str,
     body: &str,
 ) {
-    if let Err(e) = move_to_rejected(root, path, target, reason) {
+    let sender = sender.filter(|s| AGENT_IDS.contains(s));
+    // `target` may be an unvalidated `to` value; it is only ever used as
+    // a directory name when it is a known agent id (no `../` escapes).
+    let bucket = if AGENT_IDS.contains(&target) {
+        target
+    } else {
+        sender.unwrap_or(UNSORTED_BUCKET)
+    };
+    if let Err(e) = move_to_rejected(root, path, bucket, reason) {
         tracing::warn!(
             path = %path.display(),
             error = %e,
@@ -187,12 +278,51 @@ async fn reject_and_notify<R: Runtime>(
         );
         return;
     }
-    let Some(sender) = sender.filter(|s| AGENT_IDS.contains(s)) else {
+    let Some(sender) = sender else {
         return;
     };
     let text = rejection_notice(sender, target, reason, body);
     notify_agent(registry, panes_by_agent, sender, &text).await;
     emit_notice(app, sender, &text, reason);
+}
+
+/// `rejected/` sub-directory for envelopes whose target is unknown and
+/// whose sender could not be determined.
+const UNSORTED_BUCKET: &str = "_unsorted";
+
+/// Reject an entry WITHOUT reading it (it failed the file gate), filing
+/// it under `rejected/<bucket>/` (the outbox sender, or the legacy inbox
+/// directory). No notice: nothing was read to address one with.
+fn reject_unread<R: Runtime>(
+    app: &AppHandle<R>,
+    root: &Path,
+    path: &Path,
+    bucket: &str,
+    reason: &str,
+) {
+    tracing::warn!(
+        path = %path.display(),
+        reason = %reason,
+        "swarm-term bridge: inbox entry rejected unread"
+    );
+    if let Err(e) = move_to_rejected(root, path, bucket, reason) {
+        tracing::warn!(
+            path = %path.display(),
+            error = %e,
+            "swarm-term bridge: rejected-move failed"
+        );
+        return;
+    }
+    let _ = app.emit(
+        crate::events::SWARM_TERM_ROUTE,
+        json!({
+            "source": bucket,
+            "target": "?",
+            "body": "",
+            "outcome": "rejected",
+            "reason": reason,
+        }),
+    );
 }
 
 /// Routing Log row for a `[Neuron]` notice pasted into `recipient`'s pane.
@@ -220,11 +350,17 @@ async fn process_one<R: Runtime>(
     registry: &TerminalRegistry,
     root: &Path,
     path: &Path,
-    target_from_path: &str,
+    sender: &'static str,
     panes_by_agent: &Arc<HashMap<String, String>>,
     ready_panes: &Arc<Mutex<HashSet<String>>>,
     lifecycle: &Arc<LifecycleStore>,
 ) {
+    // ---- File gate --------------------------------------------------- //
+    if let Err(reason) = file_gate(path) {
+        reject_unread(app, root, path, sender, &reason);
+        return;
+    }
+
     // ---- Read + parse ------------------------------------------------ //
     let raw = match fs::read_to_string(path) {
         Ok(s) => s,
@@ -253,12 +389,11 @@ async fn process_one<R: Runtime>(
             let attempts = bump_attempts(path);
             if attempts >= MAX_DELIVERY_ATTEMPTS {
                 let reason = format!("malformed JSON x{attempts}: {e}");
-                let sender = sniff_from(&raw);
                 let _ = app.emit(
                     crate::events::SWARM_TERM_ROUTE,
                     json!({
-                        "source": sender.as_deref().unwrap_or("?"),
-                        "target": target_from_path,
+                        "source": sender,
+                        "target": "?",
                         "body": truncate(&raw, 200),
                         "outcome": "malformed",
                         "reason": reason,
@@ -270,8 +405,8 @@ async fn process_one<R: Runtime>(
                     root,
                     path,
                     panes_by_agent,
-                    sender.as_deref(),
-                    target_from_path,
+                    Some(sender),
+                    "?",
                     &reason,
                     &raw,
                 )
@@ -282,18 +417,11 @@ async fn process_one<R: Runtime>(
     };
     envelope.normalize();
 
-    // Path-derived target wins on conflict — defence against a sender
-    // dropping its file in the wrong directory.
-    if envelope.to != target_from_path {
-        tracing::warn!(
-            path = %path.display(),
-            envelope_to = %envelope.to,
-            dir_to = %target_from_path,
-            "swarm-term bridge: envelope.to / path disagreement; path wins"
-        );
-    }
-    let to_agent = target_from_path.to_string();
-    let from_agent = envelope.from.clone();
+    // The sender is the outbox the file was written to, never the
+    // content's own claim. A `from` field that names someone else is a
+    // (possibly accidental) spoof and is refused, not silently fixed.
+    let to_agent = envelope.to.clone();
+    let from_agent = sender.to_string();
     let body = envelope.body.clone();
     // The structured `task_id` is handed to the lifecycle layer as a
     // fallback id for bare-keyword bodies (see `lifecycle_synthesise`).
@@ -301,8 +429,18 @@ async fn process_one<R: Runtime>(
 
     // ---- Structural validation -------------------------------------- //
     let mut effective = envelope.clone();
-    effective.to = to_agent.clone();
-    if let Err(reason) = effective.validate() {
+    let spoofed = !effective.from.is_empty() && effective.from != sender;
+    effective.from = from_agent.clone();
+    let validation = if spoofed {
+        Err(format!(
+            "`from` is \"{}\" but the message was written to outbox/{sender}/ — \
+             the sender is taken from the outbox directory",
+            envelope.from
+        ))
+    } else {
+        effective.validate()
+    };
+    if let Err(reason) = validation {
         let _ = app.emit(
             crate::events::SWARM_TERM_ROUTE,
             json!({
