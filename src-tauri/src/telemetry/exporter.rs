@@ -116,13 +116,25 @@ fn http_client() -> &'static Client {
 ///   but no POST is ever issued, so a misconfigured env var becomes
 ///   a loud "no exports happening" condition rather than a silent
 ///   firehose to a wrong host.
-/// - Warns (returns `Ok`) when scheme is plain `http` and the host
-///   is **not** loopback. Plain HTTP to a public collector ships
-///   span attributes (and, with `NEURON_OTEL_INCLUDE_PROMPTS=1`,
-///   prompt content) in the clear; we won't refuse the configuration
-///   because some local-network collectors are HTTP-only by design,
-///   but the user should see the warning in their logs.
+/// - Refuses (returns `Err`) plain `http` to a host that is **not**
+///   loopback, unless the user opted in with
+///   [`OTEL_ALLOW_INSECURE_ENV`]`=1`. Plain HTTP to a remote collector
+///   ships span attributes (and, with `NEURON_OTEL_INCLUDE_PROMPTS=1`,
+///   prompt content) in the clear. With the opt-in (for HTTP-only
+///   collectors on a trusted local network) it is accepted with a
+///   warning.
 pub fn validate_endpoint(endpoint: &str) -> Result<(), String> {
+    let allow_insecure = std::env::var(OTEL_ALLOW_INSECURE_ENV)
+        .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true"));
+    validate_endpoint_with(endpoint, allow_insecure)
+}
+
+/// Opt-in for plain-HTTP export to a non-loopback collector.
+pub const OTEL_ALLOW_INSECURE_ENV: &str = "NEURON_OTEL_ALLOW_INSECURE_HTTP";
+
+/// [`validate_endpoint`] with the insecure-HTTP opt-in passed explicitly
+/// (pure; the env lookup stays in the wrapper so tests need no env).
+pub fn validate_endpoint_with(endpoint: &str, allow_insecure: bool) -> Result<(), String> {
     let url = reqwest::Url::parse(endpoint)
         .map_err(|e| format!("not a valid URL: {e}"))?;
     let scheme = url.scheme();
@@ -135,11 +147,19 @@ pub fn validate_endpoint(endpoint: &str) -> Result<(), String> {
         let host = url.host_str().unwrap_or("");
         let is_loopback = matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]");
         if !is_loopback {
+            if !allow_insecure {
+                return Err(format!(
+                    "plain HTTP to non-loopback host '{host}' would send span data \
+                     in the clear — use https, or set {OTEL_ALLOW_INSECURE_ENV}=1 \
+                     for a trusted HTTP-only collector"
+                ));
+            }
             tracing::warn!(
                 endpoint = %endpoint,
-                "OTLP endpoint is plain HTTP to a non-loopback host — span \
-                 attributes (and prompt content if NEURON_OTEL_INCLUDE_PROMPTS=1) \
-                 will travel in the clear"
+                "OTLP endpoint is plain HTTP to a non-loopback host ({} set) — \
+                 span attributes (and prompt content if \
+                 NEURON_OTEL_INCLUDE_PROMPTS=1) will travel in the clear",
+                OTEL_ALLOW_INSECURE_ENV
             );
         }
     }

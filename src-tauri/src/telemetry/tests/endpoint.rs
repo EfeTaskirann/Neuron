@@ -39,15 +39,19 @@ fn validate_endpoint_rejects_garbage() {
     assert!(validate_endpoint("").is_err());
 }
 
-/// Plain HTTP to a non-loopback host is allowed (some local-network
-/// collectors only speak HTTP) but should NOT be silently equivalent
-/// to https. We assert the call returns Ok; the warning emission is
-/// observable via tracing in production but not asserted here to
-/// keep the test free of subscriber installation.
+/// Plain HTTP to a non-loopback host would ship span data in the clear:
+/// refused by default, allowed only with the explicit opt-in (some
+/// trusted local-network collectors only speak HTTP). Loopback HTTP and
+/// https are unaffected by the opt-in.
 #[test]
-fn validate_endpoint_allows_plain_http_to_remote_with_warning_path() {
-    use crate::telemetry::exporter::validate_endpoint;
-    assert!(validate_endpoint("http://collector.example:4318/v1/traces").is_ok());
+fn plain_http_to_a_remote_host_requires_the_explicit_opt_in() {
+    use crate::telemetry::exporter::{validate_endpoint_with, OTEL_ALLOW_INSECURE_ENV};
+    let remote = "http://collector.example:4318/v1/traces";
+    let err = validate_endpoint_with(remote, false).expect_err("refused by default");
+    assert!(err.contains(OTEL_ALLOW_INSECURE_ENV), "error names the opt-in: {err}");
+    assert!(validate_endpoint_with(remote, true).is_ok());
+    assert!(validate_endpoint_with("http://localhost:4318/v1/traces", false).is_ok());
+    assert!(validate_endpoint_with("https://collector.example/v1/traces", false).is_ok());
 }
 
 /// Tiny shim so the assertion in `validate_endpoint_rejects_non_http_schemes`

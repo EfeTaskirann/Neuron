@@ -12,7 +12,9 @@ use tauri::{AppHandle, Manager, Runtime};
 
 use crate::error::AppError;
 use crate::mcp::client::{McpClient, ToolDescriptor};
-use crate::mcp::manifests::{DefaultRootKind, ManifestSpawn, ServerManifest};
+use crate::mcp::manifests::{
+    is_pinned_npm_spec, DefaultRootKind, ManifestSpawn, ServerManifest,
+};
 
 /// Fetch the tool list from a freshly-spawned server. Internal to the
 /// install flow.
@@ -34,8 +36,8 @@ pub(super) async fn spawn_for_manifest<R: Runtime>(
 ) -> Result<McpClient, AppError> {
     let Some(spawn) = manifest.spawn.as_ref() else {
         return Err(AppError::McpServerSpawnFailed(format!(
-            "{} is catalog-only in Week 2; install pipeline is wired \
-             in a follow-up WP",
+            "{} has no launch recipe (catalog-only entry) — see its \
+             description",
             manifest.id
         )));
     };
@@ -57,6 +59,15 @@ fn resolve_command<R: Runtime>(
             package,
             args_template,
         } => {
+            // Supply-chain guard: never let `npx -y` resolve "whatever is
+            // newest" at launch time (also enforced by a manifest test).
+            if !is_pinned_npm_spec(package) {
+                return Err(AppError::McpServerSpawnFailed(format!(
+                    "{} refuses to launch `{package}`: npm package must be \
+                     pinned to an exact version (name@x.y.z)",
+                    manifest.id
+                )));
+            }
             let root_path: Option<String> = match manifest.default_root_kind {
                 Some(DefaultRootKind::AppDataDir) => Some(resolve_app_data_dir(app)?),
                 None => None,

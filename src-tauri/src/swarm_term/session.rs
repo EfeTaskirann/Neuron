@@ -3,9 +3,9 @@
 //! `start()` spawns 9 PTY panes (one per agent in `hierarchy::AGENT_IDS`)
 //! through `TerminalRegistry::spawn_pane`, each running interactive
 //! `claude` with the user-selected project as `cwd`. Before the spawn
-//! loop it prepares `<project>/.bridgespace/<session>/{inbox,processed,
+//! loop it prepares `<project>/.bridgespace/<session>/{outbox,processed,
 //! rejected}/<agent>/` and passes per-pane environment variables
-//! (`NEURON_BRIDGE`, `NEURON_AGENT_ID`, `NEURON_INBOX`) so each claude
+//! (`NEURON_BRIDGE`, `NEURON_AGENT_ID`, `NEURON_OUTBOX`) so each claude
 //! REPL knows where to drop outbound messages. Each pane's persona +
 //! bridge protocol is its appended system prompt
 //! (`--append-system-prompt-file`); a short kickoff turn is then pasted
@@ -45,6 +45,7 @@ use crate::swarm_term::home_isolation::{
     sync_credentials,
 };
 use crate::swarm_term::lifecycle::LifecycleStore;
+use crate::swarm_term::permissions;
 use crate::swarm_term::persona::{
     build_kickoff_message, build_persona_prompt, is_ready_answer,
 };
@@ -196,7 +197,8 @@ impl TerminalSwarmRegistry {
     ) -> Result<TerminalSwarmSessionHandle, AppError> {
         // PATH-01: reject parent-dir traversal segments so a crafted
         // project_dir cannot walk out of wherever the caller intended
-        // (the 9 REPLs spawn with bypassPermissions and cwd = this dir).
+        // (the 9 REPLs spawn with cwd = this dir and may read — builders
+        // also write — everything under it; see `permissions`).
         if project_dir
             .components()
             .any(|c| matches!(c, std::path::Component::ParentDir))
@@ -243,8 +245,8 @@ impl TerminalSwarmRegistry {
         for a in &spawn.prefix_args {
             parts.push(format!("\"{}\"", a));
         }
-        parts.push("--permission-mode".to_string());
-        parts.push("bypassPermissions".to_string());
+        // Permission flags are per agent (see `permissions`), appended in
+        // the spawn loop.
         let _ = project_str.clone(); // kept for log diagnostics
         let cmd = parts.join(" ");
         tracing::info!(
@@ -252,6 +254,13 @@ impl TerminalSwarmRegistry {
             cmd = %cmd,
             "swarm-term: spawning 9 claude REPLs"
         );
+        if permissions::bypass_active() {
+            tracing::warn!(
+                "swarm-term: {}=bypass — all panes run with bypassPermissions \
+                 (unrestricted shell + file access)",
+                permissions::PERMISSIONS_ENV
+            );
+        }
 
         let registry =
             app.state::<TerminalRegistry>().inner().clone();
@@ -370,7 +379,11 @@ impl TerminalSwarmRegistry {
                 )));
             }
             let agent_cmd = format!(
-                "{cmd} --append-system-prompt-file \"{}\"",
+                "{cmd} {} --append-system-prompt-file \"{}\"",
+                permissions::join_quoted(&permissions::claude_permission_args(
+                    agent_id,
+                    &session_id,
+                )),
                 persona_file.display()
             );
             pane_homes.insert(agent_id.to_string(), pane_home.clone());
@@ -401,8 +414,8 @@ impl TerminalSwarmRegistry {
             // — but exporting them lets the user `echo $NEURON_BRIDGE`
             // in the pane to verify the path during debugging.
             let bridge_root_str = bridgespace_root.display().to_string();
-            let inbox_self = bridgespace_root
-                .join("inbox")
+            let outbox_self = bridgespace_root
+                .join("outbox")
                 .join(agent_id)
                 .display()
                 .to_string();
@@ -414,7 +427,7 @@ impl TerminalSwarmRegistry {
                 "NEURON_AGENT_ID".to_string(),
                 agent_id.to_string(),
             );
-            extra_env.insert("NEURON_INBOX".to_string(), inbox_self);
+            extra_env.insert("NEURON_OUTBOX".to_string(), outbox_self);
             let input = PaneSpawnInput {
                 cwd: project_str.clone(),
                 cmd: Some(agent_cmd),
@@ -530,7 +543,10 @@ impl TerminalSwarmRegistry {
                 if !trimmed.is_empty() {
                     tokio::time::sleep(Duration::from_millis(AUTO_PROMPT_DELAY_MS)).await;
                     if let Some(orch_pane) = panes_by_agent.get("orchestrator") {
-                        let payload = format!("\x1b[200~{trimmed}\x1b[201~");
+                        let payload = format!(
+                            "\x1b[200~{}\x1b[201~",
+                            bridge::sanitize_for_paste(trimmed)
+                        );
                         if let Err(e) = bridge::paste_then_submit(
                             &registry_for_inject,
                             orch_pane,
@@ -930,5 +946,155 @@ mod tests {
         assert!(!transcript_has_ready_answer(home.path(), "scout"));
         std::fs::write(&file, format!("{KICKOFF_ECHO}\n{READY_LINE}\n")).unwrap();
         assert!(transcript_has_ready_answer(home.path(), "scout"));
+    }
+
+    /// Opt-in LIVE run of the real session: 9 real claude panes with the
+    /// production personas, permissions and bridge, driven headless.
+    /// Spends tokens. Inputs (env): `NEURON_LIVE_PROJECT` (project dir),
+    /// `NEURON_LIVE_TASK` (text pasted to the orchestrator),
+    /// `NEURON_LIVE_TIMEOUT_MIN` (default 20), `NEURON_LIVE_OUT` (dir for
+    /// the transcript copies). Prints the message timeline and every
+    /// denied tool call, then stops the session.
+    ///
+    ///   cargo test --lib swarm_term::session::tests::live -- --ignored --nocapture
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "spawns 9 real claude REPLs and spends tokens — opt in"]
+    async fn live_swarm_run() {
+        use std::collections::BTreeMap;
+        let env = |k: &str| std::env::var(k).unwrap_or_else(|_| panic!("set {k}"));
+        let project = PathBuf::from(env("NEURON_LIVE_PROJECT"));
+        let task = env("NEURON_LIVE_TASK");
+        let out = PathBuf::from(env("NEURON_LIVE_OUT"));
+        let timeout = Duration::from_secs(
+            60 * std::env::var("NEURON_LIVE_TIMEOUT_MIN")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(20u64),
+        );
+        let started = Instant::now();
+        let stamp = |t: Instant| format!("{:>5.1}s", t.duration_since(started).as_secs_f32());
+
+        let (app, _pool, _db) =
+            crate::test_support::mock_app_with_pool_and_terminal_registry().await;
+        let registry = app.state::<TerminalRegistry>().inner().clone();
+        let swarm = Arc::new(TerminalSwarmRegistry::new());
+        swarm.start(app.handle().clone(), project.clone()).await.expect("start");
+        let (panes, ready, root, homes) = {
+            let g = swarm.inner.lock().unwrap();
+            let s = g.as_ref().expect("session");
+            (
+                s.panes_by_agent.clone(),
+                Arc::clone(&s.ready_panes),
+                s.bridgespace_root.clone().unwrap(),
+                s.homes_root.clone().unwrap(),
+            )
+        };
+        println!("[{}] session started: {}", stamp(Instant::now()), root.display());
+
+        // Readiness.
+        let ready_deadline = Instant::now() + Duration::from_secs(150);
+        loop {
+            let n = ready.lock().map(|g| g.len()).unwrap_or(0);
+            if n == panes.len() || Instant::now() > ready_deadline {
+                println!("[{}] ready panes: {n}/{}", stamp(Instant::now()), panes.len());
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+
+        // Task → orchestrator, exactly like the chat bar.
+        let orch = panes.get("orchestrator").expect("orchestrator pane");
+        let paste = format!("\x1b[200~{}\x1b[201~", bridge::sanitize_for_paste(&task));
+        bridge::paste_then_submit(&registry, orch, paste.as_bytes()).await.expect("task");
+        println!("[{}] task sent to orchestrator", stamp(Instant::now()));
+
+        // Timeline: every file that lands in processed/ or rejected/.
+        let mut seen: BTreeMap<PathBuf, ()> = BTreeMap::new();
+        let mut task_done = 0usize;
+        let mut done_at: Option<Instant> = None;
+        while started.elapsed() < timeout {
+            for kind in ["processed", "rejected"] {
+                for target in AGENT_IDS {
+                    let dir = root.join(kind).join(target);
+                    let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+                    let mut files: Vec<PathBuf> = rd
+                        .flatten()
+                        .map(|e| e.path())
+                        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("json"))
+                        .collect();
+                    files.sort();
+                    for f in files {
+                        if seen.insert(f.clone(), ()).is_some() {
+                            continue;
+                        }
+                        let raw = std::fs::read_to_string(&f).unwrap_or_default();
+                        let v: serde_json::Value =
+                            serde_json::from_str(&raw).unwrap_or(serde_json::Value::Null);
+                        let body = v["body"].as_str().unwrap_or("").replace('\n', " ⏎ ");
+                        let body: String = body.chars().take(170).collect();
+                        let from = v["from"].as_str().unwrap_or("?");
+                        let reason = if kind == "rejected" {
+                            let mut r = f.clone();
+                            r.set_extension("reason");
+                            format!(" REJECTED: {}", std::fs::read_to_string(r).unwrap_or_default())
+                        } else {
+                            String::new()
+                        };
+                        println!(
+                            "[{}] {from} → {target} [{}]: {body}{reason}",
+                            stamp(Instant::now()),
+                            v["task_id"].as_str().map(str::to_string)
+                                .unwrap_or_else(|| v["task_id"].to_string()),
+                        );
+                        if kind == "processed"
+                            && *target == "orchestrator"
+                            && body.trim_start().starts_with("TASK_DONE")
+                        {
+                            task_done += 1;
+                        }
+                    }
+                }
+            }
+            // Code task: builder TASK_DONE + tester smoke TASK_DONE, then
+            // give the orchestrator a minute for its final summary.
+            if task_done >= 2 && done_at.is_none() {
+                done_at = Some(Instant::now());
+            }
+            if done_at.is_some_and(|t| t.elapsed() > Duration::from_secs(60)) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        println!("[{}] TASK_DONE received by orchestrator: {task_done}", stamp(Instant::now()));
+
+        // Denied tool calls + transcript copies, before stop() deletes the homes.
+        std::fs::create_dir_all(&out).ok();
+        for agent in AGENT_IDS {
+            let dir = homes.join(agent).join(".claude").join("projects");
+            let Ok(projects) = std::fs::read_dir(&dir) else { continue };
+            for p in projects.flatten() {
+                for f in std::fs::read_dir(p.path()).into_iter().flatten().flatten() {
+                    let text = std::fs::read_to_string(f.path()).unwrap_or_default();
+                    std::fs::write(out.join(format!("{agent}.jsonl")), &text).ok();
+                    for line in text.lines() {
+                        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+                        let Some(parts) = v.pointer("/message/content").and_then(|c| c.as_array())
+                        else { continue };
+                        for part in parts {
+                            if part["type"] == "tool_result" && part["is_error"] == true {
+                                let c = part["content"].to_string();
+                                if c.to_lowercase().contains("permission") || c.contains("denied") {
+                                    let c: String = c.chars().take(200).collect();
+                                    println!("DENIED [{agent}] {c}");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        swarm.stop(app.handle().clone()).await.expect("stop");
+        println!("[{}] session stopped", stamp(Instant::now()));
     }
 }

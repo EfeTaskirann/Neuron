@@ -65,8 +65,10 @@ pub(crate) async fn submit_pasted(
 /// lifecycle fanouts to just-finished reviewer/orchestrator panes.
 ///
 /// `awaiting_approval` is deliberately NOT blocking: swarm-term panes
-/// run with `--permission-mode bypassPermissions`, so claude never shows
-/// a real approval prompt there. The status can only come from the
+/// run with `--permission-mode dontAsk` (or `bypassPermissions` when
+/// opted out — see `swarm_term::permissions`); neither ever shows a real
+/// approval prompt — a non-allowed tool is denied, not asked. The status
+/// can only come from the
 /// generic `Approve.*?` regex matching the agent's own output, and it
 /// is never cleared — blocking on it froze the pane's inbox for good.
 pub(super) fn is_delivery_blocked(status: Option<&str>) -> bool {
@@ -130,14 +132,32 @@ where
     }
 }
 
+/// Make arbitrary text safe to place INSIDE a bracketed paste: CR / CRLF
+/// become LF, and every other control character — the whole C0 range
+/// including ESC, DEL, and the C1 range (U+0080–U+009F, e.g. the 8-bit
+/// CSI) — is removed; only LF and TAB survive.
+///
+/// Removing the ESC byte itself (instead of replacing the `\x1b[201~`
+/// paste-end sequence) is what makes this sound: a one-pass `replace`
+/// of the sequence re-forms it from `\x1b\x1b[201~`, closing the paste
+/// early so the rest of the text reaches claude's TUI as keystrokes
+/// (Esc cancels the turn, Ctrl-C ×2 kills the pane, Shift-Tab flips the
+/// mode). Without ESC no terminal sequence can be formed at all.
+pub(crate) fn sanitize_for_paste(text: &str) -> String {
+    text.replace("\r\n", "\n")
+        .chars()
+        .map(|c| if c == '\r' { '\n' } else { c })
+        .filter(|&c| c == '\n' || c == '\t' || !c.is_control())
+        .collect()
+}
+
 /// Wire-format the routed payload that's pasted into the target pane's
 /// stdin:
 ///
 ///   * `\x1b[200~ … \x1b[201~` — xterm bracketed paste. The submitting
 ///     CR is NOT included; [`paste_then_submit`] sends it separately.
-///   * `\r` inside body → `\n` (CR inside paste = visual overstrike).
-///   * Embedded `\x1b[201~` → `[201~` (ESC byte dropped) so the
-///     bracketed paste isn't prematurely closed by the body content.
+///   * The body goes through [`sanitize_for_paste`], so it cannot close
+///     the paste early or carry terminal control sequences.
 ///   * The envelope's structured `task_id`, when present, is shown in
 ///     the signature (`— from @x [task T1] [routed by Neuron]`). Only the
 ///     body used to be pasted, so a receiver could not see the id the
@@ -148,9 +168,7 @@ pub(crate) fn format_routed_message(
     source_agent: &str,
     task_id: Option<&str>,
 ) -> String {
-    let safe = body
-        .replace('\r', "\n")
-        .replace("\x1b[201~", "[201~");
+    let safe = neutralize_bridge_markers(&sanitize_for_paste(body));
     let task = task_id
         .map(|id| {
             let printable: String = id.chars().filter(|c| !c.is_control()).collect();
@@ -164,6 +182,17 @@ pub(crate) fn format_routed_message(
     )
 }
 
+/// Defuse the bridge's own markers inside a peer's body: `[routed by
+/// Neuron]` (the routed signature) and `[Neuron]` (the bridge-notice
+/// prefix the persona tells agents to obey) become `(routed by Neuron)` /
+/// `(Neuron)`. Otherwise a body could carry a fake `— from @orchestrator
+/// [routed by Neuron]` line or pose as a bridge notice. The genuine
+/// signature is appended after this, so it is always the LAST line.
+fn neutralize_bridge_markers(body: &str) -> String {
+    body.replace("[routed by Neuron]", "(routed by Neuron)")
+        .replace("[Neuron]", "(Neuron)")
+}
+
 /// Cap on the task id echoed in the routed signature.
 const MAX_SIGNATURE_TASK_ID_CHARS: usize = 64;
 
@@ -173,9 +202,7 @@ const MAX_SIGNATURE_TASK_ID_CHARS: usize = 64;
 /// coming from the bridge itself so the agent does not reply to it as
 /// if it were a peer's message.
 pub(crate) fn format_system_notice(text: &str) -> String {
-    let safe = text
-        .replace('\r', "\n")
-        .replace("\x1b[201~", "[201~");
+    let safe = sanitize_for_paste(text);
     format!("\x1b[200~[Neuron] {safe}\x1b[201~")
 }
 

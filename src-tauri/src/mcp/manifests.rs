@@ -190,6 +190,35 @@ pub fn get(id: &str) -> Result<Option<ServerManifest>, ManifestError> {
     Ok(None)
 }
 
+/// True when an npm spec names an EXACT version (`name@1.2.3`,
+/// `@scope/name@2026.8.31`). A bare name, a dist-tag (`@latest`) or a
+/// range (`^1`, `~1.2`, `>=1`, `1.x`, `*`) is rejected: `npx -y` would
+/// fetch whatever is newest on every launch, so a compromised upstream
+/// release would run on the user's machine unreviewed.
+pub(crate) fn is_pinned_npm_spec(spec: &str) -> bool {
+    // A scoped package starts with '@'; the version separator is the
+    // LAST '@', which must come after the name.
+    let Some(at) = spec.rfind('@').filter(|&i| i > 0) else {
+        return false;
+    };
+    let version = &spec[at + 1..];
+    // MAJOR.MINOR.PATCH (digits only), optionally followed by a
+    // `-prerelease` / `+build` suffix, which may itself contain dots.
+    let core_len = version.find(['-', '+']).unwrap_or(version.len());
+    let (core, suffix) = version.split_at(core_len);
+    let numeric = |p: &str| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit());
+    let core_ok = {
+        let parts: Vec<&str> = core.split('.').collect();
+        parts.len() == 3 && parts.iter().all(|p| numeric(p))
+    };
+    let suffix_ok = suffix.is_empty()
+        || (suffix.len() > 1
+            && suffix[1..]
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'+')));
+    core_ok && suffix_ok
+}
+
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum ManifestError {
     #[error("manifest {0} failed to parse: {1}")]
@@ -236,7 +265,7 @@ mod tests {
         assert_eq!(m.default_root_kind, Some(DefaultRootKind::AppDataDir));
         match m.spawn {
             Some(ManifestSpawn::Npx { package, args_template }) => {
-                assert_eq!(package, "@modelcontextprotocol/server-filesystem");
+                assert_eq!(package, "@modelcontextprotocol/server-filesystem@2026.8.31");
                 assert_eq!(args_template, vec!["__ROOT__".to_string()]);
             }
             _ => panic!("filesystem must spawn via npx"),
@@ -251,7 +280,49 @@ mod tests {
             Some("GITHUB_PERSONAL_ACCESS_TOKEN"),
             "github MCP needs a PAT"
         );
-        assert!(matches!(m.spawn, Some(ManifestSpawn::Npx { .. })));
+        // `@modelcontextprotocol/server-github` is deprecated upstream
+        // ("no longer supported" on npm): catalog-only, never launched.
+        assert!(m.spawn.is_none());
+        assert!(m.description.contains("deprecated"));
+    }
+
+    #[test]
+    fn every_npx_manifest_is_pinned_to_an_exact_version() {
+        for m in load_all().expect("load") {
+            if let Some(ManifestSpawn::Npx { package, .. }) = &m.spawn {
+                assert!(
+                    is_pinned_npm_spec(package),
+                    "manifest `{}` runs `{package}` unpinned — use name@x.y.z",
+                    m.id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn npm_spec_pinning_rules() {
+        for ok in [
+            "left-pad@1.3.0",
+            "@modelcontextprotocol/server-filesystem@2026.8.31",
+            "@scope/pkg@1.0.0-beta.2",
+            "pkg@1.2.3+build.5",
+        ] {
+            assert!(is_pinned_npm_spec(ok), "{ok}");
+        }
+        for bad in [
+            "left-pad",
+            "@modelcontextprotocol/server-filesystem",
+            "pkg@latest",
+            "pkg@^1.2.3",
+            "pkg@~1.2",
+            "pkg@>=1.0.0",
+            "pkg@1.x",
+            "pkg@*",
+            "pkg@1.2",
+            "@scope/pkg@",
+        ] {
+            assert!(!is_pinned_npm_spec(bad), "{bad}");
+        }
     }
 
     #[test]

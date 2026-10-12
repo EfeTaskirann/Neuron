@@ -8,7 +8,7 @@
   "featured": true,
   "spawn": {
     "kind": "npx",
-    "package": "@modelcontextprotocol/server-filesystem",
+    "package": "@modelcontextprotocol/server-filesystem@2026.8.31",
     "args_template": ["__ROOT__"]
   },
   "requires_secret": null,
