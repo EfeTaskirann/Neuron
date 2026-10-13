@@ -9,7 +9,7 @@ use super::delivery::{
 };
 use super::envelope::{sniff_from, Envelope};
 use super::notify::rejection_notice;
-use super::stall::{escalation_for, reminder_for};
+use super::stall::{escalation_for, give_up_texts, reminder_for};
 use crate::swarm_term::lifecycle::{LifecycleState, Stall};
 use super::fsops::{
     archive_rejected, attempts_sidecar, bump_attempts, drop_envelope,
@@ -156,6 +156,7 @@ fn stall(state: LifecycleState, mins: u64, level: u8) -> Stall {
         state,
         age: std::time::Duration::from_secs(mins * 60),
         level,
+        give_up: false,
     }
 }
 
@@ -207,6 +208,14 @@ fn an_unsent_rework_reminds_the_coordinator_then_the_orchestrator() {
     let (to, text) = escalation_for("coordinator", &stall(LifecycleState::Failed, 21, 2));
     assert_eq!(to, "orchestrator");
     assert!(text.contains("T9"));
+}
+
+#[test]
+fn a_given_up_stall_reports_task_failed_to_the_orchestrator() {
+    let (failed, notice) =
+        give_up_texts("backend-builder", &stall(LifecycleState::Assigned, 60, 3));
+    assert!(failed.starts_with("TASK_FAILED T9 — @backend-builder 60 dakikadır"), "{failed}");
+    assert!(notice.contains("yeniden dispatch ETME"));
 }
 
 #[test]

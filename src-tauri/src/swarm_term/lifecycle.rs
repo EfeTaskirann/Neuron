@@ -144,14 +144,12 @@ pub struct Recorded {
     /// is still in flight (a tester rejection reworked by both
     /// builders): hold the retest until the last part is approved.
     pub others_in_flight: bool,
-    /// The builder's note from the latest `DONE` on a retest task —
-    /// carried into `retest <id> — <note>` so the tester knows what
-    /// changed.
-    pub retest_note: Option<String>,
-    /// The tester's final `APPROVED` closed a task it had rejected: the
-    /// builder's note of the fix, appended to `TASK_DONE` so the
-    /// orchestrator's report lists the files the rework touched.
-    pub fix_note: Option<String>,
+    /// For a task the tester rejected: the builders' `DONE` notes of the
+    /// current fix round (one per builder). Carried into `retest <id> —
+    /// <note>` so the tester knows what changed, and into the final
+    /// `TASK_DONE` so the orchestrator's report lists what the rework
+    /// touched.
+    pub builder_note: Option<String>,
     /// `CHANGES_NEEDED` count for the task so far.
     pub rejections: u8,
     /// This `CHANGES_NEEDED` used up [`MAX_REWORK_ROUNDS`]: the task is
@@ -167,8 +165,7 @@ impl Recorded {
             state,
             retest: false,
             others_in_flight: false,
-            retest_note: None,
-            fix_note: None,
+            builder_note: None,
             rejections: 0,
             limit_exceeded: false,
             already_closed: None,
@@ -445,6 +442,19 @@ pub fn misaddressed_signal(from: &str, to: &str, body: &str, task_id: Option<&st
             || (task_id.is_some_and(|id| !id.trim().is_empty()) && is_error_report(body)))
 }
 
+/// Pure: a `task_id=<id>` / `task_id: <id>` marker in a dispatch body —
+/// the personas teach writing it there AND in the envelope field, and an
+/// LLM sometimes fills only the body. The id must contain a digit, like
+/// every persona-taught id.
+pub fn body_task_id(body: &str) -> Option<&str> {
+    let lower = body.to_ascii_lowercase();
+    let at = lower.find("task_id")?;
+    let rest = body[at + "task_id".len()..]
+        .trim_start_matches(|c: char| c.is_whitespace() || matches!(c, '=' | ':' | '`' | '"'));
+    let token = rest.split_whitespace().next()?.trim_matches(is_id_trim);
+    (!token.is_empty() && token.len() <= MAX_TASK_ID_LEN && has_digit(token)).then_some(token)
+}
+
 /// Pure: the task id of a coordinator → orchestrator `TASK_FAILED <id>`
 /// report (inline id, else the envelope's `task_id`).
 pub fn task_failed_id<'a>(body: &'a str, task_id: Option<&'a str>) -> Option<&'a str> {
@@ -532,17 +542,58 @@ struct TaskMeta {
     rejections: u8,
     /// The integration-tester rejected it: its fix ends with a retest.
     needs_retest: bool,
-    /// Builder note of the latest `DONE` (for the retest request).
-    last_done_note: Option<String>,
+    /// `(builder, note)` of each builder's latest `DONE` in the current
+    /// fix round — both builders may rework a tester rejection.
+    done_notes: Vec<(String, String)>,
+    /// Level-2 stall escalations reported so far. A second one (after a
+    /// re-dispatch reset the clock) gives the task up.
+    escalations: u8,
     /// A rejection the coordinator has not re-dispatched yet.
     rework: Option<Entry>,
     closed: Option<Closure>,
 }
 
+impl TaskMeta {
+    fn builder_note(&self) -> Option<String> {
+        match self.done_notes.as_slice() {
+            [] => None,
+            [(_, note)] => Some(note.clone()),
+            many => Some(
+                many.iter()
+                    .map(|(agent, note)| format!("@{agent}: {note}"))
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            ),
+        }
+    }
+}
+
+/// How [`LifecycleStore::abandon`] resolved a `hata` report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Abandon {
+    /// The reporter's own (or judged) in-flight work: closed as failed.
+    Closed,
+    /// Nothing tracked it (e.g. the dispatch carried no structured
+    /// task_id, or it awaited a rework dispatch): closed as failed too —
+    /// otherwise the orchestrator would wait for it forever.
+    Untracked,
+    /// The task is open on someone else's pane: left alone.
+    Elsewhere,
+    /// Already closed; nothing changes.
+    AlreadyClosed(Closure),
+}
+
 /// One in-flight task that crossed a stall threshold — output of
-/// [`LifecycleStore::take_stalls`]. `level` is 1 at the threshold and 2
-/// at twice the threshold (escalation). A rework the coordinator owes
-/// is reported with `state: Failed` and an empty `source_pane`.
+/// [`LifecycleStore::take_stalls`]. `level` is 1 at the threshold, 2 at
+/// twice the threshold (escalation) and 3 at three times it. A rework the
+/// coordinator owes is reported with `state: Failed` and an empty
+/// `source_pane`.
+///
+/// `give_up`: nobody answered the reminder AND the escalation — level 3,
+/// or a second escalation after a re-dispatch reset the clock. The store
+/// has already closed the task as failed; the caller reports
+/// `TASK_FAILED`. Without this a dead pane was reminded, escalated and
+/// nudged in a loop forever.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Stall {
     pub source_pane: String,
@@ -550,10 +601,13 @@ pub struct Stall {
     pub state: LifecycleState,
     pub age: Duration,
     pub level: u8,
+    pub give_up: bool,
 }
 
 fn stall_level(age: Duration, threshold: Duration) -> u8 {
-    if age >= threshold * 2 {
+    if age >= threshold * 3 {
+        3
+    } else if age >= threshold * 2 {
         2
     } else if age >= threshold {
         1
@@ -561,6 +615,11 @@ fn stall_level(age: Duration, threshold: Duration) -> u8 {
         0
     }
 }
+
+/// Distinct task ids kept before closed ones are dropped entirely
+/// (VAL-01). Far above the soft cap: a closed id is all the single-use
+/// guard needs, so closed tasks are first shrunk, not forgotten.
+const MAX_TASK_IDS: usize = 16 * MAX_LIFECYCLE_ENTRIES;
 
 impl Inner {
     /// Settle every in-flight entry of `task_id` and record the closure.
@@ -579,13 +638,20 @@ impl Inner {
         meta.rework = None;
     }
 
-    /// VAL-01: bound memory over a long session. Evicts closed / settled
-    /// state first, keeping everything still in flight.
+    /// VAL-01: bound memory over a long session. Pane entries that are
+    /// settled go first; closed tasks keep their closure (the single-use
+    /// guard) and only lose their notes, until the far larger
+    /// [`MAX_TASK_IDS`] cap forces them out too.
     fn evict_if_full(&mut self) {
         if self.entries.len() >= MAX_LIFECYCLE_ENTRIES {
             self.entries.retain(|_, e| e.state.in_flight());
         }
         if self.tasks.len() >= MAX_LIFECYCLE_ENTRIES {
+            for m in self.tasks.values_mut().filter(|m| m.closed.is_some()) {
+                m.done_notes = Vec::new();
+            }
+        }
+        if self.tasks.len() >= MAX_TASK_IDS {
             self.tasks.retain(|_, m| m.closed.is_none());
         }
     }
@@ -667,7 +733,10 @@ impl LifecycleStore {
         match transition.kind {
             TransitionKind::Done => {
                 let meta = g.tasks.entry(id.to_string()).or_default();
-                meta.last_done_note = note.map(str::to_string);
+                meta.done_notes.retain(|(agent, _)| agent != source_agent);
+                if let Some(note) = note {
+                    meta.done_notes.push((source_agent.to_string(), note.to_string()));
+                }
             }
             // A domain reviewer approved the fix of a task the TESTER
             // rejected: the task stays open until the tester re-runs it.
@@ -677,7 +746,7 @@ impl LifecycleStore {
                     && g.tasks.get(id).is_some_and(|m| m.needs_retest) =>
             {
                 rec.retest = true;
-                rec.retest_note = g.tasks.get(id).and_then(|m| m.last_done_note.clone());
+                rec.builder_note = g.tasks.get(id).and_then(TaskMeta::builder_note);
                 rec.others_in_flight = g
                     .entries
                     .iter()
@@ -686,17 +755,22 @@ impl LifecycleStore {
             TransitionKind::Approved if verdict.is_some() => {
                 // A task closed after a tester rejection: the orchestrator
                 // must hear what the fix changed, not only "tests pass".
-                rec.fix_note = g
+                rec.builder_note = g
                     .tasks
                     .get(id)
                     .filter(|m| m.needs_retest)
-                    .and_then(|m| m.last_done_note.clone());
+                    .and_then(TaskMeta::builder_note);
                 g.close(id, Closure::Done, now);
             }
             TransitionKind::ChangesNeeded if verdict.is_some() => {
                 let meta = g.tasks.entry(id.to_string()).or_default();
                 meta.rejections = meta.rejections.saturating_add(1);
-                meta.needs_retest |= source_agent == TESTER;
+                if source_agent == TESTER {
+                    // A new fix round starts: its notes are what the
+                    // next retest is about.
+                    meta.needs_retest = true;
+                    meta.done_notes.clear();
+                }
                 rec.rejections = meta.rejections;
                 if meta.rejections > MAX_REWORK_ROUNDS {
                     rec.limit_exceeded = true;
@@ -785,31 +859,38 @@ impl LifecycleStore {
             })
     }
 
-    /// The responsible agent gave up on `task_id` (`hata — …` with the
-    /// envelope's `task_id`): settle its in-flight (`Assigned` /
-    /// `Building` / `AwaitingReview`) entries as `Failed` and close the
-    /// task, so the stall timer stops and the caller can report
-    /// `TASK_FAILED`. Only entries under `closable_panes` count — the
-    /// reporter's own pane, plus (for a reviewer / the tester) the panes
-    /// of the builders it judges — so an unrelated agent's `hata` about
-    /// the same id cannot end someone else's task. Never creates
-    /// entries. Returns whether the task closed.
-    pub fn abandon(&self, closable_panes: &[&str], task_id: &str) -> bool {
+    /// An agent gave up on `task_id` (`hata — …` with a task_id): close
+    /// the task as failed — so the stall timer stops and the caller can
+    /// report `TASK_FAILED` — unless it is open on someone else's pane.
+    /// The reporter may end work under `closable_panes` (its own pane,
+    /// plus for a reviewer / the tester the panes of the builders it
+    /// judges) and work nobody tracks; an unrelated agent's `hata` cannot
+    /// end another pane's in-flight task ([`Abandon::Elsewhere`]).
+    pub fn abandon(&self, closable_panes: &[&str], task_id: &str) -> Abandon {
         self.abandon_at(closable_panes, task_id, Instant::now())
     }
 
-    fn abandon_at(&self, closable_panes: &[&str], task_id: &str, now: Instant) -> bool {
+    fn abandon_at(&self, closable_panes: &[&str], task_id: &str, now: Instant) -> Abandon {
         let mut g = self.lock();
-        if g.tasks.get(task_id).is_some_and(|m| m.closed.is_some()) {
-            return false;
+        if let Some(closure) = g.tasks.get(task_id).and_then(|m| m.closed) {
+            return Abandon::AlreadyClosed(closure);
         }
-        let owns_it = g.entries.iter().any(|((pane, id), e)| {
-            id == task_id && e.state.in_flight() && closable_panes.contains(&pane.as_str())
-        });
-        if owns_it {
-            g.close(task_id, Closure::Failed, now);
-        }
-        owns_it
+        let in_flight = |own: bool| {
+            g.entries.iter().any(|((pane, id), e)| {
+                id == task_id
+                    && e.state.in_flight()
+                    && closable_panes.contains(&pane.as_str()) == own
+            })
+        };
+        let outcome = if in_flight(true) {
+            Abandon::Closed
+        } else if in_flight(false) {
+            return Abandon::Elsewhere;
+        } else {
+            Abandon::Untracked
+        };
+        g.close(task_id, Closure::Failed, now);
+        outcome
     }
 
     /// The coordinator reported `TASK_FAILED <id>` to the orchestrator:
@@ -834,8 +915,10 @@ impl LifecycleStore {
     /// last call: `Assigned` / `Building` older than `build_after`,
     /// `AwaitingReview` older than `review_after`, and a rejection not
     /// re-dispatched within `review_after`. Each reports level 1 once at
-    /// the threshold and level 2 once at twice the threshold; a new
-    /// transition resets the clock.
+    /// the threshold, level 2 once at twice it, and gives the task up
+    /// (closing it as failed, [`Stall::give_up`]) at three times it — or
+    /// at a second escalation, when a re-dispatch reset the clock in
+    /// between. A new transition resets the clock.
     pub fn take_stalls(
         &self,
         now: Instant,
@@ -855,12 +938,19 @@ impl LifecycleStore {
             let level = stall_level(age, threshold);
             if level > e.reminders {
                 e.reminders = level;
+                let meta = tasks.entry(task_id.clone()).or_default();
+                let mut give_up = level >= 3;
+                if level == 2 {
+                    give_up = meta.escalations >= 1;
+                    meta.escalations = meta.escalations.saturating_add(1);
+                }
                 out.push(Stall {
                     source_pane: pane.clone(),
                     task_id: task_id.clone(),
                     state: e.state,
                     age,
                     level,
+                    give_up,
                 });
             }
         }
@@ -881,10 +971,26 @@ impl LifecycleStore {
                     state: LifecycleState::Failed,
                     age,
                     level,
+                    give_up: level >= 3,
                 });
             }
         }
-        out.sort_by(|a, b| a.task_id.cmp(&b.task_id));
+        // A task gives up once, whatever stalled first; its other stalls
+        // this round are moot.
+        out.sort_by(|a, b| a.task_id.cmp(&b.task_id).then(b.give_up.cmp(&a.give_up)));
+        let mut given_up: Vec<String> = Vec::new();
+        out.retain(|st| {
+            if given_up.contains(&st.task_id) {
+                return false;
+            }
+            if st.give_up {
+                given_up.push(st.task_id.clone());
+            }
+            true
+        });
+        for id in &given_up {
+            g.close(id, Closure::Failed, now);
+        }
         out
     }
 
@@ -1351,11 +1457,18 @@ mod tests {
         assert!(s.take_stalls(t0 + 15 * MIN, 10 * MIN, 20 * MIN).is_empty());
         let l2 = s.take_stalls(t0 + 20 * MIN, 10 * MIN, 20 * MIN);
         assert_eq!(l2[0].level, 2);
-        assert!(s.take_stalls(t0 + 60 * MIN, 10 * MIN, 20 * MIN).is_empty());
+        assert!(!l2[0].give_up);
+        assert!(s.take_stalls(t0 + 25 * MIN, 10 * MIN, 20 * MIN).is_empty());
+        // Three times the threshold with no answer: given up, once.
+        let l3 = s.take_stalls(t0 + 30 * MIN, 10 * MIN, 20 * MIN);
+        assert!(l3[0].give_up);
+        assert!(s.take_stalls(t0 + 90 * MIN, 10 * MIN, 20 * MIN).is_empty());
 
         // A new transition restarts the clock.
-        rec_at(&s, "p-builder", &tr(TransitionKind::Done, "T1"), t0 + 61 * MIN);
-        assert!(s.take_stalls(t0 + 65 * MIN, 10 * MIN, 20 * MIN).is_empty());
+        rec_at(&s, "p-builder", &tr(TransitionKind::Done, "T2"), t0);
+        s.take_stalls(t0 + 10 * MIN, 10 * MIN, 20 * MIN);
+        rec_at(&s, "p-builder", &tr(TransitionKind::Done, "T2"), t0 + 11 * MIN);
+        assert!(s.take_stalls(t0 + 15 * MIN, 10 * MIN, 20 * MIN).is_empty());
     }
 
     #[test]
@@ -1377,27 +1490,30 @@ mod tests {
         let t0 = Instant::now();
         rec_at(&s, "p-fb", &tr(TransitionKind::Building, "stall-1"), t0);
         // Builder reports `hata —` for its own task.
-        assert!(s.abandon_at(&["p-fb"], "stall-1", t0 + MIN));
+        assert_eq!(s.abandon_at(&["p-fb"], "stall-1", t0 + MIN), Abandon::Closed);
         assert_eq!(s.state_of("p-fb", "stall-1"), Some(LifecycleState::Failed));
         assert!(s.take_stalls(t0 + 90 * MIN, 10 * MIN, 20 * MIN).is_empty());
 
         // The paired reviewer's `hata —` settles the builder's
         // AwaitingReview entry (the caller passes the builder's pane).
         rec_at(&s, "p-bb", &tr(TransitionKind::Done, "T8"), t0);
-        assert!(s.abandon_at(&["p-br", "p-bb"], "T8", t0));
+        assert_eq!(s.abandon_at(&["p-br", "p-bb"], "T8", t0), Abandon::Closed);
         assert_eq!(s.state_of("p-bb", "T8"), Some(LifecycleState::Failed));
 
         // An unrelated agent (e.g. scout) reporting `hata` about the same
         // id can close neither a review wait nor another pane's Building.
         rec_at(&s, "p-bb", &tr(TransitionKind::Done, "T10"), t0);
-        assert!(!s.abandon_at(&["p-scout"], "T10", t0));
+        assert_eq!(s.abandon_at(&["p-scout"], "T10", t0), Abandon::Elsewhere);
         assert_eq!(s.state_of("p-bb", "T10"), Some(LifecycleState::AwaitingReview));
         rec_at(&s, "p-x", &tr(TransitionKind::Building, "T9"), t0);
-        assert!(!s.abandon_at(&["p-y"], "T9", t0));
+        assert_eq!(s.abandon_at(&["p-y"], "T9", t0), Abandon::Elsewhere);
         assert_eq!(s.state_of("p-x", "T9"), Some(LifecycleState::Building));
-        // Unknown ids create nothing.
-        assert!(!s.abandon_at(&["p-fb"], "nope", t0));
-        assert_eq!(s.state_of("p-fb", "nope"), None);
+        assert_eq!(s.closure("T9"), None);
+        // A `hata` for a task nobody tracks still closes it (the
+        // orchestrator must hear TASK_FAILED), creating no pane entry.
+        assert_eq!(s.abandon_at(&["p-fb"], "untracked-1", t0), Abandon::Untracked);
+        assert_eq!(s.closure("untracked-1"), Some(Closure::Failed));
+        assert_eq!(s.state_of("p-fb", "untracked-1"), None);
     }
 
     #[test]
@@ -1680,7 +1796,7 @@ mod tests {
         let ap = tr(TransitionKind::Approved, "smoke-1");
         let r = rec_at(&s, "p-reviewer", &ap, t0);
         assert!(r.retest && !r.others_in_flight);
-        assert_eq!(r.retest_note.as_deref(), Some("orders.rs fixed"));
+        assert_eq!(r.builder_note.as_deref(), Some("orders.rs fixed"));
         assert_eq!(
             ok_followup("backend-reviewer", &ap, &r),
             Some((TESTER.to_string(), "retest smoke-1".to_string()))
@@ -1692,7 +1808,7 @@ mod tests {
         let r = rec_at(&s, "p-tester", &ap, t0);
         assert!(!r.retest);
         // TASK_DONE carries what the fix changed.
-        assert_eq!(r.fix_note.as_deref(), Some("orders.rs fixed"));
+        assert_eq!(r.builder_note.as_deref(), Some("orders.rs fixed"));
         assert_eq!(
             ok_followup(TESTER, &ap, &r),
             Some(("orchestrator".to_string(), "TASK_DONE smoke-1".to_string()))
@@ -1725,6 +1841,88 @@ mod tests {
         let r = s.record_at("frontend-reviewer", "p-fr", &ap, &["p-fb"], None, t0);
         assert!(r.retest && !r.others_in_flight);
         assert_eq!(ok_followup("frontend-reviewer", &ap, &r).unwrap().1, "retest smoke-2");
+    }
+
+    #[test]
+    fn a_retest_carries_every_reworking_builders_note() {
+        // Review finding: only the last builder's DONE note survived.
+        let s = LifecycleStore::new();
+        let t0 = Instant::now();
+        s.assign_at("p-tester", "smoke-4", t0);
+        rec_at(&s, "p-tester", &tr(TransitionKind::ChangesNeeded, "smoke-4"), t0);
+        let done = tr(TransitionKind::Done, "smoke-4");
+        s.record_at("backend-builder", "p-builder", &done, &[], Some("parse.rs fixed"), t0);
+        s.record_at("frontend-builder", "p-fb", &done, &[], Some("Login.tsx fixed"), t0);
+        let ap = tr(TransitionKind::Approved, "smoke-4");
+        s.record_at("backend-reviewer", "p-reviewer", &ap, &["p-builder"], None, t0);
+        let r = s.record_at("frontend-reviewer", "p-fr", &ap, &["p-fb"], None, t0);
+        let note = r.builder_note.expect("note");
+        assert!(note.contains("parse.rs fixed") && note.contains("Login.tsx fixed"), "{note}");
+        // A builder's newer DONE replaces its own older note.
+        s.record_at("backend-builder", "p-builder", &done, &[], Some("parse.rs v2"), t0);
+        s.assign_at("p-tester", "smoke-4", t0);
+        let r = rec_at(&s, "p-tester", &ap, t0);
+        let note = r.builder_note.expect("note");
+        assert!(note.contains("parse.rs v2") && !note.contains("parse.rs fixed"), "{note}");
+    }
+
+    #[test]
+    fn a_stall_nobody_answers_is_given_up_once() {
+        // Review finding: remind → escalate → nudge looped forever.
+        let s = LifecycleStore::new();
+        let t0 = Instant::now();
+        let (rv, bd) = (10 * MIN, 20 * MIN);
+        // (a) No re-dispatch: level 3 gives up.
+        s.assign_at("p-fb", "G1", t0);
+        assert!(s.take_stalls(t0 + 20 * MIN, rv, bd).iter().all(|x| !x.give_up));
+        assert!(s.take_stalls(t0 + 40 * MIN, rv, bd).iter().all(|x| !x.give_up));
+        let st = s.take_stalls(t0 + 60 * MIN, rv, bd);
+        assert_eq!(st.len(), 1);
+        assert!(st[0].give_up && st[0].level == 3);
+        assert_eq!(s.closure("G1"), Some(Closure::Failed));
+        assert!(s.take_stalls(t0 + 200 * MIN, rv, bd).is_empty(), "gives up once");
+
+        // (b) The coordinator nudges after the escalation (clock reset):
+        // the SECOND escalation gives up instead of looping.
+        s.assign_at("p-builder", "G2", t0);
+        let st = s.take_stalls(t0 + 40 * MIN, rv, bd);
+        assert!(st.iter().any(|x| x.task_id == "G2" && x.level == 2 && !x.give_up));
+        s.assign_at("p-builder", "G2", t0 + 41 * MIN);
+        let st = s.take_stalls(t0 + 81 * MIN, rv, bd);
+        let g2: Vec<_> = st.iter().filter(|x| x.task_id == "G2").collect();
+        assert_eq!(g2.len(), 1, "{st:?}");
+        assert!(g2[0].give_up);
+        assert_eq!(s.closure("G2"), Some(Closure::Failed));
+
+        // (c) An unsent rework gives up at level 3 as well.
+        rec_at(&s, "p-builder", &tr(TransitionKind::Done, "G3"), t0);
+        rec_at(&s, "p-reviewer", &tr(TransitionKind::ChangesNeeded, "G3"), t0);
+        let st = s.take_stalls(t0 + 30 * MIN, rv, bd);
+        assert!(st.iter().any(|x| x.task_id == "G3" && x.give_up), "{st:?}");
+    }
+
+    #[test]
+    fn closed_ids_stay_single_use_past_the_soft_cap() {
+        // Review finding: eviction at MAX_LIFECYCLE_ENTRIES forgot closures.
+        let s = LifecycleStore::new();
+        let t0 = Instant::now();
+        s.assign_at("p-builder", "old-1", t0);
+        rec_at(&s, "p-builder", &tr(TransitionKind::Done, "old-1"), t0);
+        rec_at(&s, "p-reviewer", &tr(TransitionKind::Approved, "old-1"), t0);
+        for n in 0..MAX_LIFECYCLE_ENTRIES + 10 {
+            s.assign_at("p-x", &format!("t{n}"), t0);
+        }
+        assert_eq!(s.closure("old-1"), Some(Closure::Done));
+        assert!(s.dispatch_conflict("p-builder", "old-1", &[]).is_some());
+    }
+
+    #[test]
+    fn body_task_id_reads_the_persona_taught_marker() {
+        assert_eq!(body_task_id("x.rs düzelt. task_id=p3. Bittiğinde DONE p3"), Some("p3"));
+        assert_eq!(body_task_id("Task_ID: `fb-7` — yap"), Some("fb-7"));
+        assert_eq!(body_task_id("task_id = T12,"), Some("T12"));
+        assert_eq!(body_task_id("task_id yok burada"), None);
+        assert_eq!(body_task_id("no marker at all"), None);
     }
 
     #[test]
@@ -1838,9 +2036,13 @@ mod tests {
         let s = LifecycleStore::new();
         let t0 = Instant::now();
         s.assign_at("p-fb", "T9", t0);
-        assert!(s.abandon_at(&["p-fb"], "T9", t0));
+        assert_eq!(s.abandon_at(&["p-fb"], "T9", t0), Abandon::Closed);
         assert_eq!(s.closure("T9"), Some(Closure::Failed));
-        assert!(!s.abandon_at(&["p-fb"], "T9", t0), "closes once");
+        assert_eq!(
+            s.abandon_at(&["p-fb"], "T9", t0),
+            Abandon::AlreadyClosed(Closure::Failed),
+            "closes once"
+        );
 
         assert!(!s.fail_task("unknown-1"));
         s.assign_at("p-builder", "T10", t0);

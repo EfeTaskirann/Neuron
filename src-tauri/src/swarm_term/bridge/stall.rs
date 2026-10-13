@@ -3,10 +3,13 @@
 //! into the responsible agent's pane; at twice the threshold the
 //! coordinator is told too, so it can re-dispatch or give the task up.
 //! A rejection the coordinator never re-dispatched reminds the
-//! coordinator, and escalates to the orchestrator. Without this a task
-//! whose review never came back waited silently forever.
+//! coordinator, and escalates to the orchestrator. If nobody answers the
+//! escalation either, the task is given up and reported `TASK_FAILED`.
+//! Without this a task whose review never came back waited silently
+//! forever.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use serde_json::json;
@@ -15,10 +18,11 @@ use tauri::{AppHandle, Emitter, Runtime};
 use crate::sidecar::terminal::TerminalRegistry;
 use crate::swarm_term::hierarchy::{reviewer_for_builder, AGENT_IDS};
 use crate::swarm_term::lifecycle::{
-    LifecycleState, LifecycleStore, Stall, MAX_REWORK_ROUNDS, TESTER,
+    LifecycleState, LifecycleStore, Stall, MAX_REWORK_ROUNDS, TASK_FAILED_PREFIX, TESTER,
 };
 
 use super::notify::notify_agent;
+use super::synth::enqueue_fanout;
 
 /// How often the watcher scans the lifecycle store for stalls.
 const STALL_CHECK_EVERY: Duration = Duration::from_secs(30);
@@ -59,10 +63,16 @@ pub(super) fn stall_check_every() -> Duration {
     }
 }
 
-/// Scan for stalled tasks and send the due reminders.
+/// How often the watcher re-reads the scan cadence (the test override is
+/// an env var; reading it on every 250 ms tick was wasted work).
+pub(super) const STALL_CADENCE_REFRESH: Duration = Duration::from_secs(5);
+
+/// Scan for stalled tasks and send the due reminders; report the tasks
+/// given up as `TASK_FAILED` to the orchestrator.
 pub(super) async fn check_stalls<R: Runtime>(
     app: &AppHandle<R>,
     registry: &TerminalRegistry,
+    root: &Path,
     panes_by_agent: &HashMap<String, String>,
     lifecycle: &LifecycleStore,
 ) {
@@ -76,6 +86,19 @@ pub(super) async fn check_stalls<R: Runtime>(
         let Some((responsible, text)) = reminder_for(source_agent, &stall) else {
             continue;
         };
+        if stall.give_up {
+            let (failed, notice) = give_up_texts(responsible, &stall);
+            tracing::warn!(
+                task_id = %stall.task_id,
+                responsible = %responsible,
+                age_secs = stall.age.as_secs(),
+                "swarm-term bridge: stalled task given up — TASK_FAILED"
+            );
+            enqueue_fanout(app, root, panes_by_agent, "orchestrator", failed, &stall.task_id);
+            notify_agent(registry, panes_by_agent, "coordinator", &notice).await;
+            emit_reminder(app, "coordinator", &notice);
+            continue;
+        }
         tracing::warn!(
             task_id = %stall.task_id,
             responsible = %responsible,
@@ -168,6 +191,23 @@ pub(super) fn reminder_for(
         )),
         _ => None,
     }
+}
+
+/// Pure: the `TASK_FAILED` body for the orchestrator and the notice for
+/// the coordinator when a stalled task is given up.
+pub(super) fn give_up_texts(responsible: &str, stall: &Stall) -> (String, String) {
+    let id = &stall.task_id;
+    let since = since(stall.age);
+    (
+        format!(
+            "{TASK_FAILED_PREFIX}{id} — @{responsible} {since} yanıt vermedi \
+             (hatırlatma ve eskalasyondan sonra da)"
+        ),
+        format!(
+            "`{id}` @{responsible}'dan yanıt alınamadığı için kapatıldı; orchestrator'a \
+             `TASK_FAILED {id}` iletildi. Bu task_id ile yeniden dispatch ETME."
+        ),
+    )
 }
 
 /// Pure: the level-2 notice — `(recipient, text)`. A stuck specialist

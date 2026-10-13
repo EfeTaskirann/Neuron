@@ -130,6 +130,12 @@ Backend `[Neuron]` ile şunları bildirir:
 - "`<id>` görevi … dakikadır @<ajan>'da takılı" → aynı task_id ile
   ilgili ajana kısa, somut bir yeniden dispatch yaz; cevap yine
   gelmezse `TASK_FAILED`.
+- "`<id>` @<ajan>'dan yanıt alınamadığı için kapatıldı" → hatırlatma ve
+  eskalasyondan sonra da cevap gelmedi; backend görevi kapattı ve
+  orchestrator'a `TASK_FAILED` iletti. O task_id ile dispatch ETME.
+- "@<ajan> `<id>` için `hata` bildirdi ama görev başka bir ajanda hâlâ
+  açık" → görev gerçekten yürümüyorsa orchestrator'a `TASK_FAILED`
+  yolla; yürüyorsa bir şey yapma.
 
 ## VAGUE TASK'I FORWARD ETME
 

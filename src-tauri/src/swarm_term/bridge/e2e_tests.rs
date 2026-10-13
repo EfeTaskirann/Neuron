@@ -304,6 +304,23 @@ async fn bridge_end_to_end_with_fake_agents() {
     assert!(failing.is_empty(), "failing checks: {failing:#?}");
 }
 
+/// Sets an env var for the rest of a test and restores it on drop, so a
+/// failing step cannot leak a test-only override into the process.
+struct EnvOverride(&'static str);
+
+impl EnvOverride {
+    fn set(key: &'static str, value: &str) -> Self {
+        std::env::set_var(key, value);
+        Self(key)
+    }
+}
+
+impl Drop for EnvOverride {
+    fn drop(&mut self) {
+        std::env::remove_var(self.0);
+    }
+}
+
 /// Poll `cond` every 100 ms for up to `secs`.
 async fn wait_until(secs: u64, cond: impl Fn() -> bool) -> bool {
     let deadline = Instant::now() + Duration::from_secs(secs);
@@ -442,19 +459,39 @@ async fn lifecycle_failure_paths_with_fake_agents() {
     step!("F2 DONE sent to the orchestrator still reached the reviewer",
         log("frontend-reviewer").contains("review F1"));
 
-    // ---- G: an unanswered dispatch is reminded, then escalated -------- //
-    // Short thresholds from here on; earlier open tasks may be reminded
-    // too — only ST1's texts are asserted.
-    std::env::set_var("NEURON_TERM_STALL_SECS", "2");
+    // ---- H: a task_id only in the body is still tracked; its hata fails it //
+    send("orchestrator", "backend-builder", "build H2 now. task_id=H2. Report DONE H2", None);
+    step!("H1 signature carries the body's task id",
+        log("backend-builder").contains("from @orchestrator [task H2] [routed by Neuron]"));
+    send("backend-builder", "coordinator", "hata - no permission for this", Some("H2"));
+    step!("H2 orchestrator got TASK_FAILED H2", log("orchestrator").contains("TASK_FAILED H2"));
+
+    // ---- G: an unanswered dispatch is reminded, escalated, given up --- //
+    // Short thresholds from here on (restored on drop, even on panic);
+    // earlier open tasks may be reminded too — only ST1's texts count.
+    let _stall_override = EnvOverride::set("NEURON_TERM_STALL_SECS", "2");
     send("orchestrator", "frontend-builder", "build ST1", Some("ST1"));
     step!("G1 builder got ST1", log("frontend-builder").contains("build ST1"));
     if !wait_until(15, || log("frontend-builder").contains("DONE ST1")).await {
         failed.push("G2 silent builder reminded about ST1".into());
     }
-    if !wait_until(15, || log("coordinator").contains("TASK_FAILED ST1")).await {
+    if !wait_until(15, || {
+        let l = log("coordinator");
+        l.contains("`ST1`") && l.contains("hatırlatmaya cevap gelmedi")
+    })
+    .await
+    {
         failed.push("G3 coordinator got the ST1 escalation".into());
     }
-    std::env::remove_var("NEURON_TERM_STALL_SECS");
+    if !wait_until(15, || {
+        let l = log("orchestrator");
+        l.contains("TASK_FAILED ST1") && l.contains("yanıt vermedi")
+    })
+    .await
+    {
+        failed.push("G4 nobody answered: ST1 given up as TASK_FAILED".into());
+    }
+    drop(_stall_override);
 
     uninstall(handle);
     for pid in panes_by_agent.values() {

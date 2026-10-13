@@ -104,9 +104,9 @@ pub(crate) fn build_persona_prompt(
          ### Araç izinlerin (backend zorunlu kılar)\n\n\
          {perms}\n\
          İzin dışı bir araç çağrısı onay sorulmadan reddedilir; aynı çağrıyı tekrar\n\
-         deneme. Tek istisna: reddedilen komut bir `cd` içeriyorsa onu `cd`'siz,\n\
-         proje kökünde bir kez daha dene. İşin bu izinlerle yine yapılamıyorsa\n\
-         coordinator'a `hata — <sebep>` yaz.\n\n\
+         deneme. Tek istisna: reddedilen komut proje kökünün DIŞINA bir `cd`\n\
+         içeriyorsa onu o `cd` olmadan, proje içinde bir kez daha dene. İşin bu\n\
+         izinlerle yine yapılamıyorsa coordinator'a `hata — <sebep>` yaz.\n\n\
          ### Dosya yolu şeması\n\n\
          Her mesaj için KENDİ outbox'unda yeni bir dosya yarat — hedef ajan ne olursa\n\
          olsun klasör hep aynı:\n\n\

@@ -29,9 +29,10 @@ use super::delivery::{
 use super::envelope::{sniff_from, Envelope};
 use super::fsops::{bump_attempts, move_to_processed, move_to_rejected};
 use super::notify::{notify_agent, rejection_notice};
-use super::stall::{check_stalls, stall_check_every};
+use super::stall::{check_stalls, stall_check_every, STALL_CADENCE_REFRESH};
 use super::synth::{
-    dispatch_conflict, lifecycle_synthesise, note_coordinator_report, note_dispatch,
+    delivery_task_id, dispatch_conflict, lifecycle_synthesise, note_coordinator_report,
+    note_dispatch,
 };
 
 /// Polling cadence for [`watcher_loop`]. Each tick scans every inbox
@@ -80,6 +81,8 @@ pub(super) async fn watcher_loop<R: Runtime>(
         "swarm-term bridge: watcher start"
     );
     let mut last_stall_check = Instant::now();
+    let mut stall_every = stall_check_every();
+    let mut stall_every_read = Instant::now();
     loop {
         process_pending(
             &app,
@@ -90,8 +93,12 @@ pub(super) async fn watcher_loop<R: Runtime>(
             &lifecycle,
         )
         .await;
-        if last_stall_check.elapsed() >= stall_check_every() {
-            check_stalls(&app, &registry, &panes_by_agent, &lifecycle).await;
+        if stall_every_read.elapsed() >= STALL_CADENCE_REFRESH {
+            stall_every = stall_check_every();
+            stall_every_read = Instant::now();
+        }
+        if last_stall_check.elapsed() >= stall_every {
+            check_stalls(&app, &registry, &root, &panes_by_agent, &lifecycle).await;
             last_stall_check = Instant::now();
         }
         tokio::select! {
@@ -475,6 +482,9 @@ async fn process_one<R: Runtime>(
     let redirected_from =
         misaddressed_signal(&from_agent, &to_agent, &body, envelope_task_id.as_deref())
             .then(|| std::mem::replace(&mut to_agent, "coordinator".to_string()));
+    // A tracked dispatch that named its task only in the body still
+    // carries that id (signature, Assigned tracking, task-id gate).
+    let envelope_task_id = delivery_task_id(&from_agent, &to_agent, &body, envelope_task_id);
 
     // ---- Hierarchy gate --------------------------------------------- //
     if !is_allowed(&from_agent, &to_agent) {
