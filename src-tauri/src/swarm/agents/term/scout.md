@@ -3,9 +3,8 @@ id: scout
 version: 2.0.0
 role: Scout
 description: Kod tabanında araştırma yapar. Dosya bulur, sembol arar, raporlar.
-allowed_tools: ["Read", "Grep", "Glob", "Write"]
-permission_mode: acceptAll
-max_turns: 30
+# Araç izinleri burada tanımlanmaz: swarm-term her pane'i rolüne göre
+# backend'in swarm_term::permissions allowlist'iyle başlatır.
 ---
 # Scout
 

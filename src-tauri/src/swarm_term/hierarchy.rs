@@ -20,24 +20,26 @@
 //! stopping for human approval at any intermediate step:
 //!
 //! ```text
-//!   Orchestrator ──goal──▶ Coordinator
-//!                              │
-//!                              │ Plan / dispatch
-//!                              ▼
-//!                          Builder
-//!                              │ DONE <task_id>
-//!                              ▼
-//!                          Coordinator
-//!                              │ review <task_id>
-//!                              ▼
-//!                          Reviewer
-//!                              │ APPROVED <task_id>
-//!                              ▼
-//!                          Coordinator
-//!                              │ TASK_DONE <task_id>
-//!                              ▼
-//!                          Orchestrator
+//!   Orchestrator ──plan + dispatch (task_id)──▶ Builder
+//!                                                  │ DONE <task_id>
+//!                                                  ▼
+//!                                              Coordinator
+//!                                                  │ review <task_id>   (retest <task_id> → tester
+//!                                                  ▼                     when the TESTER rejected it)
+//!                                              Reviewer
+//!                                                  │ APPROVED <task_id>
+//!                                                  ▼
+//!                                              Coordinator
+//!                                                  │ TASK_DONE <task_id>
+//!                                                  ▼
+//!                                              Orchestrator
 //! ```
+//!
+//! Failure side, owned by the coordinator: `CHANGES_NEEDED` → the
+//! coordinator re-dispatches the fix (at most
+//! `lifecycle::MAX_REWORK_ROUNDS` rounds); `hata` or a used-up limit →
+//! `TASK_FAILED <task_id>` to the orchestrator, which accounts for every
+//! task as `TASK_DONE` or `TASK_FAILED`.
 //!
 //! The state machine + autofanout logic lives in
 //! [`crate::swarm_term::lifecycle`]. The two key transitions there —
@@ -224,6 +226,25 @@ pub fn reviewer_for_builder(builder: &str) -> Option<&'static str> {
     }
 }
 
+/// The builders whose work a verdict (or a `hata`) from `agent` settles:
+/// the paired builder for a domain reviewer, both builders for the
+/// integration-tester (its smoke / retest runs span the whole change
+/// set), nobody for anyone else.
+pub fn builders_judged_by(agent: &str) -> &'static [&'static str] {
+    match agent {
+        "backend-reviewer" => &["backend-builder"],
+        "frontend-reviewer" => &["frontend-builder"],
+        "integration-tester" => &["backend-builder", "frontend-builder"],
+        _ => &[],
+    }
+}
+
+/// True iff `agent` hands out `task_id`-bearing work (the lifecycle
+/// tracks those dispatches as `Assigned`).
+pub fn is_dispatcher(agent: &str) -> bool {
+    matches!(agent, "orchestrator" | "coordinator")
+}
+
 /// True iff `agent` is a reviewer role. Used by the lifecycle state
 /// machine to gate `APPROVED` token synthesis.
 ///
@@ -241,10 +262,9 @@ pub fn reviewer_for_builder(builder: &str) -> Option<&'static str> {
 /// builder with `integration-tester` — domain reviewers are domain-
 /// matched (backend↔backend, frontend↔frontend), whereas the tester
 /// is a global gate that runs AFTER the paired review approves. The
-/// `DONE` fanout therefore still targets the domain reviewer; the
-/// tester only ever enters the cycle as the source of an `APPROVED`
-/// signal (which it can produce when the orchestrator dispatches it
-/// for a smoke run).
+/// `DONE` fanout therefore targets the domain reviewer — except for a
+/// task the TESTER rejected, whose fix goes back to the tester as
+/// `retest <id>` (see `lifecycle::followup_for_coordinator_inbound`).
 pub fn is_reviewer(agent: &str) -> bool {
     matches!(
         agent,

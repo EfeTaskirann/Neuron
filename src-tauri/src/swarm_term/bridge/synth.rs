@@ -1,7 +1,11 @@
-//! Lifecycle synthesis — runs only on a successful coordinator-bound
-//! delivery. Parses the body for a lifecycle token and, when it warrants
-//! a fanout, drops a synthesised follow-up envelope into the appropriate
-//! inbox for the watcher to pick up on its next tick.
+//! Lifecycle synthesis — the bridge's side of the task-lifecycle
+//! contract. [`lifecycle_synthesise`] runs on every successful
+//! coordinator-bound delivery: it parses the body for a lifecycle token
+//! and, when it warrants a fanout, drops the synthesised follow-up
+//! envelope into the coordinator's outbox for the watcher to pick up on
+//! its next tick. The other helpers keep the store in step with
+//! dispatches ([`note_dispatch`], [`dispatch_conflict`]) and with the
+//! coordinator's own `TASK_FAILED` reports ([`note_coordinator_report`]).
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -11,27 +15,43 @@ use serde_json::json;
 use tauri::{AppHandle, Emitter, Runtime};
 
 use crate::swarm_term::hierarchy::{
-    is_allowed, is_builder, is_reviewer, reviewer_for_builder,
+    builders_judged_by, is_allowed, is_builder, is_dispatcher, is_reviewer,
 };
 use crate::swarm_term::lifecycle::{
-    followup_for_coordinator_inbound, is_error_report, lifecycle_note,
-    looks_like_unparsed_signal, parse_lifecycle_token_with_fallback,
-    LifecycleState, LifecycleStore, TransitionKind,
+    error_reason, followup_for_coordinator_inbound, is_error_report, lifecycle_note,
+    looks_like_unparsed_signal, parse_lifecycle_token_with_fallback, task_failed_id,
+    Closure, LifecycleState, LifecycleStore, TransitionKind, MAX_REWORK_ROUNDS,
+    TASK_FAILED_PREFIX, TESTER,
 };
 
 use super::envelope::Envelope;
 use super::fsops::drop_envelope;
 
+/// A `[Neuron]` note the watcher pastes into `to`'s pane after a
+/// lifecycle step (an unrecognised signal, a closed task, …).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Notice {
+    pub to: String,
+    pub text: String,
+    pub reason: &'static str,
+}
+
+impl Notice {
+    fn new(to: &str, text: String, reason: &'static str) -> Self {
+        Self { to: to.to_string(), text, reason }
+    }
+}
+
 /// On a successful coordinator-bound delivery, parse the body for a
-/// lifecycle token and, if it's one that warrants a fanout, drop the
-/// synthesised follow-up envelope into the appropriate inbox. The
-/// watcher picks it up on its next tick — same delivery path as a
-/// user-authored route.
+/// lifecycle token, record it, and drop the synthesised follow-up (if
+/// any) into the coordinator's outbox. The watcher picks it up on its
+/// next tick — same delivery path as a user-authored route.
 ///
-/// Returns a notice for the SENDER when a builder/reviewer body looks
-/// like a lifecycle signal but did not parse — the caller pastes it
-/// into the sender's pane so a malformed `DONE` does not stall the
-/// chain silently.
+/// Returns the notices to paste: to the SENDER when its body looks like
+/// a lifecycle signal but did not parse (a malformed `DONE` must not
+/// stall the chain silently) or targets a closed task; to the
+/// COORDINATOR when the backend closed a task as failed, so it does not
+/// re-dispatch it.
 pub(super) fn lifecycle_synthesise<R: Runtime>(
     app: &AppHandle<R>,
     root: &Path,
@@ -40,128 +60,254 @@ pub(super) fn lifecycle_synthesise<R: Runtime>(
     task_id: Option<&str>,
     panes_by_agent: &Arc<HashMap<String, String>>,
     lifecycle: &Arc<LifecycleStore>,
-) -> Option<String> {
-    // `hata — …` with a structured task_id: the responsible agent gave
-    // up on that task. Close it so the stall timer stops reminding and
-    // escalating something the coordinator already knows failed.
-    if let Some(id) = task_id.filter(|_| is_error_report(body)) {
-        if let Some(pane) = panes_by_agent.get(from_agent) {
-            // The reporter may close its own entries, and — when it is a
-            // reviewer — the review waits of the builders it is paired
-            // with. Anyone else's `hata` about the same id closes nothing.
-            let mut closable: Vec<&str> = vec![pane.as_str()];
-            closable.extend(
-                panes_by_agent
-                    .iter()
-                    .filter(|(agent, _)| reviewer_for_builder(agent) == Some(from_agent))
-                    .map(|(_, builder_pane)| builder_pane.as_str()),
-            );
-            if lifecycle.abandon(&closable, id) {
-                tracing::info!(
-                    source = %from_agent,
-                    task_id = %id,
-                    "swarm-term bridge: task reported failed (hata) — closed"
-                );
-                let _ = app.emit(
-                    crate::events::SWARM_TERM_LIFECYCLE,
-                    json!({
-                        "source": from_agent,
-                        "source_pane": pane,
-                        "task_id": id,
-                        "transition": "Abandoned",
-                        "state": format!("{:?}", LifecycleState::Failed),
-                    }),
-                );
-            }
-        }
-        return None;
-    }
-    let Some(transition) = parse_lifecycle_token_with_fallback(body, task_id)
-    else {
-        return unparsed_signal_notice(from_agent, body, task_id.is_some());
+) -> Vec<Notice> {
+    let Some(source_pane) = panes_by_agent.get(from_agent).cloned() else {
+        return Vec::new();
     };
-    let source_pane = panes_by_agent.get(from_agent).cloned()?;
-    let new_state = lifecycle.record(&source_pane, &transition);
+    // The reporter's verdicts / `hata` reach the builders it judges.
+    let judged: Vec<&str> = builders_judged_by(from_agent)
+        .iter()
+        .filter_map(|b| panes_by_agent.get(*b).map(String::as_str))
+        .collect();
+
+    // `hata — …` with a structured task_id: the responsible agent gave
+    // up on that task. Close it and tell the orchestrator.
+    if let Some(id) = task_id.filter(|_| is_error_report(body)) {
+        let mut closable = vec![source_pane.as_str()];
+        closable.extend(&judged);
+        if !lifecycle.abandon(&closable, id) {
+            return Vec::new();
+        }
+        tracing::info!(
+            source = %from_agent,
+            task_id = %id,
+            "swarm-term bridge: task reported failed (hata) — closed"
+        );
+        emit_lifecycle(app, from_agent, &source_pane, id, "Abandoned", LifecycleState::Failed);
+        let why = error_reason(body).unwrap_or_else(|| "sebep belirtilmedi".into());
+        enqueue_fanout(
+            app,
+            root,
+            panes_by_agent,
+            "orchestrator",
+            format!("{TASK_FAILED_PREFIX}{id} — @{from_agent} hata bildirdi: {why}"),
+            id,
+        );
+        return vec![Notice::new(
+            "coordinator",
+            format!(
+                "`{id}` @{from_agent}'in `hata` bildirimiyle kapandı; orchestrator'a \
+                 `TASK_FAILED {id}` iletildi. Bu task_id ile yeniden dispatch ETME — \
+                 orchestrator karar verecek."
+            ),
+            "task closed after hata",
+        )];
+    }
+
+    let Some(transition) = parse_lifecycle_token_with_fallback(body, task_id) else {
+        return unparsed_signal_notice(from_agent, body, task_id.is_some())
+            .map(|text| {
+                Notice::new(from_agent, text, "lifecycle signal not recognised; no auto-fanout")
+            })
+            .into_iter()
+            .collect();
+    };
+    let id = transition.task_id.clone();
+    let rec = lifecycle.record(from_agent, &source_pane, &transition, &judged);
     tracing::info!(
         source = %from_agent,
         source_pane = %source_pane,
-        task_id = %transition.task_id,
+        task_id = %id,
         transition = ?transition.kind,
-        new_state = ?new_state,
+        new_state = ?rec.state,
+        rejections = rec.rejections,
+        retest = rec.retest,
         "swarm-term bridge: lifecycle transition recorded"
     );
+    if let Some(closure) = rec.already_closed {
+        let how = match closure {
+            Closure::Done => "TASK_DONE",
+            Closure::Failed => "TASK_FAILED",
+        };
+        return vec![Notice::new(
+            from_agent,
+            format!(
+                "`{id}` görevi zaten kapandı ({how}); bu sinyal işlenmedi, otomatik zincir \
+                 başlamadı. Yeni bir iş ise yeni bir task_id ile gelmesi gerekir."
+            ),
+            "task already closed",
+        )];
+    }
+    emit_lifecycle(
+        app,
+        from_agent,
+        &source_pane,
+        &id,
+        &format!("{:?}", transition.kind),
+        rec.state,
+    );
+
+    let Some((target, base)) = followup_for_coordinator_inbound(from_agent, &transition, &rec)
+    else {
+        return Vec::new();
+    };
+    // Carry the sender's free-text note (what changed / what to check /
+    // why it was rejected) so the follow-up is not context-free.
+    let synth_body = match lifecycle_note(body, &id) {
+        Some(note) => format!("{base} — {note}"),
+        None => base,
+    };
+    enqueue_fanout(app, root, panes_by_agent, &target, synth_body, &id);
+    match transition.kind {
+        TransitionKind::Approved => {
+            lifecycle.mark_done(&source_pane, &id);
+            Vec::new()
+        }
+        TransitionKind::ChangesNeeded if rec.limit_exceeded => vec![Notice::new(
+            "coordinator",
+            format!(
+                "`{id}` {}. kez reddedildi; düzeltme limiti ({MAX_REWORK_ROUNDS} tur) aşıldı. \
+                 Görev kapatıldı ve orchestrator'a `TASK_FAILED {id}` iletildi — yeniden \
+                 dispatch ETME.",
+                rec.rejections
+            ),
+            "rework limit exceeded",
+        )],
+        _ => Vec::new(),
+    }
+}
+
+/// A dispatcher (orchestrator / coordinator) delivered a `task_id`-
+/// bearing message to a builder or the tester: track it as `Assigned`,
+/// so a dispatch nobody acts on stalls instead of waiting forever.
+pub(super) fn note_dispatch<R: Runtime>(
+    app: &AppHandle<R>,
+    from_agent: &str,
+    to_agent: &str,
+    target_pane: &str,
+    task_id: Option<&str>,
+    lifecycle: &LifecycleStore,
+) {
+    let Some(id) = task_id.filter(|_| tracks_dispatch(from_agent, to_agent)) else {
+        return;
+    };
+    if lifecycle.assign(target_pane, id) {
+        emit_lifecycle(app, to_agent, target_pane, id, "Assigned", LifecycleState::Assigned);
+    }
+}
+
+/// Why a dispatch must NOT be delivered (a closed task id, or an id
+/// still open on the other builder), or `None`. Checked before delivery.
+pub(super) fn dispatch_conflict(
+    from_agent: &str,
+    to_agent: &str,
+    target_pane: &str,
+    task_id: Option<&str>,
+    panes_by_agent: &HashMap<String, String>,
+    lifecycle: &LifecycleStore,
+) -> Option<String> {
+    let id = task_id.filter(|_| tracks_dispatch(from_agent, to_agent))?;
+    let builders: Vec<(&str, &str)> = panes_by_agent
+        .iter()
+        .filter(|(agent, _)| is_builder(agent))
+        .map(|(agent, pane)| (agent.as_str(), pane.as_str()))
+        .collect();
+    lifecycle.dispatch_conflict(target_pane, id, &builders)
+}
+
+fn tracks_dispatch(from_agent: &str, to_agent: &str) -> bool {
+    is_dispatcher(from_agent) && (is_builder(to_agent) || to_agent == TESTER)
+}
+
+/// The coordinator told the orchestrator `TASK_FAILED <id>` (it gave up
+/// on a task): close it so it stops stalling and cannot be re-dispatched.
+pub(super) fn note_coordinator_report<R: Runtime>(
+    app: &AppHandle<R>,
+    from_agent: &str,
+    to_agent: &str,
+    body: &str,
+    task_id: Option<&str>,
+    panes_by_agent: &HashMap<String, String>,
+    lifecycle: &LifecycleStore,
+) {
+    if from_agent != "coordinator" || to_agent != "orchestrator" {
+        return;
+    }
+    let Some(id) = task_failed_id(body, task_id) else {
+        return;
+    };
+    if lifecycle.fail_task(id) {
+        tracing::info!(task_id = %id, "swarm-term bridge: coordinator gave up a task — closed");
+        let pane = panes_by_agent.get("coordinator").map(String::as_str).unwrap_or("");
+        emit_lifecycle(app, "coordinator", pane, id, "TaskFailed", LifecycleState::Failed);
+    }
+}
+
+fn emit_lifecycle<R: Runtime>(
+    app: &AppHandle<R>,
+    source: &str,
+    source_pane: &str,
+    task_id: &str,
+    transition: &str,
+    state: LifecycleState,
+) {
     let _ = app.emit(
         crate::events::SWARM_TERM_LIFECYCLE,
         json!({
-            "source": from_agent,
+            "source": source,
             "source_pane": source_pane,
-            "task_id": transition.task_id,
-            "transition": format!("{:?}", transition.kind),
-            "state": format!("{new_state:?}"),
+            "task_id": task_id,
+            "transition": transition,
+            "state": format!("{state:?}"),
         }),
     );
+}
 
-    let (synth_target, synth_body) =
-        followup_for_coordinator_inbound(from_agent, &transition)?;
-    // Carry the sender's free-text note (what changed / what to check)
-    // so the reviewer does not receive a context-free `review <id>`.
-    let synth_body = match lifecycle_note(body, &transition.task_id) {
-        Some(note) => format!("{synth_body} — {note}"),
-        None => synth_body,
-    };
-    if !is_allowed("coordinator", &synth_target) {
+/// Drop a coordinator-signed follow-up envelope for `target`.
+fn enqueue_fanout<R: Runtime>(
+    app: &AppHandle<R>,
+    root: &Path,
+    panes_by_agent: &HashMap<String, String>,
+    target: &str,
+    body: String,
+    task_id: &str,
+) {
+    if !is_allowed("coordinator", target) || !panes_by_agent.contains_key(target) {
         tracing::warn!(
-            source = %from_agent,
-            synth_target = %synth_target,
-            "swarm-term bridge: lifecycle fanout dropped — hierarchy forbids coordinator→{}",
-            synth_target,
+            synth_target = %target,
+            "swarm-term bridge: lifecycle fanout dropped — target not reachable"
         );
-        return None;
-    }
-    if !panes_by_agent.contains_key(&synth_target) {
-        tracing::warn!(
-            source = %from_agent,
-            synth_target = %synth_target,
-            "swarm-term bridge: lifecycle fanout dropped — no pane for synth target"
-        );
-        return None;
+        return;
     }
     let env = Envelope {
         from: "coordinator".into(),
-        to: synth_target.clone(),
-        body: synth_body.clone(),
-        task_id: Some(transition.task_id.clone()),
+        to: target.to_string(),
+        body: body.clone(),
+        task_id: Some(task_id.to_string()),
     };
     match drop_envelope(root, &env) {
         Ok(_) => {
             tracing::info!(
-                from = "coordinator",
-                to = %synth_target,
-                body = %synth_body,
+                to = %target,
+                body = %body,
                 "swarm-term bridge: lifecycle auto-fanout enqueued"
             );
             let _ = app.emit(
                 crate::events::SWARM_TERM_ROUTE,
                 json!({
                     "source": "coordinator",
-                    "target": synth_target,
-                    "body": synth_body,
+                    "target": target,
+                    "body": body,
                     "outcome": "lifecycle_fanout",
                 }),
             );
         }
-        Err(e) => {
-            tracing::warn!(
-                target = %synth_target,
-                error = %e,
-                "swarm-term bridge: failed to write synth envelope"
-            );
-        }
+        Err(e) => tracing::warn!(
+            target = %target,
+            error = %e,
+            "swarm-term bridge: failed to write synth envelope"
+        ),
     }
-    if matches!(transition.kind, TransitionKind::Approved) {
-        lifecycle.mark_done(&source_pane, &transition.task_id);
-    }
-    None
 }
 
 /// Notice for a builder/reviewer whose coordinator-bound body looks

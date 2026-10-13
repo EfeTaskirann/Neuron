@@ -69,27 +69,28 @@ fn read(p: &Path) -> String {
     fs::read_to_string(p).unwrap_or_default()
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spawns 9 real PTY panes running python — opt in via --ignored"]
-async fn bridge_end_to_end_with_fake_agents() {
-    let (app, pool, _db_dir) = mock_app_with_pool_and_terminal_registry().await;
-    let registry = app.state::<TerminalRegistry>().inner().clone();
-    let work = tempfile::tempdir().expect("tempdir");
-    let script = work.path().join("fake_agent.py");
+/// Spawn one real PTY pane per agent running [`FAKE_AGENT`], each
+/// logging what it receives to `<work>/<agent>.log`. With
+/// `tester_awaits_approval`, integration-tester runs as `claude-code`
+/// and prints a line the approval regex matches, so its pane is stuck in
+/// `awaiting_approval` (the H4 scenario).
+async fn spawn_fake_agents(
+    app: &tauri::App<tauri::test::MockRuntime>,
+    registry: &TerminalRegistry,
+    pool: &crate::db::DbPool,
+    work: &Path,
+    tester_awaits_approval: bool,
+) -> (HashMap<String, String>, HashMap<&'static str, PathBuf>) {
+    let script = work.join("fake_agent.py");
     fs::write(&script, FAKE_AGENT).expect("script");
     let python =
         std::env::var("NEURON_E2E_PYTHON").unwrap_or_else(|_| "python".into());
-
-    // ---- 9 fake-agent panes ----------------------------------------- //
     let mut panes_by_agent: HashMap<String, String> = HashMap::new();
-    let mut logs: HashMap<&str, PathBuf> = HashMap::new();
+    let mut logs: HashMap<&'static str, PathBuf> = HashMap::new();
     for &agent in AGENT_IDS {
-        let log = work.path().join(format!("{agent}.log"));
+        let log = work.join(format!("{agent}.log"));
         fs::write(&log, "").expect("log");
-        // integration-tester runs as `claude-code` and prints a line the
-        // approval regex matches, so its pane is stuck in
-        // `awaiting_approval` (the H4 scenario).
-        let (kind, banner) = if agent == "integration-tester" {
+        let (kind, banner) = if tester_awaits_approval && agent == "integration-tester" {
             ("claude-code", " 'Approve this change?'")
         } else {
             ("shell", "")
@@ -98,7 +99,7 @@ async fn bridge_end_to_end_with_fake_agents() {
         let pane = registry
             .spawn_pane(
                 PaneSpawnInput {
-                    cwd: fwd(work.path()),
+                    cwd: fwd(work),
                     cmd: Some(cmd),
                     cols: Some(220),
                     rows: Some(50),
@@ -115,6 +116,19 @@ async fn bridge_end_to_end_with_fake_agents() {
         panes_by_agent.insert(agent.to_string(), pane.id);
         logs.insert(agent, log);
     }
+    (panes_by_agent, logs)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "spawns 9 real PTY panes running python — opt in via --ignored"]
+async fn bridge_end_to_end_with_fake_agents() {
+    let (app, pool, _db_dir) = mock_app_with_pool_and_terminal_registry().await;
+    let registry = app.state::<TerminalRegistry>().inner().clone();
+    let work = tempfile::tempdir().expect("tempdir");
+
+    // ---- 9 fake-agent panes ----------------------------------------- //
+    let (panes_by_agent, logs) =
+        spawn_fake_agents(&app, &registry, &pool, work.path(), true).await;
     let log = |a: &str| read(&logs[a]);
 
     // Let the interpreters boot, and wait for the approval false
@@ -288,4 +302,162 @@ async fn bridge_end_to_end_with_fake_agents() {
     }
     assert!(fresh_still_queued, "08 fresh message to not-ready planner must stay queued");
     assert!(failing.is_empty(), "failing checks: {failing:#?}");
+}
+
+/// Poll `cond` every 100 ms for up to `secs`.
+async fn wait_until(secs: u64, cond: impl Fn() -> bool) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    loop {
+        if cond() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// The task-lifecycle FAILURE paths (swarm-logic review A1–A6) driven
+/// through real panes and the real watcher: the test plays every agent
+/// by dropping envelopes into their outboxes one step at a time, and
+/// asserts on what the bridge pasted into each pane. Bodies are ASCII —
+/// the fake agent's console input drops characters like `—`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "spawns 9 real PTY panes running python — opt in via --ignored"]
+async fn lifecycle_failure_paths_with_fake_agents() {
+    let (app, pool, _db_dir) = mock_app_with_pool_and_terminal_registry().await;
+    let registry = app.state::<TerminalRegistry>().inner().clone();
+    let work = tempfile::tempdir().expect("tempdir");
+    let (panes_by_agent, logs) =
+        spawn_fake_agents(&app, &registry, &pool, work.path(), false).await;
+    let log = |a: &str| read(&logs[a]);
+    let count = |a: &str, needle: &str| log(a).matches(needle).count();
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    let root = work.path().join("bridge");
+    prepare_layout(&root).expect("layout");
+    let ready: HashSet<String> = panes_by_agent.values().cloned().collect();
+    let handle = install(
+        app.handle().clone(),
+        root.clone(),
+        panes_by_agent.clone(),
+        Arc::new(Mutex::new(ready)),
+        Arc::new(LifecycleStore::new()),
+    );
+
+    let seq = std::cell::Cell::new(0u32);
+    let send = |from: &str, to: &str, body: &str, task_id: Option<&str>| {
+        seq.set(seq.get() + 1);
+        let mut env = serde_json::json!({ "from": from, "to": to, "body": body });
+        if let Some(id) = task_id {
+            env["task_id"] = id.into();
+        }
+        drop_raw(&root, from, &format!("m{:03}", seq.get()), &env.to_string(), None);
+    };
+    let mut failed: Vec<String> = Vec::new();
+    macro_rules! step {
+        ($name:expr, $cond:expr) => {
+            if !wait_until(10, || $cond).await {
+                failed.push($name.to_string());
+            }
+        };
+    }
+
+    // ---- A: reviewer rejects → coordinator re-dispatches → re-review -- //
+    send("orchestrator", "backend-builder", "build R1", Some("R1"));
+    step!("A1 builder got the dispatch", log("backend-builder").contains("build R1"));
+    send("backend-builder", "coordinator", "DONE R1 - v1 auth.rs", Some("R1"));
+    step!("A2 reviewer got review R1", count("backend-reviewer", "review R1") == 1);
+    send("backend-reviewer", "coordinator", "CHANGES_NEEDED R1 - add a test", Some("R1"));
+    step!("A3 coordinator got the rejection", log("coordinator").contains("CHANGES_NEEDED R1"));
+    send("coordinator", "backend-builder", "R1 fix-round-1 add a test", Some("R1"));
+    step!("A4 builder got the fix dispatch", log("backend-builder").contains("fix-round-1"));
+    send("backend-builder", "coordinator", "DONE R1 - v2 test added", Some("R1"));
+    step!("A5 reviewer re-reviews the fix", count("backend-reviewer", "review R1") == 2
+        && log("backend-reviewer").contains("v2 test added"));
+    send("backend-reviewer", "coordinator", "APPROVED R1", Some("R1"));
+    step!("A6 orchestrator got TASK_DONE R1", log("orchestrator").contains("TASK_DONE R1"));
+
+    // ---- B: tester FAIL → fix → RETEST by the tester (not a review) --- //
+    send("orchestrator", "integration-tester", "smoke S1 run cargo test", Some("S1"));
+    step!("B1 tester got the smoke run", log("integration-tester").contains("smoke S1"));
+    send("integration-tester", "coordinator",
+        "CHANGES_NEEDED S1 - test_parse fails in parse.rs, backend-builder", Some("S1"));
+    step!("B2 coordinator got the test failure", log("coordinator").contains("CHANGES_NEEDED S1"));
+    send("coordinator", "backend-builder", "S1 fix test_parse", Some("S1"));
+    step!("B3 builder got the fix dispatch", log("backend-builder").contains("S1 fix test_parse"));
+    send("backend-builder", "coordinator", "DONE S1 - parse.rs fixed", Some("S1"));
+    step!("B4 tester got retest S1 with the note", log("integration-tester").contains("retest S1")
+        && log("integration-tester").contains("parse.rs fixed"));
+    step!("B5 no reviewer review for a tester rejection", !log("backend-reviewer").contains("review S1"));
+    send("integration-tester", "coordinator", "APPROVED S1", Some("S1"));
+    step!("B6 orchestrator got TASK_DONE S1", log("orchestrator").contains("TASK_DONE S1"));
+
+    // ---- C: builder hata (misaddressed) → TASK_FAILED; id is then closed //
+    send("orchestrator", "frontend-builder", "build H1", Some("H1"));
+    step!("C1 builder got the dispatch", log("frontend-builder").contains("build H1"));
+    send("frontend-builder", "orchestrator", "hata - npm install is not allowed", Some("H1"));
+    step!("C2 hata re-addressed to the coordinator", log("coordinator").contains("npm install is not allowed"));
+    step!("C3 sender told about the re-addressing", log("frontend-builder").contains("@coordinator'a iletildi"));
+    step!("C4 orchestrator got TASK_FAILED H1 with the reason",
+        log("orchestrator").contains("TASK_FAILED H1") && log("orchestrator").contains("npm install is not allowed"));
+    step!("C5 coordinator told not to re-dispatch H1", log("coordinator").contains("TASK_FAILED H1"));
+    send("coordinator", "frontend-builder", "retry H1", Some("H1"));
+    step!("C6 dispatch of a closed id refused", !log("frontend-builder").contains("retry H1")
+        && log("coordinator").contains("already closed"));
+
+    // ---- D: rework limit — the 3rd rejection fails the task ----------- //
+    send("orchestrator", "backend-builder", "build L1", Some("L1"));
+    step!("D0 builder got L1", log("backend-builder").contains("build L1"));
+    for round in 1..=3usize {
+        send("backend-builder", "coordinator", &format!("DONE L1 - attempt {round}"), Some("L1"));
+        step!(format!("D{round} review L1 #{round}"), count("backend-reviewer", "review L1") == round);
+        send("backend-reviewer", "coordinator", &format!("CHANGES_NEEDED L1 - still wrong {round}"), Some("L1"));
+        step!(format!("D{round} rejection #{round} delivered"), count("coordinator", "CHANGES_NEEDED L1") == round);
+        if round < 3 {
+            send("coordinator", "backend-builder", &format!("L1 rework {round}"), Some("L1"));
+            step!(format!("D{round} rework dispatched"), log("backend-builder").contains(&format!("L1 rework {round}")));
+        }
+    }
+    step!("D4 orchestrator got TASK_FAILED L1", log("orchestrator").contains("TASK_FAILED L1"));
+    step!("D5 coordinator told the limit is used up", log("coordinator").contains("TASK_FAILED L1"));
+
+    // ---- E: one open task id belongs to one builder (A6) -------------- //
+    send("orchestrator", "backend-builder", "build D1 backend half", Some("D1"));
+    step!("E1 backend-builder got D1", log("backend-builder").contains("D1 backend half"));
+    send("orchestrator", "frontend-builder", "build D1 frontend half", Some("D1"));
+    step!("E2 second builder refused for the same open id",
+        !log("frontend-builder").contains("D1 frontend half")
+            && log("orchestrator").contains("still open on @backend-builder"));
+
+    // ---- F: misaddressed DONE still starts the review ----------------- //
+    send("orchestrator", "frontend-builder", "build F1", Some("F1"));
+    step!("F1 builder got F1", log("frontend-builder").contains("build F1"));
+    send("frontend-builder", "orchestrator", "DONE F1 - Login.tsx", Some("F1"));
+    step!("F2 DONE sent to the orchestrator still reached the reviewer",
+        log("frontend-reviewer").contains("review F1"));
+
+    // ---- G: an unanswered dispatch is reminded, then escalated -------- //
+    // Short thresholds from here on; earlier open tasks may be reminded
+    // too — only ST1's texts are asserted.
+    std::env::set_var("NEURON_TERM_STALL_SECS", "2");
+    send("orchestrator", "frontend-builder", "build ST1", Some("ST1"));
+    step!("G1 builder got ST1", log("frontend-builder").contains("build ST1"));
+    if !wait_until(15, || log("frontend-builder").contains("DONE ST1")).await {
+        failed.push("G2 silent builder reminded about ST1".into());
+    }
+    if !wait_until(15, || log("coordinator").contains("TASK_FAILED ST1")).await {
+        failed.push("G3 coordinator got the ST1 escalation".into());
+    }
+    std::env::remove_var("NEURON_TERM_STALL_SECS");
+
+    uninstall(handle);
+    for pid in panes_by_agent.values() {
+        let _ = registry.kill_pane(pid, &pool).await;
+    }
+    for &a in AGENT_IDS {
+        println!("===== {a}.log =====\n{}", log(a).replace('\x1b', "<ESC>"));
+    }
+    assert!(failed.is_empty(), "failing steps: {failed:#?}");
 }

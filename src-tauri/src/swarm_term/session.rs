@@ -261,6 +261,23 @@ impl TerminalSwarmRegistry {
                 permissions::PERMISSIONS_ENV
             );
         }
+        let source_root = Path::new(env!("CARGO_MANIFEST_DIR")).parent();
+        if let Some(warning) = source_root.and_then(|root| {
+            self_hosting_warning(&project_dir, root, cfg!(debug_assertions))
+        }) {
+            tracing::warn!("swarm-term: {warning}");
+            let _ = tauri::Emitter::emit(
+                &app,
+                crate::events::SWARM_TERM_ROUTE,
+                serde_json::json!({
+                    "source": "neuron",
+                    "target": "orchestrator",
+                    "body": format!("[Neuron] {warning}"),
+                    "outcome": "notice",
+                    "reason": "swarm runs on this app's own source tree",
+                }),
+            );
+        }
 
         let registry =
             app.state::<TerminalRegistry>().inner().clone();
@@ -725,6 +742,26 @@ const BLOCKING_SCREEN_MARKERS: &[&str] = &[
 /// How many trailing pane lines are inspected for those markers.
 const SCREEN_TAIL_LINES: usize = 60;
 
+/// Pure: a warning when a DEV build runs the swarm on its own source
+/// tree. Builders editing `src-tauri/` or `app/` there make `tauri dev`
+/// rebuild and restart the app, which kills the running session.
+fn self_hosting_warning(project: &Path, source_root: &Path, dev_build: bool) -> Option<String> {
+    if !dev_build {
+        return None;
+    }
+    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    // Compared canonicalised, displayed as given (no `\\?\` prefix).
+    canon(project).starts_with(canon(source_root)).then(|| {
+        format!(
+            "Swarm, dev modda çalışan bu uygulamanın kendi kaynak ağacında ({}) \
+             çalışıyor: builder'ların `src-tauri/` / `app/` değişiklikleri `tauri dev`'i \
+             yeniden başlatıp bu oturumu sonlandırır. Ayrı bir git worktree'de çalıştır \
+             (ör. `git worktree add ../neuron-swarm`).",
+            source_root.display()
+        )
+    })
+}
+
 fn screen_is_blocking(screen_tail: &str) -> bool {
     let lower = screen_tail.to_lowercase();
     BLOCKING_SCREEN_MARKERS.iter().any(|m| lower.contains(m))
@@ -912,6 +949,19 @@ mod tests {
     const KICKOFF_ECHO: &str = r#"{"type":"user","message":{"role":"user","content":"[Neuron] Oturum başladı. @scout hazır."}}"#;
 
     #[test]
+    fn a_dev_build_warns_when_the_swarm_edits_its_own_source() {
+        let src = tempfile::tempdir().expect("tempdir");
+        let inside = src.path().join("sub");
+        std::fs::create_dir_all(&inside).expect("mkdir");
+        let other = tempfile::tempdir().expect("tempdir");
+        assert!(self_hosting_warning(src.path(), src.path(), true).is_some());
+        assert!(self_hosting_warning(&inside, src.path(), true).is_some());
+        assert!(self_hosting_warning(other.path(), src.path(), true).is_none());
+        // A release build does not hot-reload — nothing to warn about.
+        assert!(self_hosting_warning(src.path(), src.path(), false).is_none());
+    }
+
+    #[test]
     fn login_and_first_run_screens_block_the_kickoff() {
         for screen in [
             "Select login method:\n❯ 1. Claude account with subscription",
@@ -974,9 +1024,49 @@ mod tests {
         let started = Instant::now();
         let stamp = |t: Instant| format!("{:>5.1}s", t.duration_since(started).as_secs_f32());
 
+        // Terminal signals (TASK_DONE + TASK_FAILED) the orchestrator must
+        // receive before the run winds down (default: one build task + smoke).
+        let expect: usize = std::env::var("NEURON_LIVE_EXPECT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2);
+
         let (app, _pool, _db) =
             crate::test_support::mock_app_with_pool_and_terminal_registry().await;
         let registry = app.state::<TerminalRegistry>().inner().clone();
+        // Bridge-originated pastes (notices, reminders) and lifecycle
+        // transitions never touch the filesystem queue — print them too.
+        {
+            use tauri::Listener;
+            let t0 = started;
+            app.listen_any(crate::events::SWARM_TERM_ROUTE, move |e| {
+                let v: serde_json::Value =
+                    serde_json::from_str(e.payload()).unwrap_or_default();
+                let outcome = v["outcome"].as_str().unwrap_or("");
+                if matches!(outcome, "notice" | "reminder") {
+                    let body: String = v["body"].as_str().unwrap_or("").chars().take(220).collect();
+                    println!(
+                        "[{:>5.1}s] {} → {}: {}",
+                        t0.elapsed().as_secs_f32(),
+                        outcome.to_uppercase(),
+                        v["target"].as_str().unwrap_or("?"),
+                        body.replace('\n', " ⏎ ")
+                    );
+                }
+            });
+            app.listen_any(crate::events::SWARM_TERM_LIFECYCLE, move |e| {
+                let v: serde_json::Value =
+                    serde_json::from_str(e.payload()).unwrap_or_default();
+                println!(
+                    "[{:>5.1}s] LIFECYCLE {} [{}] {} → {}",
+                    t0.elapsed().as_secs_f32(),
+                    v["source"].as_str().unwrap_or("?"),
+                    v["task_id"].as_str().unwrap_or("?"),
+                    v["transition"].as_str().unwrap_or("?"),
+                    v["state"].as_str().unwrap_or("?"),
+                );
+            });
+        }
         let swarm = Arc::new(TerminalSwarmRegistry::new());
         swarm.start(app.handle().clone(), project.clone()).await.expect("start");
         let (panes, ready, root, homes) = {
@@ -1046,18 +1136,19 @@ mod tests {
                             v["task_id"].as_str().map(str::to_string)
                                 .unwrap_or_else(|| v["task_id"].to_string()),
                         );
+                        let head = body.trim_start();
                         if kind == "processed"
                             && *target == "orchestrator"
-                            && body.trim_start().starts_with("TASK_DONE")
+                            && (head.starts_with("TASK_DONE") || head.starts_with("TASK_FAILED"))
                         {
                             task_done += 1;
                         }
                     }
                 }
             }
-            // Code task: builder TASK_DONE + tester smoke TASK_DONE, then
-            // give the orchestrator a minute for its final summary.
-            if task_done >= 2 && done_at.is_none() {
+            // Every expected terminal signal arrived: give the
+            // orchestrator a minute for its final summary.
+            if task_done >= expect && done_at.is_none() {
                 done_at = Some(Instant::now());
             }
             if done_at.is_some_and(|t| t.elapsed() > Duration::from_secs(60)) {
@@ -1065,7 +1156,10 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
-        println!("[{}] TASK_DONE received by orchestrator: {task_done}", stamp(Instant::now()));
+        println!(
+            "[{}] TASK_DONE/TASK_FAILED received by orchestrator: {task_done}/{expect}",
+            stamp(Instant::now())
+        );
 
         // Denied tool calls + transcript copies, before stop() deletes the homes.
         std::fs::create_dir_all(&out).ok();
@@ -1074,8 +1168,30 @@ mod tests {
             let Ok(projects) = std::fs::read_dir(&dir) else { continue };
             for p in projects.flatten() {
                 for f in std::fs::read_dir(p.path()).into_iter().flatten().flatten() {
-                    let text = std::fs::read_to_string(f.path()).unwrap_or_default();
+                    // Only the session transcript; a sibling directory /
+                    // other file must not overwrite the copy with "".
+                    if f.path().extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                        continue;
+                    }
+                    let Ok(text) = std::fs::read_to_string(f.path()) else { continue };
                     std::fs::write(out.join(format!("{agent}.jsonl")), &text).ok();
+                    // The orchestrator's last words are the run's summary.
+                    if *agent == "orchestrator" {
+                        let last = text
+                            .lines()
+                            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+                            .filter(|v| v["type"] == "assistant")
+                            .flat_map(|v| {
+                                v.pointer("/message/content")
+                                    .and_then(|c| c.as_array().cloned())
+                                    .unwrap_or_default()
+                            })
+                            .filter_map(|p| p["text"].as_str().map(str::to_string))
+                            .next_back();
+                        if let Some(last) = last {
+                            println!("ORCHESTRATOR FINAL:\n{last}");
+                        }
+                    }
                     for line in text.lines() {
                         let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
                         let Some(parts) = v.pointer("/message/content").and_then(|c| c.as_array())

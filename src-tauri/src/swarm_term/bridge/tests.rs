@@ -162,7 +162,7 @@ fn stall(state: LifecycleState, mins: u64, level: u8) -> Stall {
 #[test]
 fn awaiting_review_reminds_the_paired_reviewer() {
     let (who, text) =
-        reminder_for("frontend-builder", &stall(LifecycleState::AwaitingReview, 12, 1))
+        reminder_for(Some("frontend-builder"), &stall(LifecycleState::AwaitingReview, 12, 1))
             .expect("reminder");
     assert_eq!(who, "frontend-reviewer");
     assert!(text.contains("review T9"));
@@ -173,21 +173,51 @@ fn awaiting_review_reminds_the_paired_reviewer() {
 #[test]
 fn building_reminds_the_builder_and_terminal_states_are_silent() {
     let (who, text) =
-        reminder_for("backend-builder", &stall(LifecycleState::Building, 25, 1))
+        reminder_for(Some("backend-builder"), &stall(LifecycleState::Building, 25, 1))
             .expect("reminder");
     assert_eq!(who, "backend-builder");
     assert!(text.contains("DONE T9"));
-    assert!(reminder_for("backend-builder", &stall(LifecycleState::Done, 99, 2)).is_none());
+    assert!(reminder_for(Some("backend-builder"), &stall(LifecycleState::Done, 99, 2)).is_none());
     // AwaitingReview from a non-builder has no paired reviewer.
-    assert!(reminder_for("scout", &stall(LifecycleState::AwaitingReview, 12, 1)).is_none());
+    assert!(reminder_for(Some("scout"), &stall(LifecycleState::AwaitingReview, 12, 1)).is_none());
+}
+
+#[test]
+fn an_unanswered_dispatch_reminds_its_receiver_in_role_terms() {
+    // A4: Assigned (dispatch delivered, nothing back) stalls too — a
+    // builder is asked for DONE, the tester for its verdict.
+    let (who, text) =
+        reminder_for(Some("frontend-builder"), &stall(LifecycleState::Assigned, 21, 1))
+            .expect("builder reminder");
+    assert_eq!(who, "frontend-builder");
+    assert!(text.contains("DONE T9"));
+    let (who, text) =
+        reminder_for(Some("integration-tester"), &stall(LifecycleState::Assigned, 21, 1))
+            .expect("tester reminder");
+    assert_eq!(who, "integration-tester");
+    assert!(text.contains("APPROVED T9") && text.contains("CHANGES_NEEDED T9"));
+}
+
+#[test]
+fn an_unsent_rework_reminds_the_coordinator_then_the_orchestrator() {
+    // A3: a rejection nobody re-dispatched is the coordinator's stall.
+    let (who, text) = reminder_for(None, &stall(LifecycleState::Failed, 11, 1)).expect("rework");
+    assert_eq!(who, "coordinator");
+    assert!(text.contains("CHANGES_NEEDED") && text.contains("TASK_FAILED T9"));
+    let (to, text) = escalation_for("coordinator", &stall(LifecycleState::Failed, 21, 2));
+    assert_eq!(to, "orchestrator");
+    assert!(text.contains("T9"));
 }
 
 #[test]
 fn escalation_names_task_agent_and_age() {
-    let e = escalation_for("backend-reviewer", &stall(LifecycleState::AwaitingReview, 21, 2));
+    let (to, e) =
+        escalation_for("backend-reviewer", &stall(LifecycleState::AwaitingReview, 21, 2));
+    assert_eq!(to, "coordinator");
     assert!(e.contains("T9"));
     assert!(e.contains("@backend-reviewer"));
     assert!(e.contains("21 dakika"));
+    assert!(e.contains("TASK_FAILED T9"));
 }
 
 // ---- archive_rejected ------------------------------------------- //
