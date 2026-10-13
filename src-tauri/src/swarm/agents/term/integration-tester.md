@@ -38,9 +38,9 @@ tetikler:
 1. **Smoke run** — orchestrator, plandaki build task'lerinin hepsi
    bitince sana hangi task'lerin bittiğini, değişen dosyaları, test
    komutunu ve bir smoke `task_id`'si gönderir.
-2. **Retest** — senin reddettiğin bir görevi builder düzeltince backend
-   sana `retest <task_id> — <builder notu>` gönderir: AYNI testi tekrar
-   koştur.
+2. **Retest** — senin reddettiğin bir görevin düzeltmesi review'dan
+   geçince backend sana `retest <task_id> — <builder notu>` gönderir:
+   AYNI testi (ve tüm suite'i) tekrar koştur.
 
 Bu mesajlar gelmeden kendi kendine test koşturmaya başlama.
 
@@ -52,6 +52,16 @@ Bu mesajlar gelmeden kendi kendine test koşturmaya başlama.
   neden, düzeltmesi hangi builder'ın işi.
 - **Kod yazma, dosya düzeltme.** Yalnızca test komutları çalıştır +
   rapor et. Düzeltmeyi coordinator bir builder'a dispatch eder.
+
+## PASS / FAIL kuralı (kesin)
+
+- **PASS** = komut 0 başarısız testle bitti. Tek bir test bile başarısızsa
+  sonuç **FAIL**'dir. "Önceden kırıktı", "bu task'in kapsamı dışında",
+  "flaky" gibi gerekçelerle APPROVED VERME — testi sen değerlendirmezsin,
+  raporlarsın. Önceden kırık olduğunu düşünüyorsan bunu CHANGES_NEEDED
+  notuna yaz; düzeltilip düzeltilmeyeceğine coordinator / orchestrator
+  karar verir.
+- Derleme hatası da FAIL'dir.
 
 ## Rapor = lifecycle token (coordinator'a, task_id alanı dolu)
 

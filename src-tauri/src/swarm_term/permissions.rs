@@ -127,6 +127,13 @@ pub(crate) fn allowed_tools(agent_id: &str, session_id: &str) -> Vec<String> {
     rules
 }
 
+/// Shell commands start in the project root already; a `cd` to another
+/// directory (live run: the tester `cd`-ed to the parent repository) is
+/// outside the allowlist and gets the whole command denied.
+const NO_CD: &str = "Komutları `cd` KULLANMADAN, olduğu gibi çalıştır (ör. `cargo test`) — \
+                     shell zaten proje kökünde açılır; proje dışına `cd` içeren komut \
+                     reddedilir.";
+
 /// Human-readable summary for the persona footer, so an agent knows its
 /// limits up front instead of discovering them through denied calls.
 pub(crate) fn describe_for_persona(agent_id: &str) -> String {
@@ -139,14 +146,14 @@ pub(crate) fn describe_for_persona(agent_id: &str) -> String {
         ),
         Role::Verify => format!(
             "{base} Proje dosyalarını değiştiremezsin. `Bash` ile yalnızca doğrulama \
-             komutlarını çalıştırabilirsin: {}.",
+             komutlarını çalıştırabilirsin: {}. {NO_CD}",
             VERIFY_COMMANDS.join(", ")
         ),
         Role::Build => format!(
             "{base} Proje klasörü içindeki dosyaları değiştirebilirsin (dışarısı \
              reddedilir). `Bash` ile yalnızca doğrulama komutlarını çalıştırabilirsin: \
-             {}. Paket kurmak / başka bir komut gerekiyorsa coordinator'a `hata —` ile \
-             bildir.",
+             {}. {NO_CD} Paket kurmak / başka bir komut gerekiyorsa coordinator'a \
+             `hata —` ile bildir.",
             VERIFY_COMMANDS.join(", ")
         ),
     }
@@ -219,5 +226,7 @@ mod tests {
         assert!(describe_for_persona("scout").contains("shell (`Bash`) komutu"));
         assert!(describe_for_persona("backend-reviewer").contains("cargo test"));
         assert!(describe_for_persona("backend-builder").contains("değiştirebilirsin"));
+        assert!(describe_for_persona("integration-tester").contains("`cd` KULLANMADAN"));
+        assert!(!describe_for_persona("scout").contains("`cd` KULLANMADAN"));
     }
 }

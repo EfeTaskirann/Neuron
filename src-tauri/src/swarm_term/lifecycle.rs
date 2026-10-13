@@ -65,9 +65,9 @@ pub const TASK_DONE_PREFIX: &str = "TASK_DONE ";
 pub const TASK_FAILED_PREFIX: &str = "TASK_FAILED ";
 
 /// Body-prefix of the synthesised re-run request sent to the
-/// integration-tester when a builder finishes rework on a task the
-/// TESTER rejected — a reviewer approval would not prove the failing
-/// test passes now.
+/// integration-tester once the fix for a task the TESTER rejected has
+/// passed review — a reviewer approval alone does not prove the failing
+/// test passes now, and the tester alone never reads the fix's code.
 pub const RETEST_PREFIX: &str = "retest ";
 
 /// Rework rounds a task gets after `CHANGES_NEEDED`. The rejection
@@ -137,13 +137,21 @@ pub enum Closure {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Recorded {
     pub state: LifecycleState,
-    /// `DONE` on a task the integration-tester rejected: the fix goes
-    /// back to the tester (`retest`), not to the domain reviewer.
+    /// A domain reviewer's `APPROVED` on a task the integration-tester
+    /// rejected: the next step is the tester's `retest`, not `TASK_DONE`.
     pub retest: bool,
-    /// `DONE` while another pane still works on the same id (a tester
-    /// rejection reworked by both builders): hold the retest until the
-    /// last one finishes.
-    pub others_in_progress: bool,
+    /// That `APPROVED` came while another builder's part of the same id
+    /// is still in flight (a tester rejection reworked by both
+    /// builders): hold the retest until the last part is approved.
+    pub others_in_flight: bool,
+    /// The builder's note from the latest `DONE` on a retest task —
+    /// carried into `retest <id> — <note>` so the tester knows what
+    /// changed.
+    pub retest_note: Option<String>,
+    /// The tester's final `APPROVED` closed a task it had rejected: the
+    /// builder's note of the fix, appended to `TASK_DONE` so the
+    /// orchestrator's report lists the files the rework touched.
+    pub fix_note: Option<String>,
     /// `CHANGES_NEEDED` count for the task so far.
     pub rejections: u8,
     /// This `CHANGES_NEEDED` used up [`MAX_REWORK_ROUNDS`]: the task is
@@ -158,7 +166,9 @@ impl Recorded {
         Self {
             state,
             retest: false,
-            others_in_progress: false,
+            others_in_flight: false,
+            retest_note: None,
+            fix_note: None,
             rejections: 0,
             limit_exceeded: false,
             already_closed: None,
@@ -520,17 +530,13 @@ impl Entry {
 #[derive(Debug, Default)]
 struct TaskMeta {
     rejections: u8,
-    /// Agent that sent the latest `CHANGES_NEEDED`.
-    rejected_by: Option<String>,
+    /// The integration-tester rejected it: its fix ends with a retest.
+    needs_retest: bool,
+    /// Builder note of the latest `DONE` (for the retest request).
+    last_done_note: Option<String>,
     /// A rejection the coordinator has not re-dispatched yet.
     rework: Option<Entry>,
     closed: Option<Closure>,
-}
-
-impl TaskMeta {
-    fn tester_rejected(&self) -> bool {
-        self.rejected_by.as_deref() == Some(TESTER)
-    }
 }
 
 /// One in-flight task that crossed a stall threshold — output of
@@ -601,15 +607,18 @@ impl LifecycleStore {
     /// `source_pane`). `verdict_panes` are the builder panes whose
     /// `AwaitingReview` entries a verdict from `source_agent` settles —
     /// the paired builder for a domain reviewer, both builders for the
-    /// tester, none otherwise. Inserts the entry if it does not exist.
+    /// tester, none otherwise. `note` is the free text after the token
+    /// (kept from a `DONE` for a later retest request). Inserts the entry
+    /// if it does not exist.
     pub fn record(
         &self,
         source_agent: &str,
         source_pane: &str,
         transition: &Transition,
         verdict_panes: &[&str],
+        note: Option<&str>,
     ) -> Recorded {
-        self.record_at(source_agent, source_pane, transition, verdict_panes, Instant::now())
+        self.record_at(source_agent, source_pane, transition, verdict_panes, note, Instant::now())
     }
 
     fn record_at(
@@ -618,6 +627,7 @@ impl LifecycleStore {
         source_pane: &str,
         transition: &Transition,
         verdict_panes: &[&str],
+        note: Option<&str>,
         now: Instant,
     ) -> Recorded {
         let id = transition.task_id.as_str();
@@ -656,19 +666,37 @@ impl LifecycleStore {
         }
         match transition.kind {
             TransitionKind::Done => {
-                rec.retest = g.tasks.get(id).is_some_and(TaskMeta::tester_rejected);
-                rec.others_in_progress = g
+                let meta = g.tasks.entry(id.to_string()).or_default();
+                meta.last_done_note = note.map(str::to_string);
+            }
+            // A domain reviewer approved the fix of a task the TESTER
+            // rejected: the task stays open until the tester re-runs it.
+            TransitionKind::Approved
+                if verdict.is_some()
+                    && source_agent != TESTER
+                    && g.tasks.get(id).is_some_and(|m| m.needs_retest) =>
+            {
+                rec.retest = true;
+                rec.retest_note = g.tasks.get(id).and_then(|m| m.last_done_note.clone());
+                rec.others_in_flight = g
                     .entries
                     .iter()
-                    .any(|(k, e)| k != &key && k.1 == id && e.state.in_progress());
+                    .any(|(k, e)| k != &key && k.1 == id && e.state.in_flight());
             }
             TransitionKind::Approved if verdict.is_some() => {
+                // A task closed after a tester rejection: the orchestrator
+                // must hear what the fix changed, not only "tests pass".
+                rec.fix_note = g
+                    .tasks
+                    .get(id)
+                    .filter(|m| m.needs_retest)
+                    .and_then(|m| m.last_done_note.clone());
                 g.close(id, Closure::Done, now);
             }
             TransitionKind::ChangesNeeded if verdict.is_some() => {
                 let meta = g.tasks.entry(id.to_string()).or_default();
                 meta.rejections = meta.rejections.saturating_add(1);
-                meta.rejected_by = Some(source_agent.to_string());
+                meta.needs_retest |= source_agent == TESTER;
                 rec.rejections = meta.rejections;
                 if meta.rejections > MAX_REWORK_ROUNDS {
                     rec.limit_exceeded = true;
@@ -736,7 +764,7 @@ impl LifecycleStore {
                  give new work a NEW task_id"
             ));
         }
-        if meta.is_some_and(TaskMeta::tester_rejected)
+        if meta.is_some_and(|m| m.needs_retest)
             || !builders.iter().any(|(_, p)| *p == target_pane)
         {
             return None;
@@ -820,13 +848,6 @@ impl LifecycleStore {
         for ((pane, task_id), e) in entries.iter_mut() {
             let threshold = match e.state {
                 LifecycleState::Assigned | LifecycleState::Building => build_after,
-                // A retest is the tester's job: its own `Assigned` entry
-                // carries the stall, not the builders' review waits.
-                LifecycleState::AwaitingReview
-                    if tasks.get(task_id).is_some_and(TaskMeta::tester_rejected) =>
-                {
-                    continue
-                }
                 LifecycleState::AwaitingReview => review_after,
                 _ => continue,
             };
@@ -917,11 +938,11 @@ impl LifecycleStore {
 ///
 /// Fanouts:
 ///
-///   * `Done` from a builder → `(<paired reviewer>, "review <id>")`, or
-///     — when the TESTER rejected the task — `("integration-tester",
-///     "retest <id>")` once no other builder still works on the id;
+///   * `Done` from a builder → `(<paired reviewer>, "review <id>")`;
 ///   * `Approved` from a reviewer / the tester → `("orchestrator",
-///     "TASK_DONE <id>")`;
+///     "TASK_DONE <id>")` — except for a task the TESTER rejected, whose
+///     reviewed fix goes back to it as `("integration-tester",
+///     "retest <id>")` once no other part of the id is still in flight;
 ///   * `ChangesNeeded` that used up the rework limit → `("orchestrator",
 ///     "TASK_FAILED <id> — …")`.
 ///
@@ -949,14 +970,13 @@ pub fn followup_for_coordinator_inbound(
         // anyone else writing `DONE <id>` to coordinator is prose,
         // not a lifecycle signal.
         TransitionKind::Done if is_builder(src_agent) => {
-            if rec.retest {
-                if rec.others_in_progress {
-                    return None;
-                }
-                (TESTER, format!("{RETEST_PREFIX}{id}"))
-            } else {
-                (reviewer_for_builder(src_agent)?, format!("review {id}"))
+            (reviewer_for_builder(src_agent)?, format!("review {id}"))
+        }
+        TransitionKind::Approved if is_reviewer(src_agent) && rec.retest => {
+            if rec.others_in_flight {
+                return None;
             }
+            (TESTER, format!("{RETEST_PREFIX}{id}"))
         }
         TransitionKind::Approved if is_reviewer(src_agent) => {
             ("orchestrator", format!("{TASK_DONE_PREFIX}{id}"))
@@ -995,7 +1015,7 @@ mod tests {
     }
 
     fn rec_at(s: &LifecycleStore, pane: &str, t: &Transition, now: Instant) -> Recorded {
-        s.record_at(agent_of(pane), pane, t, &["p-builder", "p-bb"], now)
+        s.record_at(agent_of(pane), pane, t, &["p-builder", "p-bb"], None, now)
     }
 
     fn fresh() -> Recorded {
@@ -1637,35 +1657,47 @@ mod tests {
     }
 
     #[test]
-    fn tester_rejection_sends_the_fix_back_to_the_tester() {
+    fn a_tester_rejected_fix_is_reviewed_then_retested() {
         let s = LifecycleStore::new();
         let t0 = Instant::now();
         assert!(s.assign_at("p-tester", "smoke-1", t0));
-        let r = rec_at(&s, "p-tester", &tr(TransitionKind::ChangesNeeded, "smoke-1"), t0);
+        let ch = tr(TransitionKind::ChangesNeeded, "smoke-1");
+        let r = rec_at(&s, "p-tester", &ch, t0);
         assert_eq!((r.rejections, r.limit_exceeded), (1, false));
-        assert!(ok_followup(TESTER, &tr(TransitionKind::ChangesNeeded, "smoke-1"), &r).is_none());
+        assert!(ok_followup(TESTER, &ch, &r).is_none());
 
-        // Coordinator re-dispatches the fix to a builder, builder is DONE:
-        // the tester re-runs its test instead of a reviewer approving.
+        // Coordinator re-dispatches the fix; the builder's DONE goes to
+        // the domain reviewer as usual — the fix's code gets read.
         assert!(s.assign_at("p-builder", "smoke-1", t0));
         let done = tr(TransitionKind::Done, "smoke-1");
-        let r = rec_at(&s, "p-builder", &done, t0);
-        assert!(r.retest);
+        let r = s.record_at("backend-builder", "p-builder", &done, &[], Some("orders.rs fixed"), t0);
         assert_eq!(
             ok_followup("backend-builder", &done, &r),
+            Some(("backend-reviewer".to_string(), "review smoke-1".to_string()))
+        );
+
+        // The reviewer's APPROVED does NOT close it: the tester re-runs.
+        let ap = tr(TransitionKind::Approved, "smoke-1");
+        let r = rec_at(&s, "p-reviewer", &ap, t0);
+        assert!(r.retest && !r.others_in_flight);
+        assert_eq!(r.retest_note.as_deref(), Some("orders.rs fixed"));
+        assert_eq!(
+            ok_followup("backend-reviewer", &ap, &r),
             Some((TESTER.to_string(), "retest smoke-1".to_string()))
         );
+        assert_eq!(s.closure("smoke-1"), None);
 
         // The tester passes it → TASK_DONE, task closed.
         assert!(s.assign_at("p-tester", "smoke-1", t0));
-        let ap = tr(TransitionKind::Approved, "smoke-1");
         let r = rec_at(&s, "p-tester", &ap, t0);
+        assert!(!r.retest);
+        // TASK_DONE carries what the fix changed.
+        assert_eq!(r.fix_note.as_deref(), Some("orders.rs fixed"));
         assert_eq!(
             ok_followup(TESTER, &ap, &r),
             Some(("orchestrator".to_string(), "TASK_DONE smoke-1".to_string()))
         );
         assert_eq!(s.closure("smoke-1"), Some(Closure::Done));
-        assert_eq!(s.state_of("p-builder", "smoke-1"), Some(LifecycleState::Done));
     }
 
     #[test]
@@ -1682,12 +1714,17 @@ mod tests {
         s.assign_at("p-fb", "smoke-2", t0);
 
         let done = tr(TransitionKind::Done, "smoke-2");
-        let r = rec_at(&s, "p-builder", &done, t0);
-        assert!(r.retest && r.others_in_progress);
-        assert!(ok_followup("backend-builder", &done, &r).is_none());
-        let r = rec_at(&s, "p-fb", &done, t0);
-        assert!(r.retest && !r.others_in_progress);
-        assert_eq!(ok_followup("frontend-builder", &done, &r).unwrap().1, "retest smoke-2");
+        let ap = tr(TransitionKind::Approved, "smoke-2");
+        rec_at(&s, "p-builder", &done, t0);
+        // Backend part approved while the frontend part is still being
+        // built: no retest yet.
+        let r = s.record_at("backend-reviewer", "p-reviewer", &ap, &["p-builder"], None, t0);
+        assert!(r.retest && r.others_in_flight);
+        assert!(ok_followup("backend-reviewer", &ap, &r).is_none());
+        rec_at(&s, "p-fb", &done, t0);
+        let r = s.record_at("frontend-reviewer", "p-fr", &ap, &["p-fb"], None, t0);
+        assert!(r.retest && !r.others_in_flight);
+        assert_eq!(ok_followup("frontend-reviewer", &ap, &r).unwrap().1, "retest smoke-2");
     }
 
     #[test]
@@ -1780,17 +1817,20 @@ mod tests {
     }
 
     #[test]
-    fn a_retest_wait_is_the_testers_stall_not_the_reviewers() {
+    fn a_retest_run_stalls_on_the_testers_own_entry() {
         let s = LifecycleStore::new();
         let t0 = Instant::now();
         s.assign_at("p-tester", "smoke-3", t0);
         rec_at(&s, "p-tester", &tr(TransitionKind::ChangesNeeded, "smoke-3"), t0);
         s.assign_at("p-builder", "smoke-3", t0);
         rec_at(&s, "p-builder", &tr(TransitionKind::Done, "smoke-3"), t0);
+        rec_at(&s, "p-reviewer", &tr(TransitionKind::Approved, "smoke-3"), t0);
+        // The retest dispatch reaches the tester and nothing comes back.
         s.assign_at("p-tester", "smoke-3", t0);
         let st = s.take_stalls(t0 + 25 * MIN, 10 * MIN, 20 * MIN);
         assert_eq!(st.len(), 1, "{st:?}");
         assert_eq!(st[0].source_pane, "p-tester");
+        assert_eq!(st[0].state, LifecycleState::Assigned);
     }
 
     #[test]

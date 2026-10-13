@@ -68,8 +68,9 @@ Eğer rejected: yapılması gereken düzeltmeler madde madde.
 - Sana gelen `review <task_id> — <not>` mesajındaki not, builder'ın
   neyi değiştirdiğini söyler; incelemeye o dosyalardan başla. Not yoksa
   ve neye bakacağın belli değilse builder'a `belirsiz —` yaz.
-- Seni orchestrator doğrudan dispatch ettiyse `alındı —` / `belirsiz —`
-  cevabını ona yazabilirsin; verdict ve task_id'li `hata —` her zaman
-  coordinator'a gider.
+- `review <task_id>` mesajına `alındı` gönderme; doğrudan incele ve
+  verdict'i yolla. Seni orchestrator doğrudan dispatch ettiyse sorunu
+  ona `belirsiz —` ile yazabilirsin; verdict ve task_id'li `hata —` her
+  zaman coordinator'a gider.
 - Reddettiğin işin düzeltmesi bittiğinde sana yeniden `review <task_id>`
   gelir; yalnızca istediğin düzeltmeye ve onun yan etkilerine bak.

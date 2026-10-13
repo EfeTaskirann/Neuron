@@ -379,7 +379,7 @@ async fn lifecycle_failure_paths_with_fake_agents() {
     send("backend-reviewer", "coordinator", "APPROVED R1", Some("R1"));
     step!("A6 orchestrator got TASK_DONE R1", log("orchestrator").contains("TASK_DONE R1"));
 
-    // ---- B: tester FAIL → fix → RETEST by the tester (not a review) --- //
+    // ---- B: tester FAIL → fix → review → RETEST by the tester -------- //
     send("orchestrator", "integration-tester", "smoke S1 run cargo test", Some("S1"));
     step!("B1 tester got the smoke run", log("integration-tester").contains("smoke S1"));
     send("integration-tester", "coordinator",
@@ -388,11 +388,15 @@ async fn lifecycle_failure_paths_with_fake_agents() {
     send("coordinator", "backend-builder", "S1 fix test_parse", Some("S1"));
     step!("B3 builder got the fix dispatch", log("backend-builder").contains("S1 fix test_parse"));
     send("backend-builder", "coordinator", "DONE S1 - parse.rs fixed", Some("S1"));
-    step!("B4 tester got retest S1 with the note", log("integration-tester").contains("retest S1")
-        && log("integration-tester").contains("parse.rs fixed"));
-    step!("B5 no reviewer review for a tester rejection", !log("backend-reviewer").contains("review S1"));
+    step!("B4 the fix is reviewed first", log("backend-reviewer").contains("review S1"));
+    step!("B5 no retest before the review", !log("integration-tester").contains("retest S1"));
+    send("backend-reviewer", "coordinator", "APPROVED S1 - looks right", Some("S1"));
+    step!("B6 tester got retest S1 with the builder's note",
+        log("integration-tester").contains("retest S1") && log("integration-tester").contains("parse.rs fixed"));
+    step!("B7 no TASK_DONE before the retest passes", !log("orchestrator").contains("TASK_DONE S1"));
     send("integration-tester", "coordinator", "APPROVED S1", Some("S1"));
-    step!("B6 orchestrator got TASK_DONE S1", log("orchestrator").contains("TASK_DONE S1"));
+    step!("B8 orchestrator got TASK_DONE S1 naming the fix",
+        log("orchestrator").contains("TASK_DONE S1") && log("orchestrator").contains("parse.rs fixed"));
 
     // ---- C: builder hata (misaddressed) → TASK_FAILED; id is then closed //
     send("orchestrator", "frontend-builder", "build H1", Some("H1"));

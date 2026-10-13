@@ -757,9 +757,10 @@ async fn process_one<R: Runtime>(
             }
             // Lifecycle synthesis runs only on coordinator-bound
             // deliveries — the bridge fans the autonomy follow-up out
-            // (builder DONE -> reviewer "review" / tester "retest",
-            // reviewer APPROVED -> orchestrator "TASK_DONE", hata /
-            // used-up rework limit -> orchestrator "TASK_FAILED").
+            // (builder DONE -> reviewer "review", reviewer APPROVED ->
+            // orchestrator "TASK_DONE" or — for a tester-rejected task —
+            // tester "retest", hata / used-up rework limit ->
+            // orchestrator "TASK_FAILED").
             if to_agent == "coordinator" {
                 let notices = lifecycle_synthesise(
                     app,

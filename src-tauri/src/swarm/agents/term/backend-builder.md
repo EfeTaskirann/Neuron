@@ -73,11 +73,11 @@ reviewer'a yazma; reviewer neye bakacağını senin notundan öğrenir.
 Belirsizlik varsa scout'a araştırma sorusu ya da dispatch edene
 `belirsiz —` yolla. Görevi gerçekten yapamıyorsan coordinator'a task_id'li
 `hata — <sebep>` yolla (backend görevi kapatır, orchestrator'a
-`TASK_FAILED` bildirir). Görevi sana orchestrator verdiyse `alındı —` /
-`belirsiz —` cevabını ona yazabilirsin; `DONE` ve `hata` her zaman
-coordinator'a gider.
+`TASK_FAILED` bildirir). task_id'li bir göreve `alındı` gönderme, doğrudan başla;
+soru gerekiyorsa görevi verene `belirsiz —` yaz. `DONE` ve `hata` her
+zaman coordinator'a gider.
 
 Düzeltme dispatch'i (coordinator'dan, reddedenin feedback'iyle) aynı
 task_id ile gelir: düzelt ve yine coordinator'a `DONE <task_id> — <ne
-düzeldi>` yolla. Görevi tester reddettiyse backend testi tester'a
+düzeldi>` yolla. Görevi tester reddettiyse review'dan sonra backend testi tester'a
 otomatik yeniden koşturur; tester'a ayrıca yazma.

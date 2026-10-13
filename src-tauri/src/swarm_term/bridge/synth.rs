@@ -113,7 +113,11 @@ pub(super) fn lifecycle_synthesise<R: Runtime>(
             .collect();
     };
     let id = transition.task_id.clone();
-    let rec = lifecycle.record(from_agent, &source_pane, &transition, &judged);
+    // The sender's free-text note (what changed / what to check / why it
+    // was rejected) — carried into the follow-up so it is not
+    // context-free.
+    let note = lifecycle_note(body, &id);
+    let rec = lifecycle.record(from_agent, &source_pane, &transition, &judged, note.as_deref());
     tracing::info!(
         source = %from_agent,
         source_pane = %source_pane,
@@ -151,12 +155,16 @@ pub(super) fn lifecycle_synthesise<R: Runtime>(
     else {
         return Vec::new();
     };
-    // Carry the sender's free-text note (what changed / what to check /
-    // why it was rejected) so the follow-up is not context-free.
-    let synth_body = match lifecycle_note(body, &id) {
+    // A retest carries the BUILDER's note (what the fix changed), not
+    // the reviewer's approval text.
+    let note = if rec.retest { rec.retest_note.clone() } else { note };
+    let mut synth_body = match note {
         Some(note) => format!("{base} — {note}"),
         None => base,
     };
+    if let Some(fix) = &rec.fix_note {
+        synth_body.push_str(&format!(" (düzeltme: {fix})"));
+    }
     enqueue_fanout(app, root, panes_by_agent, &target, synth_body, &id);
     match transition.kind {
         TransitionKind::Approved => {

@@ -382,6 +382,8 @@ impl TerminalSwarmRegistry {
                         &profile.body,
                         &bridgespace_root,
                     );
+                    #[cfg(test)]
+                    let prompt = tests::with_injection(agent_id, prompt);
                     std::fs::write(&persona_file, prompt)
                         .map_err(|e| format!("write {}: {e}", persona_file.display()))
                 });
@@ -945,6 +947,20 @@ fn handle_from(s: &ActiveSession) -> TerminalSwarmSessionHandle {
 mod tests {
     use super::*;
 
+    /// Live-harness fault injection: extra system-prompt text per agent
+    /// (e.g. "reject every review"), so failure paths can be driven with
+    /// REAL agents. Test builds only — the app never has it.
+    static INJECTIONS: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+
+    pub(super) fn with_injection(agent_id: &str, prompt: String) -> String {
+        let g = INJECTIONS.lock().unwrap_or_else(|p| p.into_inner());
+        g.iter()
+            .filter(|(agent, _)| agent == agent_id)
+            .fold(prompt, |p, (_, extra)| {
+                format!("{p}\n\n## TEST OTURUMU TALİMATI (geçerli, uygula)\n\n{extra}")
+            })
+    }
+
     const READY_LINE: &str = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"@scout hazır."}]}}"#;
     const KICKOFF_ECHO: &str = r#"{"type":"user","message":{"role":"user","content":"[Neuron] Oturum başladı. @scout hazır."}}"#;
 
@@ -1031,6 +1047,17 @@ mod tests {
             .and_then(|v| v.parse().ok())
             .unwrap_or(2);
 
+        // `NEURON_LIVE_INJECT` = JSON `{"<agent>": "<extra persona text>"}`.
+        if let Ok(raw) = std::env::var("NEURON_LIVE_INJECT") {
+            let map: HashMap<String, String> =
+                serde_json::from_str(&raw).expect("NEURON_LIVE_INJECT must be a JSON object");
+            let mut g = INJECTIONS.lock().unwrap();
+            for (agent, extra) in map {
+                println!("INJECT [{agent}]: {extra}");
+                g.push((agent, extra));
+            }
+        }
+
         let (app, _pool, _db) =
             crate::test_support::mock_app_with_pool_and_terminal_registry().await;
         let registry = app.state::<TerminalRegistry>().inner().clone();
@@ -1101,7 +1128,7 @@ mod tests {
         // Timeline: every file that lands in processed/ or rejected/.
         let mut seen: BTreeMap<PathBuf, ()> = BTreeMap::new();
         let mut task_done = 0usize;
-        let mut done_at: Option<Instant> = None;
+        let mut last_message = Instant::now();
         while started.elapsed() < timeout {
             for kind in ["processed", "rejected"] {
                 for target in AGENT_IDS {
@@ -1117,6 +1144,7 @@ mod tests {
                         if seen.insert(f.clone(), ()).is_some() {
                             continue;
                         }
+                        last_message = Instant::now();
                         let raw = std::fs::read_to_string(&f).unwrap_or_default();
                         let v: serde_json::Value =
                             serde_json::from_str(&raw).unwrap_or(serde_json::Value::Null);
@@ -1146,12 +1174,10 @@ mod tests {
                     }
                 }
             }
-            // Every expected terminal signal arrived: give the
-            // orchestrator a minute for its final summary.
-            if task_done >= expect && done_at.is_none() {
-                done_at = Some(Instant::now());
-            }
-            if done_at.is_some_and(|t| t.elapsed() > Duration::from_secs(60)) {
+            // Every expected terminal signal arrived and the swarm has been
+            // quiet for a minute (a retry may add signals): the
+            // orchestrator has written its final summary.
+            if task_done >= expect && last_message.elapsed() > Duration::from_secs(60) {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(500)).await;

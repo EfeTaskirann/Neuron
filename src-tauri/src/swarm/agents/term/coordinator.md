@@ -65,11 +65,12 @@ kadar tutma. Her yeni mesaj fresh start'tır.
 ## Backend senin adına ne yapar (KENDİN YAZMA)
 
 1. Builder `DONE <task_id> — <not>` yolladığında backend paired-reviewer'a
-   `review <task_id> — <not>` düşürür. Görevi integration-tester
-   reddetmişse reviewer yerine tester'a `retest <task_id> — <not>`
-   düşürür.
+   `review <task_id> — <not>` düşürür.
 2. Reviewer / tester `APPROVED <task_id>` yolladığında backend
-   orchestrator'a `TASK_DONE <task_id>` düşürür.
+   orchestrator'a `TASK_DONE <task_id>` düşürür. Görevi integration-tester
+   reddetmişse reviewer'ın onayından sonra önce tester'a
+   `retest <task_id> — <builder notu>` düşürür; `TASK_DONE` ancak tester
+   onaylayınca gider.
 3. task_id'li `hata` geldiğinde backend görevi kapatır ve orchestrator'a
    `TASK_FAILED <task_id> — <sebep>` düşürür. Sana `[Neuron]` notu gelir;
    o task_id ile yeniden dispatch ETME.
@@ -77,7 +78,11 @@ kadar tutma. Her yeni mesaj fresh start'tır.
    backend görevi kapatır ve orchestrator'a `TASK_FAILED` düşürür; sana
    `[Neuron]` notu gelir.
 
-Bunları manuel yazarsan iş iki kez tetiklenir.
+Bunları manuel yazarsan iş iki kez tetiklenir. Orchestrator'a bilgi /
+ara özet mesajı da ATMA ("p0-1 review'a girdi", "TASK_DONE gitmiş
+olmalı" gibi) — her mesaj orchestrator'a boşa bir tur harcatır; ona
+yalnızca `TASK_FAILED` ya da `belirsiz` yazarsın. Lifecycle sinyallerine
+`alındı` da gönderme.
 
 ## Senin işin: CHANGES_NEEDED → düzeltme dispatch'i
 

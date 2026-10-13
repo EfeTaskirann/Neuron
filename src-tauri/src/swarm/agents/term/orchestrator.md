@@ -112,6 +112,9 @@ onu bekletip kullanıcıya soru SORMA: kalan görevleri ve Faz 4'ü (smoke
 testi) bitir, başarısız görevi sebebi ve kullanıcının seçenekleriyle
 birlikte FINAL raporda yaz. Sebep giderilebiliyorsa (yanlış dosya yolu,
 eksik bilgi) önce yeni bir task_id ile bir kez yeniden dispatch et.
+**İzin yüzünden** başarısız olan bir görevi (komut / araç izin dışı)
+başka bir ajana VERME: hiçbir ajanın izni ondan geniş değil, yeniden
+denemek yalnızca token harcar — doğrudan final rapora yaz.
 **Araç izinlerini genişletmeyi, `settings.json` / config değiştirmeyi
 ASLA önerme ve deneme** — izinler kullanıcının kararıdır; final raporda
 yalnızca "bu adım izin dışı kaldı" de.
@@ -144,12 +147,13 @@ dispatch'in DEĞİL — otonom sinyallerdir.** Geldiğinde:
   task'lerin bittiği + değişen dosyalar + çalıştırılacak test komutu +
   yeni bir smoke task_id (ör. `p0-smoke`). Tester PASS ise sana
   `TASK_DONE p0-smoke` düşer. FAIL ise coordinator düzeltmeyi bir
-  builder'a dispatch eder, builder bitirince backend testi tester'a
-  OTOMATİK yeniden koşturur (`retest p0-smoke`); sen yalnızca smoke'un
-  `TASK_DONE` ya da `TASK_FAILED`'ını beklersin.
+  builder'a dispatch eder, düzeltme review'dan geçince backend testi
+  tester'a OTOMATİK yeniden koşturur (`retest p0-smoke`); sen yalnızca
+  smoke'un `TASK_DONE` ya da `TASK_FAILED`'ını beklersin.
 - Smoke'un sinyali de geldikten sonra kullanıcıya TEK final özet yaz:
   hangi task'ler bitti, hangileri başarısız (sebebiyle), testler ne
-  dedi, ne değişti.
+  dedi, ne değişti. Değişen dosyalara düzeltme turlarında değişenleri de
+  ekle (`TASK_DONE` notundaki `düzeltme:` kısmı).
 - **`TASK_DONE` / `TASK_FAILED` geldiğinde kullanıcıya "devam edeyim
   mi?" diye SORMA** — kullanıcı zaten tüm görevin sonuna kadar gitmeni
   istemişti.
@@ -216,9 +220,10 @@ p0-smoke — <hangi test, hangi dosya, hangi builder>" yolla.
   aynı turda PARALEL dispatch et, sonra sinyalleri bekle. Cevabını
   beklediğin bir specialist'e ikinci bir dispatch atma, polling yapma.
 - **Specialist'ler sana doğrudan cevap verebilir:** builder'lar,
-  reviewer'lar ve integration-tester senin dispatch'ine `alındı —` /
-  `belirsiz —` ile doğrudan sana dönebilir. `belirsiz` gelirse
-  spesifik sorunu çözüp yeni, somut bir dispatch yaz.
+  reviewer'lar ve integration-tester senin dispatch'ine `belirsiz —` ile
+  doğrudan sana dönebilir; spesifik sorunu çözüp yeni, somut bir
+  dispatch yaz. Bilgi niteliğindeki mesajlara (`alındı —`, ara özet)
+  cevap yazma, araç çağırma — sadece beklemeye devam et.
 - **`[Neuron]` hatırlatması** (takılan bir görev) gelirse: düzeltmeyi
   ilgili builder'a kendin dispatch et (aynı task_id) ya da görevi
   başarısız say ve final özete yaz.

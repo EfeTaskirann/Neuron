@@ -24,13 +24,15 @@
 //!                                                  │ DONE <task_id>
 //!                                                  ▼
 //!                                              Coordinator
-//!                                                  │ review <task_id>   (retest <task_id> → tester
-//!                                                  ▼                     when the TESTER rejected it)
+//!                                                  │ review <task_id>
+//!                                                  ▼
 //!                                              Reviewer
 //!                                                  │ APPROVED <task_id>
 //!                                                  ▼
 //!                                              Coordinator
-//!                                                  │ TASK_DONE <task_id>
+//!                                                  │ TASK_DONE <task_id>   (retest <task_id> → tester
+//!                                                  │                        first, when the TESTER
+//!                                                  │                        rejected the task)
 //!                                                  ▼
 //!                                              Orchestrator
 //! ```
@@ -262,9 +264,10 @@ pub fn is_dispatcher(agent: &str) -> bool {
 /// builder with `integration-tester` — domain reviewers are domain-
 /// matched (backend↔backend, frontend↔frontend), whereas the tester
 /// is a global gate that runs AFTER the paired review approves. The
-/// `DONE` fanout therefore targets the domain reviewer — except for a
-/// task the TESTER rejected, whose fix goes back to the tester as
-/// `retest <id>` (see `lifecycle::followup_for_coordinator_inbound`).
+/// `DONE` fanout therefore always targets the domain reviewer; for a
+/// task the TESTER rejected, the reviewer's approval of the fix sends
+/// it back to the tester as `retest <id>` before `TASK_DONE` (see
+/// `lifecycle::followup_for_coordinator_inbound`).
 pub fn is_reviewer(agent: &str) -> bool {
     matches!(
         agent,

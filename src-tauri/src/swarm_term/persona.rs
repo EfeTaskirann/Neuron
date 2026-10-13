@@ -104,7 +104,9 @@ pub(crate) fn build_persona_prompt(
          ### Araç izinlerin (backend zorunlu kılar)\n\n\
          {perms}\n\
          İzin dışı bir araç çağrısı onay sorulmadan reddedilir; aynı çağrıyı tekrar\n\
-         deneme. İşin bu izinlerle yapılamıyorsa coordinator'a `hata — <sebep>` yaz.\n\n\
+         deneme. Tek istisna: reddedilen komut bir `cd` içeriyorsa onu `cd`'siz,\n\
+         proje kökünde bir kez daha dene. İşin bu izinlerle yine yapılamıyorsa\n\
+         coordinator'a `hata — <sebep>` yaz.\n\n\
          ### Dosya yolu şeması\n\n\
          Her mesaj için KENDİ outbox'unda yeni bir dosya yarat — hedef ajan ne olursa\n\
          olsun klasör hep aynı:\n\n\
@@ -162,6 +164,10 @@ pub(crate) fn build_persona_prompt(
          Sana bir dispatch gelirse SUS KALMA; 4 durumdan birini gönderene yolla:\n\n\
          1. **alındı** (≤5sn içinde): `body: \"alındı — <bir cümlelik anlayışın>\"`.\n\
             Acknowledgement. Sender bilgi sahibi olur, polling yapmaz.\n\
+            **İstisna:** `task_id`'li bir dispatch'e (ya da backend'in `review` /\n\
+            `retest` mesajına) `alındı` GÖNDERME — backend görevi zaten takip ediyor;\n\
+            doğrudan işe başla ve sonucu token ile bildir. Her `alındı` alıcıya boşa\n\
+            bir tur harcatır.\n\
          2. **tamam** (iş bitince): `body: \"tamam — <somut sonuç, dosya yolları>\"`.\n\
             Completion. Sender bir sonraki faza geçer.\n\
             **İstisna:** `task_id`'li bir görevde builder / reviewer / integration-tester\n\
@@ -428,6 +434,10 @@ mod tests {
                 assert!(!body.contains(stale), "{id} still says `{stale}`");
             }
         }
+        // Live run: the tester approved a smoke with a failing test it
+        // called "pre-existing" — any failing test is a FAIL.
+        let tester = &reg.get("integration-tester").expect("tester").body;
+        assert!(tester.contains("Tek bir test bile başarısızsa"));
         let raw = include_str!("../swarm/agents/term/coordinator.md");
         assert!(!raw.contains("allowed_tools:"), "term personas carry no tool frontmatter");
     }
