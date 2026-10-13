@@ -41,8 +41,8 @@ use crate::swarm_term::bridge::{
 use crate::swarm_term::heartbeat;
 use crate::swarm_term::hierarchy::AGENT_IDS;
 use crate::swarm_term::home_isolation::{
-    prepare_isolated_homes_root, seed_pane_home, sweep_orphan_homes,
-    sync_credentials,
+    mirror_project_trust, prepare_isolated_homes_root, seed_pane_home,
+    sweep_orphan_homes, sync_credentials,
 };
 use crate::swarm_term::lifecycle::LifecycleStore;
 use crate::swarm_term::permissions;
@@ -370,6 +370,11 @@ impl TerminalSwarmRegistry {
                     )));
                 }
             };
+            // The user's trust decision for this folder, under every path
+            // spelling claude may use (see `mirror_project_trust`).
+            if mirror_project_trust(&pane_home, &project_dir) {
+                tracing::debug!(agent_id = %agent_id, "swarm-term: folder trust mirrored into pane HOME");
+            }
             // Persona + bridge protocol → system-prompt file inside the
             // pane's private HOME (deleted with it on stop).
             let persona_file = pane_home.join(PERSONA_FILENAME);
@@ -731,12 +736,17 @@ async fn remove_homes_with_retry(root: &Path) {
 /// Lower-case fragments of claude screens that are NOT the REPL prompt —
 /// login method picker, first-run theme / trust / onboarding screens,
 /// the expired-credentials banner. Pasting the kickoff + Enter there
-/// would pick a menu option (e.g. start an OAuth browser flow) instead
-/// of reaching the model.
+/// would pick a menu option (e.g. start an OAuth browser flow, or — on
+/// the trust screen of claude 2.1.29x — the default "No, exit", which
+/// killed every pane) instead of reaching the model. Matched with all
+/// whitespace removed: the pane renderer moves the cursor instead of
+/// printing spaces, so the captured text reads `Quicksafetycheck:`.
 const BLOCKING_SCREEN_MARKERS: &[&str] = &[
     "select login method",
     "choose the text style",
     "trust the files",
+    "is this a project you created or one you trust",
+    "yes, i trust this folder",
     "press enter to continue",
     "please run /login",
 ];
@@ -765,8 +775,11 @@ fn self_hosting_warning(project: &Path, source_root: &Path, dev_build: bool) -> 
 }
 
 fn screen_is_blocking(screen_tail: &str) -> bool {
-    let lower = screen_tail.to_lowercase();
-    BLOCKING_SCREEN_MARKERS.iter().any(|m| lower.contains(m))
+    let squash = |s: &str| -> String {
+        s.chars().filter(|c| !c.is_whitespace()).collect::<String>().to_lowercase()
+    };
+    let screen = squash(screen_tail);
+    BLOCKING_SCREEN_MARKERS.iter().any(|m| screen.contains(&squash(m)))
 }
 
 /// True when the pane's recent output shows a login / first-run screen.
@@ -984,6 +997,10 @@ mod tests {
             "Choose the text style that looks best with your terminal",
             "Do you trust the files in this folder?",
             "OAuth token has expired. Please run /login",
+            // claude 2.1.29x trust screen, as the pane renderer captured it.
+            "Accessingworkspace:C:\\x\\inv Quicksafetycheck:Isthisaprojectyoucreatedoroneyoutrust?",
+            "❯ No, exit\n  Yes, I trust this folder\nEnter to confirm",
+            "Selectloginmethod:",
         ] {
             assert!(screen_is_blocking(screen), "{screen}");
         }
@@ -1117,6 +1134,16 @@ mod tests {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        // Diagnose panes that never became ready: their screen tail.
+        let ready_now = ready.lock().map(|g| g.clone()).unwrap_or_default();
+        for (agent, pane) in &panes {
+            if ready_now.contains(pane) {
+                continue;
+            }
+            let lines = registry.pane_lines(pane, None, &_pool).await.unwrap_or_default();
+            let tail: Vec<String> = lines.iter().rev().take(25).rev().map(|l| l.text.clone()).collect();
+            println!("NOT READY [{agent}] screen tail:\n{}", tail.join("\n"));
         }
 
         // Task → orchestrator, exactly like the chat bar.

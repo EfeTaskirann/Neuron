@@ -282,6 +282,78 @@ fn sync_credential_files(paths: &[PathBuf]) -> usize {
     updated
 }
 
+/// Carry the user's existing folder-trust decision for `project` into a
+/// pane's `.claude.json` copy, under every spelling claude may look it
+/// up with. claude 2.1.29x keys projects by a lower-case drive letter
+/// (`c:/…`) while older builds wrote `C:/…`, so a folder the user had
+/// trusted looked untrusted to the new CLI and every pane opened on the
+/// "Is this a project you trust?" screen — where the kickoff's Enter
+/// picked the default "No, exit" and killed the pane.
+///
+/// Only an EXISTING decision is mirrored: nothing changes unless the
+/// user's config already trusts `project` or one of its ancestors (any
+/// spelling). An untrusted folder still shows the screen, which the
+/// session leaves for the user to answer. The user's real config is
+/// never touched. Returns whether the pane's copy was updated.
+pub(crate) fn mirror_project_trust(pane_home: &Path, project: &Path) -> bool {
+    let path = pane_home.join(".claude.json");
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return false;
+    };
+    let Ok(mut cfg) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return false;
+    };
+    if !mirror_trust_in(&mut cfg, &project.display().to_string()) {
+        return false;
+    }
+    match serde_json::to_string_pretty(&cfg) {
+        Ok(json) => write_atomic(&path, &json).is_ok(),
+        Err(_) => false,
+    }
+}
+
+/// Spelling-independent project key: `/` separators, lower case, no
+/// trailing separator.
+fn project_key(p: &str) -> String {
+    p.replace('\\', "/").trim_end_matches('/').to_lowercase()
+}
+
+fn mirror_trust_in(cfg: &mut serde_json::Value, project: &str) -> bool {
+    use serde_json::Value;
+    let wanted = project_key(project);
+    let Some(projects) = cfg.get_mut("projects").and_then(Value::as_object_mut) else {
+        return false;
+    };
+    let trusted = projects.iter().any(|(key, entry)| {
+        let key = project_key(key);
+        entry.get("hasTrustDialogAccepted") == Some(&Value::Bool(true))
+            && (wanted == key || wanted.starts_with(&format!("{key}/")))
+    });
+    if !trusted {
+        return false;
+    }
+    let forward = project.replace('\\', "/").trim_end_matches('/').to_string();
+    let mut spellings = vec![forward.clone()];
+    if forward.as_bytes().get(1) == Some(&b':') {
+        let (drive, rest) = forward.split_at(1);
+        for d in [drive.to_ascii_uppercase(), drive.to_ascii_lowercase()] {
+            let s = format!("{d}{rest}");
+            if !spellings.contains(&s) {
+                spellings.push(s);
+            }
+        }
+    }
+    for key in spellings {
+        let entry = projects
+            .entry(key)
+            .or_insert_with(|| Value::Object(Default::default()));
+        if let Some(obj) = entry.as_object_mut() {
+            obj.insert("hasTrustDialogAccepted".into(), Value::Bool(true));
+        }
+    }
+    true
+}
+
 fn write_atomic(path: &Path, content: &str) -> std::io::Result<()> {
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".neuron-tmp");
@@ -317,6 +389,58 @@ fn real_user_home() -> Result<PathBuf, AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trust_is_mirrored_onto_every_drive_spelling_of_a_trusted_tree() {
+        // Live: the user's config trusted `C:/…/Neuron` but also held a
+        // `c:/…/Neuron: false` entry, which claude 2.1.29x reads.
+        let mut cfg = serde_json::json!({ "projects": {
+            "C:/Users/u/Neuron": { "hasTrustDialogAccepted": true, "allowedTools": [] },
+            "c:/Users/u/Neuron": { "hasTrustDialogAccepted": false, "keep": 1 }
+        }});
+        assert!(mirror_trust_in(&mut cfg, "C:\\Users\\u\\Neuron\\.livetest\\inv"));
+        let p = &cfg["projects"];
+        assert_eq!(p["C:/Users/u/Neuron/.livetest/inv"]["hasTrustDialogAccepted"], true);
+        assert_eq!(p["c:/Users/u/Neuron/.livetest/inv"]["hasTrustDialogAccepted"], true);
+        // The project itself: its false spelling flips, other fields stay.
+        assert!(mirror_trust_in(&mut cfg, "C:/Users/u/Neuron"));
+        assert_eq!(cfg["projects"]["c:/Users/u/Neuron"]["hasTrustDialogAccepted"], true);
+        assert_eq!(cfg["projects"]["c:/Users/u/Neuron"]["keep"], 1);
+    }
+
+    #[test]
+    fn no_trust_is_granted_that_the_user_never_gave() {
+        let mut cfg = serde_json::json!({ "projects": {
+            "C:/Users/u/Neuro": { "hasTrustDialogAccepted": true },
+            "C:/Users/u/Other": { "hasTrustDialogAccepted": false }
+        }});
+        let before = cfg.clone();
+        // `Neuro` is not an ancestor of `Neuron` (no prefix trap).
+        assert!(!mirror_trust_in(&mut cfg, "C:/Users/u/Neuron"));
+        assert!(!mirror_trust_in(&mut cfg, "C:/Users/u/Other/sub"));
+        assert!(!mirror_trust_in(&mut serde_json::json!({}), "C:/x"));
+        assert_eq!(cfg, before);
+        // POSIX paths have a single spelling.
+        let mut cfg = serde_json::json!({ "projects": { "/home/u/p": { "hasTrustDialogAccepted": true } } });
+        assert!(mirror_trust_in(&mut cfg, "/home/u/p/sub/"));
+        assert_eq!(cfg["projects"].as_object().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn mirror_project_trust_rewrites_only_the_pane_copy() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let file = home.path().join(".claude.json");
+        std::fs::write(&file, r#"{"projects":{"D:/w":{"hasTrustDialogAccepted":true}},"x":1}"#)
+            .expect("write");
+        assert!(mirror_project_trust(home.path(), Path::new("D:/w/proj")));
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        assert_eq!(v["projects"]["d:/w/proj"]["hasTrustDialogAccepted"], true);
+        assert_eq!(v["x"], 1);
+        // No config → nothing to do.
+        let empty = tempfile::tempdir().expect("tempdir");
+        assert!(!mirror_project_trust(empty.path(), Path::new("D:/w/proj")));
+    }
 
     fn creds(expires: i64, refresh: &str, extra: &str) -> String {
         format!(
