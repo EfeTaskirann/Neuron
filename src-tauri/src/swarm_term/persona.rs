@@ -21,6 +21,7 @@
 use std::path::Path;
 
 use crate::swarm_term::hierarchy::allowed_for;
+use crate::swarm_term::lifecycle::MAX_REWORK_ROUNDS;
 
 /// First line of the kickoff turn; the footer tells the agent to answer
 /// a message starting with it with exactly `@<id> hazır.`.
@@ -103,7 +104,9 @@ pub(crate) fn build_persona_prompt(
          ### Araç izinlerin (backend zorunlu kılar)\n\n\
          {perms}\n\
          İzin dışı bir araç çağrısı onay sorulmadan reddedilir; aynı çağrıyı tekrar\n\
-         deneme. İşin bu izinlerle yapılamıyorsa coordinator'a `hata — <sebep>` yaz.\n\n\
+         deneme. Tek istisna: reddedilen komut proje kökünün DIŞINA bir `cd`\n\
+         içeriyorsa onu o `cd` olmadan, proje içinde bir kez daha dene. İşin bu\n\
+         izinlerle yine yapılamıyorsa coordinator'a `hata — <sebep>` yaz.\n\n\
          ### Dosya yolu şeması\n\n\
          Her mesaj için KENDİ outbox'unda yeni bir dosya yarat — hedef ajan ne olursa\n\
          olsun klasör hep aynı:\n\n\
@@ -111,7 +114,7 @@ pub(crate) fn build_persona_prompt(
          Gönderenin kim olduğunu backend bu klasörden anlar. Başka bir ajanın\n\
          outbox'una yazma; eski `inbox/<hedef>/` yolu artık kullanılmıyor, oraya\n\
          yazılan mesaj iletilmez. Hedefi JSON'daki `to` alanı belirler.\n\
-         `<MSG_ID>` — her mesaj için benzersiz: `{agent_id}-<sayaç>-<4 rastgele harf>`,\n
+         `<MSG_ID>` — her mesaj için benzersiz: `{agent_id}-<sayaç>-<4 rastgele harf>`,\n\
          örn. ilk mesajın `{agent_id}-001-<4 harf>.json`, sonraki `{agent_id}-002-…`.\n\
          Sayaç her mesajda bir artar, 4 harfi her seferinde YENİ seç; örnekteki\n\
          harfleri kopyalama. Aynı dosya adını iki kez yazma — üzerine yazılır ve\n\
@@ -161,9 +164,14 @@ pub(crate) fn build_persona_prompt(
          Sana bir dispatch gelirse SUS KALMA; 4 durumdan birini gönderene yolla:\n\n\
          1. **alındı** (≤5sn içinde): `body: \"alındı — <bir cümlelik anlayışın>\"`.\n\
             Acknowledgement. Sender bilgi sahibi olur, polling yapmaz.\n\
+            **İstisna:** `task_id`'li bir dispatch'e (ya da backend'in `review` /\n\
+            `retest` mesajına) `alındı` GÖNDERME — backend görevi zaten takip ediyor;\n\
+            doğrudan işe başla ve sonucu token ile bildir. Her `alındı` alıcıya boşa\n\
+            bir tur harcatır.\n\
          2. **tamam** (iş bitince): `body: \"tamam — <somut sonuç, dosya yolları>\"`.\n\
             Completion. Sender bir sonraki faza geçer.\n\
-            **İstisna:** `task_id`'li bir görevde builder/reviewer isen işin sonunu\n\
+            **İstisna:** `task_id`'li bir görevde builder / reviewer / integration-tester\n\
+            isen işin sonunu\n\
             `tamam —` ile DEĞİL, aşağıdaki lifecycle token'ıyla (`DONE` / `APPROVED` /\n\
             `CHANGES_NEEDED`) bildir — otomatik review / TASK_DONE zinciri yalnızca\n\
             token'ı tanır; `tamam —` yazarsan zincir durur.\n\
@@ -172,29 +180,38 @@ pub(crate) fn build_persona_prompt(
             Tahmin yapma; tahminle çalışırsan reviewer reject eder.\n\
          4. **hata** (yapamadıysan): `body: \"hata — <somut sebep>\"` ve dur.\n\
             `task_id`'li bir görevse envelope'un `task_id` alanını doldurup\n\
-            coordinator'a yolla — backend görevi başarısız sayar ve o görev için\n\
-            hatırlatma göndermeyi bırakır.\n\n\
+            coordinator'a yolla — backend görevi kapatır ve orchestrator'a\n\
+            `TASK_FAILED <task_id>` bildirir. Netleştirilebilecek bir sorunsa `hata`\n\
+            değil `belirsiz` yaz; `hata` \"bu görevden vazgeçtim\" demektir.\n\n\
          **Gönderen tarafsan, ALDIĞIN state'e göre:**\n\
          - `alındı —` → SUS. Specialist çalışıyor; ikinci dispatch atma, polling yapma.\n\
          - `tamam —` → completion'ı kabul et, bir sonraki faza geç.\n\
          - `belirsiz —` → aynı vague task'i tekrar gönderme; spesifik sorunu çöz ve\n\
            yeni, somut bir dispatch yaz.\n\
-         - `hata —` → retry mı, alternative specialist mi, escalate mi karar ver.\n\
-           Aynı dispatch'i tekrar yollama (3 kez denersen reviewer reject sayar).\n\n\
-         ### Builder/Reviewer lifecycle token'ları (yalnızca rolüne uygunsa kullan)\n\n\
-         Bunlar `body` içindeki özel prefix'ler — `task_id` alanını da doldur. Backend\n\
-         bunları görür, lifecycle state machine'i ilerletir, gerekiyorsa otomatik\n\
-         fanout yapar (örn. builder DONE → reviewer'a otomatik `review <id>` dispatch).\n\n\
+         - `hata —` → aynı dispatch'i aynen tekrar yollama. `task_id`'li görevlerde\n\
+           backend görevi zaten kapattı (`TASK_FAILED`); yeniden denemek gerekiyorsa\n\
+           YENİ bir task_id ile, sorunu çözen yeni bir dispatch yaz.\n\n\
+         ### Lifecycle token'ları (yalnızca rolüne uygunsa kullan)\n\n\
+         Bunlar `body` içindeki özel prefix'ler — `task_id` alanını da doldur ve\n\
+         HER ZAMAN coordinator'a gönder (başka bir ajana yazarsan backend mesajı\n\
+         coordinator'a yönlendirir). Backend bunları görür, lifecycle state machine'i\n\
+         ilerletir, gerekiyorsa otomatik fanout yapar (örn. builder DONE → reviewer'a\n\
+         otomatik `review <id>` dispatch).\n\n\
          Token body'nin EN BAŞINDA, BÜYÜK harfle, markdown süsü (`**`, `:`) olmadan\n\
          yazılır; ardından bir boşluk ve task_id gelir.\n\n\
-         - **Builder ise** iş bitince: `body: \"DONE <task_id> — <ne değişti, hangi dosyalar>\"`\n\
-           (coordinator'e gönder). `—` sonrasındaki not reviewer'a otomatik iletilir;\n\
-           reviewer neye bakacağını oradan öğrenir, o yüzden dosya yollarını yaz.\n\
-         - **Reviewer ise** onay verince: `body: \"APPROVED <task_id>\"` (coordinator'e).\n\
-         - **Reviewer ise** değişiklik istiyorsa: `body: \"CHANGES_NEEDED <task_id>\"`\n\
-           ve ne istediğini açıkla.\n\
+         - **Builder ise** iş bitince: `body: \"DONE <task_id> — <ne değişti, hangi dosyalar>\"`.\n\
+           `—` sonrasındaki not reviewer'a (ya da yeniden test için tester'a) otomatik\n\
+           iletilir; neye bakılacağı oradan öğrenilir, o yüzden dosya yollarını yaz.\n\
          - **Builder ise** çalışmaya başladığını duyurmak istiyorsan (opsiyonel):\n\
-           `body: \"BUILDING <task_id>\"`.\n\n\
+           `body: \"BUILDING <task_id>\"`.\n\
+         - **Reviewer / integration-tester ise** onay (test PASS) verince:\n\
+           `body: \"APPROVED <task_id>\"`.\n\
+         - **Reviewer / integration-tester ise** değişiklik gerekiyorsa (test FAIL):\n\
+           `body: \"CHANGES_NEEDED <task_id> — <ne değişmeli: dosya, sebep, hangi builder>\"`.\n\
+           Düzeltmeyi coordinator dispatch eder; builder'a ayrıca yazma.\n\n\
+         Bir görev en fazla {max_rework} düzeltme turu alır: {max_rework_plus}. `CHANGES_NEEDED`'de\n\
+         backend görevi kapatır ve orchestrator'a `TASK_FAILED <task_id>` bildirir.\n\
+         Kapanmış (`TASK_DONE` / `TASK_FAILED`) bir task_id tekrar kullanılamaz.\n\n\
          ### İlk yanıt\n\n\
          Oturumun ilk mesajı `{kickoff}` ile başlar. O mesaja **yalnızca** şunu yaz\n\
          ve dur: `@{agent_id} hazır.` Başka tek karakter yazma, tool çağırma. Backend\n\
@@ -206,6 +223,8 @@ pub(crate) fn build_persona_prompt(
         example_dst = example_dst,
         kickoff = KICKOFF_PREFIX,
         perms = crate::swarm_term::permissions::describe_for_persona(agent_id),
+        max_rework = MAX_REWORK_ROUNDS,
+        max_rework_plus = MAX_REWORK_ROUNDS + 1,
     );
 
     format!("{body}{footer}")
@@ -368,6 +387,59 @@ mod tests {
         assert!(p.contains("DONE <task_id>"));
         assert!(p.contains("APPROVED <task_id>"));
         assert!(p.contains("CHANGES_NEEDED <task_id>"));
+    }
+
+    #[test]
+    fn footer_has_no_accidentally_indented_lines() {
+        // A7: one missing `\` line continuation kept the next source
+        // line's 9-space indent; 4+ leading spaces turn a markdown line
+        // into a code block (the message-id example rendered as code).
+        for &agent in crate::swarm_term::hierarchy::AGENT_IDS {
+            let p = build_persona_prompt(agent, "x", &dummy_bridge_root());
+            for line in p.lines() {
+                let indent = line.len() - line.trim_start_matches(' ').len();
+                assert!(indent < 4, "{agent}: over-indented footer line: {line:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn footer_states_one_retry_limit_and_the_failure_signal() {
+        // B2: the retry limit has one source (MAX_REWORK_ROUNDS) and the
+        // old "3 kez denersen reviewer reject sayar" wording is gone.
+        let p = build_persona_prompt("coordinator", "x", &dummy_bridge_root());
+        assert!(p.contains(&format!("en fazla {MAX_REWORK_ROUNDS} düzeltme turu")));
+        assert!(p.contains("TASK_FAILED <task_id>"));
+        assert!(!p.contains("3 kez denersen"));
+        // Tester verdicts use the same tokens and go to the coordinator.
+        let t = build_persona_prompt("integration-tester", "x", &dummy_bridge_root());
+        assert!(t.contains("Reviewer / integration-tester ise"));
+        assert!(t.contains("HER ZAMAN coordinator'a gönder"));
+    }
+
+    #[test]
+    fn term_personas_agree_with_the_backend_lifecycle() {
+        // B2/B9: persona prose quotes the backend's retry limit, no stale
+        // limits remain, and no persona carries tool frontmatter that
+        // swarm-term would ignore (permissions come from `permissions`).
+        let reg = crate::swarm::profile::ProfileRegistry::load_term(None).expect("load_term");
+        let limit = format!("en fazla {MAX_REWORK_ROUNDS} düzeltme turu");
+        for id in ["coordinator", "backend-reviewer", "frontend-reviewer"] {
+            let body = &reg.get(id).expect(id).body;
+            assert!(body.contains(&limit), "{id} must quote `{limit}`");
+        }
+        for &id in crate::swarm_term::hierarchy::AGENT_IDS {
+            let body = &reg.get(id).expect(id).body;
+            for stale in ["3 kez", "3 başarısız", "tamam — düzelttim"] {
+                assert!(!body.contains(stale), "{id} still says `{stale}`");
+            }
+        }
+        // Live run: the tester approved a smoke with a failing test it
+        // called "pre-existing" — any failing test is a FAIL.
+        let tester = &reg.get("integration-tester").expect("tester").body;
+        assert!(tester.contains("Tek bir test bile başarısızsa"));
+        let raw = include_str!("../swarm/agents/term/coordinator.md");
+        assert!(!raw.contains("allowed_tools:"), "term personas carry no tool frontmatter");
     }
 
     #[test]

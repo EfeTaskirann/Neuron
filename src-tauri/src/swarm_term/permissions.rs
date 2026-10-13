@@ -127,6 +127,15 @@ pub(crate) fn allowed_tools(agent_id: &str, session_id: &str) -> Vec<String> {
     rules
 }
 
+/// Shell commands start in the project root already; a `cd` OUT of the
+/// project (live run: the tester `cd`-ed to the parent repository) gets
+/// the whole command denied. A `cd` into a project subdirectory is
+/// allowed and sometimes needed (a package without a `-C` variant).
+const NO_CD: &str = "Shell zaten proje kökünde açılır: komutu doğrudan çalıştır (ör. \
+                     `cargo test`). Proje kökünün DIŞINA `cd` YAPMA — o komut reddedilir. \
+                     Proje içindeki bir alt klasör gerekiyorsa `-C <klasör>` biçimini ya da \
+                     `cd <alt-klasör> && <komut>` kullan.";
+
 /// Human-readable summary for the persona footer, so an agent knows its
 /// limits up front instead of discovering them through denied calls.
 pub(crate) fn describe_for_persona(agent_id: &str) -> String {
@@ -139,14 +148,14 @@ pub(crate) fn describe_for_persona(agent_id: &str) -> String {
         ),
         Role::Verify => format!(
             "{base} Proje dosyalarını değiştiremezsin. `Bash` ile yalnızca doğrulama \
-             komutlarını çalıştırabilirsin: {}.",
+             komutlarını çalıştırabilirsin: {}. {NO_CD}",
             VERIFY_COMMANDS.join(", ")
         ),
         Role::Build => format!(
             "{base} Proje klasörü içindeki dosyaları değiştirebilirsin (dışarısı \
              reddedilir). `Bash` ile yalnızca doğrulama komutlarını çalıştırabilirsin: \
-             {}. Paket kurmak / başka bir komut gerekiyorsa coordinator'a `hata —` ile \
-             bildir.",
+             {}. {NO_CD} Paket kurmak / başka bir komut gerekiyorsa coordinator'a \
+             `hata —` ile bildir.",
             VERIFY_COMMANDS.join(", ")
         ),
     }
@@ -219,5 +228,10 @@ mod tests {
         assert!(describe_for_persona("scout").contains("shell (`Bash`) komutu"));
         assert!(describe_for_persona("backend-reviewer").contains("cargo test"));
         assert!(describe_for_persona("backend-builder").contains("değiştirebilirsin"));
+        let tester = describe_for_persona("integration-tester");
+        assert!(tester.contains("DIŞINA `cd` YAPMA"));
+        // In-project subdirectories stay usable (review finding).
+        assert!(tester.contains("`cd <alt-klasör> && <komut>`"));
+        assert!(!describe_for_persona("scout").contains("DIŞINA `cd`"));
     }
 }

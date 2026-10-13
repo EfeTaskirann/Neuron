@@ -20,7 +20,7 @@ use tokio::sync::Notify;
 
 use crate::sidecar::terminal::TerminalRegistry;
 use crate::swarm_term::hierarchy::{allowed_for, is_allowed, AGENT_IDS};
-use crate::swarm_term::lifecycle::LifecycleStore;
+use crate::swarm_term::lifecycle::{misaddressed_signal, LifecycleStore};
 
 use super::delivery::{
     format_routed_message, is_delivery_blocked, submit_pasted,
@@ -29,8 +29,11 @@ use super::delivery::{
 use super::envelope::{sniff_from, Envelope};
 use super::fsops::{bump_attempts, move_to_processed, move_to_rejected};
 use super::notify::{notify_agent, rejection_notice};
-use super::stall::{check_stalls, STALL_CHECK_EVERY};
-use super::synth::lifecycle_synthesise;
+use super::stall::{check_stalls, stall_check_every, STALL_CADENCE_REFRESH};
+use super::synth::{
+    delivery_task_id, dispatch_conflict, lifecycle_synthesise, note_coordinator_report,
+    note_dispatch,
+};
 
 /// Polling cadence for [`watcher_loop`]. Each tick scans every inbox
 /// directory; the cost is 9 stats per tick which is negligible.
@@ -78,6 +81,8 @@ pub(super) async fn watcher_loop<R: Runtime>(
         "swarm-term bridge: watcher start"
     );
     let mut last_stall_check = Instant::now();
+    let mut stall_every = stall_check_every();
+    let mut stall_every_read = Instant::now();
     loop {
         process_pending(
             &app,
@@ -88,8 +93,12 @@ pub(super) async fn watcher_loop<R: Runtime>(
             &lifecycle,
         )
         .await;
-        if last_stall_check.elapsed() >= STALL_CHECK_EVERY {
-            check_stalls(&app, &registry, &panes_by_agent, &lifecycle).await;
+        if stall_every_read.elapsed() >= STALL_CADENCE_REFRESH {
+            stall_every = stall_check_every();
+            stall_every_read = Instant::now();
+        }
+        if last_stall_check.elapsed() >= stall_every {
+            check_stalls(&app, &registry, &root, &panes_by_agent, &lifecycle).await;
             last_stall_check = Instant::now();
         }
         tokio::select! {
@@ -420,7 +429,7 @@ async fn process_one<R: Runtime>(
     // The sender is the outbox the file was written to, never the
     // content's own claim. A `from` field that names someone else is a
     // (possibly accidental) spoof and is refused, not silently fixed.
-    let to_agent = envelope.to.clone();
+    let mut to_agent = envelope.to.clone();
     let from_agent = sender.to_string();
     let body = envelope.body.clone();
     // The structured `task_id` is handed to the lifecycle layer as a
@@ -465,6 +474,17 @@ async fn process_one<R: Runtime>(
         .await;
         return;
     }
+
+    // ---- Misaddressed lifecycle signal ------------------------------ //
+    // A `DONE` / verdict / task `hata` only drives the chain when the
+    // coordinator receives it; one addressed elsewhere is re-addressed
+    // there (the sender is told after delivery) instead of stalling.
+    let redirected_from =
+        misaddressed_signal(&from_agent, &to_agent, &body, envelope_task_id.as_deref())
+            .then(|| std::mem::replace(&mut to_agent, "coordinator".to_string()));
+    // A tracked dispatch that named its task only in the body still
+    // carries that id (signature, Assigned tracking, task-id gate).
+    let envelope_task_id = delivery_task_id(&from_agent, &to_agent, &body, envelope_task_id);
 
     // ---- Hierarchy gate --------------------------------------------- //
     if !is_allowed(&from_agent, &to_agent) {
@@ -531,6 +551,42 @@ async fn process_one<R: Runtime>(
             return;
         }
     };
+
+    // ---- Task-id gate ----------------------------------------------- //
+    // Task ids are single-use and one open task belongs to one builder;
+    // a dispatch that breaks that would corrupt the lifecycle.
+    if let Some(reason) = dispatch_conflict(
+        &from_agent,
+        &to_agent,
+        &target_pane,
+        envelope_task_id.as_deref(),
+        panes_by_agent,
+        lifecycle,
+    ) {
+        let _ = app.emit(
+            crate::events::SWARM_TERM_ROUTE,
+            json!({
+                "source": from_agent,
+                "target": to_agent,
+                "body": body,
+                "outcome": "rejected",
+                "reason": reason,
+            }),
+        );
+        reject_and_notify(
+            app,
+            registry,
+            root,
+            path,
+            panes_by_agent,
+            Some(from_agent.as_str()),
+            &to_agent,
+            &reason,
+            &body,
+        )
+        .await;
+        return;
+    }
 
     // ---- Persona-injection readiness -------------------------------- //
     let is_ready = ready_panes
@@ -686,33 +742,53 @@ async fn process_one<R: Runtime>(
                     "swarm-term bridge: processed-move failed"
                 );
             }
+            let task_id = envelope_task_id.as_deref();
+            note_dispatch(app, &from_agent, &to_agent, &target_pane, task_id, lifecycle);
+            note_coordinator_report(
+                app,
+                &from_agent,
+                &to_agent,
+                &body,
+                task_id,
+                panes_by_agent,
+                lifecycle,
+            );
+            if let Some(original) = &redirected_from {
+                let text = format!(
+                    "`{}` mesajın @{original} yerine @coordinator'a iletildi: lifecycle \
+                     sinyalleri (DONE / APPROVED / CHANGES_NEEDED / BUILDING, task_id'li \
+                     `hata`) yalnızca coordinator'a gönderilir. Bundan sonra doğrudan \
+                     coordinator'a yolla; @{original}'e ayrıca bir şey söyleyeceksen \
+                     token'sız ayrı bir mesaj yaz.",
+                    truncate(&body, 60)
+                );
+                notify_agent(registry, panes_by_agent, &from_agent, &text).await;
+                emit_notice(app, &from_agent, &text, "lifecycle signal re-addressed to coordinator");
+            }
             // Lifecycle synthesis runs only on coordinator-bound
             // deliveries — the bridge fans the autonomy follow-up out
             // (builder DONE -> reviewer "review", reviewer APPROVED ->
-            // orchestrator "TASK_DONE").
+            // orchestrator "TASK_DONE" or — for a tester-rejected task —
+            // tester "retest", hata / used-up rework limit ->
+            // orchestrator "TASK_FAILED").
             if to_agent == "coordinator" {
-                let notice = lifecycle_synthesise(
+                let notices = lifecycle_synthesise(
                     app,
                     root,
                     &from_agent,
                     &body,
-                    envelope_task_id.as_deref(),
+                    task_id,
                     panes_by_agent,
                     lifecycle,
                 );
-                if let Some(text) = notice {
-                    tracing::warn!(
-                        source = %from_agent,
-                        "swarm-term bridge: lifecycle-shaped body not recognised"
+                for n in notices {
+                    tracing::info!(
+                        to = %n.to,
+                        reason = n.reason,
+                        "swarm-term bridge: lifecycle notice"
                     );
-                    notify_agent(registry, panes_by_agent, &from_agent, &text)
-                        .await;
-                    emit_notice(
-                        app,
-                        &from_agent,
-                        &text,
-                        "lifecycle signal not recognised; no auto-fanout",
-                    );
+                    notify_agent(registry, panes_by_agent, &n.to, &n.text).await;
+                    emit_notice(app, &n.to, &n.text, n.reason);
                 }
             }
         }
