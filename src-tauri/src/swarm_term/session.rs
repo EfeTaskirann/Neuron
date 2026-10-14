@@ -41,7 +41,7 @@ use crate::swarm_term::bridge::{
 use crate::swarm_term::heartbeat;
 use crate::swarm_term::hierarchy::AGENT_IDS;
 use crate::swarm_term::home_isolation::{
-    mirror_project_trust, prepare_isolated_homes_root, seed_pane_home,
+    ensure_project_trust, prepare_isolated_homes_root, seed_pane_home,
     sweep_orphan_homes, sync_credentials,
 };
 use crate::swarm_term::lifecycle::LifecycleStore;
@@ -56,10 +56,32 @@ const READY_DELAY_MS: u64 = 1500;
 /// protocol, passed to claude with `--append-system-prompt-file`.
 const PERSONA_FILENAME: &str = "neuron-persona.md";
 
-/// How long to wait for a pane's `@<id> hazır.` answer before giving up
-/// on it (logged; the pane stays not-ready so the bridge returns
-/// messages addressed to it to their senders).
+/// How long to wait for a pane's `@<id> hazır.` answer after its
+/// kickoff was SENT before giving up on it (logged; the pane stays
+/// not-ready so the bridge returns messages addressed to it to their
+/// senders).
 const READY_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// How long a pane on a login / trust / first-run screen is watched for
+/// the user to resolve it; its kickoff goes out as soon as the screen
+/// clears. (It used to be given up with the rest after 90 s, so a screen
+/// answered later left the pane not-ready for the whole session.)
+const BLOCKED_SCREEN_WAIT: Duration = Duration::from_secs(30 * 60);
+
+/// How often a pane whose kickoff is not sent yet is re-checked.
+const BLOCKED_SCREEN_POLL: Duration = Duration::from_secs(1);
+
+/// A pane's kickoff goes out once its screen is non-empty, not a
+/// blocking screen, and unchanged for this many consecutive checks.
+/// claude 2.1.29x takes up to ~40 s to boot and may then open the
+/// folder-trust screen; a kickoff pasted into the still-blank pane was
+/// buffered, and its Enter answered the trust screen's default
+/// "No, exit" — the pane's claude quit before anyone saw the screen.
+const SETTLED_CHECKS: u32 = 2;
+
+/// Fallback: a pane whose screen never settles (an animation) gets its
+/// kickoff anyway after this long — still never onto a blocking screen.
+const SETTLE_FALLBACK: Duration = Duration::from_secs(60);
 
 /// If a pane has not answered by then, the kickoff is pasted once more
 /// (it may have landed before the REPL finished booting).
@@ -370,11 +392,10 @@ impl TerminalSwarmRegistry {
                     )));
                 }
             };
-            // The user's trust decision for this folder, under every path
-            // spelling claude may use (see `mirror_project_trust`).
-            if mirror_project_trust(&pane_home, &project_dir) {
-                tracing::debug!(agent_id = %agent_id, "swarm-term: folder trust mirrored into pane HOME");
-            }
+            // Settle the folder-trust screen for this pane (see
+            // `ensure_project_trust`).
+            let trust = ensure_project_trust(&pane_home, &project_dir);
+            tracing::debug!(agent_id = %agent_id, trust = ?trust, "swarm-term: pane folder trust");
             // Persona + bridge protocol → system-prompt file inside the
             // pane's private HOME (deleted with it on stop).
             let persona_file = pane_home.join(PERSONA_FILENAME);
@@ -545,10 +566,10 @@ impl TerminalSwarmRegistry {
             if !alive_for_inject.load(Ordering::SeqCst) {
                 return;
             }
-            for (agent_id, pane_id) in &panes_by_agent {
-                send_kickoff(&registry_for_inject, &pool_for_inject, agent_id, pane_id)
-                    .await;
-            }
+            // No kickoff is pasted blind: the wait loop sends each one once
+            // that pane's screen has settled (see `SETTLED_CHECKS`).
+            let kicked: HashMap<String, Option<Instant>> =
+                panes_by_agent.keys().map(|a| (a.clone(), None)).collect();
             wait_for_ready_answers(
                 &registry_for_inject,
                 &pool_for_inject,
@@ -556,6 +577,7 @@ impl TerminalSwarmRegistry {
                 &pane_homes,
                 &ready_panes_for_inject,
                 &alive_for_inject,
+                kicked,
             )
             .await;
             if !alive_for_inject.load(Ordering::SeqCst) {
@@ -782,40 +804,85 @@ fn screen_is_blocking(screen_tail: &str) -> bool {
     BLOCKING_SCREEN_MARKERS.iter().any(|m| screen.contains(&squash(m)))
 }
 
+/// The pane's recent output (last [`SCREEN_TAIL_LINES`] lines, oldest
+/// first), or `None` when it cannot be read.
+async fn pane_screen_tail(
+    registry: &TerminalRegistry,
+    pool: &DbPool,
+    pane_id: &str,
+) -> Option<String> {
+    // Live panes: ring lines + the unflushed screen (a TUI paints with
+    // cursor moves and few newlines). Closed panes: their stored lines.
+    if let Some(text) = registry.pane_screen_text(pane_id, SCREEN_TAIL_LINES).await {
+        return Some(text);
+    }
+    let lines = registry.pane_lines(pane_id, None, pool).await.ok()?;
+    let mut tail: Vec<&str> = lines
+        .iter()
+        .rev()
+        .take(SCREEN_TAIL_LINES)
+        .map(|l| l.text.as_str())
+        .collect();
+    tail.reverse();
+    Some(tail.join("\n"))
+}
+
 /// True when the pane's recent output shows a login / first-run screen.
 async fn pane_on_blocking_screen(
     registry: &TerminalRegistry,
     pool: &DbPool,
     pane_id: &str,
 ) -> bool {
-    let Ok(lines) = registry.pane_lines(pane_id, None, pool).await else {
-        return false;
-    };
-    let tail: Vec<&str> = lines
-        .iter()
-        .rev()
-        .take(SCREEN_TAIL_LINES)
-        .map(|l| l.text.as_str())
-        .collect();
-    screen_is_blocking(&tail.join("\n"))
+    pane_screen_tail(registry, pool, pane_id)
+        .await
+        .is_some_and(|tail| screen_is_blocking(&tail))
+}
+
+/// Pure: per-pane "has the screen settled?" bookkeeping. Feed it each
+/// check's screen tail; it says when the kickoff may go out — the screen
+/// is non-empty, not blocking, and identical for [`SETTLED_CHECKS`]
+/// checks in a row. A blocking screen resets it.
+#[derive(Debug, Default)]
+struct ScreenSettle {
+    last: Option<String>,
+    unchanged: u32,
+}
+
+impl ScreenSettle {
+    fn observe(&mut self, screen: &str) -> bool {
+        if screen.trim().is_empty() || screen_is_blocking(screen) {
+            *self = Self::default();
+            return false;
+        }
+        if self.last.as_deref() == Some(screen) {
+            self.unchanged += 1;
+        } else {
+            self.last = Some(screen.to_string());
+            self.unchanged = 1;
+        }
+        self.unchanged >= SETTLED_CHECKS
+    }
 }
 
 /// Paste the kickoff turn into one pane (best-effort, logged) — unless
-/// the pane is on a login / first-run screen, where it is withheld and
-/// the pane simply stays not-ready until the user resolves the screen.
+/// the pane is on a login / trust / first-run screen, where it is
+/// withheld; `wait_for_ready_answers` sends it once the user resolves
+/// the screen.
+///
+/// Returns whether the kickoff was pasted (`false` = withheld).
 async fn send_kickoff(
     registry: &TerminalRegistry,
     pool: &DbPool,
     agent_id: &str,
     pane_id: &str,
-) {
+) -> bool {
     if pane_on_blocking_screen(registry, pool, pane_id).await {
         tracing::warn!(
             agent_id = %agent_id,
-            "swarm-term: kickoff withheld — pane is on a login / first-run \
-             screen; resolve it in the pane"
+            "swarm-term: kickoff withheld — pane is on a login / trust / \
+             first-run screen; it is sent once the screen is resolved"
         );
-        return;
+        return false;
     }
     let kickoff = build_kickoff_message(agent_id);
     if let Err(e) =
@@ -827,13 +894,25 @@ async fn send_kickoff(
             "swarm-term: kickoff write failed"
         );
     }
+    true
 }
 
-/// Poll each pane's claude transcript until it has answered the
-/// kickoff, marking it ready as soon as it does. Re-sends the kickoff
-/// once to stragglers after [`KICKOFF_RESEND_AFTER`]; gives up (warn,
-/// pane stays not-ready) after [`READY_TIMEOUT`]. Returns silently as
-/// soon as the session is stopped (`alive` cleared).
+/// Send each pane's kickoff and poll its claude transcript until it has
+/// answered, marking it ready as soon as it does. `kicked` holds when
+/// each pane's kickoff was sent (`None` = not yet).
+///
+/// * An unsent kickoff goes out once the pane's screen has settled on
+///   something other than a login / trust / first-run screen
+///   ([`ScreenSettle`]) — so it can never answer such a screen, and a
+///   screen the user resolves late still gets its kickoff. Watched for
+///   up to [`BLOCKED_SCREEN_WAIT`].
+/// * A sent kickoff without an answer is re-sent once after
+///   [`KICKOFF_RESEND_AFTER`] (it may have landed before the REPL
+///   finished booting) and given up (warn, pane stays not-ready)
+///   [`READY_TIMEOUT`] after it was sent.
+///
+/// Returns as soon as every pane is settled or the session is stopped
+/// (`alive` cleared).
 async fn wait_for_ready_answers(
     registry: &TerminalRegistry,
     pool: &DbPool,
@@ -841,11 +920,14 @@ async fn wait_for_ready_answers(
     pane_homes: &HashMap<String, PathBuf>,
     ready: &Arc<Mutex<HashSet<String>>>,
     alive: &AtomicBool,
+    mut kicked: HashMap<String, Option<Instant>>,
 ) {
     let started = Instant::now();
     let mut pending: HashSet<&str> =
         panes_by_agent.keys().map(String::as_str).collect();
-    let mut resent = false;
+    let mut resent: HashSet<String> = HashSet::new();
+    let mut settle: HashMap<String, ScreenSettle> = HashMap::new();
+    let mut last_screen_check = Instant::now() - BLOCKED_SCREEN_POLL;
     loop {
         if !alive.load(Ordering::SeqCst) {
             return;
@@ -870,29 +952,65 @@ async fn wait_for_ready_answers(
                 "swarm-term: pane answered kickoff — ready"
             );
         }
-        if pending.is_empty() {
-            return;
+
+        let check_screens = last_screen_check.elapsed() >= BLOCKED_SCREEN_POLL;
+        if check_screens {
+            last_screen_check = Instant::now();
         }
-        let waited = started.elapsed();
-        if waited >= READY_TIMEOUT {
-            tracing::warn!(
-                agents = ?pending,
-                "swarm-term: panes never answered the kickoff; left not-ready \
-                 (messages to them are returned to the sender)"
-            );
-            return;
-        }
-        if !resent && waited >= KICKOFF_RESEND_AFTER {
-            resent = true;
-            for agent in &pending {
-                tracing::warn!(
-                    agent_id = %agent,
-                    "swarm-term: no kickoff answer yet — re-sending once"
-                );
-                if let Some(pane) = panes_by_agent.get(*agent) {
-                    send_kickoff(registry, pool, agent, pane).await;
+        let mut gave_up: Vec<&str> = Vec::new();
+        for &agent in &pending {
+            let Some(pane) = panes_by_agent.get(agent) else {
+                continue;
+            };
+            match kicked.get(agent).copied().flatten() {
+                // Not sent yet: send it once the screen has settled on
+                // something that is not a login / trust screen.
+                None => {
+                    if started.elapsed() >= BLOCKED_SCREEN_WAIT {
+                        gave_up.push(agent);
+                    } else if check_screens {
+                        let screen = pane_screen_tail(registry, pool, pane).await.unwrap_or_default();
+                        let settled = settle.entry(agent.to_string()).or_default().observe(&screen);
+                        let fallback = started.elapsed() >= SETTLE_FALLBACK
+                            && !screen.trim().is_empty()
+                            && !screen_is_blocking(&screen);
+                        if (settled || fallback) && send_kickoff(registry, pool, agent, pane).await {
+                            tracing::info!(
+                                agent_id = %agent,
+                                waited_ms = started.elapsed().as_millis() as u64,
+                                "swarm-term: pane screen settled — kickoff sent"
+                            );
+                            kicked.insert(agent.to_string(), Some(Instant::now()));
+                        }
+                    }
+                }
+                Some(sent_at) => {
+                    let since = sent_at.elapsed();
+                    if since >= READY_TIMEOUT {
+                        gave_up.push(agent);
+                    } else if since >= KICKOFF_RESEND_AFTER && resent.insert(agent.to_string()) {
+                        tracing::warn!(
+                            agent_id = %agent,
+                            "swarm-term: no kickoff answer yet — re-sending once"
+                        );
+                        if !send_kickoff(registry, pool, agent, pane).await {
+                            // A blocking screen appeared: wait for it again.
+                            kicked.insert(agent.to_string(), None);
+                        }
+                    }
                 }
             }
+        }
+        for agent in gave_up {
+            pending.remove(agent);
+            tracing::warn!(
+                agent_id = %agent,
+                "swarm-term: pane never answered the kickoff; left not-ready \
+                 (messages to it are returned to the sender)"
+            );
+        }
+        if pending.is_empty() {
+            return;
         }
         tokio::time::sleep(READY_POLL).await;
     }
@@ -988,6 +1106,26 @@ mod tests {
         assert!(self_hosting_warning(other.path(), src.path(), true).is_none());
         // A release build does not hot-reload — nothing to warn about.
         assert!(self_hosting_warning(src.path(), src.path(), false).is_none());
+    }
+
+    #[test]
+    fn the_kickoff_waits_for_a_settled_non_blocking_screen() {
+        let mut s = ScreenSettle::default();
+        // Blank (still booting) never settles.
+        assert!(!s.observe(""));
+        assert!(!s.observe("   \n "));
+        // A changing screen is not settled; the same screen twice is.
+        assert!(!s.observe("✻ Welcome"));
+        assert!(!s.observe("✻ Welcome\n❯ "));
+        assert!(s.observe("✻ Welcome\n❯ "));
+        // The trust screen resets it, however long it stays.
+        let trust = "Quicksafetycheck:Isthisaprojectyoucreatedoroneyoutrust?❯No,exit";
+        assert!(!s.observe(trust));
+        assert!(!s.observe(trust));
+        assert!(!s.observe(trust));
+        // Once the user answers it, the REPL settles and the kickoff goes.
+        assert!(!s.observe("❯ "));
+        assert!(s.observe("❯ "));
     }
 
     #[test]
@@ -1124,14 +1262,64 @@ mod tests {
             )
         };
         println!("[{}] session started: {}", stamp(Instant::now()), root.display());
+        // `NEURON_LIVE_RAW_DUMP=<file>`: append the orchestrator pane's raw
+        // output stream (escape sequences included) to that file.
+        if let (Ok(dump), Some(pane)) = (std::env::var("NEURON_LIVE_RAW_DUMP"), panes.get("orchestrator")) {
+            use std::io::Write as _;
+            use tauri::Listener;
+            app.listen_any(crate::events::pane_data(pane), move |e| {
+                let text: String = serde_json::from_str(e.payload()).unwrap_or_default();
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&dump) {
+                    let _ = write!(f, "{text}");
+                }
+            });
+        }
 
-        // Readiness.
-        let ready_deadline = Instant::now() + Duration::from_secs(150);
+        // Readiness. `NEURON_LIVE_ANSWER_TRUST_SECS=<n>` plays the user
+        // answering the folder-trust screen late: after n seconds every
+        // not-ready pane gets Down + Enter ("Yes, I trust this folder").
+        let answer_trust_after = std::env::var("NEURON_LIVE_ANSWER_TRUST_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(Duration::from_secs);
+        let mut trust_answered = false;
+        // `NEURON_LIVE_SCREEN_AT=<n>`: print the orchestrator's screen at n s.
+        let screen_at = std::env::var("NEURON_LIVE_SCREEN_AT")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(Duration::from_secs);
+        let mut screen_shown = false;
+        let ready_deadline = Instant::now()
+            + Duration::from_secs(150)
+            + answer_trust_after.unwrap_or_default();
         loop {
             let n = ready.lock().map(|g| g.len()).unwrap_or(0);
             if n == panes.len() || Instant::now() > ready_deadline {
                 println!("[{}] ready panes: {n}/{}", stamp(Instant::now()), panes.len());
                 break;
+            }
+            if !screen_shown && screen_at.is_some_and(|d| started.elapsed() >= d) {
+                screen_shown = true;
+                if let Some(pane) = panes.get("orchestrator") {
+                    let screen = pane_screen_tail(&registry, &_pool, pane).await.unwrap_or_default();
+                    let n = screen.chars().count();
+                    let tail: String = screen.chars().skip(n.saturating_sub(1500)).collect();
+                    println!(
+                        "SCREEN [orchestrator] at {} ({n} chars, blocking={}):\n{tail}",
+                        stamp(Instant::now()),
+                        screen_is_blocking(&screen)
+                    );
+                }
+            }
+            if !trust_answered && answer_trust_after.is_some_and(|d| started.elapsed() >= d) {
+                trust_answered = true;
+                let ready_now = ready.lock().map(|g| g.clone()).unwrap_or_default();
+                for pane in panes.values().filter(|p| !ready_now.contains(*p)) {
+                    let _ = registry.write_to_pane(pane, b"\x1b[B").await;
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    let _ = registry.write_to_pane(pane, b"\r").await;
+                }
+                println!("[{}] trust screen answered in {} panes", stamp(Instant::now()), panes.len() - ready_now.len());
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
         }

@@ -147,7 +147,16 @@ struct PaneState {
     /// without touching SQLite.
     #[allow(dead_code)]
     pid: Option<u32>,
+    /// CSI-stripped text of the current screen frame — the output since
+    /// the last cursor-home / clear-screen, capped to [`SCREEN_TAIL_BYTES`]
+    /// (see `reader::read_loop::update_frame`). A full-screen TUI such as
+    /// claude 2.1.29x paints with cursor moves and hardly any newlines, so
+    /// the ring sees nothing for minutes; this is what the screen shows.
+    screen_tail: String,
 }
+
+/// How much of the unflushed output [`PaneState::screen_tail`] keeps.
+const SCREEN_TAIL_BYTES: usize = 16 * 1024;
 
 /// Top-level registry. One per app process. Cloned cheaply because the
 /// inner state is `Arc`-backed.
@@ -351,6 +360,7 @@ impl TerminalRegistry {
             killer,
             status: status::STARTING,
             pid,
+            screen_tail: String::new(),
         }));
 
         {
@@ -404,6 +414,24 @@ impl TerminalRegistry {
     /// passthrough: the frontend collects keystrokes and ships them
     /// here. Bytes are written verbatim; the shell handles line
     /// editing.
+    /// What the pane shows now, as plain text: the current screen frame
+    /// when the pane draws frames (a full-screen TUI), else its last
+    /// `max_lines` ring lines. Only the current frame counts — the text
+    /// of an earlier screen (an answered trust prompt) must not linger.
+    /// `None` for an unknown pane.
+    pub async fn pane_screen_text(&self, pane_id: &str, max_lines: usize) -> Option<String> {
+        let panes = self.inner.panes.lock().await;
+        let state = panes.get(pane_id).cloned()?;
+        drop(panes);
+        let guard = state.lock().ok()?;
+        if !guard.screen_tail.trim().is_empty() {
+            return Some(guard.screen_tail.clone());
+        }
+        let skip = guard.ring.len().saturating_sub(max_lines);
+        let text: Vec<&str> = guard.ring.iter().skip(skip).map(|l| l.text.as_str()).collect();
+        Some(text.join("\n"))
+    }
+
     /// Read-only snapshot of a pane's lifecycle status.
     ///
     /// Returns one of the values from `status::*` (`starting`,

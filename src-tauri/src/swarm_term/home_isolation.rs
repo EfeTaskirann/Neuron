@@ -149,7 +149,41 @@ pub(crate) fn seed_pane_home(
             }
         }
     }
+    let settings = pane_claude_dir.join("settings.json");
+    if strip_pane_only_settings(&settings) {
+        tracing::debug!(agent_id = %agent_id, "swarm-term: pane settings — fullscreen TUI off");
+    }
     Ok(pane_home)
+}
+
+/// Settings keys the pane's copy drops: `tui` (e.g. `"fullscreen"`).
+/// The fullscreen TUI draws with cursor moves and almost no newlines, so
+/// the pane's line capture stayed empty — the session could not see a
+/// trust / login screen, nor tell when the REPL was up, and every
+/// kickoff decision was blind. Panes always use the line-based TUI; the
+/// user's own setting is untouched.
+const PANE_DROPPED_SETTINGS: &[&str] = &["tui"];
+
+/// Drop [`PANE_DROPPED_SETTINGS`] from a pane's `settings.json` copy.
+/// Returns whether the file changed.
+fn strip_pane_only_settings(path: &Path) -> bool {
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return false;
+    };
+    let Some(obj) = v.as_object_mut() else {
+        return false;
+    };
+    let before = obj.len();
+    obj.retain(|k, _| !PANE_DROPPED_SETTINGS.contains(&k.as_str()));
+    if obj.len() == before {
+        return false;
+    }
+    serde_json::to_string_pretty(&v)
+        .ok()
+        .is_some_and(|json| write_atomic(path, &json).is_ok())
 }
 
 /// Copy `.credentials.json` from the host home into a pane home, with
@@ -282,34 +316,67 @@ fn sync_credential_files(paths: &[PathBuf]) -> usize {
     updated
 }
 
-/// Carry the user's existing folder-trust decision for `project` into a
-/// pane's `.claude.json` copy, under every spelling claude may look it
-/// up with. claude 2.1.29x keys projects by a lower-case drive letter
-/// (`c:/…`) while older builds wrote `C:/…`, so a folder the user had
-/// trusted looked untrusted to the new CLI and every pane opened on the
-/// "Is this a project you trust?" screen — where the kickoff's Enter
-/// picked the default "No, exit" and killed the pane.
+/// How [`ensure_project_trust`] settled the folder-trust screen for a pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PaneTrust {
+    /// The user's config already trusted the folder (or an ancestor):
+    /// that decision was copied onto every path spelling.
+    Mirrored,
+    /// Never trusted, but the folder holds no project config that could
+    /// run code (no `.claude/settings*.json`, no `.mcp.json`): trusted
+    /// for the pane, since the screen guards nothing here.
+    Granted,
+    /// Left as is — the pane shows the trust screen for the user.
+    Untouched,
+}
+
+/// Settle claude's "Is this a project you trust?" screen for a pane, in
+/// the pane's `.claude.json` copy (the user's real config is never
+/// touched), under every spelling claude may look the folder up with.
 ///
-/// Only an EXISTING decision is mirrored: nothing changes unless the
-/// user's config already trusts `project` or one of its ancestors (any
-/// spelling). An untrusted folder still shows the screen, which the
-/// session leaves for the user to answer. The user's real config is
-/// never touched. Returns whether the pane's copy was updated.
-pub(crate) fn mirror_project_trust(pane_home: &Path, project: &Path) -> bool {
+/// * The user already trusted `project` or an ancestor (any spelling):
+///   mirror it. claude 2.1.29x keys projects by a lower-case drive
+///   letter (`c:/…`) while older builds wrote `C:/…`, so a trusted folder
+///   looked untrusted and every pane opened on the trust screen.
+/// * Never trusted: the screen exists so a repository's own settings
+///   (hooks, MCP servers) do not run unannounced. When the folder has
+///   none, there is nothing to guard — trust it rather than make the
+///   user answer the same screen in nine panes (a new empty project
+///   folder hit exactly that, and the agents never became ready).
+/// * Otherwise the pane keeps the screen for the user to decide.
+pub(crate) fn ensure_project_trust(pane_home: &Path, project: &Path) -> PaneTrust {
     let path = pane_home.join(".claude.json");
     let Ok(raw) = std::fs::read_to_string(&path) else {
-        return false;
+        return PaneTrust::Untouched;
     };
     let Ok(mut cfg) = serde_json::from_str::<serde_json::Value>(&raw) else {
-        return false;
+        return PaneTrust::Untouched;
     };
-    if !mirror_trust_in(&mut cfg, &project.display().to_string()) {
-        return false;
-    }
+    let project_str = project.display().to_string();
+    let outcome = if is_trusted_in(&cfg, &project_str) {
+        PaneTrust::Mirrored
+    } else if project_config_is_inert(project) {
+        PaneTrust::Granted
+    } else {
+        return PaneTrust::Untouched;
+    };
+    set_trusted_in(&mut cfg, &project_str);
     match serde_json::to_string_pretty(&cfg) {
-        Ok(json) => write_atomic(&path, &json).is_ok(),
-        Err(_) => false,
+        Ok(json) if write_atomic(&path, &json).is_ok() => outcome,
+        _ => PaneTrust::Untouched,
     }
+}
+
+/// True when `project` carries no Claude project config that executes
+/// anything on its own (settings with hooks / commands, MCP servers).
+fn project_config_is_inert(project: &Path) -> bool {
+    ![
+        project.join(".claude").join("settings.json"),
+        project.join(".claude").join("settings.local.json"),
+        project.join(".mcp.json"),
+    ]
+    .iter()
+    .any(|p| p.exists())
 }
 
 /// Spelling-independent project key: `/` separators, lower case, no
@@ -318,20 +385,34 @@ fn project_key(p: &str) -> String {
     p.replace('\\', "/").trim_end_matches('/').to_lowercase()
 }
 
-fn mirror_trust_in(cfg: &mut serde_json::Value, project: &str) -> bool {
-    use serde_json::Value;
+/// True when the config trusts `project` or one of its ancestors, under
+/// any spelling.
+fn is_trusted_in(cfg: &serde_json::Value, project: &str) -> bool {
     let wanted = project_key(project);
-    let Some(projects) = cfg.get_mut("projects").and_then(Value::as_object_mut) else {
-        return false;
+    cfg.get("projects")
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|projects| {
+            projects.iter().any(|(key, entry)| {
+                let key = project_key(key);
+                entry.get("hasTrustDialogAccepted") == Some(&serde_json::Value::Bool(true))
+                    && (wanted == key || wanted.starts_with(&format!("{key}/")))
+            })
+        })
+}
+
+/// Mark `project` trusted under its `/` spelling and both drive-letter
+/// cases, keeping any other fields of existing entries.
+fn set_trusted_in(cfg: &mut serde_json::Value, project: &str) {
+    use serde_json::Value;
+    let Some(root) = cfg.as_object_mut() else {
+        return;
     };
-    let trusted = projects.iter().any(|(key, entry)| {
-        let key = project_key(key);
-        entry.get("hasTrustDialogAccepted") == Some(&Value::Bool(true))
-            && (wanted == key || wanted.starts_with(&format!("{key}/")))
-    });
-    if !trusted {
-        return false;
-    }
+    let projects = root
+        .entry("projects")
+        .or_insert_with(|| Value::Object(Default::default()));
+    let Some(projects) = projects.as_object_mut() else {
+        return;
+    };
     let forward = project.replace('\\', "/").trim_end_matches('/').to_string();
     let mut spellings = vec![forward.clone()];
     if forward.as_bytes().get(1) == Some(&b':') {
@@ -351,7 +432,6 @@ fn mirror_trust_in(cfg: &mut serde_json::Value, project: &str) -> bool {
             obj.insert("hasTrustDialogAccepted".into(), Value::Bool(true));
         }
     }
-    true
 }
 
 fn write_atomic(path: &Path, content: &str) -> std::io::Result<()> {
@@ -389,6 +469,15 @@ fn real_user_home() -> Result<PathBuf, AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The old mirror-only behaviour, on an in-memory config.
+    fn mirror_trust_in(cfg: &mut serde_json::Value, project: &str) -> bool {
+        let trusted = is_trusted_in(cfg, project);
+        if trusted {
+            set_trusted_in(cfg, project);
+        }
+        trusted
+    }
 
     #[test]
     fn trust_is_mirrored_onto_every_drive_spelling_of_a_trusted_tree() {
@@ -432,14 +521,66 @@ mod tests {
         let file = home.path().join(".claude.json");
         std::fs::write(&file, r#"{"projects":{"D:/w":{"hasTrustDialogAccepted":true}},"x":1}"#)
             .expect("write");
-        assert!(mirror_project_trust(home.path(), Path::new("D:/w/proj")));
+        assert_eq!(ensure_project_trust(home.path(), Path::new("D:/w/proj")), PaneTrust::Mirrored);
         let v: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
         assert_eq!(v["projects"]["d:/w/proj"]["hasTrustDialogAccepted"], true);
         assert_eq!(v["x"], 1);
         // No config → nothing to do.
         let empty = tempfile::tempdir().expect("tempdir");
-        assert!(!mirror_project_trust(empty.path(), Path::new("D:/w/proj")));
+        assert_eq!(ensure_project_trust(empty.path(), Path::new("D:/w/proj")), PaneTrust::Untouched);
+    }
+
+    #[test]
+    fn pane_settings_drop_the_fullscreen_tui_and_keep_the_rest() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("settings.json");
+        std::fs::write(&file, r#"{"tui":"fullscreen","theme":"dark","effortLevel":"xhigh"}"#)
+            .expect("write");
+        assert!(strip_pane_only_settings(&file));
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        assert!(v.get("tui").is_none());
+        assert_eq!(v["theme"], "dark");
+        assert_eq!(v["effortLevel"], "xhigh");
+        // Nothing to drop / no file → unchanged.
+        assert!(!strip_pane_only_settings(&file));
+        assert!(!strip_pane_only_settings(&dir.path().join("missing.json")));
+    }
+
+    #[test]
+    fn a_new_folder_without_runnable_config_is_trusted_for_the_panes() {
+        // Live: a brand-new project folder put the trust screen in all
+        // nine panes; the agents never became ready.
+        let home = tempfile::tempdir().expect("tempdir");
+        let file = home.path().join(".claude.json");
+        std::fs::write(&file, r#"{"projects":{}}"#).expect("write");
+        let project = tempfile::tempdir().expect("project");
+        std::fs::create_dir_all(project.path().join(".claude")).expect("mkdir");
+        std::fs::write(project.path().join(".claude").join("launch.json"), "{}").expect("w");
+        assert_eq!(ensure_project_trust(home.path(), project.path()), PaneTrust::Granted);
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        assert!(is_trusted_in(&v, &project.path().display().to_string()));
+    }
+
+    #[test]
+    fn a_folder_with_runnable_project_config_keeps_the_trust_screen() {
+        for runnable in [".claude/settings.json", ".claude/settings.local.json", ".mcp.json"] {
+            let home = tempfile::tempdir().expect("tempdir");
+            let file = home.path().join(".claude.json");
+            std::fs::write(&file, r#"{"projects":{}}"#).expect("write");
+            let project = tempfile::tempdir().expect("project");
+            let p = project.path().join(runnable);
+            std::fs::create_dir_all(p.parent().unwrap()).expect("mkdir");
+            std::fs::write(&p, "{}").expect("w");
+            assert_eq!(
+                ensure_project_trust(home.path(), project.path()),
+                PaneTrust::Untouched,
+                "{runnable}"
+            );
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), r#"{"projects":{}}"#);
+        }
     }
 
     fn creds(expires: i64, refresh: &str, extra: &str) -> String {
