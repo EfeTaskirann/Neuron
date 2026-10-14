@@ -67,7 +67,8 @@ mod text;
 mod tests;
 
 use command::{
-    default_shell, expand_cwd, infer_agent_kind, tokenize_command, CLAUDE_AGENT_STRIPPED_ENV,
+    default_shell, expand_cwd, infer_agent_kind, inherited_claude_session_env, tokenize_command,
+    CLAUDE_AGENT_STRIPPED_ENV,
 };
 use reader::{flush_ring_to_db, run_reader, run_waiter};
 
@@ -265,6 +266,11 @@ impl TerminalRegistry {
         // off the user's Pro/Max OAuth channel onto BYOK billing.
         if agent_kind == "claude-code" {
             for var in CLAUDE_AGENT_STRIPPED_ENV {
+                builder.env_remove(var);
+            }
+            // Launched from inside a Claude Code session: drop ALL of
+            // that host session's variables, not just the known ones.
+            for var in inherited_claude_session_env(std::env::vars()) {
                 builder.env_remove(var);
             }
         }

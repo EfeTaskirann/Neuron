@@ -69,6 +69,31 @@ pub(super) const CLAUDE_AGENT_STRIPPED_ENV: &[&str] = &[
     "CLAUDE_CONFIG_DIR",
 ];
 
+/// Names in `parent_env` that a parent Claude Code session exported, to
+/// be removed from a spawned claude pane on top of
+/// [`CLAUDE_AGENT_STRIPPED_ENV`]. Empty unless the parent IS such a
+/// session (`CLAUDECODE` set) — then every `CLAUDE*` / `ANTHROPIC_*`
+/// variable is the host session's, not the user's. The host keeps
+/// adding new ones (`CLAUDE_CODE_CHILD_SESSION`, `…_HOST_SESSION_ID`,
+/// `…_MESSAGING_SOCKET`, …), so a fixed list goes stale: with
+/// claude 2.1.29x those made every pane a "child session" that never
+/// wrote its transcript, so no pane was ever detected as ready.
+pub(super) fn inherited_claude_session_env<I>(parent_env: I) -> Vec<String>
+where
+    I: IntoIterator<Item = (String, String)>,
+{
+    let vars: Vec<String> = parent_env.into_iter().map(|(k, _)| k).collect();
+    if !vars.iter().any(|k| k.eq_ignore_ascii_case("CLAUDECODE")) {
+        return Vec::new();
+    }
+    vars.into_iter()
+        .filter(|k| {
+            let upper = k.to_ascii_uppercase();
+            upper.starts_with("CLAUDE") || upper.starts_with("ANTHROPIC_")
+        })
+        .collect()
+}
+
 /// Best-effort home directory expansion for `cwd`. `~` and `~/...`
 /// resolve against the current user's home; other paths pass through.
 pub(super) fn expand_cwd(input: &str) -> PathBuf {
