@@ -82,6 +82,7 @@ const SESSION: TerminalSwarmSessionHandle = {
     { agentId: 'orchestrator', paneId: 'p-orch' },
     { agentId: 'coordinator', paneId: 'p-coord' },
   ],
+  permissionMode: 'restricted',
 };
 
 beforeEach(async () => {
@@ -136,6 +137,36 @@ describe('TerminalSwarmRoute', () => {
     expect(
       screen.getAllByText(/idle — pick a project and launch/i),
     ).toHaveLength(7);
+  });
+
+  it('states the restricted permission mode instead of offering a fake autonomy switch', async () => {
+    const { commands } = await import('../lib/bindings');
+    vi.mocked(commands.swarmTermSessionStatus).mockResolvedValue({
+      status: 'ok',
+      data: SESSION,
+    });
+    renderRoute();
+    const chip = await screen.findByText(/no approval prompts · role allowlists/i);
+    // Keyboard-reachable, and described by the tooltip text.
+    expect(chip).toHaveAttribute('tabindex', '0');
+    expect(chip).toHaveAccessibleDescription(/builders can edit files inside this project/i);
+    // The old toggle changed nothing in the backend — it must stay gone.
+    expect(screen.queryByRole('checkbox')).not.toBeInTheDocument();
+    expect(screen.queryByText(/run autonomously/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/permissions bypassed/i)).not.toBeInTheDocument();
+  });
+
+  it('flags a bypass-mode session as unrestricted', async () => {
+    const { commands } = await import('../lib/bindings');
+    vi.mocked(commands.swarmTermSessionStatus).mockResolvedValue({
+      status: 'ok',
+      data: { ...SESSION, permissionMode: 'bypass' },
+    });
+    renderRoute();
+    const chip = await screen.findByText(/permissions bypassed · unrestricted/i);
+    expect(chip).toHaveClass('swarm-term-perm-chip--bypass');
+    expect(chip).toHaveAccessibleDescription(/NEURON_TERM_PERMISSIONS=bypass/);
+    expect(screen.queryByText(/no approval prompts/i)).not.toBeInTheDocument();
   });
 
   it('sends a chat message as a bracketed paste followed by a separate CR', async () => {
@@ -197,6 +228,48 @@ describe('TerminalSwarmRoute', () => {
       },
       { timeout: 2000 },
     );
+  });
+
+  it('says why a launch was refused, not just the generic error copy', async () => {
+    const { commands } = await import('../lib/bindings');
+    vi.mocked(commands.swarmTermStartSession).mockResolvedValue({
+      status: 'error',
+      error: { kind: 'invalid_input', message: '`C:\\` bir sürücü kökü.' },
+    });
+    renderRoute();
+    const launch = await screen.findByRole('button', { name: /launch swarm/i });
+    // Disabled until the session-status probe settles.
+    await waitFor(() => expect(launch).toBeEnabled());
+    fireEvent.click(launch);
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent('Girilen değer geçersiz. `C:\\` bir sürücü kökü.');
+  });
+
+  it('describeError keeps the backend detail and handles plain errors', async () => {
+    const { AppErrorClient, describeError } = await import('../lib/unwrap');
+    expect(describeError(new AppErrorClient('internal', 'spawn agent `scout`: boom'))).toBe(
+      'Beklenmedik bir iç hata oluştu. spawn agent `scout`: boom',
+    );
+    expect(describeError(new AppErrorClient('conflict', ''))).toBe(
+      'İşlem mevcut bir kayıtla çakıştı.',
+    );
+    expect(describeError(new Error('IPC bridge down'))).toBe('IPC bridge down');
+    expect(describeError('plain')).toBe('plain');
+  });
+
+  it('opens and closes the Routing Log drawer from the toolbar', async () => {
+    renderRoute();
+    const toggle = await screen.findByRole('button', { name: /routing log/i });
+    expect(toggle).toHaveAttribute('aria-pressed', 'false');
+    expect(screen.queryByRole('complementary', { name: /routing log/i })).not.toBeInTheDocument();
+
+    fireEvent.click(toggle);
+    const drawer = screen.getByRole('complementary', { name: /routing log/i });
+    expect(drawer).toHaveTextContent(/no routing events yet/i);
+    expect(toggle).toHaveAttribute('aria-pressed', 'true');
+
+    fireEvent.click(toggle);
+    expect(screen.queryByRole('complementary', { name: /routing log/i })).not.toBeInTheDocument();
   });
 
   it('surfaces a session-status probe failure instead of silently showing the idle grid', async () => {

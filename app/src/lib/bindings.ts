@@ -5,6 +5,7 @@ import { invoke as __TAURI_INVOKE } from "@tauri-apps/api/core";
 /** Commands */
 export const commands = {
 	healthDb: () => typedError<DbHealth, AppErrorWire>(__TAURI_INVOKE("health_db")),
+	appFeatures: () => typedError<AppFeatures, AppErrorWire>(__TAURI_INVOKE("app_features")),
 	agentsList: () => typedError<Agent[], AppErrorWire>(__TAURI_INVOKE("agents_list")),
 	agentsGet: (id: string) => typedError<Agent, AppErrorWire>(__TAURI_INVOKE("agents_get", { id })),
 	agentsCreate: (input: AgentCreateInput) => typedError<Agent, AppErrorWire>(__TAURI_INVOKE("agents_create", { input })),
@@ -418,6 +419,8 @@ export const commands = {
 	sessionId: string,
 	projectDir: string,
 	panes: TerminalSwarmPane[],
+	// What the panes may do — the mode they were spawned with.
+	permissionMode: SwarmTermPermissionMode,
 } | null, AppErrorWire>(__TAURI_INVOKE("swarm_term_session_status")),
 	swarmTermStartSession: (projectDir: string) => typedError<TerminalSwarmSessionHandle, AppErrorWire>(__TAURI_INVOKE("swarm_term_start_session", { projectDir })),
 	swarmTermStopSession: () => typedError<null, AppErrorWire>(__TAURI_INVOKE("swarm_term_stop_session")),
@@ -540,6 +543,14 @@ export type AgentStatusRow = {
 export type AppErrorWire = {
 	kind: string,
 	message: string,
+};
+
+export type AppFeatures = {
+	/**
+	 *  Developer features are on (`NEURON_DEV_FEATURES=1` at launch):
+	 *  the Workflow canvas, Runs, Agents and the headless Swarm.
+	 */
+	devFeatures: boolean,
 };
 
 /**
@@ -1363,9 +1374,6 @@ export type Server = {
 	by: string,
 	// Mock key: `desc`.
 	desc: string,
-	installs: number,
-	rating: number,
-	featured: boolean,
 	installed: boolean,
 };
 
@@ -1600,6 +1608,20 @@ export type SwarmJobEvent =
  */
 { kind: "decision_made"; job_id: string; decision: CoordinatorDecision };
 
+/**
+ *  The permission mode a session's panes were spawned with. Captured
+ *  once at session start, so what the UI reports is exactly what the
+ *  panes run with.
+ */
+export type SwarmTermPermissionMode = 
+// `dontAsk` + the per-role allowlist ([`allowed_tools`]).
+"restricted" | 
+/**
+ *  [`PERMISSIONS_ENV`]`=bypass`: every pane runs with
+ *  `bypassPermissions` (unrestricted shell + file access).
+ */
+"bypass";
+
 export type SwarmTermPersona = {
 	id: string,
 	role: string,
@@ -1616,6 +1638,8 @@ export type TerminalSwarmSessionHandle = {
 	sessionId: string,
 	projectDir: string,
 	panes: TerminalSwarmPane[],
+	// What the panes may do — the mode they were spawned with.
+	permissionMode: SwarmTermPermissionMode,
 };
 
 /**

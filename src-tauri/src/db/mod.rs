@@ -8,14 +8,16 @@
 //! - Run all bundled migrations from `migrations/`. The migrator records
 //!   applied versions in `_sqlx_migrations`, so calling `init` on every
 //!   app launch is a no-op after the first run (the "idempotent" gate).
+//! - Move aside a database created before the migrations were squashed
+//!   into one baseline (see [`retire_pre_baseline_db`]).
 //!
 //! Per Charter §"Tech stack" SQLite is the single source of truth and
 //! the ORM lives in Rust — the frontend never opens this database.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
-use sqlx::{ConnectOptions, Executor, SqlitePool};
+use sqlx::{ConnectOptions, Connection, Executor, SqlitePool};
 use tauri::{AppHandle, Manager};
 use thiserror::Error;
 
@@ -35,6 +37,11 @@ pub type DbPool = SqlitePool;
 
 /// Database file name placed under the app data dir.
 const DB_FILENAME: &str = "neuron.db";
+
+/// `_sqlx_migrations.description` of version 1 in a database created
+/// before the migrations were squashed into `0001_baseline.sql`
+/// (2026-10-18): the old chain began with `0001_init.sql`.
+const PRE_BASELINE_FIRST_MIGRATION: &str = "init";
 
 /// Errors surfaced by `db::init` and by code that touches the pool
 /// during startup. Tauri commands generally surface their own
@@ -56,6 +63,13 @@ pub enum DbError {
 
     #[error("migration error: {0}")]
     Migrate(#[from] sqlx::migrate::MigrateError),
+
+    #[error("could not remove {path:?} after copying the pre-baseline database aside: {source}")]
+    Retire {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 /// Open (or create) the on-disk Neuron database, run migrations, and
@@ -73,6 +87,12 @@ pub async fn init(app: &AppHandle) -> Result<DbPool, DbError> {
         })?;
     }
     let path = dir.join(DB_FILENAME);
+    if let Some(copy) = retire_pre_baseline_db(&path).await? {
+        tracing::warn!(
+            copy = %copy.display(),
+            "database predates the migration baseline: kept a copy and started a fresh one"
+        );
+    }
     let pool = open_pool_at(&path).await?;
     MIGRATOR.run(&pool).await?;
     seed_demo_workflow(&pool).await?;
@@ -81,10 +101,76 @@ pub async fn init(app: &AppHandle) -> Result<DbPool, DbError> {
     Ok(pool)
 }
 
+/// The migrations were squashed into one baseline (`0001_baseline.sql`,
+/// 2026-10-18). A database created before that recorded the old chain
+/// (`0001_init` …); the baseline can neither upgrade it nor run against
+/// it (sqlx refuses a changed version 1). Such a database is copied to
+/// `neuron.pre-baseline-<ulid>.db` beside it — `VACUUM INTO` writes one
+/// self-contained file, WAL contents included — and then removed, so
+/// `init` starts a fresh one. Returns the copy's path when it did so;
+/// any other database (none yet, no ledger, the baseline lineage) is
+/// left untouched.
+async fn retire_pre_baseline_db(path: &Path) -> Result<Option<PathBuf>, DbError> {
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let mut conn = SqliteConnectOptions::new()
+        .filename(path)
+        .disable_statement_logging()
+        .connect()
+        .await?;
+    let has_ledger: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM sqlite_master \
+         WHERE type = 'table' AND name = '_sqlx_migrations')",
+    )
+    .fetch_one(&mut conn)
+    .await?;
+    let old_chain = has_ledger
+        && sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM _sqlx_migrations \
+             WHERE version = 1 AND description = ?)",
+        )
+        .bind(PRE_BASELINE_FIRST_MIGRATION)
+        .fetch_one(&mut conn)
+        .await?;
+    if !old_chain {
+        conn.close().await?;
+        return Ok(None);
+    }
+    let copy = path.with_file_name(format!("neuron.pre-baseline-{}.db", ulid::Ulid::new()));
+    sqlx::query("VACUUM INTO ?")
+        .bind(copy.to_string_lossy().into_owned())
+        .execute(&mut conn)
+        .await?;
+    conn.close().await?;
+    for file in db_files(path) {
+        match std::fs::remove_file(&file) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => return Err(DbError::Retire { path: file, source }),
+        }
+    }
+    Ok(Some(copy))
+}
+
+/// A database's files in safe removal order: the `-wal` and `-shm`
+/// sidecars, then the main file. A failure part-way therefore never
+/// leaves a stale WAL beside a missing main file — SQLite would replay
+/// it into the next database created at that path — while the old main
+/// file, still there, keeps the database detectable for a retry.
+fn db_files(path: &Path) -> [PathBuf; 3] {
+    let with_suffix = |suffix: &str| {
+        let mut file = path.as_os_str().to_owned();
+        file.push(suffix);
+        PathBuf::from(file)
+    };
+    [with_suffix("-wal"), with_suffix("-shm"), path.to_path_buf()]
+}
+
 /// Build a pool against a concrete on-disk path. Split out so tests
 /// can call it with a `tempdir()` location without going through
 /// `AppHandle`.
-async fn open_pool_at(path: &std::path::Path) -> Result<DbPool, DbError> {
+async fn open_pool_at(path: &Path) -> Result<DbPool, DbError> {
     // WAL gives us concurrent readers + a single writer, which is the
     // shape every Neuron command surface needs (UI reads while the
     // runtime appends spans).

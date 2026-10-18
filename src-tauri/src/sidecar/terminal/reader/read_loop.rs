@@ -11,7 +11,7 @@ use crate::tuning::{MAX_PENDING_BYTES, READ_CHUNK_BYTES};
 use super::super::text::{
     extract_dsr_cpr_queries, strip_csi, trim_terminal_line_end, utf8_safe_prefix_len,
 };
-use super::super::PaneState;
+use super::super::{PaneState, SCREEN_TAIL_BYTES};
 use super::emit::{emit_data, emit_line, LineEventPayload};
 use super::transition::maybe_transition_status;
 
@@ -39,6 +39,9 @@ pub(in crate::sidecar::terminal) fn run_reader<R: Runtime>(
     // `\n`). Only an incomplete trailing UTF-8 char is held back between
     // reads (≤3 bytes), so it never grows unbounded.
     let mut raw_pending: Vec<u8> = Vec::new();
+    // Raw bytes of the current screen frame — everything since the last
+    // cursor-home / clear-screen (see `update_frame`).
+    let mut frame: Vec<u8> = Vec::new();
     loop {
         let n = match reader.read(&mut buf) {
             Ok(0) => break, // EOF — child closed PTY
@@ -121,6 +124,13 @@ pub(in crate::sidecar::terminal) fn run_reader<R: Runtime>(
                 &app, &state, &pool, &pane_id, &agent_kind, trimmed, /* maybe_transition */ true,
             );
         }
+
+        // The frame the screen shows now (see `PaneState::screen_tail`).
+        update_frame(&mut frame, &buf[..n]);
+        let screen = strip_csi(&String::from_utf8_lossy(&frame));
+        if let Ok(mut guard) = state.lock() {
+            guard.screen_tail = screen;
+        }
     }
 
     // Flush the raw stream's held-back tail (an incomplete UTF-8 char,
@@ -144,6 +154,39 @@ pub(in crate::sidecar::terminal) fn run_reader<R: Runtime>(
     }
 }
 
+/// Escape sequences a full-screen TUI starts a new frame with.
+const FRAME_STARTS: &[&[u8]] = &[b"\x1b[H", b"\x1b[1;1H", b"\x1b[2J"];
+
+/// Advance the current-frame buffer with one read's bytes: a chunk that
+/// contains a frame start (cursor home / clear screen) begins a new
+/// frame at the last one; otherwise the bytes extend the frame. Capped
+/// to its last [`SCREEN_TAIL_BYTES`], on a UTF-8 boundary.
+///
+/// A TUI such as claude 2.1.29x redraws the whole screen this way. The
+/// previous frame must not linger: after the user answered the folder-
+/// trust screen, the old trust text kept the pane looking "blocked" and
+/// its kickoff was never sent.
+pub(in crate::sidecar::terminal) fn update_frame(frame: &mut Vec<u8>, chunk: &[u8]) {
+    let last_start = FRAME_STARTS
+        .iter()
+        .filter_map(|m| chunk.windows(m.len()).rposition(|w| w == *m))
+        .max();
+    match last_start {
+        Some(pos) => {
+            frame.clear();
+            frame.extend_from_slice(&chunk[pos..]);
+        }
+        None => frame.extend_from_slice(chunk),
+    }
+    if frame.len() > SCREEN_TAIL_BYTES {
+        let mut start = frame.len() - SCREEN_TAIL_BYTES;
+        while start < frame.len() && (frame[start] & 0xC0) == 0x80 {
+            start += 1;
+        }
+        frame.drain(..start);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn emit_decoded_line<R: Runtime>(
     app: &AppHandle<R>,
@@ -164,5 +207,34 @@ fn emit_decoded_line<R: Runtime>(
     emit_line(app, state, pane_id, payload, &text_for_db, "out");
     if transition_status {
         maybe_transition_status(state, app, pool, pane_id, agent_kind);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::update_frame;
+
+    #[test]
+    fn a_new_frame_replaces_the_previous_screen() {
+        let mut frame = Vec::new();
+        update_frame(&mut frame, b"\x1b[HQuick safety check: trust this folder?");
+        assert!(String::from_utf8_lossy(&frame).contains("trust this folder"));
+        // Partial redraws without a frame start extend the frame.
+        update_frame(&mut frame, b"\x1b[14;2H> Yes");
+        assert!(String::from_utf8_lossy(&frame).contains("trust this folder"));
+        // The REPL's frame (cursor home) drops the answered trust screen.
+        update_frame(&mut frame, b"\x1b[K\n\x1b[H Claude Code\n> Try");
+        let now = String::from_utf8_lossy(&frame);
+        assert!(!now.contains("trust this folder"), "{now}");
+        assert!(now.contains("Claude Code"));
+    }
+
+    #[test]
+    fn the_frame_is_capped_on_a_utf8_boundary() {
+        let mut frame = Vec::new();
+        let big = "ü".repeat(super::SCREEN_TAIL_BYTES);
+        update_frame(&mut frame, big.as_bytes());
+        assert!(frame.len() <= super::SCREEN_TAIL_BYTES);
+        assert!(std::str::from_utf8(&frame).is_ok());
     }
 }

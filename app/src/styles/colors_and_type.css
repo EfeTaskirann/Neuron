@@ -196,6 +196,11 @@
   --muted-foreground:     oklch(0.440 0.118 258);
   --accent:               oklch(0.946 0.029 305);
   --accent-foreground:    oklch(0.390 0.172 295);
+  /* The accent as a FOREGROUND — text, focus rings, outlines. `--accent`
+     is a surface tint (1.15:1 on the light background). This follows the
+     user's accent (`--ring`, set by the Appearance picker) pushed toward
+     black: ≥5.5:1 on every light surface for all five swatches. */
+  --accent-strong:        color-mix(in oklch, var(--ring) 60%, black);
   --destructive:          oklch(0.585 0.230 18);
   --destructive-foreground: oklch(0.985 0.005 18);
   --border:               oklch(0.872 0.044 258 / 0.6);
@@ -226,6 +231,9 @@
   --muted-foreground:     oklch(0.700 0.090 258);
   --accent:               oklch(0.470 0.207 296);
   --accent-foreground:    oklch(0.977 0.014 308);
+  /* Accent as a foreground (see the light block): pushed toward white,
+     ≥6.6:1 on every dark surface for all five swatches. */
+  --accent-strong:        color-mix(in oklch, var(--ring) 80%, white);
   --destructive:          oklch(0.640 0.230 18);
   --destructive-foreground: oklch(0.985 0.005 18);
   --border:               oklch(0.310 0.060 258 / 0.7);

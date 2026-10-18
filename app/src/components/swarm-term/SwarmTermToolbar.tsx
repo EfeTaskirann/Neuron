@@ -12,9 +12,12 @@ interface SwarmTermToolbarProps {
   stopPending: boolean;
   /** Decoded launch time (ms) — mounts <SessionTimer> when non-null. */
   sessionStartMs: number | null;
+  /** Whether the Routing Log drawer is open. */
+  logOpen: boolean;
   onLaunch: () => void;
   onRestart: () => void;
   onStop: () => void;
+  onToggleLog: () => void;
 }
 
 export function SwarmTermToolbar({
@@ -25,9 +28,11 @@ export function SwarmTermToolbar({
   startPending,
   stopPending,
   sessionStartMs,
+  logOpen,
   onLaunch,
   onRestart,
   onStop,
+  onToggleLog,
 }: SwarmTermToolbarProps): JSX.Element {
   return (
     <div className="swarm-term-toolbar">
@@ -75,6 +80,15 @@ export function SwarmTermToolbar({
         </>
       )}
       {sessionStartMs != null && <SessionTimer startMs={sessionStartMs} />}
+      <button
+        type="button"
+        className="btn ghost sm swarm-term-log-toggle"
+        aria-pressed={logOpen}
+        onClick={onToggleLog}
+        title={logOpen ? 'Hide the Routing Log' : 'Show every message between the agents'}
+      >
+        Routing Log
+      </button>
     </div>
   );
 }

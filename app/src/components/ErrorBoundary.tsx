@@ -5,6 +5,7 @@
 // stale component state is gone.
 import { Component, type ErrorInfo, type ReactNode } from 'react';
 import { queryClient } from '../lib/queryClient';
+import { describeError } from '../lib/unwrap';
 
 interface ErrorBoundaryProps {
   children: ReactNode;
@@ -42,7 +43,7 @@ export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundarySt
         <div className="error-boundary" role="alert">
           <div className="error-boundary-card">
             <h2>{fallbackTitle}</h2>
-            <p className="error-boundary-message">{error.message || String(error)}</p>
+            <p className="error-boundary-message">{describeError(error) || String(error)}</p>
             <button type="button" className="btn-primary" onClick={this.handleRetry}>
               Retry
             </button>

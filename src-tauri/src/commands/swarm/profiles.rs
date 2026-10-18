@@ -33,6 +33,7 @@ const SWARM_INVOKE_TIMEOUT: Duration = Duration::from_secs(60);
 pub async fn swarm_profiles_list<R: Runtime>(
     app: AppHandle<R>,
 ) -> Result<Vec<ProfileSummary>, AppError> {
+    crate::features::require_dev_features(&app, "Headless swarm")?;
     let workspace_dir = workspace_agents_dir(&app)?;
     let registry =
         ProfileRegistry::load_from(workspace_dir.as_deref())?;
@@ -74,6 +75,7 @@ pub async fn swarm_test_invoke<R: Runtime>(
     profile_id: String,
     user_message: String,
 ) -> Result<InvokeResult, AppError> {
+    crate::features::require_dev_features(&app, "Headless swarm")?;
     if profile_id.trim().is_empty() {
         return Err(AppError::InvalidInput(
             "profileId must not be empty".into(),

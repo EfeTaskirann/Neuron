@@ -3,23 +3,19 @@ use crate::test_support::{fresh_pool, mock_app_with_pool};
 // `app.state::<DbPool>()` and `app.handle()` come from `Manager`.
 use tauri::Manager as _;
 
-/// Seed all six manifest-derived servers (matches what
+/// Seed the manifest-derived servers (matches what
 /// `db::seed_mcp_servers` does at first run).
 async fn seed_all_manifest_rows(pool: &crate::db::DbPool) {
     let manifests = crate::mcp::manifests::load_all().expect("load manifests");
     for m in manifests {
         sqlx::query(
-            "INSERT OR IGNORE INTO servers \
-             (id, name, by, description, installs, rating, featured, installed) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, 0)",
+            "INSERT OR IGNORE INTO servers (id, name, by, description, installed) \
+             VALUES (?, ?, ?, ?, 0)",
         )
         .bind(&m.id)
         .bind(&m.name)
         .bind(&m.by)
         .bind(&m.description)
-        .bind(m.installs)
-        .bind(m.rating)
-        .bind(m.featured as i64)
         .execute(pool)
         .await
         .expect("seed");
@@ -35,22 +31,21 @@ async fn mcp_list_empty_returns_empty_vec() {
 }
 
 #[tokio::test]
-async fn mcp_list_orders_featured_first() {
+async fn mcp_list_orders_by_name() {
     let (app, pool, _dir) = mock_app_with_pool().await;
     sqlx::query(
-        "INSERT INTO servers (id, name, by, description, installs, rating, featured, installed) VALUES \
-         ('s1','A','Anthropic','x',100,4.0,0,0), \
-         ('s2','B','Anthropic','x',5000,4.5,1,1)",
+        "INSERT INTO servers (id, name, by, description, installed) VALUES \
+         ('s2','B','x','x',1), \
+         ('s1','A','x','x',0)",
     )
     .execute(&pool)
     .await
     .unwrap();
     let state = app.state::<crate::db::DbPool>();
     let out = mcp_list(state).await.expect("ok");
-    assert_eq!(out.len(), 2);
-    // Featured first.
-    assert_eq!(out[0].id, "s2");
-    assert!(out[0].featured);
+    let names: Vec<&str> = out.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(names, ["A", "B"]);
+    assert!(out[1].installed);
 }
 
 /// Acceptance: install on an unknown id surfaces NotFound (same
@@ -66,35 +61,12 @@ async fn mcp_install_unknown_id_is_not_found() {
     assert_eq!(err.kind(), "not_found");
 }
 
-/// Stub manifest (browser) is seeded but install must surface a
-/// clear `mcp_server_spawn_failed` rather than silently flipping
-/// the flag.
-#[tokio::test]
-async fn mcp_install_stub_manifest_surface_spawn_failed() {
-    let (app, pool, _dir) = mock_app_with_pool().await;
-    seed_all_manifest_rows(&pool).await;
-    let handle = app.handle().clone();
-    let state = app.state::<crate::db::DbPool>();
-    let err = mcp_install(handle, state, "browser".into())
-        .await
-        .unwrap_err();
-    assert_eq!(err.kind(), "mcp_server_spawn_failed");
-    // The flag must remain 0 — no stub should land in installed=1
-    // until WP-W3 wires its full pipeline.
-    let installed: i64 =
-        sqlx::query_scalar("SELECT installed FROM servers WHERE id='browser'")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    assert_eq!(installed, 0);
-}
-
 #[tokio::test]
 async fn mcp_uninstall_flips_installed_to_zero() {
     let (app, pool, _dir) = mock_app_with_pool().await;
     sqlx::query(
-        "INSERT INTO servers (id, name, by, description, installs, rating, featured, installed) \
-         VALUES ('s1','A','Anthropic','x',1,4.0,0,1)",
+        "INSERT INTO servers (id, name, by, description, installed) \
+         VALUES ('s1','A','x','x',1)",
     )
     .execute(&pool)
     .await

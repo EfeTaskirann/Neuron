@@ -23,6 +23,7 @@ pub async fn swarm_agents_list_status<R: Runtime>(
     app: AppHandle<R>,
     workspace_id: String,
 ) -> Result<Vec<AgentStatusRow>, AppError> {
+    crate::features::require_dev_features(&app, "Headless swarm")?;
     if workspace_id.trim().is_empty() {
         return Err(AppError::InvalidInput(
             "workspaceId must not be empty".into(),
@@ -45,6 +46,7 @@ pub async fn swarm_agents_shutdown_workspace<R: Runtime>(
     app: AppHandle<R>,
     workspace_id: String,
 ) -> Result<(), AppError> {
+    crate::features::require_dev_features(&app, "Headless swarm")?;
     if workspace_id.trim().is_empty() {
         return Err(AppError::InvalidInput(
             "workspaceId must not be empty".into(),

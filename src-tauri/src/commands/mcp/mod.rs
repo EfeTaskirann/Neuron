@@ -45,8 +45,7 @@ use crate::models::{CallToolResult, Server, Tool, ToolContent};
 #[specta::specta]
 pub async fn mcp_list(pool: State<'_, DbPool>) -> Result<Vec<Server>, AppError> {
     let rows = sqlx::query_as::<_, Server>(
-        "SELECT id, name, by, description, installs, rating, featured, installed \
-         FROM servers ORDER BY featured DESC, installs DESC",
+        "SELECT id, name, by, description, installed FROM servers ORDER BY name, id",
     )
     .fetch_all(pool.inner())
     .await?;

@@ -112,10 +112,113 @@ async fn migrations_are_idempotent() {
         .expect("count applied migrations");
     // Migration count grows as the schema evolves. Update this
     // when adding a new file under `migrations/`.
-    assert_eq!(
-        count, 12,
-        "twelve migrations recorded (0001 + 0002 + 0003 + 0004 + 0005 + 0006 + 0007 + 0008 + 0009 + 0010 + 0011 + 0012)"
-    );
+    assert_eq!(count, 1, "one migration recorded (0001_baseline)");
+}
+
+/// The sqlx ledger table, as sqlx creates it.
+const LEDGER_DDL: &str = "CREATE TABLE _sqlx_migrations ( \
+    version BIGINT PRIMARY KEY, description TEXT NOT NULL, \
+    installed_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, \
+    success BOOLEAN NOT NULL, checksum BLOB NOT NULL, execution_time BIGINT NOT NULL)";
+
+#[test]
+fn db_files_remove_the_sidecars_before_the_main_file() {
+    let files = db_files(std::path::Path::new("dir").join("neuron.db").as_path());
+    let names: Vec<String> = files
+        .iter()
+        .map(|f| f.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, ["neuron.db-wal", "neuron.db-shm", "neuron.db"]);
+}
+
+/// A database created before the baseline (its ledger starts with the
+/// old `0001_init`) is copied aside — with its data — and removed, and
+/// a fresh database then takes the baseline.
+#[tokio::test]
+async fn a_pre_baseline_database_is_copied_aside_and_replaced() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let path = dir.path().join("neuron.db");
+    let pool = open_pool_at(&path).await.expect("open old db");
+    sqlx::query(LEDGER_DDL).execute(&pool).await.unwrap();
+    sqlx::query(
+        "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time) \
+         VALUES (1, 'init', 1, x'00', 0), (13, 'servers drop mock stats', 1, x'00', 0)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO settings VALUES ('user.name', 'kept in the copy')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+
+    let copy = retire_pre_baseline_db(&path)
+        .await
+        .expect("retire")
+        .expect("an old-chain database is moved aside");
+    for f in db_files(&path) {
+        assert!(!f.exists(), "{} still there", f.display());
+    }
+    let name = copy.file_name().unwrap().to_string_lossy().into_owned();
+    assert!(name.starts_with("neuron.pre-baseline-") && name.ends_with(".db"), "{name}");
+
+    // The copy is a self-contained database holding the old data.
+    let old = open_pool_at(&copy).await.expect("open copy");
+    let kept: String = sqlx::query_scalar("SELECT value FROM settings WHERE key = 'user.name'")
+        .fetch_one(&old)
+        .await
+        .unwrap();
+    assert_eq!(kept, "kept in the copy");
+    old.close().await;
+
+    // A fresh database at the old path takes the baseline cleanly.
+    let fresh = open_pool_at(&path).await.expect("open fresh");
+    MIGRATOR.run(&fresh).await.expect("baseline applies");
+    let ledger: Vec<String> = sqlx::query_scalar("SELECT description FROM _sqlx_migrations")
+        .fetch_all(&fresh)
+        .await
+        .unwrap();
+    assert_eq!(ledger, vec!["baseline".to_string()]);
+}
+
+/// A baseline-lineage database, one with no ledger, and a missing file
+/// are all left exactly as they are.
+#[tokio::test]
+async fn other_databases_are_left_alone() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+
+    let missing = dir.path().join("missing.db");
+    assert!(retire_pre_baseline_db(&missing).await.unwrap().is_none());
+    assert!(!missing.exists());
+
+    let current = dir.path().join("current.db");
+    let pool = open_pool_at(&current).await.unwrap();
+    MIGRATOR.run(&pool).await.unwrap();
+    sqlx::query("UPDATE settings SET value = 'mine' WHERE key = 'user.name'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+    assert!(retire_pre_baseline_db(&current).await.unwrap().is_none());
+    let pool = open_pool_at(&current).await.unwrap();
+    let name: String = sqlx::query_scalar("SELECT value FROM settings WHERE key = 'user.name'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(name, "mine");
+    pool.close().await;
+
+    let no_ledger = dir.path().join("plain.db");
+    let pool = open_pool_at(&no_ledger).await.unwrap();
+    sqlx::query("CREATE TABLE t (x INTEGER)").execute(&pool).await.unwrap();
+    pool.close().await;
+    assert!(retire_pre_baseline_db(&no_ledger).await.unwrap().is_none());
+    assert!(no_ledger.exists());
 }
 
 /// Acceptance: WP-W2-05 — seed_mcp_servers writes every bundled
@@ -164,64 +267,68 @@ async fn seed_demo_canvas_is_idempotent() {
 }
 
 #[tokio::test]
-async fn seed_mcp_servers_is_idempotent() {
+async fn seed_mcp_servers_mirrors_the_bundled_catalog() {
     let (pool, _dir) = fresh_pool().await;
     seed_mcp_servers(&pool).await.expect("seed first time");
-    let after_first: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM servers")
-        .fetch_one(&pool)
+    let ids: Vec<String> = sqlx::query_scalar("SELECT id FROM servers ORDER BY id")
+        .fetch_all(&pool)
         .await
         .unwrap();
-    assert_eq!(after_first, 12, "all twelve manifests seeded");
+    assert_eq!(ids, vec!["filesystem".to_string()], "only the bundled catalog");
 
-    // Re-running must not duplicate or overwrite — flip one row's
-    // `installed` to 1 first and confirm it survives the re-seed.
-    sqlx::query("UPDATE servers SET installed=1 WHERE id='filesystem'")
-        .execute(&pool)
-        .await
-        .unwrap();
+    // The state an older build leaves behind: the user installed
+    // Filesystem (tools recorded), its description has since been
+    // corrected in the manifest, and a catalog-only stub is still there.
+    sqlx::query(
+        "UPDATE servers SET installed = 1, description = 'stale text' WHERE id = 'filesystem'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO servers (id, name, \"by\", description, installed) \
+         VALUES ('github', 'GitHub', 'GitHub', 'stub', 0)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO server_tools (server_id, name, description) VALUES \
+         ('filesystem', 'read_file', 'x'), ('github', 'list_issues', 'y')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
     seed_mcp_servers(&pool).await.expect("seed second time");
-    let after_second: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM servers")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    assert_eq!(after_second, 12, "no duplicates after re-seed");
-    let installed: bool =
-        sqlx::query_scalar("SELECT installed FROM servers WHERE id='filesystem'")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    assert!(
-        installed,
-        "user-toggled `installed` flag must survive re-seed"
-    );
-
-    // Acceptance: ids match the canonical twelve (data.js#servers
-    // parity per Charter Constraint #1).
-    let ids: Vec<String> =
-        sqlx::query_scalar("SELECT id FROM servers ORDER BY id")
+    let rows: Vec<(String, String, bool)> =
+        sqlx::query_as("SELECT id, description, installed FROM servers ORDER BY id")
             .fetch_all(&pool)
             .await
             .unwrap();
-    let mut expected = vec![
-        "browser",
-        "figma",
-        "filesystem",
-        "github",
-        "linear",
-        "memory",
-        "notion",
-        "postgres",
-        "sentry",
-        "slack",
-        "stripe",
-        "vector-db",
-    ];
-    expected.sort();
+    let manifest = crate::mcp::manifests::get("filesystem").unwrap().unwrap();
     assert_eq!(
-        ids,
-        expected.into_iter().map(String::from).collect::<Vec<_>>(),
-        "twelve canonical MCP servers"
+        rows,
+        vec![("filesystem".to_string(), manifest.description, true)],
+        "stub deleted, description refreshed, install state kept"
     );
+    let tools: Vec<String> = sqlx::query_scalar("SELECT server_id FROM server_tools")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(tools, vec!["filesystem".to_string()], "the stub's tools go with it");
+}
+
+/// The servers table no longer carries the design mock's invented
+/// install counts, ratings and "featured" flag.
+#[tokio::test]
+async fn servers_table_has_no_mock_stats() {
+    let (pool, _dir) = fresh_pool().await;
+    let columns: Vec<String> = sqlx::query_scalar("SELECT name FROM pragma_table_info('servers')")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(columns, ["id", "name", "by", "description", "installed"]);
 }
 
 /// Acceptance: the pool actually works end-to-end — insert and

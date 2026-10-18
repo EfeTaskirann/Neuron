@@ -93,19 +93,23 @@ pub(super) async fn seed_demo_canvas(pool: &DbPool) -> Result<(), DbError> {
 ///
 /// We elide the migration file entirely (the seed is data-dependent
 /// on the JSON manifests) and run a Rust seed function from `init`.
-/// `INSERT OR IGNORE` keeps it safe across relaunches; the user-
-/// facing `installs`/`rating`/`featured`/`installed` values do not
-/// drift on re-seed (we never overwrite them — the user may have
-/// already toggled `installed=1`).
+///
+/// The `servers` table mirrors the bundled catalog on every launch:
+/// a new manifest gets a row, an existing row takes the manifest's
+/// current name / author / description (the catalog text is code-owned,
+/// so a corrected description reaches existing installs), and a row
+/// whose manifest is no longer bundled is deleted with its tools (FK
+/// cascade). The user's `installed` flag is never overwritten.
 ///
 /// **Failure handling.** A single corrupted manifest JSON used to
 /// abort the whole startup path (the panic landed in
 /// `tauri::Builder::build().expect(...)`, so the app refused to
 /// launch on every relaunch — see report.md §K6). We now soft-load
 /// the catalog: per-file parse failures are logged via `tracing::warn!`
-/// but the surviving manifests are seeded. Each `mcp:install`
-/// against a failed id will still surface a `ManifestError` to the
-/// caller; the rest of the app stays usable.
+/// but the surviving manifests are seeded, and a failed manifest's row
+/// is kept (with its install state) rather than deleted. Each
+/// `mcp:install` against a failed id will still surface a
+/// `ManifestError` to the caller; the rest of the app stays usable.
 pub(super) async fn seed_mcp_servers(pool: &DbPool) -> Result<(), DbError> {
     let report = crate::mcp::manifests::parse_report();
     for failure in &report.failures {
@@ -115,21 +119,42 @@ pub(super) async fn seed_mcp_servers(pool: &DbPool) -> Result<(), DbError> {
             "skipping bundled MCP manifest"
         );
     }
+    let mut tx = pool.begin().await?;
     for m in &report.manifests {
         sqlx::query(
-            "INSERT OR IGNORE INTO servers \
-             (id, name, by, description, installs, rating, featured, installed) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, 0)",
+            "INSERT INTO servers (id, name, \"by\", description, installed) \
+             VALUES (?, ?, ?, ?, 0) \
+             ON CONFLICT(id) DO UPDATE SET \
+               name = excluded.name, \
+               \"by\" = excluded.\"by\", \
+               description = excluded.description",
         )
         .bind(&m.id)
         .bind(&m.name)
         .bind(&m.by)
         .bind(&m.description)
-        .bind(m.installs)
-        .bind(m.rating)
-        .bind(m.featured as i64)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
     }
+    let bundled: Vec<&str> = report
+        .manifests
+        .iter()
+        .map(|m| m.id.as_str())
+        .chain(report.failures.iter().map(|f| f.file_key.as_str()))
+        .collect();
+    let stale = if bundled.is_empty() {
+        "DELETE FROM servers".to_string()
+    } else {
+        format!(
+            "DELETE FROM servers WHERE id NOT IN ({})",
+            vec!["?"; bundled.len()].join(", ")
+        )
+    };
+    let mut delete = sqlx::query(&stale);
+    for id in &bundled {
+        delete = delete.bind(*id);
+    }
+    delete.execute(&mut *tx).await?;
+    tx.commit().await?;
     Ok(())
 }

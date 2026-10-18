@@ -1,16 +1,13 @@
 {
   "id": "filesystem",
   "name": "Filesystem",
-  "by": "Anthropic",
-  "description": "Read, write, and search the local filesystem from any agent. Sandboxed per-workspace.",
-  "installs": 12400,
-  "rating": 4.9,
-  "featured": true,
+  "by": "Model Context Protocol",
+  "description": "Read, write and search files in its own sandbox folder under Neuron's app data, and nowhere else on disk.",
   "spawn": {
     "kind": "npx",
     "package": "@modelcontextprotocol/server-filesystem@2026.8.31",
     "args_template": ["__ROOT__"]
   },
   "requires_secret": null,
-  "default_root_kind": "app_data_dir"
+  "default_root_kind": "mcp_sandbox"
 }

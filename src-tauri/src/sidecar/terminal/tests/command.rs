@@ -1,7 +1,48 @@
 //! Command-string coverage: tokenizer, agent-kind inference,
 //! default-shell resolution, and `~`/absolute cwd expansion.
-use super::super::command::{default_shell, expand_cwd, infer_agent_kind, tokenize_command};
+use super::super::command::{
+    default_shell, expand_cwd, infer_agent_kind, inherited_claude_session_env, tokenize_command,
+};
 use std::path::PathBuf;
+
+fn env(pairs: &[&str]) -> Vec<(String, String)> {
+    pairs.iter().map(|k| (k.to_string(), "1".to_string())).collect()
+}
+
+/// Neuron launched from inside a Claude Code session: every host
+/// session variable is dropped from the panes (live: with claude
+/// 2.1.29x they turned each pane into a transcript-less child session,
+/// so no pane ever became ready and every message was rejected).
+#[test]
+fn a_parent_claude_session_leaks_none_of_its_env_into_panes() {
+    let mut removed = inherited_claude_session_env(env(&[
+        "CLAUDECODE",
+        "CLAUDE_CODE_CHILD_SESSION",
+        "CLAUDE_CODE_HOST_SESSION_ID",
+        "CLAUDE_AGENT_SDK_VERSION",
+        "Anthropic_Base_Url",
+        "PATH",
+        "USERPROFILE",
+    ]));
+    removed.sort();
+    assert_eq!(
+        removed,
+        vec![
+            "Anthropic_Base_Url",
+            "CLAUDECODE",
+            "CLAUDE_AGENT_SDK_VERSION",
+            "CLAUDE_CODE_CHILD_SESSION",
+            "CLAUDE_CODE_HOST_SESSION_ID",
+        ]
+    );
+}
+
+/// A normal launch keeps the user's own settings (e.g. a deliberate
+/// `CLAUDE_CODE_USE_BEDROCK`); only the fixed scrub list applies there.
+#[test]
+fn a_normal_launch_keeps_the_users_claude_env() {
+    assert!(inherited_claude_session_env(env(&["CLAUDE_CODE_USE_BEDROCK", "PATH"])).is_empty());
+}
 
 /// Acceptance: tokenizer handles bare programs, args, and quoted
 /// segments. Required so `terminal:spawn({cmd: "/bin/sh -c \"echo

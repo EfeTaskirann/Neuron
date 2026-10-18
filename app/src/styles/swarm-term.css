@@ -12,12 +12,40 @@
   --phase-done:     var(--syn-success);
 }
 
+/* Row: the swarm column, then the optional Routing Log drawer. */
 .route-swarm-term {
   display: flex;
-  flex-direction: column;
+  flex-direction: row;
   gap: 12px;
   padding: 16px 20px 20px;
   min-height: 0;
+}
+
+.swarm-term-main {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+}
+
+/* Routing Log drawer — hosts the log route, which fills it (`.route`
+ * is absolutely positioned) and scrolls its own table. */
+.swarm-term-log-drawer {
+  position: relative;
+  flex: 0 0 clamp(300px, 36%, 480px);
+  min-height: 0;
+  border-left: 1px solid var(--border);
+}
+.swarm-term-log-drawer .route-routing-log {
+  padding: 0 0 0 12px;
+}
+
+.swarm-term-log-toggle[aria-pressed='true'] {
+  background: var(--surface-2);
+  border-color: var(--border);
+  color: var(--foreground);
 }
 
 .swarm-term-toolbar {
@@ -98,7 +126,7 @@
 .swarm-term-pane-id {
   font-family: var(--font-mono, ui-monospace, monospace);
   font-size: 12px;
-  color: var(--accent);
+  color: var(--accent-strong);
   font-weight: 600;
 }
 
@@ -122,12 +150,12 @@
   cursor: pointer;
 }
 .swarm-term-pane-expand:hover {
-  color: var(--accent);
+  color: var(--accent-strong);
   border-color: var(--border);
   background: var(--surface-1);
 }
 .swarm-term-pane.expanded .swarm-term-pane-expand {
-  color: var(--accent);
+  color: var(--accent-strong);
 }
 
 /* Grid in expanded mode: one row × one column, only the .expanded
@@ -147,7 +175,9 @@
 .swarm-term-pane-body {
   flex: 1 1 auto;
   min-height: 0;
-  background: #0a0a0f;
+  /* = xterm's canvas background (#0a0a0f in useXtermPane.ts) in OKLCH,
+     so the area around the canvas doesn't show a seam. */
+  background: oklch(0.147 0.011 285);
   position: relative;
   overflow: hidden;
 }
@@ -201,7 +231,7 @@
 }
 
 .swarm-term-chat input:focus {
-  outline: 2px solid var(--accent);
+  outline: 2px solid var(--accent-strong);
   outline-offset: -1px;
 }
 
@@ -324,9 +354,9 @@
 .swarm-term-hier-chip.is-source,
 .swarm-term-hier-chip.is-target {
   box-shadow:
-    0 0 0 2px color-mix(in oklab, var(--accent) 80%, transparent),
-    0 0 12px color-mix(in oklab, var(--accent) 50%, transparent);
-  border-color: var(--accent);
+    0 0 0 2px color-mix(in oklab, var(--accent-strong) 80%, transparent),
+    0 0 12px color-mix(in oklab, var(--accent-strong) 50%, transparent);
+  border-color: var(--accent-strong);
   animation: swarm-term-hier-pulse 1.2s ease-in-out infinite;
 }
 .swarm-term-hier-chip.is-source {
@@ -337,13 +367,13 @@
   0%,
   100% {
     box-shadow:
-      0 0 0 2px color-mix(in oklab, var(--accent) 80%, transparent),
-      0 0 12px color-mix(in oklab, var(--accent) 50%, transparent);
+      0 0 0 2px color-mix(in oklab, var(--accent-strong) 80%, transparent),
+      0 0 12px color-mix(in oklab, var(--accent-strong) 50%, transparent);
   }
   50% {
     box-shadow:
-      0 0 0 2px color-mix(in oklab, var(--accent) 60%, transparent),
-      0 0 18px color-mix(in oklab, var(--accent) 70%, transparent);
+      0 0 0 2px color-mix(in oklab, var(--accent-strong) 60%, transparent),
+      0 0 18px color-mix(in oklab, var(--accent-strong) 70%, transparent);
   }
 }
 
@@ -400,124 +430,81 @@
  * inside the 3×3 grid so it's clear WHICH terminal just received the
  * latest message even when the operator isn't looking at the strip. */
 .swarm-term-pane.swarm-term-pane--active {
-  border-color: var(--accent);
-  box-shadow: 0 0 0 1px var(--accent);
+  border-color: var(--accent-strong);
+  box-shadow: 0 0 0 1px var(--accent-strong);
 }
 
 /* ── Accessibility: focus ring on pane wrappers ────────────────────
- * Two-tone ring (accent on top of a dark inner stroke) keeps the
- * indicator ≥3:1 against both the pane background AND the page
- * background, satisfying WCAG 2.1 AA focus-indicator contrast. */
+ * Two-tone ring (`--accent-strong` on top of an inner background
+ * stroke). `--accent-strong` is ≥5.5:1 on every surface in both themes,
+ * so the indicator clears WCAG 2.1 AA focus contrast (3:1) against the
+ * pane AND the page. (`--accent`, used here before, is a surface tint:
+ * 2.6:1 dark, 1.15:1 light.) */
 .swarm-term-pane:focus {
   outline: none;
 }
 .swarm-term-pane:focus-visible {
-  outline: 3px solid var(--accent);
+  outline: 3px solid var(--accent-strong);
   outline-offset: 2px;
   /* inner separator stroke: --background reads dark in dark mode and
      as a white gap ring in light mode — both keep ≥3:1 vs the accent */
   box-shadow: 0 0 0 1px var(--background);
 }
 
-/* ── Run-autonomously toggle (chat toolbar) ────────────────────────
- * Native checkbox kept for a11y; track + thumb are decorative siblings
- * with `aria-hidden` so screen readers announce the underlying input
- * and its visible label only. Keyboard focus is conveyed via a
- * high-contrast ring on the track. */
-.swarm-term-auto-toggle {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  cursor: pointer;
-  user-select: none;
-  flex: 0 0 auto;
-  padding: 4px 8px;
-  border-radius: 6px;
-}
-.swarm-term-auto-toggle input[type='checkbox'] {
-  position: absolute;
-  opacity: 0;
-  pointer-events: none;
-  width: 1px;
-  height: 1px;
-  margin: 0;
-}
-.swarm-term-auto-toggle-track {
+/* ── Permission-mode chip (chat bar) ───────────────────────────────
+ * States what the agents may do: the per-role allowlist with no
+ * approval prompts, or — loudly — the unrestricted bypass mode. The
+ * full explanation is a tooltip shown on hover AND keyboard focus. */
+.swarm-term-perm {
   position: relative;
-  display: inline-block;
-  width: 34px;
-  height: 18px;
-  border-radius: 999px;
-  background: color-mix(in oklab, var(--background) 70%, var(--muted-foreground));
-  border: 1px solid var(--border);
-  transition: background 180ms ease;
+  display: inline-flex;
   flex: 0 0 auto;
 }
-.swarm-term-auto-toggle-thumb {
-  position: absolute;
-  top: 1px;
-  left: 1px;
-  width: 14px;
-  height: 14px;
-  border-radius: 50%;
-  background: var(--foreground);
-  transition: transform 180ms ease;
-}
-.swarm-term-auto-toggle
-  input[type='checkbox']:checked
-  ~ .swarm-term-auto-toggle-track {
-  background: var(--accent);
-  border-color: var(--accent);
-}
-.swarm-term-auto-toggle
-  input[type='checkbox']:checked
-  ~ .swarm-term-auto-toggle-track
-  .swarm-term-auto-toggle-thumb {
-  transform: translateX(16px);
-}
-.swarm-term-auto-toggle
-  input[type='checkbox']:focus-visible
-  ~ .swarm-term-auto-toggle-track {
-  outline: 3px solid var(--accent);
-  outline-offset: 2px;
-  /* inner separator stroke: --background reads dark in dark mode and
-     as a white gap ring in light mode — both keep ≥3:1 vs the accent */
-  box-shadow: 0 0 0 1px var(--background);
-}
-.swarm-term-auto-toggle-label {
-  font-size: 12px;
-  color: var(--foreground);
-}
-
-/* AUTO chip — visible while autonomous mode is ON so the operator
- * always knows agent dispatches are NOT going to pause for them. */
-.swarm-term-auto-chip {
+.swarm-term-perm-chip {
   display: inline-flex;
   align-items: center;
-  font-size: 10px;
-  font-weight: 700;
-  letter-spacing: 0.1em;
-  padding: 2px 8px;
-  border-radius: 999px;
-  background: color-mix(in oklab, var(--background) 50%, var(--accent));
-  border: 1px solid var(--accent);
-  color: var(--foreground);
   flex: 0 0 auto;
-}
-
-/* Chat form decoration when autonomous mode is on: a subtle left
- * stripe so the input never looks like "waiting for me". */
-.swarm-term-chat--auto {
-  box-shadow: inset 3px 0 0 var(--accent);
-  padding-left: 8px;
+  padding: 0 10px;
+  border: 1px solid var(--border);
   border-radius: 6px;
+  background: var(--surface-1);
+  color: var(--muted-foreground);
+  font-size: 12px;
+  white-space: nowrap;
+  cursor: help;
 }
-
-/* Body-level marker for non-React surfaces (approval modals) to
- * detect autonomous mode and self-suppress if they choose to. */
-body[data-swarm-autonomous='1'] .approval-prompt,
-body[data-swarm-autonomous='1'] [data-suppress-when-autonomous] {
-  display: none !important;
+.swarm-term-perm-chip:focus-visible {
+  outline: 2px solid var(--accent-strong);
+  outline-offset: 2px;
+}
+.swarm-term-perm-tip {
+  display: none;
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  z-index: 30;
+  width: 360px;
+  max-width: 70vw;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--popover);
+  color: var(--popover-foreground);
+  box-shadow: var(--shadow-pop);
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 1.5;
+  white-space: normal;
+}
+.swarm-term-perm-chip:hover + .swarm-term-perm-tip,
+.swarm-term-perm-chip:focus + .swarm-term-perm-tip {
+  display: block;
+}
+.swarm-term-perm-chip--bypass {
+  background: color-mix(in oklab, var(--surface-1) 80%, var(--destructive));
+  border-color: var(--destructive);
+  color: var(--foreground);
+  font-weight: 600;
 }
 
 /* "Update Claude" corner — fixed bottom-left, only meaningfully usable

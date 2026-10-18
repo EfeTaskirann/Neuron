@@ -1,6 +1,7 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import { render, screen } from '@testing-library/react';
 import { ErrorBoundary } from './ErrorBoundary';
+import { AppErrorClient } from '../lib/unwrap';
 
 // T1-02 — route-level ErrorBoundary smoke. Each of the 9 routes is
 // wrapped in <ErrorBoundary fallbackTitle="…"> (App.tsx::RouteHost),
@@ -47,6 +48,20 @@ describe('ErrorBoundary', () => {
     expect(screen.getByText('kaboom from child')).toBeInTheDocument();
     // The retry affordance is present so the user can recover.
     expect(screen.getByRole('button', { name: /retry/i })).toBeInTheDocument();
+  });
+
+  it("shows a backend error's detail, not just its generic copy", () => {
+    function BackendBoom(): JSX.Element {
+      throw new AppErrorClient('mcp_server_spawn_failed', 'npx not found on PATH');
+    }
+    render(
+      <ErrorBoundary fallbackTitle="Couldn't load servers">
+        <BackendBoom />
+      </ErrorBoundary>,
+    );
+    expect(
+      screen.getByText('MCP sunucusu başlatılamadı. npx not found on PATH'),
+    ).toBeInTheDocument();
   });
 
   it('falls back to the default title when none is provided', () => {

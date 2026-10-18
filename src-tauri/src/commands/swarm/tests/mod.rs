@@ -16,6 +16,7 @@
 
 mod agents;
 mod dispatch;
+mod gate;
 mod jobs;
 mod orchestrator;
 mod profiles;

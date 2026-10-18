@@ -66,6 +66,91 @@ pub(super) const MAX_ENVELOPE_BYTES: u64 = 256 * 1024;
 /// of flooding the Routing Log with one row per 250 ms tick.
 const RETRY_EVENT_EVERY: u32 = 20;
 
+/// Where a settled outbox file belongs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SettledDest {
+    Processed { target: String },
+    Rejected { bucket: String, reason: String },
+}
+
+/// An outbox file whose outcome is final — delivered, or rejected with
+/// the sender told — but whose move out of the outbox failed (an
+/// antivirus scan or a sync client holding the file). Processing it
+/// again would paste it a second time and re-run the lifecycle
+/// follow-ups, so later ticks only retry the move.
+#[derive(Debug, Clone)]
+struct StuckMove {
+    dest: SettledDest,
+    /// The file when it settled: a changed mtime or size means the
+    /// sender has since written a new message under the same name.
+    /// `None` while the file's metadata cannot be read (the same lock
+    /// that failed the move can fail the stat); the first readable
+    /// stamp is adopted.
+    stamp: Option<FileStamp>,
+}
+
+/// `(mtime, size)` of a file.
+type FileStamp = (Option<SystemTime>, u64);
+
+/// Settled files still waiting for their move, keyed by outbox path.
+type StuckMoves = HashMap<PathBuf, StuckMove>;
+
+fn file_stamp(path: &Path) -> Option<FileStamp> {
+    fs::metadata(path).ok().map(|m| (m.modified().ok(), m.len()))
+}
+
+/// Remember that `path` is settled for `dest` although its move failed.
+/// Recorded even when its metadata cannot be read: skipping it would
+/// let the next scan process (and paste) it again. A file that turns
+/// out to be gone is dropped by the first retry.
+fn note_stuck(stuck: &mut StuckMoves, path: &Path, dest: SettledDest) {
+    stuck.insert(
+        path.to_path_buf(),
+        StuckMove {
+            dest,
+            stamp: file_stamp(path),
+        },
+    );
+}
+
+fn settle(root: &Path, path: &Path, dest: &SettledDest) -> io::Result<()> {
+    match dest {
+        SettledDest::Processed { target } => move_to_processed(root, path, target),
+        SettledDest::Rejected { bucket, reason } => move_to_rejected(root, path, bucket, reason),
+    }
+}
+
+/// Retry the moves that failed on earlier ticks. An entry whose file now
+/// holds a different message is dropped — the scan that follows then
+/// processes it as new — and so is one whose file is gone (the move
+/// reports `NotFound`). Unreadable metadata alone never drops an entry.
+fn retry_stuck_moves(root: &Path, stuck: &mut StuckMoves) {
+    stuck.retain(|path, entry| {
+        let now = match fs::metadata(path) {
+            Ok(m) => Some((m.modified().ok(), m.len())),
+            // Gone: nothing left to move.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return false,
+            // Unreadable (still locked): judge by the move below.
+            Err(_) => None,
+        };
+        match (entry.stamp, now) {
+            (Some(was), Some(is)) if was != is => return false,
+            (None, Some(_)) => entry.stamp = now,
+            _ => {}
+        }
+        match settle(root, path, &entry.dest) {
+            Ok(()) => {
+                tracing::info!(
+                    path = %path.display(),
+                    "swarm-term bridge: settled file moved on retry"
+                );
+                false
+            }
+            Err(e) => e.kind() != io::ErrorKind::NotFound,
+        }
+    });
+}
+
 pub(super) async fn watcher_loop<R: Runtime>(
     app: AppHandle<R>,
     registry: TerminalRegistry,
@@ -83,6 +168,7 @@ pub(super) async fn watcher_loop<R: Runtime>(
     let mut last_stall_check = Instant::now();
     let mut stall_every = stall_check_every();
     let mut stall_every_read = Instant::now();
+    let mut stuck = StuckMoves::new();
     loop {
         process_pending(
             &app,
@@ -91,6 +177,7 @@ pub(super) async fn watcher_loop<R: Runtime>(
             &panes_by_agent,
             &ready_panes,
             &lifecycle,
+            &mut stuck,
         )
         .await;
         if stall_every_read.elapsed() >= STALL_CADENCE_REFRESH {
@@ -111,6 +198,7 @@ pub(super) async fn watcher_loop<R: Runtime>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn process_pending<R: Runtime>(
     app: &AppHandle<R>,
     registry: &TerminalRegistry,
@@ -118,34 +206,24 @@ async fn process_pending<R: Runtime>(
     panes_by_agent: &Arc<HashMap<String, String>>,
     ready_panes: &Arc<Mutex<HashSet<String>>>,
     lifecycle: &Arc<LifecycleStore>,
+    stuck: &mut StuckMoves,
 ) {
+    retry_stuck_moves(root, stuck);
+
     // Legacy `inbox/<target>/` drops (the pre-outbox protocol, where the
     // sender was taken from the file's own `from` field): never
     // delivered — rejected with a pointer to the sender's outbox.
     for &dir_agent in AGENT_IDS {
         for path in json_entries(&root.join("inbox").join(dir_agent)) {
-            reject_legacy_inbox(app, registry, root, &path, dir_agent, panes_by_agent)
+            if stuck.contains_key(&path) {
+                continue;
+            }
+            reject_legacy_inbox(app, registry, root, &path, dir_agent, panes_by_agent, stuck)
                 .await;
         }
     }
 
-    // Outboxes: the SENDER is the directory the file was written to.
-    // One FIFO across all senders by write time (mtime; renames preserve
-    // it), path as the tie-break — agents pick their own filenames, so
-    // name order is not chronological.
-    let mut entries: Vec<(Option<SystemTime>, PathBuf, &'static str)> = AGENT_IDS
-        .iter()
-        .flat_map(|&sender| {
-            json_entries(&root.join("outbox").join(sender))
-                .into_iter()
-                .map(move |p| {
-                    let mtime = fs::metadata(&p).and_then(|m| m.modified()).ok();
-                    (mtime, p, sender)
-                })
-        })
-        .collect();
-    entries.sort();
-    for (_, path, sender) in entries {
+    for (_, path, sender) in outbox_entries(root, stuck) {
         process_one(
             app,
             registry,
@@ -155,9 +233,36 @@ async fn process_pending<R: Runtime>(
             panes_by_agent,
             ready_panes,
             lifecycle,
+            stuck,
         )
         .await;
     }
+}
+
+/// The outbox files to process this tick. The SENDER is the directory
+/// the file was written to. One FIFO across all senders by write time
+/// (mtime; renames preserve it), path as the tie-break — agents pick
+/// their own filenames, so name order is not chronological. Files that
+/// settled on an earlier tick but are still waiting for their move are
+/// left out.
+fn outbox_entries(
+    root: &Path,
+    stuck: &StuckMoves,
+) -> Vec<(Option<SystemTime>, PathBuf, &'static str)> {
+    let mut entries: Vec<(Option<SystemTime>, PathBuf, &'static str)> = AGENT_IDS
+        .iter()
+        .flat_map(|&sender| {
+            json_entries(&root.join("outbox").join(sender))
+                .into_iter()
+                .filter(move |p| !stuck.contains_key(p))
+                .map(move |p| {
+                    let mtime = fs::metadata(&p).and_then(|m| m.modified()).ok();
+                    (mtime, p, sender)
+                })
+        })
+        .collect();
+    entries.sort();
+    entries
 }
 
 /// `*.json` entries of `dir` (empty when it does not exist).
@@ -183,9 +288,10 @@ async fn reject_legacy_inbox<R: Runtime>(
     path: &Path,
     dir_agent: &str,
     panes_by_agent: &HashMap<String, String>,
+    stuck: &mut StuckMoves,
 ) {
     if let Err(reason) = file_gate(path) {
-        reject_unread(app, root, path, dir_agent, &reason);
+        reject_unread(app, root, path, dir_agent, &reason, stuck);
         return;
     }
     let raw = fs::read_to_string(path).unwrap_or_default();
@@ -214,6 +320,7 @@ async fn reject_legacy_inbox<R: Runtime>(
         dir_agent,
         &reason,
         &raw,
+        stuck,
     )
     .await;
 }
@@ -255,10 +362,10 @@ fn should_emit_retry_event(attempts: u32) -> bool {
     attempts == 1 || attempts % RETRY_EVENT_EVERY == 0
 }
 
-/// Move `path` to `rejected/` and, when that succeeds and the sender is
-/// a known agent, paste a `[Neuron]` notice into the sender's pane. The
-/// notice is gated on the move so a file that could not be moved (and
-/// will be re-processed next tick) does not notify twice.
+/// Move `path` to `rejected/` and, when the sender is a known agent,
+/// paste a `[Neuron]` notice into the sender's pane. A file whose move
+/// fails is remembered as settled ([`StuckMoves`]): it is never
+/// processed — or noticed — again, only its move is retried.
 #[allow(clippy::too_many_arguments)]
 async fn reject_and_notify<R: Runtime>(
     app: &AppHandle<R>,
@@ -270,6 +377,7 @@ async fn reject_and_notify<R: Runtime>(
     target: &str,
     reason: &str,
     body: &str,
+    stuck: &mut StuckMoves,
 ) {
     let sender = sender.filter(|s| AGENT_IDS.contains(s));
     // `target` may be an unvalidated `to` value; it is only ever used as
@@ -283,9 +391,16 @@ async fn reject_and_notify<R: Runtime>(
         tracing::warn!(
             path = %path.display(),
             error = %e,
-            "swarm-term bridge: rejected-move failed"
+            "swarm-term bridge: rejected-move failed — retrying the move only"
         );
-        return;
+        note_stuck(
+            stuck,
+            path,
+            SettledDest::Rejected {
+                bucket: bucket.to_string(),
+                reason: reason.to_string(),
+            },
+        );
     }
     let Some(sender) = sender else {
         return;
@@ -301,13 +416,15 @@ const UNSORTED_BUCKET: &str = "_unsorted";
 
 /// Reject an entry WITHOUT reading it (it failed the file gate), filing
 /// it under `rejected/<bucket>/` (the outbox sender, or the legacy inbox
-/// directory). No notice: nothing was read to address one with.
+/// directory). No notice: nothing was read to address one with. A failed
+/// move is remembered as settled, like in [`reject_and_notify`].
 fn reject_unread<R: Runtime>(
     app: &AppHandle<R>,
     root: &Path,
     path: &Path,
     bucket: &str,
     reason: &str,
+    stuck: &mut StuckMoves,
 ) {
     tracing::warn!(
         path = %path.display(),
@@ -318,9 +435,16 @@ fn reject_unread<R: Runtime>(
         tracing::warn!(
             path = %path.display(),
             error = %e,
-            "swarm-term bridge: rejected-move failed"
+            "swarm-term bridge: rejected-move failed — retrying the move only"
         );
-        return;
+        note_stuck(
+            stuck,
+            path,
+            SettledDest::Rejected {
+                bucket: bucket.to_string(),
+                reason: reason.to_string(),
+            },
+        );
     }
     let _ = app.emit(
         crate::events::SWARM_TERM_ROUTE,
@@ -363,10 +487,11 @@ async fn process_one<R: Runtime>(
     panes_by_agent: &Arc<HashMap<String, String>>,
     ready_panes: &Arc<Mutex<HashSet<String>>>,
     lifecycle: &Arc<LifecycleStore>,
+    stuck: &mut StuckMoves,
 ) {
     // ---- File gate --------------------------------------------------- //
     if let Err(reason) = file_gate(path) {
-        reject_unread(app, root, path, sender, &reason);
+        reject_unread(app, root, path, sender, &reason, stuck);
         return;
     }
 
@@ -418,6 +543,7 @@ async fn process_one<R: Runtime>(
                     "?",
                     &reason,
                     &raw,
+                    stuck,
                 )
                 .await;
             }
@@ -470,6 +596,7 @@ async fn process_one<R: Runtime>(
             &to_agent,
             &reason,
             &body,
+            stuck,
         )
         .await;
         return;
@@ -514,6 +641,7 @@ async fn process_one<R: Runtime>(
             &to_agent,
             &reason,
             &body,
+            stuck,
         )
         .await;
         return;
@@ -546,6 +674,7 @@ async fn process_one<R: Runtime>(
                 &to_agent,
                 reason,
                 &body,
+                stuck,
             )
             .await;
             return;
@@ -583,6 +712,7 @@ async fn process_one<R: Runtime>(
             &to_agent,
             &reason,
             &body,
+            stuck,
         )
         .await;
         return;
@@ -631,6 +761,7 @@ async fn process_one<R: Runtime>(
                 &to_agent,
                 &reason,
                 &body,
+                stuck,
             )
             .await;
         }
@@ -681,6 +812,7 @@ async fn process_one<R: Runtime>(
                 &to_agent,
                 &reason,
                 &body,
+                stuck,
             )
             .await;
         }
@@ -736,10 +868,20 @@ async fn process_one<R: Runtime>(
                 }),
             );
             if let Err(e) = move_to_processed(root, path, &to_agent) {
+                // Delivered: from here on only the move may be retried —
+                // processing the file again would paste it twice and
+                // re-run the lifecycle follow-ups below.
                 tracing::warn!(
                     path = %path.display(),
                     error = %e,
-                    "swarm-term bridge: processed-move failed"
+                    "swarm-term bridge: processed-move failed — retrying the move only"
+                );
+                note_stuck(
+                    stuck,
+                    path,
+                    SettledDest::Processed {
+                        target: to_agent.clone(),
+                    },
                 );
             }
             let task_id = envelope_task_id.as_deref();
@@ -820,9 +962,159 @@ async fn process_one<R: Runtime>(
                     &to_agent,
                     reason,
                     &body,
+                    stuck,
                 )
                 .await;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::swarm_term::bridge::prepare_layout;
+
+    fn outbox_file(root: &Path, sender: &str, name: &str, body: &str) -> PathBuf {
+        let path = root.join("outbox").join(sender).join(name);
+        fs::write(&path, body).expect("write outbox file");
+        path
+    }
+
+    /// Put a FILE where a destination directory goes, so moves into it fail.
+    fn block(dir: &Path) {
+        fs::remove_dir_all(dir).expect("rm dir");
+        fs::write(dir, b"").expect("blocker");
+    }
+
+    fn unblock(dir: &Path) {
+        fs::remove_file(dir).expect("rm blocker");
+        fs::create_dir_all(dir).expect("mkdir");
+    }
+
+    #[test]
+    fn a_delivered_file_whose_move_fails_is_moved_later_never_reprocessed() {
+        let d = tempfile::tempdir().expect("tempdir");
+        let root = d.path();
+        prepare_layout(root).expect("layout");
+        let path = outbox_file(root, "scout", "m1.json", r#"{"to":"orchestrator","body":"hi"}"#);
+        let processed = root.join("processed").join("orchestrator");
+        block(&processed);
+
+        // The delivery path: the move fails, the file is remembered.
+        assert!(move_to_processed(root, &path, "orchestrator").is_err());
+        let mut stuck = StuckMoves::new();
+        note_stuck(&mut stuck, &path, SettledDest::Processed { target: "orchestrator".into() });
+
+        // Still blocked: retried, kept, and left out of the next scan.
+        retry_stuck_moves(root, &mut stuck);
+        assert!(stuck.contains_key(&path));
+        assert!(outbox_entries(root, &stuck).is_empty());
+
+        // Unblocked: moved once, then forgotten.
+        unblock(&processed);
+        retry_stuck_moves(root, &mut stuck);
+        assert!(stuck.is_empty());
+        assert!(!path.exists());
+        assert!(processed.join("m1.json").is_file());
+        assert!(outbox_entries(root, &stuck).is_empty());
+    }
+
+    #[test]
+    fn a_stuck_rejection_lands_with_its_reason() {
+        let d = tempfile::tempdir().expect("tempdir");
+        let root = d.path();
+        prepare_layout(root).expect("layout");
+        let path = outbox_file(root, "scout", "m2.json", r#"{"to":"backend-builder","body":"x"}"#);
+        let rejected = root.join("rejected").join("backend-builder");
+        block(&rejected);
+
+        let dest = SettledDest::Rejected {
+            bucket: "backend-builder".into(),
+            reason: "hierarchy denies scout→backend-builder".into(),
+        };
+        assert!(settle(root, &path, &dest).is_err());
+        let mut stuck = StuckMoves::new();
+        note_stuck(&mut stuck, &path, dest);
+        retry_stuck_moves(root, &mut stuck);
+        assert_eq!(stuck.len(), 1);
+
+        unblock(&rejected);
+        retry_stuck_moves(root, &mut stuck);
+        assert!(stuck.is_empty());
+        assert!(rejected.join("m2.json").is_file());
+        assert_eq!(
+            fs::read_to_string(rejected.join("m2.reason")).expect("reason"),
+            "hierarchy denies scout→backend-builder"
+        );
+    }
+
+    #[test]
+    fn a_rewritten_or_vanished_file_leaves_the_stuck_set() {
+        let d = tempfile::tempdir().expect("tempdir");
+        let root = d.path();
+        prepare_layout(root).expect("layout");
+        block(&root.join("processed").join("orchestrator"));
+        let rewritten = outbox_file(root, "scout", "a.json", r#"{"to":"orchestrator","body":"1"}"#);
+        let vanished = outbox_file(root, "planner", "b.json", r#"{"to":"orchestrator","body":"2"}"#);
+        let mut stuck = StuckMoves::new();
+        for p in [&rewritten, &vanished] {
+            note_stuck(&mut stuck, p, SettledDest::Processed { target: "orchestrator".into() });
+        }
+
+        // A NEW message under the same name, and a file someone removed.
+        fs::write(&rewritten, r#"{"to":"orchestrator","body":"a newer, longer message"}"#)
+            .expect("rewrite");
+        fs::remove_file(&vanished).expect("rm");
+        retry_stuck_moves(root, &mut stuck);
+        assert!(stuck.is_empty());
+        // The rewritten file is processed again as the new message it is.
+        let pending: Vec<PathBuf> =
+            outbox_entries(root, &stuck).into_iter().map(|(_, p, _)| p).collect();
+        assert_eq!(pending, vec![rewritten]);
+    }
+
+    #[test]
+    fn a_file_already_gone_is_dropped_by_the_first_retry() {
+        let d = tempfile::tempdir().expect("tempdir");
+        let root = d.path();
+        prepare_layout(root).expect("layout");
+        let mut stuck = StuckMoves::new();
+        note_stuck(
+            &mut stuck,
+            &root.join("outbox").join("scout").join("gone.json"),
+            SettledDest::Processed { target: "orchestrator".into() },
+        );
+        assert_eq!(stuck.len(), 1, "remembered even without metadata");
+        retry_stuck_moves(root, &mut stuck);
+        assert!(stuck.is_empty(), "the move reports NotFound, so it is dropped");
+    }
+
+    /// The lock that failed the move can also fail the stat: such an
+    /// entry is still never reprocessed, adopts the first readable
+    /// stamp, and is moved once the lock clears.
+    #[test]
+    fn an_unreadable_stamp_still_blocks_reprocessing() {
+        let d = tempfile::tempdir().expect("tempdir");
+        let root = d.path();
+        prepare_layout(root).expect("layout");
+        let path = outbox_file(root, "scout", "m3.json", r#"{"to":"orchestrator","body":"hi"}"#);
+        let processed = root.join("processed").join("orchestrator");
+        block(&processed);
+        let mut stuck = StuckMoves::new();
+        stuck.insert(
+            path.clone(),
+            StuckMove {
+                dest: SettledDest::Processed { target: "orchestrator".into() },
+                stamp: None,
+            },
+        );
+        assert!(outbox_entries(root, &stuck).is_empty());
+        retry_stuck_moves(root, &mut stuck);
+        assert_eq!(stuck[&path].stamp, file_stamp(&path), "stamp adopted");
+        unblock(&processed);
+        retry_stuck_moves(root, &mut stuck);
+        assert!(stuck.is_empty());
+        assert!(processed.join("m3.json").is_file());
     }
 }

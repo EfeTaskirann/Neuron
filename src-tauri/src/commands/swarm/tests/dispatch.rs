@@ -28,6 +28,7 @@ async fn mock_app_with_w5_state() -> (
         .manage(pool.clone())
         .manage(bus.clone())
         .manage(registry.clone())
+        .manage(crate::features::DevFeatures(true))
         .build(tauri::test::mock_context(tauri::test::noop_assets()))
         .expect("mock app");
     (app, bus, registry, pool, dir)

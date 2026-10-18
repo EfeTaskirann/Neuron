@@ -8,7 +8,6 @@ import { parseSwarmTermStartMs } from '../components/swarm-term/constants';
 import { useActiveProject } from '../hooks/useActiveProject';
 import { useTerminalWrite } from '../hooks/mutations';
 import {
-  useAutonomousMode,
   useRunClaudeUpdate,
   useStartSwarmTermSession,
   useStopSwarmTermSession,
@@ -16,11 +15,10 @@ import {
   useSwarmTermSessionStatus,
 } from '../hooks/useTerminalSwarmSession';
 import { useClaudeUpdateProgress } from '../hooks/useClaudeUpdateProgress';
-import {
-  useActiveEdge,
-  useAgentLifecycle,
-  useRoutingEvents,
-} from '../hooks/useRoutingEvents';
+import { useRoutingEvents } from '../hooks/useRoutingEvents';
+import { useActiveEdge, useAgentLifecycle } from '../hooks/useAgentLifecycle';
+import { describeError } from '../lib/unwrap';
+import { RoutingLogRoute } from './RoutingLogRoute';
 
 /** Gap between the pasted chat message and its submitting CR. */
 const SUBMIT_DELAY_MS = 200;
@@ -51,9 +49,9 @@ export function TerminalSwarmRoute(): JSX.Element {
   const { project } = useActiveProject();
   const projectDir = project?.path ?? null;
   const [launchError, setLaunchError] = useState<string | null>(null);
-  // Lifted out of <OrchestratorChatBar> (which is session-gated) so the
-  // localStorage/body-attr mirror stays live for the whole route.
-  const [autonomous, setAutonomous] = useAutonomousMode();
+  // The Routing Log keeps its history in a module store, so closing the
+  // drawer loses nothing.
+  const [logOpen, setLogOpen] = useState(false);
   const { events: routeEvents } = useRoutingEvents(500);
   const activeEdge = useActiveEdge(routeEvents, 3_000);
   const lifecycle = useAgentLifecycle(routeEvents);
@@ -84,7 +82,7 @@ export function TerminalSwarmRoute(): JSX.Element {
     try {
       await startMut.mutateAsync(projectDir);
     } catch (err) {
-      setLaunchError(err instanceof Error ? err.message : String(err));
+      setLaunchError(describeError(err));
     }
   };
 
@@ -92,7 +90,7 @@ export function TerminalSwarmRoute(): JSX.Element {
     try {
       await stopMut.mutateAsync();
     } catch (err) {
-      setLaunchError(err instanceof Error ? err.message : String(err));
+      setLaunchError(describeError(err));
     }
   };
 
@@ -104,7 +102,7 @@ export function TerminalSwarmRoute(): JSX.Element {
       await stopMut.mutateAsync();
       await startMut.mutateAsync(dir);
     } catch (err) {
-      setLaunchError(err instanceof Error ? err.message : String(err));
+      setLaunchError(describeError(err));
     }
   };
 
@@ -142,62 +140,68 @@ export function TerminalSwarmRoute(): JSX.Element {
         await new Promise((resolve) => setTimeout(resolve, SUBMIT_DELAY_MS));
         await writeMut.mutateAsync({ paneId, data: '\r' });
       } catch (err) {
-        setLaunchError(err instanceof Error ? err.message : String(err));
+        setLaunchError(describeError(err));
       }
     });
   };
 
   return (
     <div className="route route-swarm-term">
-      <SwarmTermToolbar
-        projectDir={projectDir}
-        sessionProjectDir={session?.projectDir ?? null}
-        sessionActive={sessionActive}
-        canLaunch={canLaunch}
-        startPending={startMut.isPending}
-        stopPending={stopMut.isPending}
-        sessionStartMs={sessionStartMs}
-        onLaunch={launch}
-        onRestart={restart}
-        onStop={stop}
-      />
-
-      {launchError && (
-        <div className="swarm-term-error" role="alert">
-          {launchError}
-        </div>
-      )}
-      {sessionProbeFailed && (
-        <div className="swarm-term-error" role="alert">
-          Session status unavailable:{' '}
-          {sessionProbeError instanceof Error
-            ? sessionProbeError.message
-            : String(sessionProbeError)}
-        </div>
-      )}
-
-      <HierarchyDiagram
-        lifecycle={lifecycle}
-        activeSource={activeEdge?.source ?? null}
-        activeTarget={activeEdge?.target ?? null}
-        personasById={personasById}
-        panesByAgent={panesByAgent}
-      />
-
-      {sessionActive && orchestratorPaneId && (
-        <OrchestratorChatBar
-          onSend={sendToOrchestrator}
-          autonomous={autonomous}
-          setAutonomous={setAutonomous}
+      <div className="swarm-term-main">
+        <SwarmTermToolbar
+          projectDir={projectDir}
+          sessionProjectDir={session?.projectDir ?? null}
+          sessionActive={sessionActive}
+          canLaunch={canLaunch}
+          startPending={startMut.isPending}
+          stopPending={stopMut.isPending}
+          sessionStartMs={sessionStartMs}
+          logOpen={logOpen}
+          onLaunch={launch}
+          onRestart={restart}
+          onStop={stop}
+          onToggleLog={() => setLogOpen((open) => !open)}
         />
-      )}
 
-      <SwarmTermGrid
-        personasById={personasById}
-        panesByAgent={panesByAgent}
-        lifecycle={lifecycle}
-        activeEdge={activeEdge}
-      />
+        {launchError && (
+          <div className="swarm-term-error" role="alert">
+            {launchError}
+          </div>
+        )}
+        {sessionProbeFailed && (
+          <div className="swarm-term-error" role="alert">
+            Session status unavailable: {describeError(sessionProbeError)}
+          </div>
+        )}
+
+        <HierarchyDiagram
+          lifecycle={lifecycle}
+          activeSource={activeEdge?.source ?? null}
+          activeTarget={activeEdge?.target ?? null}
+          personasById={personasById}
+          panesByAgent={panesByAgent}
+        />
+
+        {sessionActive && orchestratorPaneId && (
+          <OrchestratorChatBar
+            onSend={sendToOrchestrator}
+            permissionMode={session.permissionMode}
+          />
+        )}
+
+        <SwarmTermGrid
+          personasById={personasById}
+          panesByAgent={panesByAgent}
+          lifecycle={lifecycle}
+          activeEdge={activeEdge}
+        />
+      </div>
+
+      {logOpen && (
+        <aside className="swarm-term-log-drawer" aria-label="Routing Log">
+          <RoutingLogRoute />
+        </aside>
+      )}
 
       <ClaudeUpdateCorner
         sessionActive={sessionActive}

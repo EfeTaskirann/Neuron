@@ -29,6 +29,17 @@ pub(super) fn setup(
         )
         .try_init();
 
+    // Developer features (`NEURON_DEV_FEATURES=1`) — read once, before
+    // anything below consults them. See `crate::features`.
+    let dev_features = crate::features::DevFeatures::from_env();
+    app.manage(dev_features);
+    if dev_features.0 {
+        tracing::info!(
+            "developer features on ({}=1)",
+            crate::features::DEV_FEATURES_ENV
+        );
+    }
+
     // tauri-specta needs `mount_events` if you collect events;
     // we don't (we use raw `app.emit("mailbox.new", ...)` so
     // the WP-W2-03 spec stays tooling-agnostic), but calling
@@ -45,21 +56,24 @@ pub(super) fn setup(
     app.manage(pool);
 
     // WP-W2-04 — spawn the LangGraph Python sidecar after the
-    // pool is in app state (the read loop needs it). A spawn
-    // failure is non-fatal: the app continues, but
-    // `runs:create` will return `AppError::Sidecar` until the
-    // user installs Python + runs `uv sync`. The sidecar
+    // pool is in app state (the read loop needs it). It only backs
+    // the Workflow canvas, a developer feature, so it starts only
+    // with those on. A spawn failure is non-fatal: the app
+    // continues, but `runs:create` will return `AppError::Sidecar`
+    // until the user installs Python + runs `uv sync`. The sidecar
     // README shows the steps.
-    match sidecar::agent::spawn_runtime(app.handle()) {
-        Ok(handle) => {
-            app.manage(handle);
-        }
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                "LangGraph sidecar unavailable; \
-                 run `cd src-tauri/sidecar/agent_runtime && uv sync` to install"
-            );
+    if dev_features.0 {
+        match sidecar::agent::spawn_runtime(app.handle()) {
+            Ok(handle) => {
+                app.manage(handle);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "LangGraph sidecar unavailable; \
+                     run `cd src-tauri/sidecar/agent_runtime && uv sync` to install"
+                );
+            }
         }
     }
 

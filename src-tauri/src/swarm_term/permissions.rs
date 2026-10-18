@@ -24,11 +24,43 @@
 //! that project's code, and an agent can still write into another
 //! agent's outbox inside `.bridgespace` (builders) — see the bridge's
 //! trust model. Setting [`PERMISSIONS_ENV`]`=bypass` restores the old
-//! unrestricted mode for every pane (logged as a warning).
+//! unrestricted mode for every pane (logged as a warning and reported
+//! to the UI through [`SwarmTermPermissionMode`]).
+
+use serde::{Deserialize, Serialize};
+use specta::Type;
 
 /// Opt-out: `NEURON_TERM_PERMISSIONS=bypass` → every pane runs with
 /// `bypassPermissions` again.
 pub(crate) const PERMISSIONS_ENV: &str = "NEURON_TERM_PERMISSIONS";
+
+/// The permission mode a session's panes were spawned with. Captured
+/// once at session start, so what the UI reports is exactly what the
+/// panes run with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub enum SwarmTermPermissionMode {
+    /// `dontAsk` + the per-role allowlist ([`allowed_tools`]).
+    Restricted,
+    /// [`PERMISSIONS_ENV`]`=bypass`: every pane runs with
+    /// `bypassPermissions` (unrestricted shell + file access).
+    Bypass,
+}
+
+/// The mode a session started now gets, from [`PERMISSIONS_ENV`].
+pub(crate) fn current_mode() -> SwarmTermPermissionMode {
+    mode_from(std::env::var(PERMISSIONS_ENV).ok().as_deref())
+}
+
+/// Pure: [`PERMISSIONS_ENV`]'s value → mode. Only `bypass` (trimmed,
+/// any case) opts out.
+fn mode_from(value: Option<&str>) -> SwarmTermPermissionMode {
+    if value.is_some_and(|v| v.trim().eq_ignore_ascii_case("bypass")) {
+        SwarmTermPermissionMode::Bypass
+    } else {
+        SwarmTermPermissionMode::Restricted
+    }
+}
 
 /// Coarse role used to pick an allowlist.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,26 +114,20 @@ const VERIFY_COMMANDS: &[&str] = &[
     "git show",
 ];
 
-/// The `claude` CLI arguments that set `agent_id`'s permissions for a
-/// session whose bridge root is `.bridgespace/<session_id>/` under the
-/// pane's working directory (the project).
-pub(crate) fn claude_permission_args(agent_id: &str, session_id: &str) -> Vec<String> {
-    if bypass_requested() {
+/// The `claude` CLI arguments that set `agent_id`'s permissions under
+/// `mode`, for a session whose bridge root is `.bridgespace/<session_id>/`
+/// under the pane's working directory (the project).
+pub(crate) fn claude_permission_args(
+    mode: SwarmTermPermissionMode,
+    agent_id: &str,
+    session_id: &str,
+) -> Vec<String> {
+    if mode == SwarmTermPermissionMode::Bypass {
         return vec!["--permission-mode".into(), "bypassPermissions".into()];
     }
     let mut args = vec!["--permission-mode".into(), "dontAsk".into(), "--allowedTools".into()];
     args.extend(allowed_tools(agent_id, session_id));
     args
-}
-
-fn bypass_requested() -> bool {
-    std::env::var(PERMISSIONS_ENV)
-        .is_ok_and(|v| v.trim().eq_ignore_ascii_case("bypass"))
-}
-
-/// True when the opt-out is active (for a one-time startup warning).
-pub(crate) fn bypass_active() -> bool {
-    bypass_requested()
 }
 
 /// Pure: the allowlist for one agent.
@@ -214,13 +240,43 @@ mod tests {
 
     #[test]
     fn args_use_dont_ask_and_quote_cleanly() {
-        let args = claude_permission_args("scout", "swarm-term-01X");
-        if !bypass_active() {
-            assert_eq!(&args[..3], &["--permission-mode", "dontAsk", "--allowedTools"]);
-        }
+        let args =
+            claude_permission_args(SwarmTermPermissionMode::Restricted, "scout", "swarm-term-01X");
+        assert_eq!(&args[..3], &["--permission-mode", "dontAsk", "--allowedTools"]);
         let joined = join_quoted(&args);
         assert!(joined.contains("\"Read(./**)\""));
         assert!(!args.iter().any(|a| a.contains('"') || a.contains('\\')));
+    }
+
+    #[test]
+    fn bypass_mode_drops_the_allowlist() {
+        assert_eq!(
+            claude_permission_args(SwarmTermPermissionMode::Bypass, "backend-builder", "s"),
+            ["--permission-mode", "bypassPermissions"]
+        );
+    }
+
+    #[test]
+    fn only_the_bypass_value_opts_out() {
+        use SwarmTermPermissionMode::{Bypass, Restricted};
+        assert_eq!(mode_from(None), Restricted);
+        assert_eq!(mode_from(Some("")), Restricted);
+        assert_eq!(mode_from(Some("off")), Restricted);
+        assert_eq!(mode_from(Some("bypassPermissions")), Restricted);
+        assert_eq!(mode_from(Some("bypass")), Bypass);
+        assert_eq!(mode_from(Some("  BYPASS \n")), Bypass);
+    }
+
+    #[test]
+    fn mode_serializes_for_the_ui() {
+        assert_eq!(
+            serde_json::to_string(&SwarmTermPermissionMode::Restricted).unwrap(),
+            "\"restricted\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SwarmTermPermissionMode::Bypass).unwrap(),
+            "\"bypass\""
+        );
     }
 
     #[test]

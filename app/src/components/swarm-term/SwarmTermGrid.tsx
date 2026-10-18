@@ -9,7 +9,7 @@ import { SwarmPane } from '../SwarmPane';
 import type {
   ActiveEdge,
   AgentLifecycle,
-} from '../../hooks/useRoutingEvents';
+} from '../../hooks/useAgentLifecycle';
 import type { SwarmTermPersona } from '../../lib/bindings';
 import { LifecyclePill } from './LifecyclePill';
 import { SLOT_ORDER } from './constants';

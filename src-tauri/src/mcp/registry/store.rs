@@ -38,7 +38,7 @@ pub(super) async fn persist_install(
     }
     let updated = sqlx::query_as::<_, Server>(
         "UPDATE servers SET installed = 1 WHERE id = ? \
-         RETURNING id, name, by, description, installs, rating, featured, installed",
+         RETURNING id, name, by, description, installed",
     )
     .bind(&manifest.id)
     .fetch_optional(&mut *tx)
@@ -62,7 +62,7 @@ pub(super) async fn uninstall_server(pool: &DbPool, id: &str) -> Result<Server, 
         .await?;
     let updated = sqlx::query_as::<_, Server>(
         "UPDATE servers SET installed = 0 WHERE id = ? \
-         RETURNING id, name, by, description, installs, rating, featured, installed",
+         RETURNING id, name, by, description, installed",
     )
     .bind(id)
     .fetch_optional(&mut *tx)

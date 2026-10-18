@@ -1,4 +1,4 @@
-import type { AgentLifecycle } from '../hooks/useRoutingEvents';
+import type { AgentLifecycle } from '../hooks/useAgentLifecycle';
 
 // Hierarchy visualization grouping. Mirrors the four tiers documented
 // in `src-tauri/src/swarm_term/hierarchy.rs` ALLOWED graph and the

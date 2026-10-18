@@ -2,9 +2,9 @@
 //! `spawn_for_manifest` and inserting tools directly. The real
 //! npx-spawning integration test is `#[ignore]` so CI can opt in.
 
-use super::spawn::npx_executable;
+use super::spawn::{mcp_sandbox_dir, npx_executable};
 use super::store::persist_install;
-use super::{install, list_tools, uninstall};
+use super::{list_tools, uninstall};
 use crate::db::DbPool;
 use crate::mcp::client::{McpClient, ToolDescriptor};
 use crate::mcp::manifests;
@@ -16,17 +16,13 @@ async fn seed_manifest_rows(pool: &DbPool) {
     let manifests = manifests::load_all().expect("load manifests");
     for m in manifests {
         sqlx::query(
-            "INSERT OR IGNORE INTO servers \
-             (id, name, by, description, installs, rating, featured, installed) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, 0)",
+            "INSERT OR IGNORE INTO servers (id, name, by, description, installed) \
+             VALUES (?, ?, ?, ?, 0)",
         )
         .bind(&m.id)
         .bind(&m.name)
         .bind(&m.by)
         .bind(&m.description)
-        .bind(m.installs)
-        .bind(m.rating)
-        .bind(m.featured as i64)
         .execute(pool)
         .await
         .expect("seed manifest row");
@@ -160,22 +156,17 @@ async fn list_tools_round_trips_through_db() {
     assert_eq!(got[0].input_schema_json, "{\"b\":2}");
 }
 
-/// Stub manifests (browser, slack, vector-db, postgres) MUST
-/// surface a clear error rather than silently flip the flag.
-#[tokio::test]
-async fn install_stub_manifest_returns_spawn_failed() {
-    let (pool, _dir) = fresh_pool().await;
-    seed_manifest_rows(&pool).await;
-    // Build a fake AppHandle for the call. The stub manifest path
-    // never actually reaches the spawn boundary — we go through
-    // `fetch_tools → spawn_for_manifest` which short-circuits on
-    // `manifest.spawn.is_none()`.
-    let app = tauri::test::mock_builder()
-        .manage(pool.clone())
-        .build(tauri::test::mock_context(tauri::test::noop_assets()))
-        .expect("mock app");
-    let err = install(&pool, app.handle(), "browser").await.unwrap_err();
-    assert_eq!(err.kind(), "mcp_server_spawn_failed");
+/// The Filesystem server is rooted in a folder of its own — never the
+/// app data dir, which holds the database and the swarm panes'
+/// credential copies.
+#[test]
+fn filesystem_root_is_its_own_sandbox_not_the_app_data_dir() {
+    let app_data = std::path::Path::new("appdata");
+    let root = mcp_sandbox_dir(app_data, "filesystem");
+    assert_eq!(root, app_data.join("mcp").join("filesystem"));
+    assert_ne!(root, app_data);
+    let swarm_homes = app_data.join("swarm-term").join("homes");
+    assert!(!swarm_homes.starts_with(&root) && !root.starts_with(&swarm_homes));
 }
 
 /// Smoke: integration test that actually spawns

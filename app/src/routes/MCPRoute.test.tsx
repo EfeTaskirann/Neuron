@@ -6,7 +6,6 @@ import type { ReactNode } from 'react';
 // Mirror `SwarmRoute.test.tsx`: stub the command surface the route reaches
 // (server catalog + install/uninstall mutations), drive the real
 // `useServers`/`useMcpInstall`/`useMcpUninstall` hooks through `unwrap`.
-// T1-01 render-smoke coverage for the `mcp` tab, which had none before.
 vi.mock('../lib/bindings', () => ({
   commands: {
     mcpList: vi.fn(),
@@ -27,25 +26,19 @@ function renderRoute(): { qc: QueryClient } {
   return { qc };
 }
 
-const FEATURED_SERVER: Server = {
-  id: 'srv-fs',
+const FS_SERVER: Server = {
+  id: 'filesystem',
   name: 'Filesystem',
-  by: 'Anthropic',
-  desc: 'Local file access',
-  installs: 12_000,
-  rating: 4.8,
-  featured: true,
+  by: 'Model Context Protocol',
+  desc: 'Read, write and search files in its own sandbox folder',
   installed: false,
 };
 
-const PLAIN_SERVER: Server = {
+const GIT_SERVER: Server = {
   id: 'srv-git',
   name: 'Git',
   by: 'community',
   desc: 'Repo operations',
-  installs: 3_400,
-  rating: 4.5,
-  featured: false,
   installed: true,
 };
 
@@ -53,11 +46,21 @@ beforeEach(async () => {
   const { commands } = await import('../lib/bindings');
   vi.mocked(commands.mcpList).mockResolvedValue({
     status: 'ok',
-    data: [FEATURED_SERVER, PLAIN_SERVER],
+    data: [FS_SERVER, GIT_SERVER],
   });
-  vi.mocked(commands.mcpInstall).mockResolvedValue({ status: 'ok', data: PLAIN_SERVER });
-  vi.mocked(commands.mcpUninstall).mockResolvedValue({ status: 'ok', data: PLAIN_SERVER });
+  vi.mocked(commands.mcpInstall).mockResolvedValue({ status: 'ok', data: FS_SERVER });
+  vi.mocked(commands.mcpUninstall).mockResolvedValue({ status: 'ok', data: GIT_SERVER });
 });
+
+/** The "installed" filter chip — an installed server's uninstall button
+ *  is also named "installed" (its pill), so pick the chip by class. */
+function installedChip(): HTMLElement {
+  const chip = screen
+    .getAllByRole('button', { name: 'installed' })
+    .find((b) => b.classList.contains('chip'));
+  if (!chip) throw new Error('no installed chip');
+  return chip;
+}
 
 describe('MCPRoute', () => {
   it('shows the loading state before the servers query resolves', () => {
@@ -65,17 +68,18 @@ describe('MCPRoute', () => {
     expect(screen.getByText(/loading servers/i)).toBeInTheDocument();
   });
 
-  it('renders featured + full catalog with the server count in the search box', async () => {
+  it('lists each server once, with an honest intro and no invented stats', async () => {
     renderRoute();
     await waitFor(() =>
       expect(screen.getByPlaceholderText(/search 2 servers/i)).toBeInTheDocument(),
     );
-    // A featured server appears twice: once in the Featured strip and once
-    // in the "All servers" list; a non-featured one appears only in the list.
-    expect(screen.getAllByText('Filesystem').length).toBeGreaterThanOrEqual(2);
+    expect(screen.getByText('Filesystem')).toBeInTheDocument();
     expect(screen.getByText('Git')).toBeInTheDocument();
-    expect(screen.getByText('Featured')).toBeInTheDocument();
-    expect(screen.getByText('All servers')).toBeInTheDocument();
+    expect(screen.getByText(/swarm agents don't use these servers yet/i)).toBeInTheDocument();
+    expect(screen.queryByText('Featured')).not.toBeInTheDocument();
+    expect(screen.queryByText(/★/)).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'official' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'community' })).not.toBeInTheDocument();
   });
 
   it('renders the empty catalog without throwing', async () => {
@@ -85,6 +89,7 @@ describe('MCPRoute', () => {
     await waitFor(() =>
       expect(screen.getByPlaceholderText(/search 0 servers/i)).toBeInTheDocument(),
     );
+    expect(screen.getByText(/no servers in the catalog/i)).toBeInTheDocument();
   });
 
   it('filters the catalog by the search box', async () => {
@@ -94,19 +99,14 @@ describe('MCPRoute', () => {
       target: { value: 'git' },
     });
     expect(screen.getByText('Git')).toBeInTheDocument();
-    // Filesystem (featured, no "git" in name/desc/by) drops from both the
-    // featured strip and the list.
     expect(screen.queryByText('Filesystem')).not.toBeInTheDocument();
   });
 
-  it('filters the catalog by the official chip', async () => {
+  it('filters the catalog to installed servers', async () => {
     renderRoute();
     await waitFor(() => expect(screen.getByText('Git')).toBeInTheDocument());
-    // Filesystem is featured (official); Git is not. ('installed' would
-    // collide with a server's installed/uninstall pill button, so we
-    // assert the chip filter via the unambiguous 'official' chip.)
-    fireEvent.click(screen.getByRole('button', { name: 'official' }));
-    expect(screen.getAllByText('Filesystem').length).toBeGreaterThanOrEqual(1);
-    expect(screen.queryByText('Git')).not.toBeInTheDocument();
+    fireEvent.click(installedChip());
+    expect(screen.getByText('Git')).toBeInTheDocument();
+    expect(screen.queryByText('Filesystem')).not.toBeInTheDocument();
   });
 });
