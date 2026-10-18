@@ -175,7 +175,9 @@
 .swarm-term-pane-body {
   flex: 1 1 auto;
   min-height: 0;
-  background: #0a0a0f;
+  /* = xterm's canvas background (#0a0a0f in useXtermPane.ts) in OKLCH,
+     so the area around the canvas doesn't show a seam. */
+  background: oklch(0.147 0.011 285);
   position: relative;
   overflow: hidden;
 }

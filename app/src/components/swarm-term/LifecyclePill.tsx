@@ -1,4 +1,4 @@
-import type { AgentLifecycle } from '../../hooks/useRoutingEvents';
+import type { AgentLifecycle } from '../../hooks/useAgentLifecycle';
 import { LIFECYCLE_LABEL } from './constants';
 
 interface LifecyclePillProps {

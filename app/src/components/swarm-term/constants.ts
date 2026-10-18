@@ -1,4 +1,4 @@
-import type { AgentLifecycle } from '../../hooks/useRoutingEvents';
+import type { AgentLifecycle } from '../../hooks/useAgentLifecycle';
 
 // Fixed 3×3 slot order for the agent terminal grid. Both the grid
 // render and the arrow-key navigation index into this array, so the

@@ -1376,9 +1376,9 @@ html[data-motion="off"] *::after {
    state, so the palette mirrors the row tags below and is visible in the
    default-all-active state (all 11 outcomes enabled). */
 .route-routing-log .chip.chip-outcome-ok.active {
-  background: color-mix(in oklch, oklch(0.72 0.16 145) 18%, transparent);
-  border-color: oklch(0.72 0.16 145);
-  color: oklch(0.92 0.16 145);
+  background: color-mix(in oklch, var(--syn-success) 18%, transparent);
+  border-color: var(--syn-success);
+  color: color-mix(in oklch, var(--syn-success) 70%, white);
 }
 .route-routing-log .chip.chip-outcome-malformed.active,
 .route-routing-log .chip.chip-outcome-denied.active,
@@ -1386,21 +1386,21 @@ html[data-motion="off"] *::after {
 .route-routing-log .chip.chip-outcome-target_locked.active,
 .route-routing-log .chip.chip-outcome-target_write_timeout.active,
 .route-routing-log .chip.chip-outcome-rejected.active {
-  background: color-mix(in oklch, oklch(0.62 0.18 25) 18%, transparent);
-  border-color: oklch(0.62 0.18 25);
-  color: oklch(0.92 0.18 25);
+  background: color-mix(in oklch, var(--syn-error) 18%, transparent);
+  border-color: var(--syn-error);
+  color: color-mix(in oklch, var(--syn-error) 70%, white);
 }
 .route-routing-log .chip.chip-outcome-target_not_ready.active,
 .route-routing-log .chip.chip-outcome-notice.active,
 .route-routing-log .chip.chip-outcome-reminder.active {
-  background: color-mix(in oklch, oklch(0.7 0.16 80) 18%, transparent);
-  border-color: oklch(0.7 0.16 80);
-  color: oklch(0.93 0.16 80);
+  background: color-mix(in oklch, var(--syn-warning) 18%, transparent);
+  border-color: var(--syn-warning);
+  color: color-mix(in oklch, var(--syn-warning) 70%, white);
 }
 .route-routing-log .chip.chip-outcome-lifecycle_fanout.active {
-  background: color-mix(in oklch, var(--neuron-violet-500) 18%, transparent);
-  border-color: var(--neuron-violet-500);
-  color: oklch(0.9 0.1 290);
+  background: color-mix(in oklch, var(--syn-running) 18%, transparent);
+  border-color: var(--syn-running);
+  color: color-mix(in oklch, var(--syn-running) 70%, white);
 }
 .routing-log-body {
   flex: 1 1 auto;
