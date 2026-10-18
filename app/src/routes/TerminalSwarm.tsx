@@ -158,7 +158,18 @@ export function TerminalSwarmRoute(): JSX.Element {
     () => new Map(paneStates.map((p) => [p.agentId, p])),
     [paneStates],
   );
-  const chatDisabledReason = chatWaitReason(paneStatesByAgent.get('orchestrator'));
+  // A hold (usage limit, budget, the user's pause) stops the bridge, but
+  // the chat writes straight to the orchestrator pane — so lock it too, or
+  // its submitting CR lands on claude's limit menu / a wasted turn.
+  const chatHoldReason = session?.usageLimited
+    ? 'Kullanım limiti: swarm duraklatıldı. Limit kalkınca ya da “Şimdi sürdür” ile devam.'
+    : session?.budgetReached
+      ? 'Mesaj bütçesi doldu. “Bütçeyi artır, sürdür” ile devam.'
+      : session?.paused
+        ? 'Duraklatıldı: araç çubuğundaki “Sürdür” ile devam.'
+        : null;
+  const chatDisabledReason =
+    chatHoldReason ?? chatWaitReason(paneStatesByAgent.get('orchestrator'));
   const startMut = useStartSwarmTermSession();
   const trustMut = useTrustSwarmTermProject();
   const stopMut = useStopSwarmTermSession();

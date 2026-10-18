@@ -504,6 +504,18 @@ describe('TerminalSwarmRoute', () => {
     await waitFor(() => expect(commands.swarmTermSetPaused).toHaveBeenCalledWith(true));
   });
 
+  it('locks the orchestrator chat while a usage-limit hold is on', async () => {
+    const { commands } = await import('../lib/bindings');
+    vi.mocked(commands.swarmTermSessionStatus).mockResolvedValue({
+      status: 'ok',
+      data: { ...SESSION, usageLimited: true, limitResetsAt: null },
+    });
+    renderRoute();
+    const input = await screen.findByLabelText(/message to orchestrator/i);
+    expect(input).toBeDisabled();
+    expect(input).toHaveAttribute('placeholder', expect.stringMatching(/Kullanım limiti/));
+  });
+
   it('shows a paused swarm and offers to resume it', async () => {
     const { commands } = await import('../lib/bindings');
     vi.mocked(commands.swarmTermSessionStatus).mockResolvedValue({
