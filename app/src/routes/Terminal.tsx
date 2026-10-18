@@ -14,6 +14,7 @@
 // live under `components/terminal/` (T2-01 split).
 import { useMemo, useState } from 'react';
 import { usePanes } from '../hooks/usePanes';
+import { useSwarmTermSessionSnapshot } from '../hooks/useTerminalSwarmSession';
 import { MailboxPanel } from '../components/terminal/MailboxPanel';
 import { PaneTabStrip } from '../components/terminal/PaneTabStrip';
 import { PaneView } from '../components/terminal/PaneView';
@@ -25,6 +26,14 @@ import {
 
 export function TerminalRoute(): JSX.Element {
   const { data: panes = [], isLoading, isError, error } = usePanes();
+  // The running swarm session's panes are stopped from Terminal Swarm, so
+  // they have no close control here; a swarm-term row from a crashed or
+  // past session is not in this set and stays closeable.
+  const { data: swarmSession } = useSwarmTermSessionSnapshot();
+  const liveSwarmPaneIds = useMemo(
+    () => new Set(swarmSession?.panes.map((p) => p.paneId) ?? []),
+    [swarmSession],
+  );
   const [activeId, setActiveId] = useState<string | null>(null);
 
   // Resolve the active pane at render time so a purged-out
@@ -65,12 +74,14 @@ export function TerminalRoute(): JSX.Element {
           panes={panes}
           activeId={activePane.id}
           onSelect={setActiveId}
+          liveSwarmPaneIds={liveSwarmPaneIds}
         />
         <div className="pane-active">
           <PaneView
             key={activePane.id}
             pane={activePane}
             active
+            liveSwarmPaneIds={liveSwarmPaneIds}
             onActivate={() => setActiveId(activePane.id)}
           />
         </div>

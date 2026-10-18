@@ -60,6 +60,7 @@ vi.mock('@xterm/xterm/css/xterm.css', () => ({}));
 
 import { TerminalSwarmRoute } from './TerminalSwarm';
 import { setActiveProject } from '../hooks/useActiveProject';
+import { formatResetTime } from '../lib/swarmNotify';
 import type { SwarmTermPersona, TerminalSwarmSessionHandle } from '../lib/bindings';
 
 function renderRoute(): void {
@@ -351,11 +352,7 @@ describe('TerminalSwarmRoute', () => {
     renderRoute();
     const banner = await screen.findByRole('alert');
     expect(banner).toHaveTextContent('Claude kullanım limitine ulaşıldı');
-    const shown = new Date(resetsAt * 1000).toLocaleTimeString('tr-TR', {
-      hour: '2-digit',
-      minute: '2-digit',
-    });
-    expect(banner).toHaveTextContent(`sıfırlanma: ${shown}`);
+    expect(banner).toHaveTextContent(`sıfırlanma: ${formatResetTime(resetsAt)}`);
     fireEvent.click(screen.getByRole('button', { name: 'Şimdi sürdür' }));
     await waitFor(() => expect(commands.swarmTermResumeDeliveries).toHaveBeenCalled());
   });

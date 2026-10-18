@@ -72,8 +72,14 @@ describe('session alerts', () => {
     ]);
   });
 
-  it('formats the reset time as hours and minutes', () => {
-    expect(formatResetTime(Date.UTC(2026, 9, 18, 13, 50) / 1000)).toMatch(/^\d{2}[:.]\d{2}$/);
+  it('formats the reset time: HH:MM today, with the date otherwise', () => {
+    const now = new Date();
+    const todayAt = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 4, 5).getTime() / 1000;
+    expect(formatResetTime(todayAt)).toMatch(/^\d{2}[:.]\d{2}$/);
+    // A different day (8 days out, past any weekly reset) carries a date
+    // part as well as the time.
+    const otherDay = formatResetTime(Math.floor(Date.now() / 1000) + 8 * 24 * 3600);
+    expect(otherDay).toMatch(/\d{1,2}[./]\d{1,2}.*\d{2}[:.]\d{2}/);
   });
 });
 

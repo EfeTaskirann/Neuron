@@ -28,6 +28,7 @@ export interface LogOrchestratorJobInput {
 
 export function useLogOrchestratorJob() {
   return useMutation<null, Error, LogOrchestratorJobInput>({
+    meta: { errorsShownInline: true },
     mutationFn: ({ workspaceId, jobId, goal }) =>
       unwrap(commands.swarmOrchestratorLogJob(workspaceId, jobId, goal)),
   });

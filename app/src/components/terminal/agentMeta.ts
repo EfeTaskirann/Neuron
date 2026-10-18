@@ -27,9 +27,16 @@ export function metaFor(agent: string): AgentInfo {
 // disable the per-tab close button in favour of the bulk cleanup.
 export const TERMINAL_STATUSES = new Set(['closed', 'error', 'success']);
 
-/** A pane the running Terminal Swarm owns: it is stopped from there. */
-export function isLiveSwarmPane(pane: { workspace: string; status: string }): boolean {
-  return pane.workspace === 'swarm-term' && pane.status !== 'closed';
+/** A pane the RUNNING Terminal Swarm still owns (its id is in the current
+ *  session) — it is stopped from there, not closed in this tab. A
+ *  swarm-term row from a crashed / past session is not live and stays
+ *  closeable here. */
+export function isLiveSwarmPane(
+  pane: { workspace: string },
+  liveSwarmPaneIds: ReadonlySet<string>,
+  id: string,
+): boolean {
+  return pane.workspace === 'swarm-term' && liveSwarmPaneIds.has(id);
 }
 
 export const STATUS_LABEL: Record<string, string> = {

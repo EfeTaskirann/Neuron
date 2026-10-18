@@ -18,7 +18,6 @@ import {
   useSetSwarmTermPaused,
   useStartSwarmTermSession,
   useStopSwarmTermSession,
-  useSwarmTermAlerts,
   useSwarmTermPersonas,
   useSwarmTermSessionStatus,
   useTrustSwarmTermProject,
@@ -151,7 +150,6 @@ export function TerminalSwarmRoute(): JSX.Element {
     error: sessionProbeError,
   } = useSwarmTermSessionStatus();
   const lifecycle = useAgentLifecycle(routeEvents, session?.sessionId ?? null);
-  useSwarmTermAlerts();
   const paneStates = useMemo(() => session?.paneStates ?? [], [session]);
   const paneStatesByAgent = useMemo(
     () => new Map(paneStates.map((p) => [p.agentId, p])),
@@ -202,41 +200,56 @@ export function TerminalSwarmRoute(): JSX.Element {
     }
   };
 
+  // Launch / Stop / Restart await a dialog (and, for launch, a change-list
+  // read) before their mutation turns pending, so `canLaunch` / `isPending`
+  // don't cover that window — this guard stops a second click starting a
+  // second action.
+  const actionInFlight = useRef(false);
+
   const launch = async () => {
-    if (!projectDir) return;
-    setLaunchError(null);
-    // A start takes a new checkpoint: changes since the last one would no
-    // longer be revertible from the panel. A failed read does not block.
-    const pending = await fetchSwarmTermChanges(qc, projectDir)
-      .then((c) => c.files.length)
-      .catch(() => 0);
-    if (pending > 0 && !(await confirmNewCheckpoint(pending))) return;
+    if (!projectDir || actionInFlight.current) return;
+    actionInFlight.current = true;
     try {
+      setLaunchError(null);
+      // A start takes a new checkpoint: changes since the last one would
+      // no longer be revertible from the panel. A failed read does not block.
+      const pending = await fetchSwarmTermChanges(qc, projectDir)
+        .then((c) => c.files.length)
+        .catch(() => 0);
+      if (pending > 0 && !(await confirmNewCheckpoint(pending))) return;
       await startWithConsent(projectDir);
     } catch (err) {
       setLaunchError(describeError(err));
+    } finally {
+      actionInFlight.current = false;
     }
   };
 
   const stop = async () => {
-    if (!(await confirmStop(session?.panes.length ?? 0))) return;
+    if (actionInFlight.current) return;
+    actionInFlight.current = true;
     try {
+      if (!(await confirmStop(session?.panes.length ?? 0))) return;
       await stopMut.mutateAsync();
     } catch (err) {
       setLaunchError(describeError(err));
+    } finally {
+      actionInFlight.current = false;
     }
   };
 
   const restart = async () => {
-    if (!sessionActive) return;
-    if (!(await confirmRestart(session.panes.length))) return;
-    const dir = session.projectDir;
-    setLaunchError(null);
+    if (!sessionActive || actionInFlight.current) return;
+    actionInFlight.current = true;
     try {
+      if (!(await confirmRestart(session.panes.length))) return;
+      setLaunchError(null);
       await stopMut.mutateAsync();
-      await startWithConsent(dir);
+      await startWithConsent(session.projectDir);
     } catch (err) {
       setLaunchError(describeError(err));
+    } finally {
+      actionInFlight.current = false;
     }
   };
 

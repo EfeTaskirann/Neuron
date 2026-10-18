@@ -23,6 +23,7 @@ export interface OrchestratorDecideInput {
 
 export function useOrchestratorDecide() {
   return useMutation<OrchestratorOutcome, Error, OrchestratorDecideInput>({
+    meta: { errorsShownInline: true },
     mutationFn: ({ workspaceId, userMessage }) =>
       unwrap(commands.swarmOrchestratorDecide(workspaceId, userMessage)),
   });

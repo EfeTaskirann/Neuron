@@ -17,6 +17,7 @@ export interface RunSwarmJobInput {
 export function useRunSwarmJob() {
   const qc = useQueryClient();
   return useMutation<JobOutcome, Error, RunSwarmJobInput>({
+    meta: { errorsShownInline: true },
     mutationFn: ({ workspaceId, goal }) =>
       unwrap(commands.swarmRunJob(workspaceId, goal)),
     onSettled: () => {

@@ -14,7 +14,7 @@ import { useMe } from './hooks/useMe';
 import { useRuns } from './hooks/useRuns';
 import { useRunCreate } from './hooks/mutations';
 import { useActiveProject } from './hooks/useActiveProject';
-import { useSwarmTermSessionSnapshot } from './hooks/useTerminalSwarmSession';
+import { useSwarmTermAlerts, useSwarmTermSessionSnapshot } from './hooks/useTerminalSwarmSession';
 import { useAppFeatures } from './hooks/useAppFeatures';
 import { ProjectPickerRoute } from './routes/ProjectPickerRoute';
 import { AgentsRoute } from './routes/AgentsRoute';
@@ -347,6 +347,9 @@ export function App(): JSX.Element {
   const [showInspector, setShowInspector] = useState(true);
   const { project } = useActiveProject();
   const { data: swarmSession } = useSwarmTermSessionSnapshot();
+  // App-wide: limit / budget / exit alerts fire whatever tab is open, and
+  // the shared session-status query stays fresh for the guards below.
+  useSwarmTermAlerts();
   useConfirmCloseWhileSwarmRuns(swarmSession != null);
   const inspectorOpen = route === 'canvas' && showInspector;
   // Pick the most recent run as the inspector's default subject —

@@ -102,8 +102,9 @@ export function useTerminalWrite({ errorsShownInline = false }: { errorsShownInl
   });
 }
 
-export function useTerminalResize() {
+export function useTerminalResize({ errorsShownInline = false }: { errorsShownInline?: boolean } = {}) {
   return useMutation<null, Error, { paneId: string; cols: number; rows: number }>({
+    meta: { errorsShownInline },
     mutationFn: ({ paneId, cols, rows }) =>
       unwrap(commands.terminalResize(paneId, cols, rows)),
   });

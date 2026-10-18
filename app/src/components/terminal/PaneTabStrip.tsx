@@ -12,12 +12,15 @@ interface PaneTabStripProps {
   panes: Pane[];
   activeId: string;
   onSelect: (id: string) => void;
+  /** Pane ids the running swarm session owns (stopped from Terminal Swarm). */
+  liveSwarmPaneIds: ReadonlySet<string>;
 }
 
 export function PaneTabStrip({
   panes,
   activeId,
   onSelect,
+  liveSwarmPaneIds,
 }: PaneTabStripProps): JSX.Element {
   // Tab "✕" force-removes the pane (kill + DB delete in one call) so
   // the strip actually shrinks. `terminal:kill` alone only flips
@@ -31,7 +34,7 @@ export function PaneTabStrip({
         const isActive = p.id === activeId;
         // A live pane of the Terminal Swarm is stopped from there: closing
         // it here would take one agent out from under the running session.
-        const swarmOwned = isLiveSwarmPane(p);
+        const swarmOwned = isLiveSwarmPane(p, liveSwarmPaneIds, p.id);
         return (
           // div, not button: the close affordance nested inside must be
           // a REAL <button> (it's the only caller of terminal:delete —

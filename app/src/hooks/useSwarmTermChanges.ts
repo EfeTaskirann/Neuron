@@ -1,4 +1,10 @@
-import { useMutation, useQuery, useQueryClient, type QueryClient } from '@tanstack/react-query';
+import {
+  keepPreviousData,
+  useMutation,
+  useQuery,
+  useQueryClient,
+  type QueryClient,
+} from '@tanstack/react-query';
 import { commands } from '../lib/bindings';
 import { unwrap } from '../lib/unwrap';
 
@@ -16,6 +22,7 @@ export function fetchSwarmTermChanges(qc: QueryClient, projectDir: string) {
   return qc.fetchQuery({
     queryKey: changesKey(projectDir),
     queryFn: () => unwrap(commands.swarmTermChanges(projectDir)),
+    staleTime: 0,
   });
 }
 
@@ -42,6 +49,9 @@ export function useSwarmTermChangeDiff(
     queryKey: ['swarm-term', 'change-diff', projectDir, path, version],
     queryFn: () => unwrap(commands.swarmTermChangeDiff(projectDir!, path!)),
     enabled: projectDir != null && path != null,
+    // A list poll bumps `version`, so the diff refetches; keep the last
+    // diff shown meanwhile instead of blanking and resetting the scroll.
+    placeholderData: keepPreviousData,
   });
 }
 

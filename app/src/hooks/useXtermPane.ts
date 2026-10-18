@@ -71,8 +71,10 @@ export function useXtermPane(
   const { data: snapshot, isError: snapshotFailed } = usePaneLines(paneId, {
     live: false,
   });
-  const writeMut = useTerminalWrite();
-  const resizeMut = useTerminalResize();
+  // Writes and resizes to a pane that has exited fail with NotFound; the
+  // pane's own state shows that, so these are not global-toast errors.
+  const writeMut = useTerminalWrite({ errorsShownInline: true });
+  const resizeMut = useTerminalResize({ errorsShownInline: true });
 
   const writeIfNew = useCallback((term: XTerm, line: PaneLine) => {
     if (line.seq <= maxWrittenSeqRef.current) return;

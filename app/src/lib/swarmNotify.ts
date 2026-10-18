@@ -52,12 +52,17 @@ export function notifyTaskSignal(body: string): void {
   requestAttention();
 }
 
-/** "HH:MM" of a reset time given in unix seconds, on the user's clock. */
+/** A reset time (unix seconds) on the user's clock: "HH:MM" when it is
+ *  today, "DD.MM HH:MM" otherwise — a weekly limit can reset days away. */
 export function formatResetTime(resetsAt: number): string {
-  return new Date(resetsAt * 1000).toLocaleTimeString('tr-TR', {
-    hour: '2-digit',
-    minute: '2-digit',
-  });
+  const when = new Date(resetsAt * 1000);
+  const today = when.toDateString() === new Date().toDateString();
+  return when.toLocaleString(
+    'tr-TR',
+    today
+      ? { hour: '2-digit', minute: '2-digit' }
+      : { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' },
+  );
 }
 
 /** Toast (and taskbar flash) when the usage limit holds the swarm. */

@@ -34,41 +34,42 @@ export function useSwarmTermPersonas() {
   });
 }
 
-/** The session handle without the live refresh — for the shell; the
- *  Terminal Swarm route keeps the shared cache fresh. */
-export function useSwarmTermSessionSnapshot() {
-  return useQuery({
-    queryKey: ['swarm-term', 'status'],
+/** The session handle. Freshness comes from [`useSwarmTermAlerts`], which
+ *  runs app-wide and invalidates this shared key on every session /
+ *  pane-state event — so the route and the shell agree whatever tab is
+ *  open. */
+function sessionStatusQuery() {
+  return {
+    queryKey: ['swarm-term', 'status'] as const,
     queryFn: () => unwrap(commands.swarmTermSessionStatus()),
-  });
+  };
+}
+
+export function useSwarmTermSessionSnapshot() {
+  return useQuery(sessionStatusQuery());
 }
 
 export function useSwarmTermSessionStatus() {
-  const qc = useQueryClient();
-  // The handle carries every pane's readiness: refetch it when a pane's
-  // state changes or a session starts / stops anywhere (not only after
-  // this window's own start / stop mutations).
-  const refresh = () => {
-    qc.invalidateQueries({ queryKey: ['swarm-term', 'status'] });
-  };
-  useTauriEvent('swarm-term:pane-state', refresh);
-  useTauriEvent('swarm-term:session', refresh);
-  return useQuery({
-    queryKey: ['swarm-term', 'status'],
-    queryFn: () => unwrap(commands.swarmTermSessionStatus()),
-  });
+  return useQuery(sessionStatusQuery());
 }
 
 /**
- * Tell the user, also when the window is in the background, that the
- * usage limit holds the swarm or that an agent's claude exited. Mount once.
+ * App-wide (mounted once in <App>): tell the user — even on another tab
+ * or with the window in the background — that the usage limit or the
+ * message budget holds the swarm, or that an agent's claude exited; and
+ * keep the shared session-status query fresh for every consumer (the
+ * route's readiness, the shell's close / project-switch guards).
  */
 export function useSwarmTermAlerts(): void {
+  const qc = useQueryClient();
+  const refresh = () => qc.invalidateQueries({ queryKey: ['swarm-term', 'status'] });
   useTauriEvent<SessionEvent>('swarm-term:session', (e) => {
+    refresh();
     if (e.state === 'limited') notifyUsageLimit(e.resetsAt ?? null);
     if (e.state === 'budget') notifyBudgetReached();
   });
   useTauriEvent<PaneStateEvent>('swarm-term:pane-state', (e) => {
+    refresh();
     if (e.readiness === 'exited') notifyPaneExited(e.agentId);
   });
 }
