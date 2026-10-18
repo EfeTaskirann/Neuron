@@ -215,6 +215,11 @@ export function TerminalSwarmRoute(): JSX.Element {
             Session status unavailable: {describeError(sessionProbeError)}
           </div>
         )}
+        {session?.preflightNote && (
+          <div className="swarm-term-note" role="status">
+            {session.preflightNote}
+          </div>
+        )}
 
         <HierarchyDiagram
           lifecycle={lifecycle}

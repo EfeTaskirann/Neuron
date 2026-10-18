@@ -88,6 +88,8 @@ const SESSION: TerminalSwarmSessionHandle = {
     { agentId: 'coordinator', paneId: 'p-coord' },
   ],
   permissionMode: 'restricted',
+  claudeVersion: '2.1.296',
+  preflightNote: null,
 };
 
 beforeEach(async () => {
@@ -248,6 +250,38 @@ describe('TerminalSwarmRoute', () => {
     fireEvent.click(launch);
     const alert = await screen.findByRole('alert');
     expect(alert).toHaveTextContent('Girilen değer geçersiz. `C:\\` bir sürücü kökü.');
+  });
+
+  it('shows a pre-flight note without blocking the session', async () => {
+    const { commands } = await import('../lib/bindings');
+    vi.mocked(commands.swarmTermSessionStatus).mockResolvedValue({
+      status: 'ok',
+      data: { ...SESSION, preflightNote: 'claude 2.1.300 bu Neuron sürümüyle test edilmedi' },
+    });
+    renderRoute();
+    const note = await screen.findByText(/2\.1\.300 bu Neuron sürümüyle test edilmedi/);
+    expect(note).toHaveAttribute('role', 'status');
+    // The session runs: its chrome is there, no error banner.
+    expect(screen.getByRole('button', { name: /stop swarm/i })).toBeInTheDocument();
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
+
+  it('says how to log in when claude has no login', async () => {
+    const { commands } = await import('../lib/bindings');
+    vi.mocked(commands.swarmTermStartSession).mockResolvedValue({
+      status: 'error',
+      error: {
+        kind: 'claude_login_required',
+        message: "Bir terminalde `claude` çalıştırıp `/login` ile giriş yap, sonra swarm'ı yeniden başlat.",
+      },
+    });
+    renderRoute();
+    const launch = await screen.findByRole('button', { name: /launch swarm/i });
+    await waitFor(() => expect(launch).toBeEnabled());
+    fireEvent.click(launch);
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent('Claude Code’a giriş yapılmamış.');
+    expect(alert).toHaveTextContent('/login');
   });
 
   it('asks to trust a new folder once, records the yes and launches', async () => {

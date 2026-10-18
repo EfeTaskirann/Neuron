@@ -42,6 +42,8 @@ const APP_ERROR_COPY: Record<string, string> = {
   cancelled: 'İptal edildi.',
   feature_disabled: 'Geliştirici özelliği kapalı.',
   consent_required: 'Bu işlem için önce onayın gerekiyor.',
+  claude_version_unsupported: 'Kurulu Claude Code sürümü desteklenmiyor.',
+  claude_login_required: 'Claude Code’a giriş yapılmamış.',
   internal: 'Beklenmedik bir iç hata oluştu.',
 };
 

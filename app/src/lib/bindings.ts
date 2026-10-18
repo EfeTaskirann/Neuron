@@ -421,6 +421,16 @@ export const commands = {
 	panes: TerminalSwarmPane[],
 	// What the panes may do — the mode they were spawned with.
 	permissionMode: SwarmTermPermissionMode,
+	/**
+	 *  The `claude` CLI version the panes run (pre-flight check), when
+	 *  it could be read.
+	 */
+	claudeVersion: string | null,
+	/**
+	 *  A pre-flight finding that did not block the start (an untested
+	 *  newer claude, a check that could not run) — for the UI to show.
+	 */
+	preflightNote: string | null,
 } | null, AppErrorWire>(__TAURI_INVOKE("swarm_term_session_status")),
 	swarmTermStartSession: (projectDir: string) => typedError<TerminalSwarmSessionHandle, AppErrorWire>(__TAURI_INVOKE("swarm_term_start_session", { projectDir })),
 	/**
@@ -1647,6 +1657,16 @@ export type TerminalSwarmSessionHandle = {
 	panes: TerminalSwarmPane[],
 	// What the panes may do — the mode they were spawned with.
 	permissionMode: SwarmTermPermissionMode,
+	/**
+	 *  The `claude` CLI version the panes run (pre-flight check), when
+	 *  it could be read.
+	 */
+	claudeVersion: string | null,
+	/**
+	 *  A pre-flight finding that did not block the start (an untested
+	 *  newer claude, a check that could not run) — for the UI to show.
+	 */
+	preflightNote: string | null,
 };
 
 /**

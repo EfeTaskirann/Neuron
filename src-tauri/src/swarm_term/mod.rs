@@ -37,6 +37,7 @@ pub mod lifecycle;
 pub(crate) mod pane_config;
 pub(crate) mod permissions;
 pub mod persona;
+pub(crate) mod preflight;
 pub(crate) mod project_guard;
 pub mod session;
 pub(crate) mod trust;

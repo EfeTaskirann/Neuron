@@ -49,6 +49,7 @@ use crate::swarm_term::project_guard;
 use crate::swarm_term::persona::{
     build_kickoff_message, build_persona_prompt, is_ready_answer,
 };
+use crate::swarm_term::preflight;
 use crate::swarm_term::trust;
 
 const READY_DELAY_MS: u64 = 1500;
@@ -123,6 +124,12 @@ pub struct TerminalSwarmSessionHandle {
     pub panes: Vec<TerminalSwarmPane>,
     /// What the panes may do — the mode they were spawned with.
     pub permission_mode: SwarmTermPermissionMode,
+    /// The `claude` CLI version the panes run (pre-flight check), when
+    /// it could be read.
+    pub claude_version: Option<String>,
+    /// A pre-flight finding that did not block the start (an untested
+    /// newer claude, a check that could not run) — for the UI to show.
+    pub preflight_note: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
@@ -177,6 +184,12 @@ pub(crate) struct ActiveSession {
     /// together with the transcripts the manifest names. `None` for
     /// synthetic / test sessions that bypass the spawn loop.
     pub session_dir: Option<PathBuf>,
+    /// Where the panes' transcripts are looked up (and deleted on stop).
+    pub projects_dirs: Vec<PathBuf>,
+    /// See [`TerminalSwarmSessionHandle::claude_version`] /
+    /// [`TerminalSwarmSessionHandle::preflight_note`].
+    pub claude_version: Option<String>,
+    pub preflight_note: Option<String>,
     /// Pane ids that have completed persona injection and are safe
     /// targets for inter-agent routes. Populated by the persona-inject
     /// async task as each `write_to_pane` call returns Ok; read by
@@ -272,6 +285,12 @@ impl TerminalSwarmRegistry {
         };
 
         let spawn = resolve_claude_spawn()?;
+        // One clear error instead of nine broken panes: a claude too old
+        // for the pane flags, or no login (see `preflight`).
+        let preflight = preflight::run(&spawn).await?;
+        if let Some(note) = &preflight.note {
+            tracing::warn!("swarm-term pre-flight: {note}");
+        }
         let project_str = project_dir.display().to_string();
         let mut parts: Vec<String> =
             vec![format!("\"{}\"", spawn.program.display())];
@@ -337,7 +356,12 @@ impl TerminalSwarmRegistry {
             .app_data_dir()
             .map_err(|e| AppError::Internal(format!("app_data_dir: {e}")))?;
         let swarm_term_dir = pane_config::swarm_term_data_dir(&app_data);
-        let projects_dirs = pane_config::claude_projects_dirs();
+        // claude's own answer first (`auth status`), the usual spots after.
+        let mut projects_dirs = pane_config::claude_projects_dirs();
+        if let Some(dir) = preflight.projects_dir.clone() {
+            projects_dirs.retain(|d| d != &dir);
+            projects_dirs.insert(0, dir);
+        }
         // No session is running (the reservation above guarantees it),
         // so every leftover is an orphan of a session that never reached
         // `stop()`: its bridge tree, its transcripts and Neuron files, and
@@ -529,6 +553,9 @@ impl TerminalSwarmRegistry {
             bridge: Some(bridge_handle),
             bridgespace_root: Some(bridgespace_root.clone()),
             session_dir: Some(session_dir.clone()),
+            projects_dirs: projects_dirs.clone(),
+            claude_version: preflight.version.map(|v| v.to_string()),
+            preflight_note: preflight.note.clone(),
             ready_panes: Arc::clone(&ready_panes),
             alive: Arc::clone(&alive),
         };
@@ -637,10 +664,11 @@ impl TerminalSwarmRegistry {
         &self,
         app: AppHandle<R>,
     ) -> Result<(), AppError> {
-        let (pane_ids, bridge, session_dir, bridgespace_root): (
+        let (pane_ids, bridge, session_dir, projects_dirs, bridgespace_root): (
             Vec<String>,
             Option<BridgeHandle>,
             Option<PathBuf>,
+            Vec<PathBuf>,
             Option<PathBuf>,
         ) = {
             let mut guard = self.inner.lock().map_err(|_| {
@@ -653,6 +681,7 @@ impl TerminalSwarmRegistry {
                         s.panes_by_agent.into_values().collect(),
                         s.bridge,
                         s.session_dir,
+                        s.projects_dirs,
                         s.bridgespace_root,
                     )
                 }
@@ -670,7 +699,7 @@ impl TerminalSwarmRegistry {
             let _ = registry.kill_pane(&pid, &pool).await;
         }
         if let Some(dir) = session_dir {
-            remove_session_with_retry(&pane_config::claude_projects_dirs(), &dir).await;
+            remove_session_with_retry(&projects_dirs, &dir).await;
         }
         if let Some(root) = bridgespace_root {
             // Keep the rejection evidence (envelopes + `.reason`) —
@@ -1152,6 +1181,8 @@ fn handle_from(s: &ActiveSession) -> TerminalSwarmSessionHandle {
         project_dir: s.project_dir.display().to_string(),
         panes,
         permission_mode: s.permission_mode,
+        claude_version: s.claude_version.clone(),
+        preflight_note: s.preflight_note.clone(),
     }
 }
 

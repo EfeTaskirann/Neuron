@@ -213,6 +213,15 @@
   font-family: var(--font-mono, ui-monospace, monospace);
 }
 
+/* A pre-flight finding that did not block the start. */
+.swarm-term-note {
+  background: color-mix(in oklab, var(--surface-1) 85%, var(--syn-warning));
+  color: var(--foreground);
+  padding: 8px 12px;
+  border-radius: 6px;
+  font-size: 12px;
+}
+
 .swarm-term-chat {
   display: flex;
   gap: 8px;
