@@ -146,12 +146,22 @@ pub(super) fn lifecycle_synthesise<R: Runtime>(
     if let Some(closure) = rec.already_closed {
         return vec![closed_notice(from_agent, &id, closure)];
     }
+    // A CHANGES_NEEDED that used up the rework limit CLOSES the task as
+    // failed; both it and a normal within-limit rejection record
+    // `state: Failed` (lifecycle::apply_transition), so label the closing
+    // one "Failed" — otherwise the UI shows it as "rework" (a fix coming)
+    // instead of "failed".
+    let transition_label = if rec.limit_exceeded {
+        "Failed".to_string()
+    } else {
+        format!("{:?}", transition.kind)
+    };
     emit_lifecycle(
         app,
         from_agent,
         &source_pane,
         &id,
-        &format!("{:?}", transition.kind),
+        &transition_label,
         rec.state,
         &task_owners(lifecycle, panes_by_agent, &id),
     );

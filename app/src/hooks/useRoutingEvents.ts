@@ -120,9 +120,16 @@ function pushRouteEvent(p: RawPayload): void {
   if (out.length > ROUTE_EVENT_CAP) out.length = ROUTE_EVENT_CAP;
   routeEvents = out;
   emitRouteStore();
-  // A closed task reaches the orchestrator as a bridge fanout — the one
-  // app-lifetime place that sees it whatever tab is open.
-  if (next.outcome === 'lifecycle_fanout' && next.target === 'orchestrator') {
+  // A closed task reaches the orchestrator either as a bridge fanout
+  // (Approved → TASK_DONE) or as the coordinator's own TASK_FAILED (a
+  // give-up / rework-limit), which is delivered as an ordinary route. We
+  // notify on both; notifyTaskSignal no-ops on anything that isn't a
+  // TASK_DONE / TASK_FAILED. This listener is app-lifetime, so the toast
+  // and taskbar flash fire whatever tab is open.
+  if (
+    next.target === 'orchestrator' &&
+    (next.outcome === 'lifecycle_fanout' || next.outcome === 'ok')
+  ) {
     notifyTaskSignal(next.body);
   }
 }

@@ -15,16 +15,20 @@ export interface TaskSignal {
   note: string;
 }
 
-const SIGNAL_RE = /^\s*(TASK_DONE|TASK_FAILED)\s+(\S+)\s*(?:[—–-]\s*([\s\S]*))?$/;
+const SIGNAL_RE = /^\s*(TASK_DONE|TASK_FAILED)\s+(\S+)\s*([\s\S]*)$/;
 
-/** Pure: the task signal at the start of a fanout body, if it is one. */
+/** Pure: the task signal at the start of a fanout body, if it is one.
+ *  The note is whatever follows the id (the backend writes it with a
+ *  dash — `— verdict` — or without — `(düzeltme: …)`); a leading dash is
+ *  dropped. */
 export function taskSignal(body: string): TaskSignal | null {
   const m = SIGNAL_RE.exec(body);
   if (!m) return null;
+  const note = (m[3] ?? '').replace(/^[\s—–-]+/, '').trim();
   return {
     kind: m[1] === 'TASK_DONE' ? 'done' : 'failed',
     taskId: m[2]!,
-    note: (m[3] ?? '').trim(),
+    note,
   };
 }
 

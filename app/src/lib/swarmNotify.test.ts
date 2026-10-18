@@ -41,6 +41,12 @@ describe('taskSignal', () => {
       note: '3. ret: düzeltme limiti aşıldı',
     });
     expect(taskSignal('TASK_DONE p0-smoke')).toEqual({ kind: 'done', taskId: 'p0-smoke', note: '' });
+    // A note without a dash (the retest fanout writes "(düzeltme: …)").
+    expect(taskSignal('TASK_DONE fix-2 (düzeltme: auth.rs)')).toEqual({
+      kind: 'done',
+      taskId: 'fix-2',
+      note: '(düzeltme: auth.rs)',
+    });
   });
 
   it('ignores every other fanout', () => {
