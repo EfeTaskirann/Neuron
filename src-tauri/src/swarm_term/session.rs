@@ -1329,9 +1329,13 @@ mod tests {
             if ready_now.contains(pane) {
                 continue;
             }
-            let lines = registry.pane_lines(pane, None, &_pool).await.unwrap_or_default();
-            let tail: Vec<String> = lines.iter().rev().take(25).rev().map(|l| l.text.clone()).collect();
-            println!("NOT READY [{agent}] screen tail:\n{}", tail.join("\n"));
+            let screen = pane_screen_tail(&registry, &_pool, pane).await.unwrap_or_default();
+            let n = screen.chars().count();
+            let tail: String = screen.chars().skip(n.saturating_sub(700)).collect();
+            println!(
+                "NOT READY [{agent}] ({n} chars, blocking={}) screen:\n{tail}",
+                screen_is_blocking(&screen)
+            );
         }
 
         // Task → orchestrator, exactly like the chat bar.
