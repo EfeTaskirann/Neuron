@@ -40,6 +40,7 @@ const APP_ERROR_COPY: Record<string, string> = {
   timeout: 'İşlem zaman aşımına uğradı.',
   workspace_busy: 'Bu çalışma alanında zaten devam eden bir iş var.',
   cancelled: 'İptal edildi.',
+  feature_disabled: 'Geliştirici özelliği kapalı.',
   internal: 'Beklenmedik bir iç hata oluştu.',
 };
 

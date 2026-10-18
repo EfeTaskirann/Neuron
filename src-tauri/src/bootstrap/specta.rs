@@ -27,6 +27,8 @@ pub fn specta_builder_for_export() -> tauri_specta::Builder<tauri::Wry> {
         .commands(collect_commands![
             // health (smoke)
             commands::health::health_db,
+            // app features (developer-feature flag)
+            commands::features::app_features::<tauri::Wry>,
             // agents
             commands::agents::agents_list,
             commands::agents::agents_get,

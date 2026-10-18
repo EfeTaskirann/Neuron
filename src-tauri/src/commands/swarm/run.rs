@@ -68,6 +68,7 @@ pub async fn swarm_run_job<R: Runtime>(
     workspace_id: String,
     goal: String,
 ) -> Result<JobOutcome, AppError> {
+    crate::features::require_dev_features(&app, "Headless swarm")?;
     if workspace_id.trim().is_empty() {
         return Err(AppError::InvalidInput(
             "workspaceId must not be empty".into(),

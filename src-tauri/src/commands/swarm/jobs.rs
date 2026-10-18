@@ -66,6 +66,7 @@ pub async fn swarm_cancel_job<R: Runtime>(
     app: AppHandle<R>,
     job_id: String,
 ) -> Result<(), AppError> {
+    crate::features::require_dev_features(&app, "Headless swarm")?;
     if job_id.trim().is_empty() {
         return Err(AppError::InvalidInput(
             "jobId must not be empty".into(),
@@ -167,6 +168,7 @@ pub async fn swarm_list_jobs<R: Runtime>(
     workspace_id: Option<String>,
     limit: Option<u32>,
 ) -> Result<Vec<JobSummary>, AppError> {
+    crate::features::require_dev_features(&app, "Headless swarm")?;
     let registry =
         require_state::<_, Arc<JobRegistry>>(&app, "swarm JobRegistry")?;
     let effective_limit = limit
@@ -185,6 +187,7 @@ pub async fn swarm_get_job<R: Runtime>(
     app: AppHandle<R>,
     job_id: String,
 ) -> Result<JobDetail, AppError> {
+    crate::features::require_dev_features(&app, "Headless swarm")?;
     if job_id.trim().is_empty() {
         return Err(AppError::InvalidInput(
             "jobId must not be empty".into(),

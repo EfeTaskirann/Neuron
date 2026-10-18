@@ -21,6 +21,7 @@ import {
   useRoutingEvents,
 } from '../hooks/useRoutingEvents';
 import { AppErrorClient } from '../lib/unwrap';
+import { RoutingLogRoute } from './RoutingLogRoute';
 
 /** Gap between the pasted chat message and its submitting CR. */
 const SUBMIT_DELAY_MS = 200;
@@ -64,6 +65,9 @@ export function TerminalSwarmRoute(): JSX.Element {
   const { project } = useActiveProject();
   const projectDir = project?.path ?? null;
   const [launchError, setLaunchError] = useState<string | null>(null);
+  // The Routing Log keeps its history in a module store, so closing the
+  // drawer loses nothing.
+  const [logOpen, setLogOpen] = useState(false);
   const { events: routeEvents } = useRoutingEvents(500);
   const activeEdge = useActiveEdge(routeEvents, 3_000);
   const lifecycle = useAgentLifecycle(routeEvents);
@@ -159,51 +163,61 @@ export function TerminalSwarmRoute(): JSX.Element {
 
   return (
     <div className="route route-swarm-term">
-      <SwarmTermToolbar
-        projectDir={projectDir}
-        sessionProjectDir={session?.projectDir ?? null}
-        sessionActive={sessionActive}
-        canLaunch={canLaunch}
-        startPending={startMut.isPending}
-        stopPending={stopMut.isPending}
-        sessionStartMs={sessionStartMs}
-        onLaunch={launch}
-        onRestart={restart}
-        onStop={stop}
-      />
-
-      {launchError && (
-        <div className="swarm-term-error" role="alert">
-          {launchError}
-        </div>
-      )}
-      {sessionProbeFailed && (
-        <div className="swarm-term-error" role="alert">
-          Session status unavailable: {describeError(sessionProbeError)}
-        </div>
-      )}
-
-      <HierarchyDiagram
-        lifecycle={lifecycle}
-        activeSource={activeEdge?.source ?? null}
-        activeTarget={activeEdge?.target ?? null}
-        personasById={personasById}
-        panesByAgent={panesByAgent}
-      />
-
-      {sessionActive && orchestratorPaneId && (
-        <OrchestratorChatBar
-          onSend={sendToOrchestrator}
-          permissionMode={session.permissionMode}
+      <div className="swarm-term-main">
+        <SwarmTermToolbar
+          projectDir={projectDir}
+          sessionProjectDir={session?.projectDir ?? null}
+          sessionActive={sessionActive}
+          canLaunch={canLaunch}
+          startPending={startMut.isPending}
+          stopPending={stopMut.isPending}
+          sessionStartMs={sessionStartMs}
+          logOpen={logOpen}
+          onLaunch={launch}
+          onRestart={restart}
+          onStop={stop}
+          onToggleLog={() => setLogOpen((open) => !open)}
         />
-      )}
 
-      <SwarmTermGrid
-        personasById={personasById}
-        panesByAgent={panesByAgent}
-        lifecycle={lifecycle}
-        activeEdge={activeEdge}
-      />
+        {launchError && (
+          <div className="swarm-term-error" role="alert">
+            {launchError}
+          </div>
+        )}
+        {sessionProbeFailed && (
+          <div className="swarm-term-error" role="alert">
+            Session status unavailable: {describeError(sessionProbeError)}
+          </div>
+        )}
+
+        <HierarchyDiagram
+          lifecycle={lifecycle}
+          activeSource={activeEdge?.source ?? null}
+          activeTarget={activeEdge?.target ?? null}
+          personasById={personasById}
+          panesByAgent={panesByAgent}
+        />
+
+        {sessionActive && orchestratorPaneId && (
+          <OrchestratorChatBar
+            onSend={sendToOrchestrator}
+            permissionMode={session.permissionMode}
+          />
+        )}
+
+        <SwarmTermGrid
+          personasById={personasById}
+          panesByAgent={panesByAgent}
+          lifecycle={lifecycle}
+          activeEdge={activeEdge}
+        />
+      </div>
+
+      {logOpen && (
+        <aside className="swarm-term-log-drawer" aria-label="Routing Log">
+          <RoutingLogRoute />
+        </aside>
+      )}
 
       <ClaudeUpdateCorner
         sessionActive={sessionActive}

@@ -183,6 +183,22 @@ a { color: inherit; }
   background: var(--neuron-violet-300);
   box-shadow: var(--glow-violet-sm);
 }
+/* Label over the developer routes (NEURON_DEV_FEATURES=1); a plain
+   divider when the sidebar is collapsed. */
+.sb-section {
+  margin: 10px 0 2px;
+  padding: 0 10px;
+  font-size: 11px; font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted-foreground);
+}
+.app-shell.collapsed .sb-section {
+  height: 1px;
+  margin: 8px 6px;
+  padding: 0;
+  background: var(--border);
+}
 
 .sb-foot {
   display: grid;

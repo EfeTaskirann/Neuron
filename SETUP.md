@@ -179,6 +179,7 @@ Neuron/
 | `NEURON_SWARM_STAGE_TIMEOUT_SEC` | 60 (180 testlerde) | FSM her stage'i için timeout |
 | `NEURON_SWARM_AGENT_TURN_CAP` | 200 | persistent session turn cap (üstüne respawn) |
 | `NEURON_OTEL_ENDPOINT` | (boş) | OTLP collector endpoint; boşsa export döngüsü çalışmaz |
+| `NEURON_DEV_FEATURES` | (kapalı) | `1` / `true` ile geliştirici özellikleri açılır: Workflow canvas + LangGraph sidecar, Runs, Agents ve eski headless Swarm menüde görünür, sidecar başlar. Kapalıyken eski swarm komutları reddedilir. Açılışta bir kez okunur. |
 | `RUST_LOG` | `warn,neuron=info` | tracing seviyesi (`debug` için override) |
 
 ---

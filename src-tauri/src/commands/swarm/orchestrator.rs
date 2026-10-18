@@ -124,6 +124,7 @@ pub async fn swarm_orchestrator_decide<R: Runtime>(
     workspace_id: String,
     user_message: String,
 ) -> Result<OrchestratorOutcome, AppError> {
+    crate::features::require_dev_features(&app, "Headless swarm")?;
     if workspace_id.trim().is_empty() {
         return Err(AppError::InvalidInput(
             "workspaceId must not be empty".into(),
@@ -211,6 +212,7 @@ pub async fn swarm_orchestrator_history<R: Runtime>(
     workspace_id: String,
     limit: Option<u32>,
 ) -> Result<Vec<OrchestratorMessage>, AppError> {
+    crate::features::require_dev_features(&app, "Headless swarm")?;
     if workspace_id.trim().is_empty() {
         return Err(AppError::InvalidInput(
             "workspaceId must not be empty".into(),
@@ -235,6 +237,7 @@ pub async fn swarm_orchestrator_clear_history<R: Runtime>(
     app: AppHandle<R>,
     workspace_id: String,
 ) -> Result<(), AppError> {
+    crate::features::require_dev_features(&app, "Headless swarm")?;
     if workspace_id.trim().is_empty() {
         return Err(AppError::InvalidInput(
             "workspaceId must not be empty".into(),
@@ -261,6 +264,7 @@ pub async fn swarm_orchestrator_log_job<R: Runtime>(
     job_id: String,
     goal: String,
 ) -> Result<(), AppError> {
+    crate::features::require_dev_features(&app, "Headless swarm")?;
     if workspace_id.trim().is_empty() {
         return Err(AppError::InvalidInput(
             "workspaceId must not be empty".into(),

@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, beforeEach } from 'vitest';
-import { render, screen, fireEvent, waitFor } from '@testing-library/react';
+import { render, screen, fireEvent, waitFor, within } from '@testing-library/react';
 import { QueryClientProvider, QueryClient } from '@tanstack/react-query';
 import { App } from './App';
 import { Canvas } from './routes/Canvas';
@@ -13,6 +13,14 @@ import {
 // `beforeEach`; specific cases override via mockResolvedValueOnce.
 vi.mock('./lib/bindings', () => ({
   commands: {
+    appFeatures: vi.fn(),
+    swarmTermListPersonas: vi.fn(),
+    swarmTermSessionStatus: vi.fn(),
+    swarmTermStartSession: vi.fn(),
+    swarmTermStopSession: vi.fn(),
+    swarmTermRunUpdate: vi.fn(),
+    terminalWrite: vi.fn(),
+    terminalResize: vi.fn(),
     meGet: vi.fn(),
     agentsList: vi.fn(),
     runsList: vi.fn(),
@@ -225,6 +233,14 @@ const SERVERS_OK = {
 
 beforeEach(async () => {
   const { commands } = await import('./lib/bindings');
+  // Developer features on, so every route stays reachable from the nav;
+  // the default (off) is covered by its own test.
+  vi.mocked(commands.appFeatures).mockResolvedValue({
+    status: 'ok',
+    data: { devFeatures: true },
+  });
+  vi.mocked(commands.swarmTermListPersonas).mockResolvedValue({ status: 'ok', data: [] });
+  vi.mocked(commands.swarmTermSessionStatus).mockResolvedValue({ status: 'ok', data: null });
   vi.mocked(commands.meGet).mockResolvedValue(ME_OK);
   vi.mocked(commands.agentsList).mockResolvedValue(AGENTS_OK);
   vi.mocked(commands.runsList).mockResolvedValue(RUNS_OK);
@@ -238,24 +254,48 @@ beforeEach(async () => {
   vi.mocked(commands.mailboxList).mockResolvedValue({ status: 'ok', data: [] });
 });
 
+const CORE_NAV = ['Terminal Swarm', 'Terminal', 'MCP', 'Settings'];
+const DEV_NAV = ['Workflow', 'Swarm', 'Agents', 'Runs'];
+
 describe('App shell', () => {
-  it('renders the sidebar with all 9 nav items', () => {
+  it('lists the core routes, then the developer group when developer features are on', async () => {
     renderApp();
-    const nav = screen.getByRole('navigation');
-    expect(nav).toBeInTheDocument();
-    for (const label of [
-      'Workflow',
-      'Terminal',
-      'Terminal Swarm',
-      'Swarm',
-      'Agents',
-      'Runs',
-      'MCP',
-      'Routing Log',
-      'Settings',
-    ]) {
-      expect(screen.getByText(label)).toBeInTheDocument();
+    const nav = screen.getByRole('navigation', { name: 'Main' });
+    await within(nav).findByText('Developer');
+    for (const label of [...CORE_NAV, ...DEV_NAV]) {
+      expect(within(nav).getByText(label)).toBeInTheDocument();
     }
+    // The Routing Log lives inside Terminal Swarm now, not in the nav.
+    expect(within(nav).queryByText('Routing Log')).not.toBeInTheDocument();
+    const order = Array.from(nav.querySelectorAll('.sb-item')).map((li) => li.textContent);
+    expect(order).toEqual([...CORE_NAV, ...DEV_NAV]);
+  });
+
+  it('hides the developer routes by default', async () => {
+    const { commands } = await import('./lib/bindings');
+    vi.mocked(commands.appFeatures).mockResolvedValue({
+      status: 'ok',
+      data: { devFeatures: false },
+    });
+    renderApp();
+    const nav = screen.getByRole('navigation', { name: 'Main' });
+    await waitFor(() => expect(commands.appFeatures).toHaveBeenCalled());
+    for (const label of CORE_NAV) {
+      expect(within(nav).getByText(label)).toBeInTheDocument();
+    }
+    for (const label of [...DEV_NAV, 'Developer']) {
+      expect(within(nav).queryByText(label)).not.toBeInTheDocument();
+    }
+  });
+
+  it('opens on Terminal Swarm', async () => {
+    renderApp();
+    expect(await screen.findByRole('button', { name: /launch swarm/i })).toBeInTheDocument();
+    const nav = screen.getByRole('navigation', { name: 'Main' });
+    expect(within(nav).getByText('Terminal Swarm').closest('li')).toHaveAttribute(
+      'aria-current',
+      'page',
+    );
   });
 
   it('gates the shell behind the project picker when no project is set', () => {
@@ -288,7 +328,7 @@ describe('App shell', () => {
 describe('AgentsRoute', () => {
   it('renders an agent card per backend agent + the New agent slot', async () => {
     renderApp();
-    fireEvent.click(screen.getByText('Agents'));
+    fireEvent.click(await screen.findByText('Agents'));
     await waitFor(() => expect(screen.getByText('Planner')).toBeInTheDocument());
     expect(screen.getByText('Coder')).toBeInTheDocument();
     expect(screen.getByText(/gpt-4o.*temp.*0\.2/)).toBeInTheDocument();
@@ -299,7 +339,7 @@ describe('AgentsRoute', () => {
 describe('RunsRoute', () => {
   it('renders a row per run with derived totals', async () => {
     renderApp();
-    fireEvent.click(screen.getByText('Runs'));
+    fireEvent.click(await screen.findByText('Runs'));
     await waitFor(() => expect(screen.getByText('r-1')).toBeInTheDocument());
     expect(screen.getByText('r-2')).toBeInTheDocument();
     // Totals across all runs (not the filtered view): tokens 1.5k,
@@ -310,7 +350,7 @@ describe('RunsRoute', () => {
 
   it('filters runs by status when a chip is clicked', async () => {
     renderApp();
-    fireEvent.click(screen.getByText('Runs'));
+    fireEvent.click(await screen.findByText('Runs'));
     await waitFor(() => expect(screen.getByText('r-1')).toBeInTheDocument());
     // The "Çalışıyor" (running) label appears as both a chip button
     // and a status pill on r-2's row; scope to button role to pick
@@ -366,6 +406,7 @@ describe('RunInspector', () => {
   // both the span-row and the sheet, so getAllByText is safer.
   it('renders span timeline from useRun()', async () => {
     renderApp();
+    fireEvent.click(await screen.findByText('Workflow'));
     const orchestratorMatches = await screen.findAllByText(
       'orchestrator.run',
       {},
@@ -379,6 +420,7 @@ describe('RunInspector', () => {
 
   it('shows the prompt/response sheet for the selected llm span', async () => {
     renderApp();
+    fireEvent.click(await screen.findByText('Workflow'));
     await screen.findByText('llm.plan', {}, { timeout: 5000 });
     fireEvent.click(screen.getByText('llm.plan'));
     expect(screen.getByText('Prompt')).toBeInTheDocument();
@@ -454,7 +496,7 @@ describe('Mutations', () => {
     });
 
     renderApp();
-    fireEvent.click(screen.getByText('Agents'));
+    fireEvent.click(await screen.findByText('Agents'));
     await waitFor(() => expect(screen.getByText('Planner')).toBeInTheDocument());
     // The "+ New agent" button is the only one with that text
     // before the form mounts. After click it gets replaced by the
@@ -511,7 +553,8 @@ describe('Mutations', () => {
       },
     });
     renderApp();
-    // Default route is canvas; topbar Run button is visible.
+    // The topbar Run button belongs to the (developer) Workflow route.
+    fireEvent.click(await screen.findByText('Workflow'));
     fireEvent.click(screen.getByRole('button', { name: /^Run$/i }));
     await waitFor(() => expect(commands.runsCreate).toHaveBeenCalled());
     expect(vi.mocked(commands.runsCreate).mock.calls[0]![0]).toBe('daily-summary');

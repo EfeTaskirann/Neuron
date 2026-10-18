@@ -12,12 +12,40 @@
   --phase-done:     var(--syn-success);
 }
 
+/* Row: the swarm column, then the optional Routing Log drawer. */
 .route-swarm-term {
   display: flex;
-  flex-direction: column;
+  flex-direction: row;
   gap: 12px;
   padding: 16px 20px 20px;
   min-height: 0;
+}
+
+.swarm-term-main {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+}
+
+/* Routing Log drawer — hosts the log route, which fills it (`.route`
+ * is absolutely positioned) and scrolls its own table. */
+.swarm-term-log-drawer {
+  position: relative;
+  flex: 0 0 clamp(300px, 36%, 480px);
+  min-height: 0;
+  border-left: 1px solid var(--border);
+}
+.swarm-term-log-drawer .route-routing-log {
+  padding: 0 0 0 12px;
+}
+
+.swarm-term-log-toggle[aria-pressed='true'] {
+  background: var(--surface-2);
+  border-color: var(--border);
+  color: var(--foreground);
 }
 
 .swarm-term-toolbar {

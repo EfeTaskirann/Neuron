@@ -48,6 +48,7 @@ async fn mock_app_with_brain_state() -> (
         .manage(bus.clone())
         .manage(agent_registry.clone())
         .manage(projector_registry)
+        .manage(crate::features::DevFeatures(true))
         .build(tauri::test::mock_context(tauri::test::noop_assets()))
         .expect("mock app");
     (app, job_registry, bus, agent_registry, dir)

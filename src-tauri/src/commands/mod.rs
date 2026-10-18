@@ -11,6 +11,7 @@
 //! `tauri_specta::collect_commands![]`.
 
 pub mod agents;
+pub mod features;
 pub mod health;
 pub mod mailbox;
 pub mod mcp;

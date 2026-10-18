@@ -5,6 +5,7 @@ import { invoke as __TAURI_INVOKE } from "@tauri-apps/api/core";
 /** Commands */
 export const commands = {
 	healthDb: () => typedError<DbHealth, AppErrorWire>(__TAURI_INVOKE("health_db")),
+	appFeatures: () => typedError<AppFeatures, AppErrorWire>(__TAURI_INVOKE("app_features")),
 	agentsList: () => typedError<Agent[], AppErrorWire>(__TAURI_INVOKE("agents_list")),
 	agentsGet: (id: string) => typedError<Agent, AppErrorWire>(__TAURI_INVOKE("agents_get", { id })),
 	agentsCreate: (input: AgentCreateInput) => typedError<Agent, AppErrorWire>(__TAURI_INVOKE("agents_create", { input })),
@@ -542,6 +543,14 @@ export type AgentStatusRow = {
 export type AppErrorWire = {
 	kind: string,
 	message: string,
+};
+
+export type AppFeatures = {
+	/**
+	 *  Developer features are on (`NEURON_DEV_FEATURES=1` at launch):
+	 *  the Workflow canvas, Runs, Agents and the headless Swarm.
+	 */
+	devFeatures: boolean,
 };
 
 /**

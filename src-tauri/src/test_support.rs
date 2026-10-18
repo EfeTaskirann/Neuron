@@ -107,6 +107,8 @@ pub async fn mock_app_with_pool() -> (
     let (pool, dir) = fresh_pool().await;
     let app = tauri::test::mock_builder()
         .manage(pool.clone())
+        // The headless-swarm commands under test are developer features.
+        .manage(crate::features::DevFeatures(true))
         .build(tauri::test::mock_context(tauri::test::noop_assets()))
         .expect("mock app");
     (app, pool, dir)
@@ -126,6 +128,7 @@ pub async fn mock_app_with_pool_and_terminal_registry() -> (
     let app = tauri::test::mock_builder()
         .manage(pool.clone())
         .manage(crate::sidecar::terminal::TerminalRegistry::new())
+        .manage(crate::features::DevFeatures(true))
         .build(tauri::test::mock_context(tauri::test::noop_assets()))
         .expect("mock app");
     (app, pool, dir)

@@ -1,10 +1,11 @@
 // WP-W2-08 — app shell. Mirrors `Neuron Design/app/shell.jsx`'s DOM
-// and class names verbatim so the moved CSS resolves unchanged. All
-// nine routes are wired to real components in `RouteHost`. The shell
-// itself is gated behind `ProjectPickerRoute` until an active project
-// is picked (folder = cwd for Terminal / Terminal Swarm spawns).
-// User/workspace strings come from `useMe()`.
-import { useEffect, useRef, useState } from 'react';
+// and class names verbatim so the moved CSS resolves unchanged. Every
+// route is wired to a real component in `RouteHost`; the older
+// surfaces are developer features (see `NAV`). The shell itself is
+// gated behind `ProjectPickerRoute` until an active project is picked
+// (folder = cwd for Terminal / Terminal Swarm spawns). User/workspace
+// strings come from `useMe()`.
+import { Fragment, useEffect, useRef, useState } from 'react';
 import { open } from '@tauri-apps/plugin-dialog';
 import { Brandmark, NIcon, type IconName } from './components/icons';
 import { ErrorBoundary } from './components/ErrorBoundary';
@@ -12,6 +13,7 @@ import { useMe } from './hooks/useMe';
 import { useRuns } from './hooks/useRuns';
 import { useRunCreate } from './hooks/mutations';
 import { useActiveProject } from './hooks/useActiveProject';
+import { useAppFeatures } from './hooks/useAppFeatures';
 import { ProjectPickerRoute } from './routes/ProjectPickerRoute';
 import { AgentsRoute } from './routes/AgentsRoute';
 import { RunsRoute } from './routes/RunsRoute';
@@ -22,7 +24,6 @@ import { RunInspector } from './routes/RunInspector';
 import { TerminalRoute } from './routes/Terminal';
 import { SwarmRoute } from './routes/SwarmRoute';
 import { TerminalSwarmRoute } from './routes/TerminalSwarm';
-import { RoutingLogRoute } from './routes/RoutingLogRoute';
 
 type Route =
   | 'canvas'
@@ -32,19 +33,27 @@ type Route =
   | 'agents'
   | 'runs'
   | 'mcp'
-  | 'routing-log'
   | 'settings';
 
-const NAV: { id: Route; label: string; icon: IconName }[] = [
-  { id: 'canvas', label: 'Workflow', icon: 'workflow' },
-  { id: 'terminal', label: 'Terminal', icon: 'server' },
+interface NavItem {
+  id: Route;
+  label: string;
+  icon: IconName;
+  /** Developer feature (`NEURON_DEV_FEATURES=1`): listed only when on. */
+  dev?: boolean;
+}
+
+// Terminal Swarm first: it is the flagship and the default route. The
+// developer group comes last, under its own label.
+const NAV: NavItem[] = [
   { id: 'terminal-swarm', label: 'Terminal Swarm', icon: 'bot' },
-  { id: 'swarm', label: 'Swarm', icon: 'bot' },
-  { id: 'agents', label: 'Agents', icon: 'bot' },
-  { id: 'runs', label: 'Runs', icon: 'activity' },
+  { id: 'terminal', label: 'Terminal', icon: 'server' },
   { id: 'mcp', label: 'MCP', icon: 'store' },
-  { id: 'routing-log', label: 'Routing Log', icon: 'branch' },
   { id: 'settings', label: 'Settings', icon: 'settings' },
+  { id: 'canvas', label: 'Workflow', icon: 'workflow', dev: true },
+  { id: 'swarm', label: 'Swarm', icon: 'bot', dev: true },
+  { id: 'agents', label: 'Agents', icon: 'bot', dev: true },
+  { id: 'runs', label: 'Runs', icon: 'activity', dev: true },
 ];
 
 const TOPBAR_TITLE: Record<Route, string> = {
@@ -55,7 +64,6 @@ const TOPBAR_TITLE: Record<Route, string> = {
   agents: 'Agents',
   runs: 'Runs',
   mcp: 'MCP marketplace',
-  'routing-log': 'Routing Log',
   settings: 'Settings',
 };
 
@@ -64,9 +72,17 @@ interface SidebarProps {
   onNavigate: (next: Route) => void;
   collapsed: boolean;
   onToggle: () => void;
+  /** Show the developer routes (`useAppFeatures().devFeatures`). */
+  devFeatures: boolean;
 }
 
-function Sidebar({ route, onNavigate, collapsed, onToggle }: SidebarProps): JSX.Element {
+function Sidebar({
+  route,
+  onNavigate,
+  collapsed,
+  onToggle,
+  devFeatures,
+}: SidebarProps): JSX.Element {
   const { data: me } = useMe();
   // Loading placeholders — kept terse so the layout doesn't shift
   // when the hook resolves. Workspace count comes from the backend
@@ -75,8 +91,9 @@ function Sidebar({ route, onNavigate, collapsed, onToggle }: SidebarProps): JSX.
   const userName = me?.user.name ?? 'Loading…';
   const workspaceName = me?.workspace.name ?? 'Loading…';
   const workspaceCount = me?.workspace.count;
+  const items = NAV.filter((item) => devFeatures || !item.dev);
   return (
-    <nav className="sidebar" role="navigation">
+    <nav className="sidebar" role="navigation" aria-label="Main">
       <div
         className="sb-brand"
         onClick={onToggle}
@@ -106,25 +123,31 @@ function Sidebar({ route, onNavigate, collapsed, onToggle }: SidebarProps): JSX.
       )}
 
       <ul className="sb-nav">
-        {NAV.map((item) => (
-          <li
-            key={item.id}
-            className={`sb-item${route === item.id ? ' active' : ''}`}
-            role="button"
-            tabIndex={0}
-            aria-current={route === item.id ? 'page' : undefined}
-            onClick={() => onNavigate(item.id)}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter' || e.key === ' ') {
-                e.preventDefault();
-                onNavigate(item.id);
-              }
-            }}
-          >
-            <NIcon name={item.icon} size={18} />
-            {!collapsed && <span>{item.label}</span>}
-            {!collapsed && route === item.id && <span className="sb-dot" />}
-          </li>
+        {items.map((item, i) => (
+          <Fragment key={item.id}>
+            {item.dev && !items[i - 1]?.dev && (
+              <li className="sb-section" aria-hidden="true">
+                {collapsed ? null : 'Developer'}
+              </li>
+            )}
+            <li
+              className={`sb-item${route === item.id ? ' active' : ''}`}
+              role="button"
+              tabIndex={0}
+              aria-current={route === item.id ? 'page' : undefined}
+              onClick={() => onNavigate(item.id)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' || e.key === ' ') {
+                  e.preventDefault();
+                  onNavigate(item.id);
+                }
+              }}
+            >
+              <NIcon name={item.icon} size={18} />
+              {!collapsed && <span>{item.label}</span>}
+              {!collapsed && route === item.id && <span className="sb-dot" />}
+            </li>
+          </Fragment>
         ))}
       </ul>
 
@@ -276,12 +299,6 @@ function RouteHost({ route }: { route: Route }): JSX.Element {
           <MCPRoute />
         </ErrorBoundary>
       );
-    case 'routing-log':
-      return (
-        <ErrorBoundary fallbackTitle="Couldn't load routing log">
-          <RoutingLogRoute />
-        </ErrorBoundary>
-      );
     case 'settings':
       // SettingsRoute has no data deps, but ErrorBoundary still
       // catches render-time bugs while we iterate on the panes.
@@ -301,8 +318,10 @@ function RouteHost({ route }: { route: Route }): JSX.Element {
 }
 
 export function App(): JSX.Element {
-  const [route, setRoute] = useState<Route>('canvas');
+  const [route, setRoute] = useState<Route>('terminal-swarm');
   const [collapsed, setCollapsed] = useState(false);
+  const { data: features } = useAppFeatures();
+  const devFeatures = features?.devFeatures ?? false;
   const [showInspector, setShowInspector] = useState(true);
   const { project } = useActiveProject();
   // Pick the most recent run as the inspector's default subject.
@@ -328,6 +347,7 @@ export function App(): JSX.Element {
         onNavigate={setRoute}
         collapsed={collapsed}
         onToggle={() => setCollapsed((c) => !c)}
+        devFeatures={devFeatures}
       />
       <Topbar route={route} />
       <main className="app-main">

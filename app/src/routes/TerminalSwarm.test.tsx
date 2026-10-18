@@ -262,6 +262,21 @@ describe('TerminalSwarmRoute', () => {
     expect(describeError('plain')).toBe('plain');
   });
 
+  it('opens and closes the Routing Log drawer from the toolbar', async () => {
+    renderRoute();
+    const toggle = await screen.findByRole('button', { name: /routing log/i });
+    expect(toggle).toHaveAttribute('aria-pressed', 'false');
+    expect(screen.queryByRole('complementary', { name: /routing log/i })).not.toBeInTheDocument();
+
+    fireEvent.click(toggle);
+    const drawer = screen.getByRole('complementary', { name: /routing log/i });
+    expect(drawer).toHaveTextContent(/no routing events yet/i);
+    expect(toggle).toHaveAttribute('aria-pressed', 'true');
+
+    fireEvent.click(toggle);
+    expect(screen.queryByRole('complementary', { name: /routing log/i })).not.toBeInTheDocument();
+  });
+
   it('surfaces a session-status probe failure instead of silently showing the idle grid', async () => {
     const { commands } = await import('../lib/bindings');
     vi.mocked(commands.swarmTermSessionStatus).mockRejectedValue(
