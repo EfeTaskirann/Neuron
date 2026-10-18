@@ -16,12 +16,16 @@ interface SwarmTermToolbarProps {
   sessionStartMs: number | null;
   /** Whether the Routing Log drawer is open. */
   logOpen: boolean;
+  /** Whether the Changes panel is open, and how many files it lists. */
+  changesOpen: boolean;
+  changesCount: number | null;
   /** Every pane's readiness while a session runs (empty otherwise). */
   paneStates: TerminalSwarmPaneState[];
   onLaunch: () => void;
   onRestart: () => void;
   onStop: () => void;
   onToggleLog: () => void;
+  onToggleChanges: () => void;
 }
 
 export function SwarmTermToolbar({
@@ -33,11 +37,14 @@ export function SwarmTermToolbar({
   stopPending,
   sessionStartMs,
   logOpen,
+  changesOpen,
+  changesCount,
   paneStates,
   onLaunch,
   onRestart,
   onStop,
   onToggleLog,
+  onToggleChanges,
 }: SwarmTermToolbarProps): JSX.Element {
   return (
     <div className="swarm-term-toolbar">
@@ -94,6 +101,19 @@ export function SwarmTermToolbar({
         title={logOpen ? 'Hide the Routing Log' : 'Show every message between the agents'}
       >
         Routing Log
+      </button>
+      <button
+        type="button"
+        className="btn ghost sm swarm-term-log-toggle"
+        aria-pressed={changesOpen}
+        onClick={onToggleChanges}
+        title={
+          changesOpen
+            ? 'Değişiklikler panelini kapat'
+            : 'Ajanların checkpoint’ten beri değiştirdiği dosyalar'
+        }
+      >
+        {changesCount ? `Değişiklikler (${changesCount})` : 'Değişiklikler'}
       </button>
     </div>
   );

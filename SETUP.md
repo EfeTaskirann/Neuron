@@ -231,6 +231,21 @@ Neuron/
    yönlendirilen mesajlar) o projedeki `claude` prompt geçmişinde
    (yukarı ok) görünür; transcript'leri oturum kapanınca silinir.
 
+7. **Her swarm başlangıcı bir git checkpoint'i alır (2026-10-18)**:
+   klasörün o anki hali (commit'lenmemiş değişiklikler ve izlenmeyen
+   dosyalar dahil) özel bir index dosyasıyla bir git *tree*'si olarak
+   saklanır. Branch'ine, index'ine ve dosyalarına dokunulmaz; commit
+   ya da ref oluşmaz. Depoda kalan iz yalnızca `git add`'in de yazacağı
+   nesnelerdir; git bunları her zamanki süresi (iki hafta) dolunca
+   temizler. Değişiklikler paneli checkpoint'ten beri değişen dosyaları
+   ve diff'lerini gösterir. Geri al dosyayı checkout'un yazacağı haliyle
+   (satır sonları deponun ayarına göre, `git stash` gibi) geri koyar.
+   Tut checkpoint'i şimdiye taşır. İzlenmeyen `node_modules/`,
+   `target/` vb. klasörler ve 1 MB üstü izlenmeyen dosyalar checkpoint'e
+   girmez; `.gitignore`'daki dosyalar da girmez. Git deposu olmayan bir
+   klasörde checkpoint yoktur ve uygulama bunu söyler. Kayıt:
+   `%APPDATA%\app.neuron.desktop\swarm-term\checkpoints\`.
+
 ---
 
 ## 9. Mevcut durum (2026-05-07 itibarıyla)

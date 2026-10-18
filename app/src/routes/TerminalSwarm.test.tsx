@@ -15,6 +15,10 @@ vi.mock('../lib/bindings', () => ({
     swarmTermStopSession: vi.fn(),
     swarmTermRestartAgent: vi.fn(),
     swarmTermResumeDeliveries: vi.fn(),
+    swarmTermChanges: vi.fn(),
+    swarmTermChangeDiff: vi.fn(),
+    swarmTermRevertChanges: vi.fn(),
+    swarmTermKeepChanges: vi.fn(),
     swarmTermRunUpdate: vi.fn(),
     terminalLines: vi.fn(),
     terminalWrite: vi.fn(),
@@ -98,6 +102,7 @@ const SESSION: TerminalSwarmSessionHandle = {
   ],
   usageLimited: false,
   limitResetsAt: null,
+  changesNote: null,
 };
 
 beforeEach(async () => {
@@ -109,6 +114,10 @@ beforeEach(async () => {
   vi.mocked(commands.swarmTermSessionStatus).mockResolvedValue({
     status: 'ok',
     data: null,
+  });
+  vi.mocked(commands.swarmTermChanges).mockResolvedValue({
+    status: 'ok',
+    data: { checkpointAt: null, files: [], truncated: false, note: null },
   });
   vi.mocked(commands.terminalLines).mockResolvedValue({ status: 'ok', data: [] });
   vi.mocked(commands.terminalWrite).mockResolvedValue({ status: 'ok', data: null });
@@ -448,6 +457,44 @@ describe('TerminalSwarmRoute', () => {
 
     fireEvent.click(toggle);
     expect(screen.queryByRole('complementary', { name: /routing log/i })).not.toBeInTheDocument();
+  });
+
+  it('counts the changed files on the toolbar and opens the Changes panel', async () => {
+    const { commands } = await import('../lib/bindings');
+    vi.mocked(commands.swarmTermSessionStatus).mockResolvedValue({ status: 'ok', data: SESSION });
+    vi.mocked(commands.swarmTermChanges).mockResolvedValue({
+      status: 'ok',
+      data: {
+        checkpointAt: 1_790_000_000,
+        files: [
+          { path: 'src/orders.rs', kind: 'modified', additions: 1, deletions: 1 },
+          { path: 'src/new.rs', kind: 'added', additions: 4, deletions: 0 },
+        ],
+        truncated: false,
+        note: null,
+      },
+    });
+    renderRoute();
+    const toggle = await screen.findByRole('button', { name: 'Değişiklikler (2)' });
+    expect(commands.swarmTermChanges).toHaveBeenCalledWith('C:\\test-project');
+    fireEvent.click(toggle);
+    const panel = screen.getByRole('complementary', { name: 'Değişiklikler' });
+    expect(panel).toHaveTextContent('src/orders.rs');
+    expect(panel).toHaveTextContent('+4 −0');
+    // One drawer at a time.
+    fireEvent.click(screen.getByRole('button', { name: /routing log/i }));
+    expect(screen.queryByRole('complementary', { name: 'Değişiklikler' })).not.toBeInTheDocument();
+  });
+
+  it('says when the session runs without a checkpoint', async () => {
+    const { commands } = await import('../lib/bindings');
+    const note = 'Bu klasör bir git deposu değil: Neuron ajanların değişikliklerini gösteremez ve geri alamaz.';
+    vi.mocked(commands.swarmTermSessionStatus).mockResolvedValue({
+      status: 'ok',
+      data: { ...SESSION, changesNote: note },
+    });
+    renderRoute();
+    expect(await screen.findByText(note)).toHaveAttribute('role', 'status');
   });
 
   it('surfaces a session-status probe failure instead of silently showing the idle grid', async () => {

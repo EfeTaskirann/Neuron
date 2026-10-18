@@ -443,6 +443,11 @@ export const commands = {
 	usageLimited: boolean,
 	// When claude said the limit resets (unix seconds), if it did.
 	limitResetsAt: number | null,
+	/**
+	 *  Why the session has no checkpoint (a folder without git), or what
+	 *  its snapshots leave out (see `checkpoint`).
+	 */
+	changesNote: string | null,
 } | null, AppErrorWire>(__TAURI_INVOKE("swarm_term_session_status")),
 	swarmTermStartSession: (projectDir: string) => typedError<TerminalSwarmSessionHandle, AppErrorWire>(__TAURI_INVOKE("swarm_term_start_session", { projectDir })),
 	/**
@@ -463,6 +468,20 @@ export const commands = {
 	 *  and the stall clocks run again.
 	 */
 	swarmTermResumeDeliveries: () => typedError<TerminalSwarmSessionHandle, AppErrorWire>(__TAURI_INVOKE("swarm_term_resume_deliveries")),
+	/**
+	 *  What changed in `project_dir` since its checkpoint — taken when the
+	 *  swarm started there.
+	 */
+	swarmTermChanges: (projectDir: string) => typedError<SwarmTermChanges, AppErrorWire>(__TAURI_INVOKE("swarm_term_changes", { projectDir })),
+	// One changed file's diff against the checkpoint.
+	swarmTermChangeDiff: (projectDir: string, path: string) => typedError<string, AppErrorWire>(__TAURI_INVOKE("swarm_term_change_diff", { projectDir, path })),
+	/**
+	 *  Put changed files back as they were at the checkpoint (`paths`, or
+	 *  every changed file).
+	 */
+	swarmTermRevertChanges: (projectDir: string, paths: string[] | null) => typedError<SwarmTermChanges, AppErrorWire>(__TAURI_INVOKE("swarm_term_revert_changes", { projectDir, paths })),
+	// Keep what changed: the checkpoint moves to now.
+	swarmTermKeepChanges: (projectDir: string) => typedError<SwarmTermChanges, AppErrorWire>(__TAURI_INVOKE("swarm_term_keep_changes", { projectDir })),
 	/**
 	 *  Update the host's `claude` CLI to the latest version. Rejects while a
 	 *  swarm-term session is running so the binary on disk isn't swapped
@@ -658,6 +677,11 @@ export type CallToolResult = {
 	content: ToolContent[],
 	isError: boolean,
 };
+
+// How a file differs from its checkpoint.
+export type ChangeKind = "added" | "modified" | "deleted" | 
+// A file became a link, or the other way round.
+"type_changed";
 
 /**
  *  Result returned by `swarm_term_run_update` once the update child has
@@ -1661,6 +1685,29 @@ export type SwarmJobEvent =
  */
 { kind: "decision_made"; job_id: string; decision: CoordinatorDecision };
 
+export type SwarmTermChangedFile = {
+	// Relative to the project folder, `/`-separated.
+	path: string,
+	kind: ChangeKind,
+	// Lines added / removed; `None` for a binary file.
+	additions: number | null,
+	deletions: number | null,
+};
+
+// What changed in a project since its checkpoint.
+export type SwarmTermChanges = {
+	/**
+	 *  When the checkpoint was taken (unix seconds); `None`: there is
+	 *  none for this folder (yet).
+	 */
+	checkpointAt: number | null,
+	files: SwarmTermChangedFile[],
+	// More files changed than are listed.
+	truncated: boolean,
+	// Why nothing can be shown, or what the snapshots leave out.
+	note: string | null,
+};
+
 /**
  *  The permission mode a session's panes were spawned with. Captured
  *  once at session start, so what the UI reports is exactly what the
@@ -1722,6 +1769,11 @@ export type TerminalSwarmSessionHandle = {
 	usageLimited: boolean,
 	// When claude said the limit resets (unix seconds), if it did.
 	limitResetsAt: number | null,
+	/**
+	 *  Why the session has no checkpoint (a folder without git), or what
+	 *  its snapshots leave out (see `checkpoint`).
+	 */
+	changesNote: string | null,
 };
 
 /**

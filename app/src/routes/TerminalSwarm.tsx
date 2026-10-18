@@ -1,6 +1,7 @@
 import { useMemo, useRef, useState } from 'react';
 import { ask } from '@tauri-apps/plugin-dialog';
 import { HierarchyDiagram } from '../components/SwarmHierarchy';
+import { ChangesDrawer } from '../components/swarm-term/ChangesDrawer';
 import { ClaudeUpdateCorner } from '../components/swarm-term/ClaudeUpdateCorner';
 import { OrchestratorChatBar } from '../components/swarm-term/OrchestratorChatBar';
 import { SwarmTermGrid } from '../components/swarm-term/SwarmTermGrid';
@@ -20,6 +21,7 @@ import {
   useTrustSwarmTermProject,
 } from '../hooks/useTerminalSwarmSession';
 import { useClaudeUpdateProgress } from '../hooks/useClaudeUpdateProgress';
+import { useSwarmTermChanges } from '../hooks/useSwarmTermChanges';
 import { useRoutingEvents } from '../hooks/useRoutingEvents';
 import { useActiveEdge, useAgentLifecycle } from '../hooks/useAgentLifecycle';
 import { formatResetTime } from '../lib/swarmNotify';
@@ -59,6 +61,9 @@ function askToTrustFolder(folder: string): Promise<boolean> {
       '9 ajan buradaki dosyaları okur, builder’lar değiştirir. Testleri ve build’i ' +
       'çalıştırmak projenin kendi kodunu senin yetkilerinle çalıştırır. Yalnız güvendiğin ' +
       'bir projede devam et.\n\n' +
+      'Her başlangıçta klasörün o anki hali bir git checkpoint’i olarak saklanır: ' +
+      'ajanların değişikliklerini Değişiklikler panelinde görüp geri alabilirsin ' +
+      '(git deposu olmayan bir klasörde bu yapılamaz).\n\n' +
       'Onaylarsan Claude Code’un bu klasör için sorduğu “güveniyor musun?” ' +
       'sorusu ajanlar için senin adına “evet” diye yanıtlanır.',
     {
@@ -96,9 +101,11 @@ export function TerminalSwarmRoute(): JSX.Element {
   const { project } = useActiveProject();
   const projectDir = project?.path ?? null;
   const [launchError, setLaunchError] = useState<string | null>(null);
-  // The Routing Log keeps its history in a module store, so closing the
-  // drawer loses nothing.
-  const [logOpen, setLogOpen] = useState(false);
+  // One drawer at a time: the Routing Log (its history lives in a module
+  // store, so closing it loses nothing) or the Changes panel.
+  const [drawer, setDrawer] = useState<'log' | 'changes' | null>(null);
+  const toggleDrawer = (which: 'log' | 'changes') =>
+    setDrawer((open) => (open === which ? null : which));
   const { events: routeEvents } = useRoutingEvents(500);
   const activeEdge = useActiveEdge(routeEvents, 3_000);
 
@@ -127,6 +134,13 @@ export function TerminalSwarmRoute(): JSX.Element {
   const writeMut = useTerminalWrite();
 
   const sessionActive = session != null;
+  // The running session's folder, else the active project (its last
+  // session's checkpoint): polled while the agents work.
+  const changesProject = session?.projectDir ?? projectDir;
+  const changesQuery = useSwarmTermChanges(changesProject, {
+    enabled: sessionActive || drawer === 'changes',
+    live: sessionActive,
+  });
   // `!sessionLoading`: while the status probe is in flight we don't
   // yet know whether a session exists — launching then would only
   // bounce off the backend's Conflict guard.
@@ -248,12 +262,15 @@ export function TerminalSwarmRoute(): JSX.Element {
           startPending={startMut.isPending}
           stopPending={stopMut.isPending}
           sessionStartMs={sessionStartMs}
-          logOpen={logOpen}
+          logOpen={drawer === 'log'}
+          changesOpen={drawer === 'changes'}
+          changesCount={changesQuery.data?.files.length ?? null}
           paneStates={paneStates}
           onLaunch={launch}
           onRestart={restart}
           onStop={stop}
-          onToggleLog={() => setLogOpen((open) => !open)}
+          onToggleLog={() => toggleDrawer('log')}
+          onToggleChanges={() => toggleDrawer('changes')}
         />
 
         {launchError && (
@@ -269,6 +286,11 @@ export function TerminalSwarmRoute(): JSX.Element {
         {session?.preflightNote && (
           <div className="swarm-term-note" role="status">
             {session.preflightNote}
+          </div>
+        )}
+        {session?.changesNote && (
+          <div className="swarm-term-note" role="status">
+            {session.changesNote}
           </div>
         )}
         {session?.usageLimited && (
@@ -319,9 +341,21 @@ export function TerminalSwarmRoute(): JSX.Element {
         />
       </div>
 
-      {logOpen && (
+      {drawer === 'log' && (
         <aside className="swarm-term-log-drawer" aria-label="Routing Log">
           <RoutingLogRoute />
+        </aside>
+      )}
+      {drawer === 'changes' && changesProject && (
+        <aside className="swarm-term-log-drawer" aria-label="Değişiklikler">
+          <ChangesDrawer
+            projectDir={changesProject}
+            changes={changesQuery.data}
+            updatedAt={changesQuery.dataUpdatedAt}
+            fetching={changesQuery.isFetching}
+            error={changesQuery.error}
+            onRefresh={() => void changesQuery.refetch()}
+          />
         </aside>
       )}
 

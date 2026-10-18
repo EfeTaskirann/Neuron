@@ -44,6 +44,126 @@
   padding: 0 0 0 12px;
 }
 
+/* The Changes panel (ChangesDrawer.tsx): files, actions, one diff. */
+.swarm-term-changes {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  height: 100%;
+  min-height: 0;
+  padding: 0 0 0 12px;
+  font-size: 12px;
+}
+.swarm-term-changes-head,
+.swarm-term-changes-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.swarm-term-changes-head h2 {
+  margin: 0;
+  flex: 1;
+  font-size: 14px;
+}
+.swarm-term-changes-since,
+.swarm-term-changes-actions span,
+.swarm-term-changes-empty,
+.swarm-term-change-counts {
+  color: var(--muted-foreground);
+}
+.swarm-term-changes-actions span {
+  flex: 1;
+}
+.swarm-term-changes-empty {
+  margin: 0;
+}
+.swarm-term-changes-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 40%;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.swarm-term-changes-list li {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 4px;
+  border-bottom: 1px solid var(--border);
+}
+.swarm-term-changes-list li:last-child {
+  border-bottom: none;
+}
+.swarm-term-changes-list li.selected {
+  background: var(--surface-2);
+}
+.swarm-term-change-file {
+  display: flex;
+  flex: 1;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  padding: 4px;
+  background: transparent;
+  border: none;
+  color: var(--foreground);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.swarm-term-change-path {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.swarm-term-change-path,
+.swarm-term-change-counts,
+.swarm-term-change-kind,
+.swarm-term-diff {
+  font-family: var(--font-mono, ui-monospace, monospace);
+}
+.swarm-term-change-kind {
+  width: 1.2em;
+  font-weight: 600;
+  text-align: center;
+}
+.swarm-term-change-kind--added {
+  color: var(--syn-success);
+}
+.swarm-term-change-kind--deleted {
+  color: var(--syn-error);
+}
+.swarm-term-change-kind--modified,
+.swarm-term-change-kind--type_changed {
+  color: var(--syn-warning);
+}
+.swarm-term-diff-box {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.swarm-term-diff {
+  margin: 0;
+  padding: 8px;
+  font-size: 11px;
+  line-height: 1.45;
+  white-space: pre;
+}
+.swarm-term-diff-add {
+  background: color-mix(in oklab, var(--background) 82%, var(--syn-success));
+}
+.swarm-term-diff-del {
+  background: color-mix(in oklab, var(--background) 82%, var(--syn-error));
+}
+.swarm-term-diff-hunk {
+  color: var(--muted-foreground);
+}
+
 .swarm-term-log-toggle[aria-pressed='true'] {
   background: var(--surface-2);
   border-color: var(--border);

@@ -4,8 +4,10 @@
 //! `swarm_term_session_status`, `swarm_term_start_session`,
 //! `swarm_term_trust_project` (the user's yes to running the swarm in a
 //! folder), `swarm_term_stop_session`, `swarm_term_restart_agent`,
-//! `swarm_term_resume_deliveries` (after the usage limit), and
-//! `swarm_term_run_update`
+//! `swarm_term_resume_deliveries` (after the usage limit), the Changes
+//! panel's `swarm_term_changes` / `swarm_term_change_diff` /
+//! `swarm_term_revert_changes` / `swarm_term_keep_changes` (see
+//! `swarm_term::checkpoint`), and `swarm_term_run_update`
 //! (update the host `claude` CLI). Inter-agent routing is event-driven via the
 //! file-IPC bridge (`swarm_term::bridge`), emitted as `swarm-term:route`
 //! / `swarm-term:lifecycle` events — not a command.
@@ -22,6 +24,7 @@ use tokio::process::Command;
 use crate::error::AppError;
 use crate::swarm::binding::{resolve_claude_spawn, subscription_env};
 use crate::swarm::ProfileRegistry;
+use crate::swarm_term::checkpoint::{self, SwarmTermChanges};
 use crate::swarm_term::TerminalSwarmSessionHandle;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
@@ -153,6 +156,89 @@ pub async fn swarm_term_resume_deliveries<R: Runtime>(
         .inner()
         .clone();
     registry.resume_deliveries(&app)
+}
+
+/// The folder a Changes-panel command is about, and Neuron's data dir
+/// (where the folder's checkpoint is kept).
+fn changes_target<R: Runtime>(
+    app: &AppHandle<R>,
+    project_dir: &str,
+) -> Result<(std::path::PathBuf, std::path::PathBuf), AppError> {
+    let project = std::path::PathBuf::from(project_dir.trim());
+    if project.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+        return Err(AppError::InvalidInput(
+            "project_dir must not contain '..' path segments".into(),
+        ));
+    }
+    if !project.is_dir() {
+        return Err(AppError::InvalidInput(format!(
+            "project_dir {} does not exist or is not a directory",
+            project.display()
+        )));
+    }
+    let app_data = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| AppError::Internal(format!("app_data_dir: {e}")))?;
+    Ok((app_data, project))
+}
+
+/// Run git work off the async runtime; its complaint becomes the error.
+async fn run_git<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, AppError> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?
+        .map_err(AppError::Internal)
+}
+
+/// What changed in `project_dir` since its checkpoint — taken when the
+/// swarm started there.
+#[tauri::command(rename_all = "camelCase")]
+#[specta::specta]
+pub async fn swarm_term_changes<R: Runtime>(
+    app: AppHandle<R>,
+    project_dir: String,
+) -> Result<SwarmTermChanges, AppError> {
+    let (app_data, project) = changes_target(&app, &project_dir)?;
+    run_git(move || Ok(checkpoint::changes(&app_data, &project))).await
+}
+
+/// One changed file's diff against the checkpoint.
+#[tauri::command(rename_all = "camelCase")]
+#[specta::specta]
+pub async fn swarm_term_change_diff<R: Runtime>(
+    app: AppHandle<R>,
+    project_dir: String,
+    path: String,
+) -> Result<String, AppError> {
+    let (app_data, project) = changes_target(&app, &project_dir)?;
+    run_git(move || checkpoint::file_diff(&app_data, &project, &path)).await
+}
+
+/// Put changed files back as they were at the checkpoint (`paths`, or
+/// every changed file).
+#[tauri::command(rename_all = "camelCase")]
+#[specta::specta]
+pub async fn swarm_term_revert_changes<R: Runtime>(
+    app: AppHandle<R>,
+    project_dir: String,
+    paths: Option<Vec<String>>,
+) -> Result<SwarmTermChanges, AppError> {
+    let (app_data, project) = changes_target(&app, &project_dir)?;
+    run_git(move || checkpoint::revert(&app_data, &project, paths.as_deref())).await
+}
+
+/// Keep what changed: the checkpoint moves to now.
+#[tauri::command(rename_all = "camelCase")]
+#[specta::specta]
+pub async fn swarm_term_keep_changes<R: Runtime>(
+    app: AppHandle<R>,
+    project_dir: String,
+) -> Result<SwarmTermChanges, AppError> {
+    let (app_data, project) = changes_target(&app, &project_dir)?;
+    run_git(move || checkpoint::keep(&app_data, &project)).await
 }
 
 /// Result returned by `swarm_term_run_update` once the update child has

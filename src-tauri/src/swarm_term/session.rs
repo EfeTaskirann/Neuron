@@ -41,6 +41,7 @@ use crate::swarm::profile::ProfileRegistry;
 use crate::swarm_term::bridge::{
     self, BridgeControl, BridgeHandle, PauseReason, SharedPanes, BRIDGE_DIRNAME,
 };
+use crate::swarm_term::checkpoint;
 use crate::swarm_term::heartbeat;
 use crate::swarm_term::hierarchy::AGENT_IDS;
 use crate::swarm_term::lifecycle::LifecycleStore;
@@ -141,6 +142,9 @@ pub struct TerminalSwarmSessionHandle {
     pub usage_limited: bool,
     /// When claude said the limit resets (unix seconds), if it did.
     pub limit_resets_at: Option<i64>,
+    /// Why the session has no checkpoint (a folder without git), or what
+    /// its snapshots leave out (see `checkpoint`).
+    pub changes_note: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
@@ -225,6 +229,8 @@ pub(crate) struct ActiveSession {
     /// [`TerminalSwarmSessionHandle::preflight_note`].
     pub claude_version: Option<String>,
     pub preflight_note: Option<String>,
+    /// See [`TerminalSwarmSessionHandle::changes_note`].
+    pub changes_note: Option<String>,
     /// Every pane's readiness, published by the kickoff task.
     pub pane_states: Arc<PaneStates>,
     /// Pane ids that have answered their kickoff and are safe targets for
@@ -410,6 +416,21 @@ impl TerminalSwarmRegistry {
         bridge::prepare_layout(&bridgespace_root)?;
         heartbeat::beat(&bridgespace_root);
 
+        // The way back: the project as it is now, before any agent runs
+        // (see `checkpoint`). A folder without git runs without one, and
+        // the UI says so.
+        let changes_note = {
+            let (app_data, project, sid) = (app_data.clone(), project_dir.clone(), session_id.clone());
+            match tokio::task::spawn_blocking(move || checkpoint::take(&app_data, &project, &sid)).await {
+                Ok(Ok(note)) => note,
+                Ok(Err(why)) => {
+                    tracing::warn!(why = %why, "swarm-term: the session has no checkpoint");
+                    Some(why)
+                }
+                Err(e) => Some(format!("checkpoint: {e}")),
+            }
+        };
+
         // The session's own files and every pane's claude session id —
         // on disk before any pane runs, so even after a crash the next
         // start knows which transcripts to delete.
@@ -586,6 +607,7 @@ impl TerminalSwarmRegistry {
             projects_dirs: projects_dirs.clone(),
             claude_version: preflight.version.map(|v| v.to_string()),
             preflight_note: preflight.note.clone(),
+            changes_note,
             pane_states: Arc::clone(&pane_states),
             ready_panes: Arc::clone(&ready_panes),
             alive: Arc::clone(&alive),
@@ -1933,6 +1955,7 @@ fn handle_from(s: &ActiveSession) -> TerminalSwarmSessionHandle {
         pane_states: s.pane_states.snapshot(),
         usage_limited: limit.limited,
         limit_resets_at: limit.resets_at,
+        changes_note: s.changes_note.clone(),
     }
 }
 
@@ -2443,6 +2466,21 @@ mod tests {
             "[{}] TASK_DONE/TASK_FAILED received by orchestrator: {task_done}/{expect}",
             stamp(Instant::now())
         );
+
+        // What the Changes panel shows of the run (see `checkpoint`);
+        // `NEURON_LIVE_REVERT=1` puts all of it back.
+        let app_data = app.path().app_data_dir().expect("app data dir");
+        let changed = checkpoint::changes(&app_data, &project);
+        println!(
+            "CHANGES since the checkpoint: {:?}{}",
+            changed.files.iter().map(|f| (f.path.as_str(), f.kind)).collect::<Vec<_>>(),
+            changed.note.as_deref().map(|n| format!(" — {n}")).unwrap_or_default()
+        );
+        if std::env::var("NEURON_LIVE_REVERT").is_ok() {
+            let left = checkpoint::revert(&app_data, &project, None).expect("revert");
+            println!("REVERTED — left changed: {:?}", left.files);
+            assert!(left.files.is_empty(), "everything is back as it was");
+        }
 
         // Denied tool calls + transcript copies, before stop() deletes the
         // transcripts.
