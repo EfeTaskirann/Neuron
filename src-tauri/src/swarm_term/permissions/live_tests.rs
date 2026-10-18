@@ -101,13 +101,15 @@ fn turn(project: &Project, agent: &str, instruction: &str) -> String {
     let mut child = Command::new(&spawn.program)
         .args(&spawn.prefix_args)
         .args(["-p", &prompt, "--model", "haiku", "--output-format", "stream-json", "--verbose"])
-        // Keep the probe off the user's own settings files and MCP servers.
-        .args(["--setting-sources", "project", "--strict-mcp-config"])
+        // Keep the probe off the user's own settings files and MCP
+        // servers, and out of their transcript history.
+        .args(["--setting-sources", "project", "--strict-mcp-config", "--no-session-persistence"])
         .args(claude_permission_args(SwarmTermPermissionMode::Restricted, agent, SESSION))
         .current_dir(&project.root)
         .env_clear()
         .envs(std::env::vars().filter(|(name, _)| !is_claude_env(name)))
         .env("DISABLE_AUTOUPDATER", "1")
+        .env("CLAUDE_CODE_DISABLE_AUTO_MEMORY", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
