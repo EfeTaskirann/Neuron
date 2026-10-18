@@ -213,9 +213,6 @@ const SERVERS_OK = {
       name: 'Filesystem',
       by: 'modelcontextprotocol',
       desc: 'Read/write files in a workspace root',
-      installs: 12_400,
-      rating: 4.8,
-      featured: true,
       installed: true,
     },
     {
@@ -223,9 +220,6 @@ const SERVERS_OK = {
       name: 'GitHub',
       by: 'modelcontextprotocol',
       desc: 'Repo, issue, and PR access',
-      installs: 8_900,
-      rating: 4.6,
-      featured: false,
       installed: false,
     },
   ],
@@ -362,18 +356,14 @@ describe('RunsRoute', () => {
 });
 
 describe('MCPRoute', () => {
-  it('renders featured + all-servers sections from useServers()', async () => {
+  it('renders one row per server from useServers()', async () => {
     renderApp();
     fireEvent.click(screen.getByText('MCP'));
-    await waitFor(() => expect(screen.getAllByText('Filesystem').length).toBeGreaterThan(0));
-    // Filesystem (featured + installed) appears in featured AND all
-    // sections; GitHub (not featured, not installed) only in all.
-    expect(screen.getAllByText('Filesystem').length).toBeGreaterThanOrEqual(2);
+    await waitFor(() => expect(screen.getByText('Filesystem')).toBeInTheDocument());
     expect(screen.getByText('GitHub')).toBeInTheDocument();
-    // Installed pill renders for filesystem; install button renders
-    // for github.
+    // Installed pill renders for filesystem; install button for github.
     expect(screen.getAllByText('installed').length).toBeGreaterThanOrEqual(1);
-    expect(screen.getAllByText('Install').length).toBeGreaterThanOrEqual(1);
+    expect(screen.getByText('Install')).toBeInTheDocument();
   });
 });
 
@@ -529,10 +519,8 @@ describe('Mutations', () => {
     renderApp();
     fireEvent.click(screen.getByText('MCP'));
     await waitFor(() => expect(screen.getByText('GitHub')).toBeInTheDocument());
-    // Multiple Install buttons (featured + row); clicking any one
-    // fires the mutation with the matching server id.
-    const installButtons = screen.getAllByText('Install');
-    fireEvent.click(installButtons[0]!);
+    // GitHub is the only server not yet installed.
+    fireEvent.click(screen.getByText('Install'));
     await waitFor(() => expect(commands.mcpInstall).toHaveBeenCalled());
     expect(vi.mocked(commands.mcpInstall).mock.calls[0]![0]).toBe('github');
   });

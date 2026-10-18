@@ -113,8 +113,8 @@ async fn migrations_are_idempotent() {
     // Migration count grows as the schema evolves. Update this
     // when adding a new file under `migrations/`.
     assert_eq!(
-        count, 12,
-        "twelve migrations recorded (0001 + 0002 + 0003 + 0004 + 0005 + 0006 + 0007 + 0008 + 0009 + 0010 + 0011 + 0012)"
+        count, 13,
+        "thirteen migrations recorded (0001 … 0013)"
     );
 }
 
@@ -164,64 +164,68 @@ async fn seed_demo_canvas_is_idempotent() {
 }
 
 #[tokio::test]
-async fn seed_mcp_servers_is_idempotent() {
+async fn seed_mcp_servers_mirrors_the_bundled_catalog() {
     let (pool, _dir) = fresh_pool().await;
     seed_mcp_servers(&pool).await.expect("seed first time");
-    let after_first: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM servers")
-        .fetch_one(&pool)
+    let ids: Vec<String> = sqlx::query_scalar("SELECT id FROM servers ORDER BY id")
+        .fetch_all(&pool)
         .await
         .unwrap();
-    assert_eq!(after_first, 12, "all twelve manifests seeded");
+    assert_eq!(ids, vec!["filesystem".to_string()], "only the bundled catalog");
 
-    // Re-running must not duplicate or overwrite — flip one row's
-    // `installed` to 1 first and confirm it survives the re-seed.
-    sqlx::query("UPDATE servers SET installed=1 WHERE id='filesystem'")
-        .execute(&pool)
-        .await
-        .unwrap();
+    // The state an older build leaves behind: the user installed
+    // Filesystem (tools recorded), its description has since been
+    // corrected in the manifest, and a catalog-only stub is still there.
+    sqlx::query(
+        "UPDATE servers SET installed = 1, description = 'stale text' WHERE id = 'filesystem'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO servers (id, name, \"by\", description, installed) \
+         VALUES ('github', 'GitHub', 'GitHub', 'stub', 0)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO server_tools (server_id, name, description) VALUES \
+         ('filesystem', 'read_file', 'x'), ('github', 'list_issues', 'y')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
     seed_mcp_servers(&pool).await.expect("seed second time");
-    let after_second: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM servers")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    assert_eq!(after_second, 12, "no duplicates after re-seed");
-    let installed: bool =
-        sqlx::query_scalar("SELECT installed FROM servers WHERE id='filesystem'")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    assert!(
-        installed,
-        "user-toggled `installed` flag must survive re-seed"
-    );
-
-    // Acceptance: ids match the canonical twelve (data.js#servers
-    // parity per Charter Constraint #1).
-    let ids: Vec<String> =
-        sqlx::query_scalar("SELECT id FROM servers ORDER BY id")
+    let rows: Vec<(String, String, bool)> =
+        sqlx::query_as("SELECT id, description, installed FROM servers ORDER BY id")
             .fetch_all(&pool)
             .await
             .unwrap();
-    let mut expected = vec![
-        "browser",
-        "figma",
-        "filesystem",
-        "github",
-        "linear",
-        "memory",
-        "notion",
-        "postgres",
-        "sentry",
-        "slack",
-        "stripe",
-        "vector-db",
-    ];
-    expected.sort();
+    let manifest = crate::mcp::manifests::get("filesystem").unwrap().unwrap();
     assert_eq!(
-        ids,
-        expected.into_iter().map(String::from).collect::<Vec<_>>(),
-        "twelve canonical MCP servers"
+        rows,
+        vec![("filesystem".to_string(), manifest.description, true)],
+        "stub deleted, description refreshed, install state kept"
     );
+    let tools: Vec<String> = sqlx::query_scalar("SELECT server_id FROM server_tools")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(tools, vec!["filesystem".to_string()], "the stub's tools go with it");
+}
+
+/// The servers table no longer carries the design mock's invented
+/// install counts, ratings and "featured" flag.
+#[tokio::test]
+async fn servers_table_has_no_mock_stats() {
+    let (pool, _dir) = fresh_pool().await;
+    let columns: Vec<String> = sqlx::query_scalar("SELECT name FROM pragma_table_info('servers')")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(columns, ["id", "name", "by", "description", "installed"]);
 }
 
 /// Acceptance: the pool actually works end-to-end — insert and

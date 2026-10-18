@@ -34,21 +34,14 @@ pub(super) async fn spawn_for_manifest<R: Runtime>(
     app: &AppHandle<R>,
     manifest: &ServerManifest,
 ) -> Result<McpClient, AppError> {
-    let Some(spawn) = manifest.spawn.as_ref() else {
-        return Err(AppError::McpServerSpawnFailed(format!(
-            "{} has no launch recipe (catalog-only entry) — see its \
-             description",
-            manifest.id
-        )));
-    };
     let env = resolve_env(manifest)?;
-    let (program, args) = resolve_command(app, manifest, spawn)?;
+    let (program, args) = resolve_command(app, manifest, &manifest.spawn)?;
     McpClient::spawn(&program, &args, &env).await
 }
 
 /// Substitute `__ROOT__` placeholders in the spawn template with a
-/// resolved on-disk path (the per-app data dir for Filesystem). Other
-/// placeholders are reserved for future packages.
+/// resolved on-disk path (the server's own sandbox folder for
+/// Filesystem). Other placeholders are reserved for future packages.
 fn resolve_command<R: Runtime>(
     app: &AppHandle<R>,
     manifest: &ServerManifest,
@@ -69,7 +62,7 @@ fn resolve_command<R: Runtime>(
                 )));
             }
             let root_path: Option<String> = match manifest.default_root_kind {
-                Some(DefaultRootKind::AppDataDir) => Some(resolve_app_data_dir(app)?),
+                Some(DefaultRootKind::McpSandbox) => Some(resolve_mcp_sandbox(app, &manifest.id)?),
                 None => None,
             };
             let mut args = vec!["-y".to_string(), package.clone()];
@@ -91,22 +84,26 @@ fn resolve_command<R: Runtime>(
     }
 }
 
-/// Resolve the per-app data dir as a string and ensure it exists. The
-/// Filesystem MCP server in particular fails its handshake if the
-/// supplied root does not exist.
-fn resolve_app_data_dir<R: Runtime>(app: &AppHandle<R>) -> Result<String, AppError> {
-    let dir = app
+/// Resolve `server_id`'s sandbox folder, `<app data>/mcp/<server_id>`,
+/// as a string and ensure it exists. The Filesystem MCP server fails
+/// its handshake if the supplied root does not exist. The app data dir
+/// itself is never handed out: it holds the database and the swarm
+/// panes' credential copies.
+fn resolve_mcp_sandbox<R: Runtime>(app: &AppHandle<R>, server_id: &str) -> Result<String, AppError> {
+    let app_data = app
         .path()
         .app_data_dir()
         .map_err(|e| AppError::Internal(format!("app data dir: {e}")))?;
-    if !dir.exists() {
-        std::fs::create_dir_all(&dir).map_err(|e| {
-            AppError::Internal(format!(
-                "create app data dir at {dir:?}: {e}"
-            ))
-        })?;
-    }
+    let dir = mcp_sandbox_dir(&app_data, server_id);
+    std::fs::create_dir_all(&dir).map_err(|e| {
+        AppError::Internal(format!("create MCP sandbox at {dir:?}: {e}"))
+    })?;
     Ok(dir.to_string_lossy().into_owned())
+}
+
+/// Pure: the sandbox folder of `server_id` under `app_data`.
+pub(super) fn mcp_sandbox_dir(app_data: &std::path::Path, server_id: &str) -> std::path::PathBuf {
+    app_data.join("mcp").join(server_id)
 }
 
 /// Resolve any environment variables a manifest declares.

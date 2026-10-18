@@ -1,8 +1,9 @@
 //! Bundled MCP server manifests.
 //!
 //! Each manifest describes one seeded server: the catalog metadata
-//! (id, name, description, installs, rating, featured) and the spawn
-//! recipe used by [`crate::mcp::registry`] when the user installs it.
+//! (id, name, author, description) and the spawn recipe used by
+//! [`crate::mcp::registry`] when the user installs it. Only servers
+//! Neuron can actually launch are bundled: `spawn` is required.
 //!
 //! Manifests are baked into the binary at compile time via
 //! `include_str!` so the installer is self-contained — no JSON files
@@ -46,9 +47,10 @@ pub enum ManifestSpawn {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum DefaultRootKind {
-    /// Tauri's per-app data dir, resolved at install time. The
-    /// installer creates the dir if missing.
-    AppDataDir,
+    /// A folder of the server's own, `<app data>/mcp/<server id>`,
+    /// created on demand. Never the app data dir itself: that holds the
+    /// database and the swarm panes' credential copies.
+    McpSandbox,
 }
 
 /// One MCP server manifest as parsed from JSON.
@@ -60,16 +62,10 @@ pub struct ServerManifest {
     pub name: String,
     pub by: String,
     pub description: String,
-    pub installs: i64,
-    pub rating: f64,
-    pub featured: bool,
 
-    /// Spawn recipe for `mcp:install` and `mcp:callTool`. `None` means
-    /// the manifest is a catalog-only stub — listing the server is
-    /// fine but installing it returns
-    /// [`crate::error::AppError::McpServerSpawnFailed`].
-    #[serde(default)]
-    pub spawn: Option<ManifestSpawn>,
+    /// Spawn recipe for `mcp:install` and `mcp:callTool`. Required: a
+    /// server Neuron cannot launch is not bundled.
+    pub spawn: ManifestSpawn,
 
     /// OS-keychain entry name to look up before spawning. The exact
     /// keyring lookup is deferred to Week-3 when WP-W2-04's API-key
@@ -90,24 +86,8 @@ pub struct ServerManifest {
 ///
 /// The order matters for the seed-list smoke test: it asserts ids in
 /// this exact order.
-pub const ALL_MANIFESTS_JSON: &[(&str, &str)] = &[
-    ("filesystem", include_str!("manifests/filesystem.json")),
-    ("github", include_str!("manifests/github.json")),
-    ("postgres", include_str!("manifests/postgres.json")),
-    ("browser", include_str!("manifests/browser.json")),
-    ("slack", include_str!("manifests/slack.json")),
-    ("vector-db", include_str!("manifests/vector-db.json")),
-    // Catalog-only stubs added 2026-04-29 for mock-shape parity
-    // (data.js#servers ships twelve rows). All have `spawn: null`,
-    // so `mcp:install` against any of them returns
-    // `McpServerSpawnFailed` until refactor.md G2 lands in Week 3.
-    ("linear", include_str!("manifests/linear.json")),
-    ("notion", include_str!("manifests/notion.json")),
-    ("stripe", include_str!("manifests/stripe.json")),
-    ("sentry", include_str!("manifests/sentry.json")),
-    ("figma", include_str!("manifests/figma.json")),
-    ("memory", include_str!("manifests/memory.json")),
-];
+pub const ALL_MANIFESTS_JSON: &[(&str, &str)] =
+    &[("filesystem", include_str!("manifests/filesystem.json"))];
 
 /// Outcome of parsing every bundled manifest exactly once. The
 /// successfully-parsed entries land in `manifests`; per-file parse or
@@ -258,44 +238,37 @@ mod tests {
     }
 
     #[test]
-    fn filesystem_manifest_has_app_data_root() {
+    fn filesystem_manifest_is_rooted_in_its_own_sandbox() {
         let m = get("filesystem").expect("load").expect("present");
-        assert!(m.featured);
-        assert_eq!(m.by, "Anthropic");
-        assert_eq!(m.default_root_kind, Some(DefaultRootKind::AppDataDir));
-        match m.spawn {
-            Some(ManifestSpawn::Npx { package, args_template }) => {
-                assert_eq!(package, "@modelcontextprotocol/server-filesystem@2026.8.31");
-                assert_eq!(args_template, vec!["__ROOT__".to_string()]);
-            }
-            _ => panic!("filesystem must spawn via npx"),
-        }
+        assert_eq!(m.by, "Model Context Protocol");
+        assert_eq!(m.default_root_kind, Some(DefaultRootKind::McpSandbox));
+        let ManifestSpawn::Npx { package, args_template } = m.spawn;
+        assert_eq!(package, "@modelcontextprotocol/server-filesystem@2026.8.31");
+        assert_eq!(args_template, vec!["__ROOT__".to_string()]);
     }
 
+    /// Only launchable servers are bundled (the design mock's
+    /// catalog-only stubs and their invented stats are gone).
     #[test]
-    fn github_manifest_requires_secret() {
-        let m = get("github").expect("load").expect("present");
-        assert_eq!(
-            m.requires_secret.as_deref(),
-            Some("GITHUB_PERSONAL_ACCESS_TOKEN"),
-            "github MCP needs a PAT"
-        );
-        // `@modelcontextprotocol/server-github` is deprecated upstream
-        // ("no longer supported" on npm): catalog-only, never launched.
-        assert!(m.spawn.is_none());
-        assert!(m.description.contains("deprecated"));
+    fn the_catalog_lists_only_launchable_servers() {
+        let ids: Vec<String> = load_all().expect("load").into_iter().map(|m| m.id).collect();
+        assert_eq!(ids, vec!["filesystem".to_string()]);
+        for (key, raw) in ALL_MANIFESTS_JSON {
+            for field in ["\"installs\"", "\"rating\"", "\"featured\""] {
+                assert!(!raw.contains(field), "manifest `{key}` still carries {field}");
+            }
+        }
     }
 
     #[test]
     fn every_npx_manifest_is_pinned_to_an_exact_version() {
         for m in load_all().expect("load") {
-            if let Some(ManifestSpawn::Npx { package, .. }) = &m.spawn {
-                assert!(
-                    is_pinned_npm_spec(package),
-                    "manifest `{}` runs `{package}` unpinned — use name@x.y.z",
-                    m.id
-                );
-            }
+            let ManifestSpawn::Npx { package, .. } = &m.spawn;
+            assert!(
+                is_pinned_npm_spec(package),
+                "manifest `{}` runs `{package}` unpinned — use name@x.y.z",
+                m.id
+            );
         }
     }
 
@@ -325,12 +298,12 @@ mod tests {
         }
     }
 
+    /// A manifest without a launch recipe no longer parses: catalog-only
+    /// entries cannot slip back into the bundle.
     #[test]
-    fn stub_manifests_have_no_spawn() {
-        // Browser is a pure catalog row in Week 2; install must surface
-        // a clear error rather than silently flip the flag.
-        let m = get("browser").expect("load").expect("present");
-        assert!(m.spawn.is_none());
+    fn a_manifest_without_a_spawn_recipe_is_rejected() {
+        let stub = r#"{"id":"x","name":"X","by":"x","description":"x"}"#;
+        assert!(serde_json::from_str::<ServerManifest>(stub).is_err());
     }
 
     #[test]

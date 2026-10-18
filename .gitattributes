@@ -4,7 +4,8 @@
 # line endings, and the app then refuses to start ("migration N was
 # previously applied but has been modified"). Pin every migration's line
 # endings to the bytes it was originally applied with:
-#   0001–0011 were applied with CRLF, 0012 with LF.
+#   0001–0011 were applied with CRLF, 0012 and 0013 with LF.
 # New migrations: add an explicit line here (prefer eol=lf).
 src-tauri/migrations/*.sql text eol=crlf
 src-tauri/migrations/0012_pane_lines_unique.sql text eol=lf
+src-tauri/migrations/0013_servers_drop_mock_stats.sql text eol=lf

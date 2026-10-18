@@ -12,9 +12,6 @@ pub struct Server {
     /// Mock key: `desc`.
     #[serde(rename = "desc")]
     pub description: String,
-    pub installs: i64,
-    pub rating: f64,
-    pub featured: bool,
     pub installed: bool,
 }
 

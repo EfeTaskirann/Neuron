@@ -8,16 +8,13 @@
 //!
 //! - `install(pool, app, id)`:
 //!     1. Look up the manifest. Reject unknown ids with `NotFound`.
-//!     2. Verify the manifest is fully wired (`spawn` is set). Stub
-//!        manifests (browser, slack, vector-db, postgres) error out
-//!        with [`AppError::McpServerSpawnFailed`] until Week 3 adds a
-//!        sandbox + secret-prompt flow.
-//!     3. Resolve the spawn template (substitute `__ROOT__` for
-//!        Filesystem) and any required secret env var.
-//!     4. Spawn the server, perform the handshake, run `tools/list`.
-//!     5. Persist `installed=1` plus one row per tool in
+//!     2. Resolve the spawn template (substitute `__ROOT__` with the
+//!        server's own sandbox folder for Filesystem) and any required
+//!        secret env var. Every bundled manifest has a spawn recipe.
+//!     3. Spawn the server, perform the handshake, run `tools/list`.
+//!     4. Persist `installed=1` plus one row per tool in
 //!        `server_tools`. Return the updated `Server` row.
-//!     6. `shutdown()` the client so the spawned `npx` exits cleanly.
+//!     5. `shutdown()` the client so the spawned `npx` exits cleanly.
 //!
 //! - `uninstall(pool, id)` flips `installed=0` and deletes
 //!   `server_tools` for that id (FK cascades on the row).

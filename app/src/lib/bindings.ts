@@ -1374,9 +1374,6 @@ export type Server = {
 	by: string,
 	// Mock key: `desc`.
 	desc: string,
-	installs: number,
-	rating: number,
-	featured: boolean,
 	installed: boolean,
 };
 

@@ -594,49 +594,17 @@ kbd {
 }
 .mcp-search input::placeholder { color: var(--muted-foreground); }
 .mcp-chips { gap: 6px; }
-
-.mcp-featured {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
-  gap: 16px;
-  margin-bottom: 8px;
+.mcp-intro {
+  margin: 0 0 12px;
+  font-size: 13px;
+  line-height: 1.5;
+  max-width: 72ch;
 }
+
 .mcp-list {
   display: flex; flex-direction: column; gap: 8px;
 }
 
-.server-card {
-  display: flex; flex-direction: column;
-  gap: 12px;
-  padding: 16px;
-  background: var(--card);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-2xl);
-  box-shadow: var(--shadow-card);
-  transition: box-shadow var(--duration-normal) var(--ease-out),
-              transform var(--duration-fast) var(--ease-out),
-              border-color var(--duration-fast) var(--ease-out);
-}
-.server-card:hover {
-  box-shadow: var(--shadow-card-hover);
-  transform: translateY(-1px);
-  border-color: color-mix(in oklch, var(--neuron-violet-500) 25%, var(--border));
-}
-.server-card.featured {
-  background:
-    linear-gradient(135deg,
-      color-mix(in oklch, var(--neuron-violet-500) 8%, transparent) 0%,
-      transparent 60%),
-    var(--card);
-  border-color: color-mix(in oklch, var(--neuron-violet-500) 35%, var(--border));
-}
-
-.server-card-head {
-  display: grid;
-  grid-template-columns: 44px 1fr auto;
-  align-items: center;
-  gap: 12px;
-}
 .server-icon {
   width: 44px; height: 44px;
   border-radius: 12px;
@@ -646,24 +614,10 @@ kbd {
   flex: none;
 }
 .server-icon.sm { width: 28px; height: 28px; border-radius: 8px; }
-.server-name { font-size: 14px; font-weight: 600; }
-.server-by   { font-size: 11px; color: var(--muted-foreground); margin-top: 2px; }
-.server-spacer { display: none; }
-.server-desc {
-  font-size: 12.5px; line-height: 1.5;
-  color: color-mix(in oklch, var(--foreground) 78%, var(--muted-foreground));
-  display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden;
-}
-.server-foot {
-  display: flex; gap: 14px;
-  font-size: 11px; color: var(--muted-foreground);
-  font-family: var(--font-mono);
-}
-.server-foot span { display: inline-flex; align-items: center; gap: 4px; }
 
 .server-row {
   display: grid;
-  grid-template-columns: 28px 1fr auto auto;
+  grid-template-columns: 28px 1fr auto;
   align-items: center;
   gap: 12px;
   padding: 10px 14px;
@@ -681,12 +635,7 @@ kbd {
 .sr-line { display: flex; align-items: baseline; gap: 8px; }
 .sr-name { font-size: 13px; font-weight: 600; }
 .sr-by   { font-size: 11px; color: var(--muted-foreground); }
-.sr-desc { font-size: 12px; color: var(--muted-foreground); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.sr-stats {
-  display: flex; gap: 10px;
-  font-size: 11px; color: var(--muted-foreground);
-  font-family: var(--font-mono);
-}
+.sr-desc { font-size: 12px; line-height: 1.5; color: var(--muted-foreground); }
 
 /* ============================================================
    SETTINGS ROUTE
@@ -1291,8 +1240,7 @@ html[data-density="compact"] .btn {
   padding: 0 10px;
   font-size: 12px;
 }
-html[data-density="compact"] .agent-card,
-html[data-density="compact"] .server-card {
+html[data-density="compact"] .agent-card {
   padding: 12px;
 }
 html[data-density="compact"] .route {
