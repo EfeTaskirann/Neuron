@@ -171,10 +171,12 @@ pub(super) async fn watcher_loop<R: Runtime>(
     let mut stall_every = stall_check_every();
     let mut stall_every_read = Instant::now();
     let mut stuck = StuckMoves::new();
+    let mut was_paused = false;
     loop {
-        // Paused (usage limit, the user): every message waits in its
-        // outbox, in order, until the bridge runs again.
+        // Paused (usage limit, budget, the user): every message waits in
+        // its outbox, in order, until the bridge runs again.
         if control.is_paused() {
+            was_paused = true;
             tokio::select! {
                 _ = cancel.notified() => {
                     tracing::info!("swarm-term bridge: watcher cancelled");
@@ -183,6 +185,14 @@ pub(super) async fn watcher_loop<R: Runtime>(
                 _ = tokio::time::sleep(Duration::from_millis(WATCH_POLL_MS)) => {}
             }
             continue;
+        }
+        if was_paused {
+            // A message's grace (NOT_READY_GRACE / LOCKED_GRACE) is its
+            // file age, which kept growing through the hold. Restart it
+            // from the resume so a message held for minutes is not
+            // rejected the instant its target is still warming up.
+            reset_grace_clocks(&root);
+            was_paused = false;
         }
         // The current agent → pane map (a restarted agent has a new pane).
         let panes_by_agent: Arc<HashMap<String, String>> =
@@ -194,6 +204,7 @@ pub(super) async fn watcher_loop<R: Runtime>(
             &panes_by_agent,
             &ready_panes,
             &lifecycle,
+            &control,
             &mut stuck,
         )
         .await;
@@ -223,6 +234,7 @@ async fn process_pending<R: Runtime>(
     panes_by_agent: &Arc<HashMap<String, String>>,
     ready_panes: &Arc<Mutex<HashSet<String>>>,
     lifecycle: &Arc<LifecycleStore>,
+    control: &Arc<super::BridgeControl>,
     stuck: &mut StuckMoves,
 ) {
     retry_stuck_moves(root, stuck);
@@ -241,6 +253,13 @@ async fn process_pending<R: Runtime>(
     }
 
     for (_, path, sender) in outbox_entries(root, stuck) {
+        // A hold set mid-tick (the user's Pause, the budget or the usage
+        // limit) stops the rest of this tick: each paste can take seconds,
+        // and under the usage limit a late paste lands on claude's limit
+        // menu. The remaining files wait, in order, for the next run.
+        if control.is_paused() {
+            return;
+        }
         process_one(
             app,
             registry,
@@ -373,6 +392,22 @@ fn waited(path: &Path, attempts: u32) -> Duration {
         .and_then(|m| SystemTime::now().duration_since(m).ok())
         .unwrap_or_default();
     by_attempts.max(by_mtime)
+}
+
+/// Set every pending outbox / legacy-inbox file's mtime to now, so the
+/// delivery grace ([`waited`]) is measured from the resume rather than
+/// from when the message was first written (which includes the hold).
+fn reset_grace_clocks(root: &Path) {
+    let now = SystemTime::now();
+    for kind in ["outbox", "inbox"] {
+        for &agent in AGENT_IDS {
+            for path in json_entries(&root.join(kind).join(agent)) {
+                if let Ok(file) = fs::OpenOptions::new().write(true).open(&path) {
+                    let _ = file.set_modified(now);
+                }
+            }
+        }
+    }
 }
 
 fn should_emit_retry_event(attempts: u32) -> bool {
@@ -1007,6 +1042,20 @@ mod tests {
     fn unblock(dir: &Path) {
         fs::remove_file(dir).expect("rm blocker");
         fs::create_dir_all(dir).expect("mkdir");
+    }
+
+    #[test]
+    fn reset_grace_clocks_moves_pending_mtimes_forward() {
+        let d = tempfile::tempdir().expect("tempdir");
+        let root = d.path();
+        prepare_layout(root).expect("layout");
+        let path = outbox_file(root, "scout", "m.json", r#"{"to":"orchestrator","body":"hi"}"#);
+        // Backdate the message as if it had waited through a long hold.
+        let old = SystemTime::now() - Duration::from_secs(3600);
+        fs::OpenOptions::new().write(true).open(&path).unwrap().set_modified(old).unwrap();
+        reset_grace_clocks(root);
+        let m = fs::metadata(&path).unwrap().modified().unwrap();
+        assert!(m > old + Duration::from_secs(1800), "pending mtime was not reset on resume");
     }
 
     #[test]
