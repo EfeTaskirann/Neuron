@@ -8,6 +8,7 @@
 import { Fragment, useEffect, useRef, useState } from 'react';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { ask, open } from '@tauri-apps/plugin-dialog';
+import { confirmWarning } from './lib/confirm';
 import { Brandmark, NIcon, type IconName } from './components/icons';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { useMe } from './hooks/useMe';
@@ -218,12 +219,14 @@ function Topbar({
       if (
         swarmProjectDir != null &&
         selected !== swarmProjectDir &&
-        !(await ask(
-          `Swarm şu an şu klasörde çalışıyor:\n${swarmProjectDir}\n\nProje değişince swarm ` +
+        !(await confirmWarning({
+          title: 'Projeyi değiştir',
+          okLabel: 'Değiştir',
+          message:
+            `Swarm şu an şu klasörde çalışıyor:\n${swarmProjectDir}\n\nProje değişince swarm ` +
             'orada çalışmayı sürdürür; yeni projede çalıştırmak için onu durdurup orada başlatman ' +
             'gerekir. Proje değiştirilsin mi?',
-          { title: 'Projeyi değiştir', kind: 'warning', okLabel: 'Değiştir', cancelLabel: 'Vazgeç' },
-        ))
+        }))
       ) {
         return;
       }

@@ -1,6 +1,6 @@
 import { useMemo, useRef, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
-import { ask } from '@tauri-apps/plugin-dialog';
+import { confirmWarning } from '../lib/confirm';
 import { HierarchyDiagram } from '../components/SwarmHierarchy';
 import { ChangesDrawer } from '../components/swarm-term/ChangesDrawer';
 import { ClaudeUpdateCorner } from '../components/swarm-term/ClaudeUpdateCorner';
@@ -58,8 +58,11 @@ function chatWaitReason(state: TerminalSwarmPaneState | undefined): string | nul
  * answers Claude Code's own "do you trust this folder?" for the panes.
  */
 function askToTrustFolder(folder: string): Promise<boolean> {
-  return ask(
-    `Swarm şu klasörde çalışacak:\n${folder}\n\n` +
+  return confirmWarning({
+    title: 'Bu klasöre güveniyor musun?',
+    okLabel: 'Güveniyorum, başlat',
+    message:
+      `Swarm şu klasörde çalışacak:\n${folder}\n\n` +
       'Ajanlar buradaki dosyaları okur, builder’lar değiştirir. Testleri ve build’i ' +
       'çalıştırmak projenin kendi kodunu senin yetkilerinle çalıştırır. Projenin commit’li ' +
       '`.claude/` ayarları da (hook’lar, izinler) bu yetkilerle çalışabilir. Yalnız ' +
@@ -70,42 +73,42 @@ function askToTrustFolder(folder: string): Promise<boolean> {
       'Ajanlar senin Claude girişini paylaştığı için, onaylarsan Claude Code’un bu ' +
       'klasör için sorduğu “güveniyor musun?” sorusu senin adına “evet” yanıtlanır; bu ' +
       'güven kalıcıdır ve bu klasörde kendi `claude` oturumların da bir daha sormaz.',
-    {
-      title: 'Bu klasöre güveniyor musun?',
-      kind: 'warning',
-      okLabel: 'Güveniyorum, başlat',
-      cancelLabel: 'Vazgeç',
-    },
-  );
+  });
 }
 
 /** Stop asks first: every agent's claude session ends with it. */
 function confirmStop(agents: number): Promise<boolean> {
-  return ask(
-    `Swarm durdurulsun mu?\n\n${agents} ajanın claude oturumu kapanır; yarım kalan işleri ` +
+  return confirmWarning({
+    title: 'Swarm’ı durdur',
+    okLabel: 'Durdur',
+    message:
+      `Swarm durdurulsun mu?\n\n${agents} ajanın claude oturumu kapanır; yarım kalan işleri ` +
       'kaybolur. Değişiklikler panelindeki checkpoint kalır.',
-    { title: 'Swarm’ı durdur', kind: 'warning', okLabel: 'Durdur', cancelLabel: 'Vazgeç' },
-  );
+  });
 }
 
 /** Restart asks first: the agents start over, and so does the checkpoint. */
 function confirmRestart(agents: number): Promise<boolean> {
-  return ask(
-    `Swarm yeniden başlatılsın mı?\n\n${agents} ajan kapanıp sıfırdan açılır; konuşmaları ve ` +
+  return confirmWarning({
+    title: 'Swarm’ı yeniden başlat',
+    okLabel: 'Yeniden başlat',
+    message:
+      `Swarm yeniden başlatılsın mı?\n\n${agents} ajan kapanıp sıfırdan açılır; konuşmaları ve ` +
       'yarım kalan işleri kaybolur. Yeni oturum yeni bir checkpoint alır: şimdiye kadarki ' +
       'değişiklikler artık Değişiklikler panelinden geri alınamaz.',
-    { title: 'Swarm’ı yeniden başlat', kind: 'warning', okLabel: 'Yeniden başlat', cancelLabel: 'Vazgeç' },
-  );
+  });
 }
 
 /** A launch over changes the user has not kept or reverted asks first. */
 function confirmNewCheckpoint(files: number): Promise<boolean> {
-  return ask(
-    `Önceki oturumun ${files} dosyalık değişikliği henüz tutulmadı ya da geri alınmadı.\n\n` +
+  return confirmWarning({
+    title: 'Swarm’ı başlat',
+    okLabel: 'Başlat',
+    message:
+      `Önceki oturumun ${files} dosyalık değişikliği henüz tutulmadı ya da geri alınmadı.\n\n` +
       'Yeni başlangıç yeni bir checkpoint alır: bu değişiklikler artık Değişiklikler ' +
       'panelinden geri alınamaz. Yine de başlatılsın mı?',
-    { title: 'Swarm’ı başlat', kind: 'warning', okLabel: 'Başlat', cancelLabel: 'Vazgeç' },
-  );
+  });
 }
 
 /**

@@ -93,16 +93,14 @@ pub async fn swarm_term_start_session<R: Runtime>(
     registry.start(app.clone(), path).await
 }
 
-/// Record the user's trust in `project_dir` — their "yes" in the dialog
-/// the UI shows when `swarm_term_start_session` answers
-/// `consent_required`. Only a folder the swarm may run in at all can be
-/// trusted (the same checks as the start).
-#[tauri::command(rename_all = "camelCase")]
-#[specta::specta]
-pub async fn swarm_term_trust_project<R: Runtime>(
-    app: AppHandle<R>,
-    project_dir: String,
-) -> Result<(), AppError> {
+/// Validate a user-supplied project folder for the swarm commands: no
+/// `..` segment, a real directory, and within the guard's allowed roots
+/// — the same gate `TerminalSwarmRegistry::start` applies. Returns the
+/// path.
+fn validated_project_dir<R: Runtime>(
+    app: &AppHandle<R>,
+    project_dir: &str,
+) -> Result<std::path::PathBuf, AppError> {
     let path = std::path::PathBuf::from(project_dir.trim());
     if path.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
         return Err(AppError::InvalidInput(
@@ -115,7 +113,21 @@ pub async fn swarm_term_trust_project<R: Runtime>(
             path.display()
         )));
     }
-    crate::swarm_term::project_guard::check(&app, &path)?;
+    crate::swarm_term::project_guard::check(app, &path)?;
+    Ok(path)
+}
+
+/// Record the user's trust in `project_dir` — their "yes" in the dialog
+/// the UI shows when `swarm_term_start_session` answers
+/// `consent_required`. Only a folder the swarm may run in at all can be
+/// trusted (the same checks as the start).
+#[tauri::command(rename_all = "camelCase")]
+#[specta::specta]
+pub async fn swarm_term_trust_project<R: Runtime>(
+    app: AppHandle<R>,
+    project_dir: String,
+) -> Result<(), AppError> {
+    let path = validated_project_dir(&app, &project_dir)?;
     let pool = app.state::<crate::db::DbPool>().inner().clone();
     crate::swarm_term::trust::trust(&pool, &path).await
 }
@@ -213,18 +225,7 @@ fn changes_target<R: Runtime>(
     app: &AppHandle<R>,
     project_dir: &str,
 ) -> Result<(std::path::PathBuf, std::path::PathBuf), AppError> {
-    let project = std::path::PathBuf::from(project_dir.trim());
-    if project.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
-        return Err(AppError::InvalidInput(
-            "project_dir must not contain '..' path segments".into(),
-        ));
-    }
-    if !project.is_dir() {
-        return Err(AppError::InvalidInput(format!(
-            "project_dir {} does not exist or is not a directory",
-            project.display()
-        )));
-    }
+    let project = validated_project_dir(app, project_dir)?;
     let app_data = app
         .path()
         .app_data_dir()
