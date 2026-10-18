@@ -147,10 +147,9 @@ describe('TerminalSwarmRoute', () => {
     });
     renderRoute();
     const chip = await screen.findByText(/no approval prompts · role allowlists/i);
-    expect(chip).toHaveAttribute(
-      'title',
-      expect.stringMatching(/builders can edit files inside this project/i),
-    );
+    // Keyboard-reachable, and described by the tooltip text.
+    expect(chip).toHaveAttribute('tabindex', '0');
+    expect(chip).toHaveAccessibleDescription(/builders can edit files inside this project/i);
     // The old toggle changed nothing in the backend — it must stay gone.
     expect(screen.queryByRole('checkbox')).not.toBeInTheDocument();
     expect(screen.queryByText(/run autonomously/i)).not.toBeInTheDocument();
@@ -166,10 +165,7 @@ describe('TerminalSwarmRoute', () => {
     renderRoute();
     const chip = await screen.findByText(/permissions bypassed · unrestricted/i);
     expect(chip).toHaveClass('swarm-term-perm-chip--bypass');
-    expect(chip).toHaveAttribute(
-      'title',
-      expect.stringMatching(/NEURON_TERM_PERMISSIONS=bypass/),
-    );
+    expect(chip).toHaveAccessibleDescription(/NEURON_TERM_PERMISSIONS=bypass/);
     expect(screen.queryByText(/no approval prompts/i)).not.toBeInTheDocument();
   });
 
@@ -250,8 +246,7 @@ describe('TerminalSwarmRoute', () => {
   });
 
   it('describeError keeps the backend detail and handles plain errors', async () => {
-    const { describeError } = await import('./TerminalSwarm');
-    const { AppErrorClient } = await import('../lib/unwrap');
+    const { AppErrorClient, describeError } = await import('../lib/unwrap');
     expect(describeError(new AppErrorClient('internal', 'spawn agent `scout`: boom'))).toBe(
       'Beklenmedik bir iç hata oluştu. spawn agent `scout`: boom',
     );

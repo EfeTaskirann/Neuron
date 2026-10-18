@@ -83,16 +83,18 @@ fn rejection(project: &Path, guards: &Guards) -> Option<Rejection> {
     if guards.homes.iter().any(|home| home.starts_with(project)) {
         return Some(Rejection::HomeOrAbove);
     }
-    if guards
+    // Scratch space: a project strictly inside the temp folder skips only
+    // the guarded folders that CONTAIN temp (on Windows `%LOCALAPPDATA%`
+    // holds Temp). Folders inside or beside temp still apply, so a temp
+    // dir misconfigured to the home folder or a drive root exempts nothing.
+    let in_temp = guards
         .temp
         .as_deref()
-        .is_some_and(|temp| project != temp && project.starts_with(temp))
-    {
-        return None;
-    }
+        .filter(|temp| project != *temp && project.starts_with(temp));
     guards
         .guarded
         .iter()
+        .filter(|(dir, _)| !in_temp.is_some_and(|temp| temp.starts_with(dir)))
         .find(|(dir, _)| project.starts_with(dir) || dir.starts_with(project))
         .map(|(dir, kind)| Rejection::Guarded {
             dir: dir.clone(),
@@ -147,13 +149,14 @@ fn collect<R: Runtime>(app: &AppHandle<R>) -> Guards {
         .flatten()
         .collect();
 
+    let mut homes: Vec<PathBuf> = raw_homes.iter().filter_map(|h| resolve(h)).collect();
+    homes.sort();
+    homes.dedup();
     let mut guards = Guards {
-        temp: std::fs::canonicalize(std::env::temp_dir()).ok(),
+        homes,
+        temp: resolve(&std::env::temp_dir()),
         ..Guards::default()
     };
-    for home in &raw_homes {
-        push_unique(&mut guards.homes, home);
-    }
 
     let app_data = [
         paths.data_dir(),
@@ -170,8 +173,8 @@ fn collect<R: Runtime>(app: &AppHandle<R>) -> Guards {
             push_guarded(&mut guards.guarded, &home.join(name), GuardedKind::Credentials);
         }
         if cfg!(target_os = "macos") {
-            // Keychains and every app's data.
-            push_guarded(&mut guards.guarded, &home.join("Library"), GuardedKind::Credentials);
+            // Every app's data (and the keychains).
+            push_guarded(&mut guards.guarded, &home.join("Library"), GuardedKind::AppData);
         }
     }
     for dir in system_dirs() {
@@ -202,16 +205,13 @@ fn system_dirs() -> Vec<PathBuf> {
     UNIX_SYSTEM_DIRS.iter().map(PathBuf::from).collect()
 }
 
-fn push_unique(list: &mut Vec<PathBuf>, dir: &Path) {
-    if let Ok(canonical) = std::fs::canonicalize(dir) {
-        if !list.contains(&canonical) {
-            list.push(canonical);
-        }
-    }
+/// `dir` canonicalised, or `None` when it does not exist / resolve.
+fn resolve(dir: &Path) -> Option<PathBuf> {
+    std::fs::canonicalize(dir).ok()
 }
 
 fn push_guarded(list: &mut Vec<(PathBuf, GuardedKind)>, dir: &Path, kind: GuardedKind) {
-    if let Ok(canonical) = std::fs::canonicalize(dir) {
+    if let Some(canonical) = resolve(dir) {
         if !list.iter().any(|(d, _)| *d == canonical) {
             list.push((canonical, kind));
         }
@@ -291,6 +291,29 @@ mod tests {
             rejection(&root.join("Windows").join("System32"), &g),
             guarded(root.join("Windows"), GuardedKind::System)
         );
+    }
+
+    /// A temp dir misconfigured to the home folder or a drive root must
+    /// not open credential, app-data or OS folders.
+    #[test]
+    fn a_broad_temp_dir_exempts_nothing_that_matters() {
+        let (root, mut g) = machine();
+        let home = root.join("Users").join("me");
+        let local = home.join("AppData").join("Local");
+        for temp in [home.clone(), root.clone()] {
+            g.temp = Some(temp);
+            let ssh = home.join(".ssh");
+            assert_eq!(rejection(&ssh.join("keys"), &g), guarded(ssh, GuardedKind::Credentials));
+            assert_eq!(
+                rejection(&local.join("Google"), &g),
+                guarded(local.clone(), GuardedKind::AppData)
+            );
+            assert_eq!(
+                rejection(&root.join("Windows").join("System32"), &g),
+                guarded(root.join("Windows"), GuardedKind::System)
+            );
+            assert_eq!(rejection(&home.join("code").join("app"), &g), None);
+        }
     }
 
     #[test]

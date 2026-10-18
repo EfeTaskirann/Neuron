@@ -143,10 +143,7 @@ async fn retire_pre_baseline_db(path: &Path) -> Result<Option<PathBuf>, DbError>
         .execute(&mut conn)
         .await?;
     conn.close().await?;
-    for suffix in ["", "-wal", "-shm"] {
-        let mut file = path.as_os_str().to_owned();
-        file.push(suffix);
-        let file = PathBuf::from(file);
+    for file in db_files(path) {
         match std::fs::remove_file(&file) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -154,6 +151,20 @@ async fn retire_pre_baseline_db(path: &Path) -> Result<Option<PathBuf>, DbError>
         }
     }
     Ok(Some(copy))
+}
+
+/// A database's files in safe removal order: the `-wal` and `-shm`
+/// sidecars, then the main file. A failure part-way therefore never
+/// leaves a stale WAL beside a missing main file — SQLite would replay
+/// it into the next database created at that path — while the old main
+/// file, still there, keeps the database detectable for a retry.
+fn db_files(path: &Path) -> [PathBuf; 3] {
+    let with_suffix = |suffix: &str| {
+        let mut file = path.as_os_str().to_owned();
+        file.push(suffix);
+        PathBuf::from(file)
+    };
+    [with_suffix("-wal"), with_suffix("-shm"), path.to_path_buf()]
 }
 
 /// Build a pool against a concrete on-disk path. Split out so tests

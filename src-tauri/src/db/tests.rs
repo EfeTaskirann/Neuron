@@ -121,15 +121,14 @@ const LEDGER_DDL: &str = "CREATE TABLE _sqlx_migrations ( \
     installed_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, \
     success BOOLEAN NOT NULL, checksum BLOB NOT NULL, execution_time BIGINT NOT NULL)";
 
-fn db_files(path: &std::path::Path) -> Vec<std::path::PathBuf> {
-    ["", "-wal", "-shm"]
+#[test]
+fn db_files_remove_the_sidecars_before_the_main_file() {
+    let files = db_files(std::path::Path::new("dir").join("neuron.db").as_path());
+    let names: Vec<String> = files
         .iter()
-        .map(|suffix| {
-            let mut f = path.as_os_str().to_owned();
-            f.push(suffix);
-            std::path::PathBuf::from(f)
-        })
-        .collect()
+        .map(|f| f.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, ["neuron.db-wal", "neuron.db-shm", "neuron.db"]);
 }
 
 /// A database created before the baseline (its ledger starts with the

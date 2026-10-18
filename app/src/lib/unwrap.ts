@@ -18,6 +18,19 @@ export class AppErrorClient extends Error {
   }
 }
 
+/**
+ * The line to show for a failed action: the error kind's copy plus the
+ * backend's detail. `AppErrorClient.message` is only the kind's generic
+ * copy, so without the detail an error never says why (which folder the
+ * project guard rejected, which server failed to start, …).
+ */
+export function describeError(err: unknown): string {
+  if (err instanceof AppErrorClient && err.detail && err.detail !== err.message) {
+    return `${err.message} ${err.detail}`;
+  }
+  return err instanceof Error ? err.message : String(err);
+}
+
 // `typedError` (in `bindings.ts`) wraps every command in a
 // `{status:'ok',data}|{status:'error',error}` tagged union. TanStack
 // Query expects a thrown error for the failure path, so each hook

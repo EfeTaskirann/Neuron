@@ -6,9 +6,10 @@ import { unwrap } from '../lib/unwrap';
 // pass `undefined` (no filter) or a partial filter. The query key
 // includes the filter so different filter selections cache
 // separately rather than thrashing one entry.
-export function useRuns(filter?: RunFilter) {
+export function useRuns(filter?: RunFilter, options?: { enabled?: boolean }) {
   return useQuery<Run[]>({
     queryKey: ['runs', filter ?? null],
     queryFn: () => unwrap(commands.runsList(filter ?? null)),
+    enabled: options?.enabled ?? true,
   });
 }

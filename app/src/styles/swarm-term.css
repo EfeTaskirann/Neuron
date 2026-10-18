@@ -452,7 +452,12 @@
 /* ── Permission-mode chip (chat bar) ───────────────────────────────
  * States what the agents may do: the per-role allowlist with no
  * approval prompts, or — loudly — the unrestricted bypass mode. The
- * full explanation rides in the tooltip and in sr-only text. */
+ * full explanation is a tooltip shown on hover AND keyboard focus. */
+.swarm-term-perm {
+  position: relative;
+  display: inline-flex;
+  flex: 0 0 auto;
+}
 .swarm-term-perm-chip {
   display: inline-flex;
   align-items: center;
@@ -465,6 +470,33 @@
   font-size: 12px;
   white-space: nowrap;
   cursor: help;
+}
+.swarm-term-perm-chip:focus-visible {
+  outline: 2px solid var(--accent-strong);
+  outline-offset: 2px;
+}
+.swarm-term-perm-tip {
+  display: none;
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  z-index: 30;
+  width: 360px;
+  max-width: 70vw;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--popover);
+  color: var(--popover-foreground);
+  box-shadow: var(--shadow-pop);
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 1.5;
+  white-space: normal;
+}
+.swarm-term-perm-chip:hover + .swarm-term-perm-tip,
+.swarm-term-perm-chip:focus + .swarm-term-perm-tip {
+  display: block;
 }
 .swarm-term-perm-chip--bypass {
   background: color-mix(in oklab, var(--surface-1) 80%, var(--destructive));

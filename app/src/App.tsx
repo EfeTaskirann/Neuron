@@ -112,7 +112,7 @@ function Sidebar({
         {items.map((item, i) => (
           <Fragment key={item.id}>
             {item.dev && !items[i - 1]?.dev && (
-              <li className="sb-section" aria-hidden="true">
+              <li className="sb-section" role="separator" aria-label="Developer">
                 {collapsed ? null : 'Developer'}
               </li>
             )}
@@ -282,11 +282,12 @@ export function App(): JSX.Element {
   const devFeatures = features?.devFeatures ?? false;
   const [showInspector, setShowInspector] = useState(true);
   const { project } = useActiveProject();
-  // Pick the most recent run as the inspector's default subject.
-  // `runs:list` is already sorted started_at DESC server-side.
-  const { data: runs = [] } = useRuns();
-  const inspectorRunId = runs[0]?.id ?? null;
   const inspectorOpen = route === 'canvas' && showInspector;
+  // Pick the most recent run as the inspector's default subject —
+  // fetched only while the (developer) inspector is open. `runs:list`
+  // is already sorted started_at DESC server-side.
+  const { data: runs = [] } = useRuns(undefined, { enabled: inspectorOpen });
+  const inspectorRunId = runs[0]?.id ?? null;
   // Project gate: until a folder is picked there is no cwd for the
   // terminal routes to spawn into, so the shell stays hidden. Picking
   // writes the store; `useSyncExternalStore` re-renders us out of the

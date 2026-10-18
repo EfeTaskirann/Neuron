@@ -83,7 +83,10 @@ struct StuckMove {
     dest: SettledDest,
     /// The file when it settled: a changed mtime or size means the
     /// sender has since written a new message under the same name.
-    stamp: FileStamp,
+    /// `None` while the file's metadata cannot be read (the same lock
+    /// that failed the move can fail the stat); the first readable
+    /// stamp is adopted.
+    stamp: Option<FileStamp>,
 }
 
 /// `(mtime, size)` of a file.
@@ -97,11 +100,17 @@ fn file_stamp(path: &Path) -> Option<FileStamp> {
 }
 
 /// Remember that `path` is settled for `dest` although its move failed.
+/// Recorded even when its metadata cannot be read: skipping it would
+/// let the next scan process (and paste) it again. A file that turns
+/// out to be gone is dropped by the first retry.
 fn note_stuck(stuck: &mut StuckMoves, path: &Path, dest: SettledDest) {
-    // A file that is already gone needs no move.
-    if let Some(stamp) = file_stamp(path) {
-        stuck.insert(path.to_path_buf(), StuckMove { dest, stamp });
-    }
+    stuck.insert(
+        path.to_path_buf(),
+        StuckMove {
+            dest,
+            stamp: file_stamp(path),
+        },
+    );
 }
 
 fn settle(root: &Path, path: &Path, dest: &SettledDest) -> io::Result<()> {
@@ -111,13 +120,23 @@ fn settle(root: &Path, path: &Path, dest: &SettledDest) -> io::Result<()> {
     }
 }
 
-/// Retry the moves that failed on earlier ticks. An entry whose file is
-/// gone, or now holds a different message, is dropped — the latter is
-/// then processed as a new message by the scan that follows.
+/// Retry the moves that failed on earlier ticks. An entry whose file now
+/// holds a different message is dropped — the scan that follows then
+/// processes it as new — and so is one whose file is gone (the move
+/// reports `NotFound`). Unreadable metadata alone never drops an entry.
 fn retry_stuck_moves(root: &Path, stuck: &mut StuckMoves) {
     stuck.retain(|path, entry| {
-        if file_stamp(path) != Some(entry.stamp) {
-            return false;
+        let now = match fs::metadata(path) {
+            Ok(m) => Some((m.modified().ok(), m.len())),
+            // Gone: nothing left to move.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return false,
+            // Unreadable (still locked): judge by the move below.
+            Err(_) => None,
+        };
+        match (entry.stamp, now) {
+            (Some(was), Some(is)) if was != is => return false,
+            (None, Some(_)) => entry.stamp = now,
+            _ => {}
         }
         match settle(root, path, &entry.dest) {
             Ok(()) => {
@@ -127,7 +146,7 @@ fn retry_stuck_moves(root: &Path, stuck: &mut StuckMoves) {
                 );
                 false
             }
-            Err(_) => true,
+            Err(e) => e.kind() != io::ErrorKind::NotFound,
         }
     });
 }
@@ -1056,14 +1075,46 @@ mod tests {
     }
 
     #[test]
-    fn a_file_already_gone_is_not_remembered() {
+    fn a_file_already_gone_is_dropped_by_the_first_retry() {
         let d = tempfile::tempdir().expect("tempdir");
+        let root = d.path();
+        prepare_layout(root).expect("layout");
         let mut stuck = StuckMoves::new();
         note_stuck(
             &mut stuck,
-            &d.path().join("gone.json"),
+            &root.join("outbox").join("scout").join("gone.json"),
             SettledDest::Processed { target: "orchestrator".into() },
         );
+        assert_eq!(stuck.len(), 1, "remembered even without metadata");
+        retry_stuck_moves(root, &mut stuck);
+        assert!(stuck.is_empty(), "the move reports NotFound, so it is dropped");
+    }
+
+    /// The lock that failed the move can also fail the stat: such an
+    /// entry is still never reprocessed, adopts the first readable
+    /// stamp, and is moved once the lock clears.
+    #[test]
+    fn an_unreadable_stamp_still_blocks_reprocessing() {
+        let d = tempfile::tempdir().expect("tempdir");
+        let root = d.path();
+        prepare_layout(root).expect("layout");
+        let path = outbox_file(root, "scout", "m3.json", r#"{"to":"orchestrator","body":"hi"}"#);
+        let processed = root.join("processed").join("orchestrator");
+        block(&processed);
+        let mut stuck = StuckMoves::new();
+        stuck.insert(
+            path.clone(),
+            StuckMove {
+                dest: SettledDest::Processed { target: "orchestrator".into() },
+                stamp: None,
+            },
+        );
+        assert!(outbox_entries(root, &stuck).is_empty());
+        retry_stuck_moves(root, &mut stuck);
+        assert_eq!(stuck[&path].stamp, file_stamp(&path), "stamp adopted");
+        unblock(&processed);
+        retry_stuck_moves(root, &mut stuck);
         assert!(stuck.is_empty());
+        assert!(processed.join("m3.json").is_file());
     }
 }

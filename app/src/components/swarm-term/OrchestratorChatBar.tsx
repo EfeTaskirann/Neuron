@@ -24,6 +24,8 @@ export const BYPASS_PERMISSIONS_DETAIL =
   'bypassPermissions, i.e. unrestricted shell and file access as your user ' +
   'account.';
 
+const PERMISSION_DETAIL_ID = 'swarm-term-perm-detail';
+
 // Chat bar for the `@orchestrator` pane: the session's permission mode +
 // text input. Owns its own draft state so the parent route doesn't
 // reconcile on every keystroke.
@@ -47,12 +49,20 @@ export function OrchestratorChatBar({
 
   return (
     <form className="swarm-term-chat" onSubmit={submit}>
-      <span
-        className={`swarm-term-perm-chip${bypass ? ' swarm-term-perm-chip--bypass' : ''}`}
-        title={permissionDetail}
-      >
-        {bypass ? 'Permissions bypassed · unrestricted' : 'No approval prompts · role allowlists'}
-        <span className="sr-only">. {permissionDetail}</span>
+      {/* The chip is focusable so keyboard users can open the
+          explanation too; it shows on hover and focus, and screen
+          readers get it once, as the chip's description. */}
+      <span className="swarm-term-perm">
+        <span
+          className={`swarm-term-perm-chip${bypass ? ' swarm-term-perm-chip--bypass' : ''}`}
+          tabIndex={0}
+          aria-describedby={PERMISSION_DETAIL_ID}
+        >
+          {bypass ? 'Permissions bypassed · unrestricted' : 'No approval prompts · role allowlists'}
+        </span>
+        <span id={PERMISSION_DETAIL_ID} role="tooltip" className="swarm-term-perm-tip">
+          {permissionDetail}
+        </span>
       </span>
       <input
         type="text"
