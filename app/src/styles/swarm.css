@@ -22,9 +22,11 @@
   gap: 8px;
 }
 
+/* The designed surface/text pair: 7.1:1 dark, 8.9:1 light. Text in
+   `--background` on `--accent` read 2.6:1 dark and 1.15:1 light. */
 .swarm-view-seg button[aria-pressed="true"] {
   background: var(--accent);
-  color: var(--background);
+  color: var(--accent-foreground);
 }
 
 /* Recent-jobs view inherits the original two-pane grid. Wrapped in

@@ -126,7 +126,7 @@
 .swarm-term-pane-id {
   font-family: var(--font-mono, ui-monospace, monospace);
   font-size: 12px;
-  color: var(--accent);
+  color: var(--accent-strong);
   font-weight: 600;
 }
 
@@ -150,12 +150,12 @@
   cursor: pointer;
 }
 .swarm-term-pane-expand:hover {
-  color: var(--accent);
+  color: var(--accent-strong);
   border-color: var(--border);
   background: var(--surface-1);
 }
 .swarm-term-pane.expanded .swarm-term-pane-expand {
-  color: var(--accent);
+  color: var(--accent-strong);
 }
 
 /* Grid in expanded mode: one row × one column, only the .expanded
@@ -229,7 +229,7 @@
 }
 
 .swarm-term-chat input:focus {
-  outline: 2px solid var(--accent);
+  outline: 2px solid var(--accent-strong);
   outline-offset: -1px;
 }
 
@@ -352,9 +352,9 @@
 .swarm-term-hier-chip.is-source,
 .swarm-term-hier-chip.is-target {
   box-shadow:
-    0 0 0 2px color-mix(in oklab, var(--accent) 80%, transparent),
-    0 0 12px color-mix(in oklab, var(--accent) 50%, transparent);
-  border-color: var(--accent);
+    0 0 0 2px color-mix(in oklab, var(--accent-strong) 80%, transparent),
+    0 0 12px color-mix(in oklab, var(--accent-strong) 50%, transparent);
+  border-color: var(--accent-strong);
   animation: swarm-term-hier-pulse 1.2s ease-in-out infinite;
 }
 .swarm-term-hier-chip.is-source {
@@ -365,13 +365,13 @@
   0%,
   100% {
     box-shadow:
-      0 0 0 2px color-mix(in oklab, var(--accent) 80%, transparent),
-      0 0 12px color-mix(in oklab, var(--accent) 50%, transparent);
+      0 0 0 2px color-mix(in oklab, var(--accent-strong) 80%, transparent),
+      0 0 12px color-mix(in oklab, var(--accent-strong) 50%, transparent);
   }
   50% {
     box-shadow:
-      0 0 0 2px color-mix(in oklab, var(--accent) 60%, transparent),
-      0 0 18px color-mix(in oklab, var(--accent) 70%, transparent);
+      0 0 0 2px color-mix(in oklab, var(--accent-strong) 60%, transparent),
+      0 0 18px color-mix(in oklab, var(--accent-strong) 70%, transparent);
   }
 }
 
@@ -428,19 +428,21 @@
  * inside the 3×3 grid so it's clear WHICH terminal just received the
  * latest message even when the operator isn't looking at the strip. */
 .swarm-term-pane.swarm-term-pane--active {
-  border-color: var(--accent);
-  box-shadow: 0 0 0 1px var(--accent);
+  border-color: var(--accent-strong);
+  box-shadow: 0 0 0 1px var(--accent-strong);
 }
 
 /* ── Accessibility: focus ring on pane wrappers ────────────────────
- * Two-tone ring (accent on top of a dark inner stroke) keeps the
- * indicator ≥3:1 against both the pane background AND the page
- * background, satisfying WCAG 2.1 AA focus-indicator contrast. */
+ * Two-tone ring (`--accent-strong` on top of an inner background
+ * stroke). `--accent-strong` is ≥5.5:1 on every surface in both themes,
+ * so the indicator clears WCAG 2.1 AA focus contrast (3:1) against the
+ * pane AND the page. (`--accent`, used here before, is a surface tint:
+ * 2.6:1 dark, 1.15:1 light.) */
 .swarm-term-pane:focus {
   outline: none;
 }
 .swarm-term-pane:focus-visible {
-  outline: 3px solid var(--accent);
+  outline: 3px solid var(--accent-strong);
   outline-offset: 2px;
   /* inner separator stroke: --background reads dark in dark mode and
      as a white gap ring in light mode — both keep ≥3:1 vs the accent */
