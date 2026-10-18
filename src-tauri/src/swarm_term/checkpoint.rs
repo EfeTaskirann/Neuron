@@ -121,6 +121,13 @@ struct Stored {
     session_id: String,
     /// Untracked files are part of the snapshots.
     untracked: bool,
+    /// Untracked files that EXISTED at the checkpoint but were left out
+    /// of its tree (ignored, or over [`MAX_UNTRACKED_BYTES`]). They are
+    /// the user's, never the agents': kept out of the change list and the
+    /// revert so one that later becomes eligible (an agent un-ignores it,
+    /// or trims it under the cap) is never deleted as "added".
+    #[serde(default)]
+    skipped: Vec<String>,
     note: Option<String>,
 }
 
@@ -129,42 +136,77 @@ struct Stored {
 /// is no checkpoint (not a git repository, no git).
 pub(crate) fn take(app_data: &Path, project: &Path, session_id: &str) -> Result<Option<String>, String> {
     let _one = LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    let (top, prefix) = repo_of(project)?;
     let project_name = name_of(project);
     let (meta, index) = files_of(app_data, &project_name);
     std::fs::create_dir_all(meta.parent().expect("checkpoint dir"))
         .map_err(|e| format!("checkpoint klasörü: {e}"))?;
+    match take_snapshot(project, &project_name, session_id, &index) {
+        Ok(s) => {
+            let note = s.note.clone();
+            save(&meta, &s)?;
+            Ok(note)
+        }
+        Err(e) => {
+            // A failed snapshot must NOT leave the previous session's
+            // checkpoint in force: `changes`/`revert` would then run
+            // against a stale tree and roll back the user's own
+            // between-session edits. Clear it — the session runs with no
+            // checkpoint and the panel says so.
+            forget(&meta, &index);
+            Err(e)
+        }
+    }
+}
+
+/// Build the checkpoint for `project` into the private `index` (the
+/// fallible half of [`take`]). The record is not saved here.
+fn take_snapshot(
+    project: &Path,
+    project_name: &str,
+    session_id: &str,
+    index: &Path,
+) -> Result<Stored, String> {
+    let (top, prefix) = repo_of(project)?;
     // Start from the user's index: its stat data keeps the snapshot cheap.
     let real_index = git(&top, None, &["rev-parse", "--git-path", "index"], None)?;
     let real_index = top.join(String::from_utf8_lossy(&real_index).trim());
-    let _ = std::fs::remove_file(&index);
+    let _ = std::fs::remove_file(index);
+    let _ = std::fs::remove_dir_all(index);
     if real_index.is_file() {
-        std::fs::copy(&real_index, &index).map_err(|e| format!("git index: {e}"))?;
+        std::fs::copy(&real_index, index).map_err(|e| format!("git index: {e}"))?;
     }
     let mut s = Stored {
-        project: project_name,
+        project: project_name.to_string(),
         top,
         prefix,
         tree: String::new(),
-        created_at: unix_now(),
+        created_at: crate::time::now_seconds(),
         session_id: session_id.to_string(),
         untracked: true,
+        skipped: Vec::new(),
         note: None,
     };
-    update_tracked(&s, &index)?;
-    let untracked = new_untracked(&s, &index)?;
-    if untracked.len() > MAX_UNTRACKED_FILES {
+    update_tracked(&s, index)?;
+    let included = new_untracked(&s, index)?;
+    if included.len() > MAX_UNTRACKED_FILES {
         s.untracked = false;
         s.note = Some(format!(
             "Projede {} izlenmeyen dosya var: checkpoint yalnız git'in izlediği dosyaları kapsıyor.",
-            untracked.len()
+            included.len()
         ));
     } else {
-        add_paths(&s, &index, &untracked)?;
+        add_paths(&s, index, &included)?;
+        s.skipped = present_untracked_excluded(&s, index, &included)?;
     }
-    s.tree = write_tree(&s, &index)?;
-    save(&meta, &s)?;
-    Ok(s.note)
+    s.tree = write_tree(&s, index)?;
+    Ok(s)
+}
+
+/// Drop a project's checkpoint (record + private index), in every form.
+fn forget(meta: &Path, index: &Path) {
+    let _ = std::fs::remove_file(meta);
+    let _ = std::fs::remove_file(index);
+    let _ = std::fs::remove_dir_all(index);
 }
 
 /// What changed in `project` since its checkpoint. Problems (no
@@ -225,7 +267,7 @@ pub(crate) fn revert(app_data: &Path, project: &Path, paths: Option<&[String]>) 
         };
         let done = match f.kind {
             ChangeKind::Added => remove_added(project, &dest),
-            _ => restore(&s, &format!("{}{}", s.prefix, f.path), &dest),
+            _ => restore(&s, project, &format!("{}{}", s.prefix, f.path), &dest),
         };
         if let Err(e) = done {
             failed.push(format!("{}: {e}", f.path));
@@ -243,7 +285,7 @@ pub(crate) fn keep(app_data: &Path, project: &Path) -> Result<SwarmTermChanges, 
     let _one = LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let (mut s, index) = load(app_data, project)?.ok_or_else(no_checkpoint)?;
     s.tree = refresh(&s, &index)?.0;
-    s.created_at = unix_now();
+    s.created_at = crate::time::now_seconds();
     let (meta, _) = files_of(app_data, &s.project);
     save(&meta, &s)?;
     list_changes(&s, &index)
@@ -251,13 +293,6 @@ pub(crate) fn keep(app_data: &Path, project: &Path) -> Result<SwarmTermChanges, 
 
 fn no_checkpoint() -> String {
     "Bu klasör için checkpoint yok.".into()
-}
-
-fn unix_now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
 }
 
 /// The project folder as the checkpoint records it: resolved, so every
@@ -411,21 +446,56 @@ fn new_untracked(s: &Stored, index: &Path) -> Result<Vec<String>, String> {
         .split(|&b| b == 0)
         .filter(|p| !p.is_empty())
         .map(|p| String::from_utf8_lossy(p).into_owned())
-        .filter(|p| takes_untracked(&s.top, &s.prefix, p))
+        .filter(|p| takes_untracked(s, p))
         .collect())
 }
 
-/// Pure-ish: does a snapshot take in the untracked file `path` (relative
-/// to the repository top)?
-fn takes_untracked(top: &Path, prefix: &str, path: &str) -> bool {
+/// The untracked files that EXIST now but the snapshot leaves out because
+/// they are ignored or over the size cap (not the ones in a skipped dir /
+/// the bridge, which never matter). Stored as `Stored.skipped` so they
+/// stay the user's — see that field.
+fn present_untracked_excluded(
+    s: &Stored,
+    index: &Path,
+    included: &[String],
+) -> Result<Vec<String>, String> {
+    // `--others` WITHOUT `--exclude-standard` lists every untracked file,
+    // ignored ones included.
+    let out = git(
+        &s.top,
+        Some(index),
+        &["ls-files", "-z", "--others", "--", &literal(&s.prefix)],
+        None,
+    )?;
+    Ok(out
+        .split(|&b| b == 0)
+        .filter(|p| !p.is_empty())
+        .map(|p| String::from_utf8_lossy(p).into_owned())
+        .filter(|p| !bridge_or_skipped_dir(&s.prefix, p) && !included.iter().any(|i| i == p))
+        .take(MAX_UNTRACKED_FILES)
+        .collect())
+}
+
+/// A path (relative to the repository top) that never belongs in a
+/// snapshot or the change list: the bridge folder, or a dependency /
+/// build directory ([`SKIPPED_DIRS`]).
+fn bridge_or_skipped_dir(prefix: &str, path: &str) -> bool {
     let in_project = path.strip_prefix(prefix).unwrap_or(path);
-    if in_project.split('/').next() == Some(BRIDGE_DIRNAME) {
+    in_project.split('/').next() == Some(BRIDGE_DIRNAME)
+        || path.split('/').any(|c| SKIPPED_DIRS.contains(&c))
+}
+
+/// Pure-ish: does a snapshot take in the untracked file `path` (relative
+/// to the repository top)? A file the checkpoint deliberately left out
+/// (`Stored.skipped`) stays out, so it is never treated as agent-added.
+fn takes_untracked(s: &Stored, path: &str) -> bool {
+    if bridge_or_skipped_dir(&s.prefix, path) {
         return false;
     }
-    if path.split('/').any(|c| SKIPPED_DIRS.contains(&c)) {
+    if s.skipped.iter().any(|sk| sk == path) {
         return false;
     }
-    std::fs::metadata(top.join(path)).is_ok_and(|m| m.is_file() && m.len() <= MAX_UNTRACKED_BYTES)
+    std::fs::metadata(s.top.join(path)).is_ok_and(|m| m.is_file() && m.len() <= MAX_UNTRACKED_BYTES)
 }
 
 fn add_paths(s: &Stored, index: &Path, paths: &[String]) -> Result<(), String> {
@@ -437,7 +507,11 @@ fn add_paths(s: &Stored, index: &Path, paths: &[String]) -> Result<(), String> {
         list.extend_from_slice(p.as_bytes());
         list.push(0);
     }
-    git(&s.top, Some(index), &["update-index", "--add", "-z", "--stdin"], Some(&list)).map(|_| ())
+    // `--remove`: a path that vanished between the listing and here (a
+    // build tool's temp file, an editor swap file) is recorded as removed
+    // instead of aborting the whole snapshot.
+    git(&s.top, Some(index), &["update-index", "--add", "--remove", "-z", "--stdin"], Some(&list))
+        .map(|_| ())
 }
 
 fn write_tree(s: &Stored, index: &Path) -> Result<String, String> {
@@ -557,7 +631,26 @@ fn remove_added(project: &Path, dest: &Path) -> Result<(), String> {
 
 /// Write the checkpoint's version of `full` (relative to the repository
 /// top) to `dest`, through git's checkout filters (line endings, ...).
-fn restore(s: &Stored, full: &str, dest: &Path) -> Result<(), String> {
+///
+/// A symlink/junction that replaced the tracked file (or a parent folder
+/// of it) since the checkpoint is NOT followed: writing through it would
+/// land outside the project. The link at `dest` is removed so the file is
+/// restored in its place; a linked PARENT is refused for the user to sort
+/// out by hand.
+fn restore(s: &Stored, project: &Path, full: &str, dest: &Path) -> Result<(), String> {
+    let is_link = |p: &Path| {
+        p.symlink_metadata().map(|m| m.file_type().is_symlink()).unwrap_or(false)
+    };
+    let mut ancestor = dest.parent();
+    while let Some(dir) = ancestor {
+        if dir == project {
+            break;
+        }
+        if is_link(dir) {
+            return Err("hedefin üst klasörü bir sembolik bağ; elle geri al".into());
+        }
+        ancestor = dir.parent();
+    }
     let object = format!("{}:{full}", s.tree);
     let kind = git(&s.top, None, &["cat-file", "-t", &object], None)?;
     if String::from_utf8_lossy(&kind).trim() != "blob" {
@@ -566,6 +659,10 @@ fn restore(s: &Stored, full: &str, dest: &Path) -> Result<(), String> {
     let content = git(&s.top, None, &["cat-file", "--filters", &object], None)?;
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    // Replace a link at the path itself (don't write through it).
+    if is_link(dest) {
+        std::fs::remove_file(dest).map_err(|e| e.to_string())?;
     }
     std::fs::write(dest, content).map_err(|e| e.to_string())
 }
@@ -714,6 +811,70 @@ mod tests {
         assert!(c.checkpoint_at.is_none() && c.files.is_empty());
         assert!(c.note.unwrap().contains("checkpoint yok"));
         assert!(revert(&app, &plain, None).is_err());
+    }
+
+    #[test]
+    fn reverting_keeps_a_pre_existing_ignored_file_the_agent_unignores() {
+        let Some((base, r)) = repo() else { return };
+        let app = base.path().join("app");
+        // A tracked .gitignore hides the user's secret.env, which exists
+        // before the session.
+        std::fs::write(r.join(".gitignore"), "secret.env\n").unwrap();
+        git_ok(&r, &["add", ".gitignore"]);
+        std::fs::write(r.join("secret.env"), "API_KEY=keep-me\n").unwrap();
+        take(&app, &r, "s1").unwrap();
+        // The agent un-ignores it (the file is still the user's on disk).
+        std::fs::write(r.join(".gitignore"), "\n").unwrap();
+        let c = changes(&app, &r);
+        assert!(c.files.iter().any(|f| f.path == ".gitignore"));
+        assert!(
+            !c.files.iter().any(|f| f.path == "secret.env"),
+            "a pre-existing ignored file is not an agent change: {:?}",
+            kinds(&c)
+        );
+        // Revert everything: the user's secret must survive.
+        revert(&app, &r, None).unwrap();
+        assert_eq!(std::fs::read_to_string(r.join("secret.env")).unwrap(), "API_KEY=keep-me\n");
+    }
+
+    #[test]
+    fn a_failed_take_clears_the_stale_checkpoint() {
+        let Some((base, r)) = repo() else { return };
+        let app = base.path().join("app");
+        take(&app, &r, "s1").unwrap();
+        assert!(changes(&app, &r).checkpoint_at.is_some());
+        // Block the next snapshot: a pre-existing index.lock makes
+        // `git add -u` on the private index fail, with the repo intact.
+        let (_, index) = files_of(&app, &name_of(&r));
+        let lock = index.with_extension("index.lock");
+        std::fs::write(&lock, b"").unwrap();
+        // The user hand-edits between sessions.
+        std::fs::write(r.join("src/lib.rs"), "user edit between sessions\n").unwrap();
+        assert!(take(&app, &r, "s2").is_err());
+        std::fs::remove_file(&lock).ok();
+        // The stale checkpoint is gone, so revert can't roll the edit back.
+        let c = changes(&app, &r);
+        assert!(c.checkpoint_at.is_none(), "stale checkpoint still live: {:?}", kinds(&c));
+        assert!(c.note.unwrap().contains("checkpoint yok"));
+        assert_eq!(std::fs::read_to_string(r.join("src/lib.rs")).unwrap(), "user edit between sessions\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn revert_refuses_to_write_through_a_symlinked_parent() {
+        use std::os::unix::fs::symlink;
+        let Some((base, r)) = repo() else { return };
+        let app = base.path().join("app");
+        take(&app, &r, "s1").unwrap();
+        std::fs::write(r.join("src/lib.rs"), "changed\n").unwrap();
+        // The src/ folder is swapped for a link pointing outside the project.
+        let outside = base.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::remove_dir_all(r.join("src")).unwrap();
+        symlink(&outside, r.join("src")).unwrap();
+        let left = revert(&app, &r, Some(&["src/lib.rs".to_string()])).unwrap();
+        assert!(!outside.join("lib.rs").exists(), "revert wrote through the link");
+        assert!(left.note.unwrap_or_default().contains("sembolik bağ"));
     }
 
     #[test]
