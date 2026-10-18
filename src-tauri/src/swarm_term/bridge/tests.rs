@@ -415,6 +415,23 @@ fn format_routed_message_shows_the_envelope_task_id_in_the_signature() {
 }
 
 #[test]
+fn a_body_that_starts_with_a_repl_trigger_cannot_act_as_one() {
+    // A slash / bash / memory trigger at the start would run against the
+    // shared claude session when the paste is submitted.
+    for (body, trigger) in [("/logout now", '/'), ("  !rm -rf x", '!'), ("#remember this", '#')] {
+        let s = format_routed_message(body, "scout", None);
+        let inner = &s["\x1b[200~".len()..];
+        let first = inner.chars().next().unwrap();
+        assert_eq!(first, '\u{200B}', "{body}: not defused");
+        assert_ne!(first, trigger);
+        assert!(s.contains(body), "the body is still delivered: {body}");
+    }
+    // A slash in the MIDDLE (a path) is left alone.
+    let s = format_routed_message("see src/orders.rs", "scout", None);
+    assert!(s.starts_with("\x1b[200~see src/orders.rs"));
+}
+
+#[test]
 fn paste_escape_cannot_be_reformed_from_a_double_esc() {
     // Security review: a one-pass replace of `\x1b[201~` re-formed it
     // from `\x1b\x1b[201~`, closing the paste early so the rest reached
