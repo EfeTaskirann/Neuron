@@ -310,12 +310,16 @@ describe('App shell', () => {
   // dispatches to a real component. The previous "stub renders"
   // case is replaced by the per-route assertions below.
 
-  it('renders user and workspace from useMe()', async () => {
+  it('renders the user from useMe() and no controls that do nothing', async () => {
     renderApp();
     await waitFor(() => expect(screen.getByText('Efe')).toBeInTheDocument());
-    expect(screen.getAllByText('Personal').length).toBeGreaterThanOrEqual(2);
-    expect(screen.getByText('3 workflows')).toBeInTheDocument();
     expect(screen.getAllByText('EF').length).toBeGreaterThanOrEqual(1);
+    // Gone: the plan badge, the workspace switcher (it switched nothing)
+    // and the topbar search (it searched nothing, and showed ⌘K on Windows).
+    expect(screen.queryByText('Free plan')).not.toBeInTheDocument();
+    expect(screen.queryByText(/workflows$/)).not.toBeInTheDocument();
+    expect(screen.queryByRole('textbox', { name: /search workflows/i })).not.toBeInTheDocument();
+    expect(screen.queryByText('⌘K')).not.toBeInTheDocument();
   });
 });
 
@@ -494,8 +498,8 @@ describe('Mutations', () => {
     // look up the button explicitly.
     fireEvent.click(screen.getByRole('button', { name: /new agent/i }));
     // Find the form inputs by placeholder — `getAllByRole('textbox')`
-    // also picks up the topbar search field, which would shift
-    // indices and silently target the wrong input.
+    // would also pick up any other text field on the page, shifting
+    // indices and silently targeting the wrong input.
     const nameInput = screen.getByPlaceholderText('Planner') as HTMLInputElement;
     const roleInput = screen.getByPlaceholderText('Plans the day') as HTMLInputElement;
     fireEvent.change(nameInput, { target: { value: 'Researcher' } });

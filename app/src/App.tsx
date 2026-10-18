@@ -5,7 +5,7 @@
 // gated behind `ProjectPickerRoute` until an active project is picked
 // (folder = cwd for Terminal / Terminal Swarm spawns). User/workspace
 // strings come from `useMe()`.
-import { Fragment, useEffect, useRef, useState } from 'react';
+import { Fragment, useState } from 'react';
 import { open } from '@tauri-apps/plugin-dialog';
 import { Brandmark, NIcon, type IconName } from './components/icons';
 import { ErrorBoundary } from './components/ErrorBoundary';
@@ -85,12 +85,9 @@ function Sidebar({
 }: SidebarProps): JSX.Element {
   const { data: me } = useMe();
   // Loading placeholders — kept terse so the layout doesn't shift
-  // when the hook resolves. Workspace count comes from the backend
-  // (`SELECT COUNT(*) FROM workflows`); no client-side derivation.
+  // when the hook resolves.
   const initials = me?.user.initials ?? '··';
   const userName = me?.user.name ?? 'Loading…';
-  const workspaceName = me?.workspace.name ?? 'Loading…';
-  const workspaceCount = me?.workspace.count;
   const items = NAV.filter((item) => devFeatures || !item.dev);
   return (
     <nav className="sidebar" role="navigation" aria-label="Main">
@@ -110,17 +107,6 @@ function Sidebar({
         <Brandmark size={28} />
         {!collapsed && <span className="sb-wordmark">Neuron</span>}
       </div>
-
-      {!collapsed && (
-        <div className="sb-workspace">
-          <div className="sb-ws-avatar">{initials}</div>
-          <div className="sb-ws-meta">
-            <div className="sb-ws-name">{workspaceName}</div>
-            <div className="sb-ws-sub">{workspaceCount ?? '—'} workflows</div>
-          </div>
-          <NIcon name="chevron" size={14} style={{ opacity: 0.5 }} />
-        </div>
-      )}
 
       <ul className="sb-nav">
         {items.map((item, i) => (
@@ -151,16 +137,13 @@ function Sidebar({
         ))}
       </ul>
 
+      {/* The local user's name (Settings → Account); informational, not a menu. */}
       <div className="sb-foot">
         <div className="sb-foot-avatar">{initials}</div>
         {!collapsed && (
-          <>
-            <div className="sb-foot-meta">
-              <div className="sb-foot-name">{userName}</div>
-              <div className="sb-foot-sub">Free plan</div>
-            </div>
-            <NIcon name="chevron" size={14} style={{ opacity: 0.5 }} />
-          </>
+          <div className="sb-foot-meta">
+            <div className="sb-foot-name">{userName}</div>
+          </div>
         )}
       </div>
     </nav>
@@ -170,7 +153,6 @@ function Sidebar({
 function Topbar({ route }: { route: Route }): JSX.Element {
   const runCreate = useRunCreate();
   const { project, setProject } = useActiveProject();
-  const searchRef = useRef<HTMLInputElement>(null);
   // "Change" opens the native folder picker directly instead of clearing
   // the active project and dropping the user onto the full-screen
   // ProjectPickerRoute gate. Cancelling the OS dialog (returns null) is
@@ -186,24 +168,10 @@ function Topbar({ route }: { route: Route }): JSX.Element {
       // Dialog plugin errors are non-fatal — keep the current project.
     }
   };
-  // ⌘K / Ctrl+K focuses the search input — the <kbd> hint in the
-  // markup must not advertise a shortcut that doesn't exist.
-  useEffect(() => {
-    const onKeyDown = (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
-        e.preventDefault();
-        searchRef.current?.focus();
-      }
-    };
-    window.addEventListener('keydown', onKeyDown);
-    return () => window.removeEventListener('keydown', onKeyDown);
-  }, []);
   return (
     <header className="topbar">
       <div className="topbar-l">
         <div className="topbar-crumb">
-          <span className="crumb-mute">Personal</span>
-          <NIcon name="chevronR" size={12} style={{ opacity: 0.4 }} />
           <span>{TOPBAR_TITLE[route]}</span>
         </div>
         {project && (
@@ -219,16 +187,6 @@ function Topbar({ route }: { route: Route }): JSX.Element {
             </button>
           </div>
         )}
-      </div>
-
-      <div className="topbar-search">
-        <NIcon name="search" size={14} />
-        <input
-          ref={searchRef}
-          aria-label="Search workflows, agents, servers"
-          placeholder="Search workflows, agents, servers…"
-        />
-        <kbd>⌘K</kbd>
       </div>
 
       <div className="topbar-r">
