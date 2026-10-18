@@ -110,6 +110,8 @@ pub type SharedPanes = Arc<RwLock<HashMap<String, String>>>;
 pub enum PauseReason {
     /// The account's usage limit is hit: no agent can answer.
     UsageLimit,
+    /// The agents used up the session's message budget.
+    Budget,
     /// The user paused the swarm.
     User,
 }

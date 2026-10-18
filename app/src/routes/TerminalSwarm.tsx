@@ -10,9 +10,11 @@ import { parseSwarmTermStartMs } from '../components/swarm-term/constants';
 import { useActiveProject } from '../hooks/useActiveProject';
 import { useTerminalWrite } from '../hooks/mutations';
 import {
+  useExtendSwarmTermBudget,
   useRestartSwarmTermAgent,
   useResumeSwarmTermDeliveries,
   useRunClaudeUpdate,
+  useSetSwarmTermPaused,
   useStartSwarmTermSession,
   useStopSwarmTermSession,
   useSwarmTermAlerts,
@@ -129,6 +131,8 @@ export function TerminalSwarmRoute(): JSX.Element {
   const stopMut = useStopSwarmTermSession();
   const restartAgentMut = useRestartSwarmTermAgent();
   const resumeMut = useResumeSwarmTermDeliveries();
+  const pauseMut = useSetSwarmTermPaused();
+  const budgetMut = useExtendSwarmTermBudget();
   const updateMut = useRunClaudeUpdate();
   const updateProgress = useClaudeUpdateProgress(updateMut.isPending);
   const writeMut = useTerminalWrite();
@@ -203,6 +207,25 @@ export function TerminalSwarmRoute(): JSX.Element {
     }
   };
 
+  const togglePause = async () => {
+    if (!sessionActive) return;
+    setLaunchError(null);
+    try {
+      await pauseMut.mutateAsync(!session.paused);
+    } catch (err) {
+      setLaunchError(describeError(err));
+    }
+  };
+
+  const extendBudget = async () => {
+    setLaunchError(null);
+    try {
+      await budgetMut.mutateAsync();
+    } catch (err) {
+      setLaunchError(describeError(err));
+    }
+  };
+
   const resumeDeliveries = async () => {
     setLaunchError(null);
     try {
@@ -265,12 +288,15 @@ export function TerminalSwarmRoute(): JSX.Element {
           logOpen={drawer === 'log'}
           changesOpen={drawer === 'changes'}
           changesCount={changesQuery.data?.files.length ?? null}
+          paused={session?.paused ?? false}
+          pausePending={pauseMut.isPending}
           paneStates={paneStates}
           onLaunch={launch}
           onRestart={restart}
           onStop={stop}
           onToggleLog={() => toggleDrawer('log')}
           onToggleChanges={() => toggleDrawer('changes')}
+          onTogglePause={togglePause}
         />
 
         {launchError && (
@@ -291,6 +317,29 @@ export function TerminalSwarmRoute(): JSX.Element {
         {session?.changesNote && (
           <div className="swarm-term-note" role="status">
             {session.changesNote}
+          </div>
+        )}
+        {session?.paused && (
+          <div className="swarm-term-note" role="status">
+            Swarm duraklatıldı: mesajlar outbox’larda sırayla bekliyor, takılma hatırlatmaları
+            durdu. Çalışan bir ajan elindeki turu bitirir.
+          </div>
+        )}
+        {session?.budgetReached && (
+          <div className="swarm-term-limit" role="alert">
+            <p>
+              <strong>Mesaj bütçesi doldu</strong> ({session.messagesDelivered}/
+              {session.messageBudget}). Ajanlar arası mesaj teslimi ve takılma hatırlatmaları
+              durdu.
+            </p>
+            <button
+              type="button"
+              className="btn"
+              onClick={extendBudget}
+              disabled={budgetMut.isPending}
+            >
+              Bütçeyi artır, sürdür
+            </button>
           </div>
         )}
         {session?.usageLimited && (
@@ -337,6 +386,7 @@ export function TerminalSwarmRoute(): JSX.Element {
           activeEdge={activeEdge}
           paneStates={paneStatesByAgent}
           onRestartAgent={restartAgent}
+          liteTeam={session?.liteTeam ?? false}
           restartingAgent={restartAgentMut.isPending ? (restartAgentMut.variables ?? null) : null}
         />
       </div>

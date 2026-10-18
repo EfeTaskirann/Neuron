@@ -1,14 +1,19 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { commands, type PaneReadiness, type SwarmTermPersona } from '../lib/bindings';
+import {
+  commands,
+  type PaneReadiness,
+  type SwarmTermPersona,
+  type SwarmTermTeam,
+} from '../lib/bindings';
 import { unwrap } from '../lib/unwrap';
-import { notifyPaneExited, notifyUsageLimit } from '../lib/swarmNotify';
+import { notifyBudgetReached, notifyPaneExited, notifyUsageLimit } from '../lib/swarmNotify';
 import { dismissToast, showToast } from '../lib/toast';
 import { useTauriEvent } from './useTauriEvent';
 
 /** `swarm-term:session` payload (see `session.rs`). */
 interface SessionEvent {
   sessionId: string;
-  state: 'started' | 'stopped' | 'limited' | 'running';
+  state: 'started' | 'stopped' | 'limited' | 'paused' | 'budget' | 'running';
   /** With `limited`: when claude said the limit resets (unix seconds). */
   resetsAt?: number | null;
 }
@@ -52,6 +57,7 @@ export function useSwarmTermSessionStatus() {
 export function useSwarmTermAlerts(): void {
   useTauriEvent<SessionEvent>('swarm-term:session', (e) => {
     if (e.state === 'limited') notifyUsageLimit(e.resetsAt ?? null);
+    if (e.state === 'budget') notifyBudgetReached();
   });
   useTauriEvent<PaneStateEvent>('swarm-term:pane-state', (e) => {
     if (e.readiness === 'exited') notifyPaneExited(e.agentId);
@@ -108,6 +114,50 @@ export function useResumeSwarmTermDeliveries() {
     mutationFn: () => unwrap(commands.swarmTermResumeDeliveries()),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['swarm-term', 'status'] });
+    },
+  });
+}
+
+/** Pause / resume the running swarm's deliveries. */
+export function useSetSwarmTermPaused() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (paused: boolean) => unwrap(commands.swarmTermSetPaused(paused)),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['swarm-term', 'status'] });
+    },
+  });
+}
+
+/** More messages for a session whose budget is used up. */
+export function useExtendSwarmTermBudget() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: () => unwrap(commands.swarmTermExtendBudget()),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['swarm-term', 'status'] });
+    },
+  });
+}
+
+/** The cost controls (team, models, message budget) — Settings → Models. */
+export function useSwarmTermTeam() {
+  return useQuery({
+    queryKey: ['swarm-term', 'team'],
+    queryFn: () => unwrap(commands.swarmTermGetTeam()),
+  });
+}
+
+export function useSaveSwarmTermTeam() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (team: SwarmTermTeam) => unwrap(commands.swarmTermSetTeam(team)),
+    // Shown at once; a refused value comes back from the backend.
+    onMutate: (team) => {
+      qc.setQueryData(['swarm-term', 'team'], team);
+    },
+    onSettled: () => {
+      qc.invalidateQueries({ queryKey: ['swarm-term', 'team'] });
     },
   });
 }

@@ -69,6 +69,16 @@ export function notifyUsageLimit(resetsAt: number | null): void {
   requestAttention();
 }
 
+/** Toast (and taskbar flash) when the message budget holds the swarm. */
+export function notifyBudgetReached(): void {
+  showToast({
+    variant: 'error',
+    body: 'Mesaj bütçesi doldu; swarm durdu. Sürdürmek için bütçeyi artır.',
+    durationMs: 12000,
+  });
+  requestAttention();
+}
+
 /** Toast (and taskbar flash) when an agent's claude process ended. */
 export function notifyPaneExited(agentId: string): void {
   showToast({

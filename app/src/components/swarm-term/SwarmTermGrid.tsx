@@ -25,6 +25,9 @@ interface SwarmTermGridProps {
   onRestartAgent?: (agentId: string) => void;
   /** The agent whose restart is in flight. */
   restartingAgent?: string | null;
+  /** The session runs the Lite team: a slot without a pane is an agent it
+   *  leaves out. */
+  liteTeam?: boolean;
 }
 
 /** Readiness from which an agent is offered a restart. */
@@ -42,6 +45,7 @@ export function SwarmTermGrid({
   paneStates,
   onRestartAgent,
   restartingAgent = null,
+  liteTeam = false,
 }: SwarmTermGridProps): JSX.Element {
   // Click-to-expand: when an agent's pane is "expanded" the grid
   // hides the other 8 tiles and gives this one the full container.
@@ -230,6 +234,8 @@ export function SwarmTermGrid({
             <div className="swarm-term-pane-body">
               {paneId ? (
                 <SwarmPane paneId={paneId} agentId={agentId} />
+              ) : liteTeam ? (
+                <em>Bu oturumda yok (Lite takım)</em>
               ) : (
                 <em>idle — pick a project and launch</em>
               )}

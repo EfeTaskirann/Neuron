@@ -15,6 +15,7 @@ vi.mock('./lib/bindings', () => ({
   commands: {
     appFeatures: vi.fn(),
     swarmTermListPersonas: vi.fn(),
+    swarmTermGetTeam: vi.fn(),
     swarmTermSessionStatus: vi.fn(),
     swarmTermStartSession: vi.fn(),
     swarmTermStopSession: vi.fn(),
@@ -234,6 +235,10 @@ beforeEach(async () => {
     data: { devFeatures: true },
   });
   vi.mocked(commands.swarmTermListPersonas).mockResolvedValue({ status: 'ok', data: [] });
+  vi.mocked(commands.swarmTermGetTeam).mockResolvedValue({
+    status: 'ok',
+    data: { lite: false, models: {}, messageBudget: 300 },
+  });
   vi.mocked(commands.swarmTermSessionStatus).mockResolvedValue({ status: 'ok', data: null });
   vi.mocked(commands.meGet).mockResolvedValue(ME_OK);
   vi.mocked(commands.agentsList).mockResolvedValue(AGENTS_OK);
@@ -628,7 +633,7 @@ describe('Mailbox', () => {
 });
 
 describe('SettingsRoute', () => {
-  it('opens on Appearance and switches sections on click', () => {
+  it('opens on Appearance and switches sections on click', async () => {
     renderApp();
     fireEvent.click(screen.getByText('Settings'));
     // Appearance pane is the default — Theme/Accent rows render.
@@ -638,6 +643,6 @@ describe('SettingsRoute', () => {
     // Models pane (now a real pane, not a placeholder) should render.
     fireEvent.click(screen.getByText('Models'));
     expect(screen.queryByText('Theme')).not.toBeInTheDocument();
-    expect(screen.getByText('claude-opus-4')).toBeInTheDocument();
+    expect(await screen.findByRole('radiogroup', { name: 'Takım' })).toBeInTheDocument();
   });
 });

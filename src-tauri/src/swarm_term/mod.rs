@@ -43,6 +43,7 @@ pub(crate) mod preflight;
 pub(crate) mod project_facts;
 pub(crate) mod project_guard;
 pub mod session;
+pub mod team;
 pub(crate) mod trust;
 
 pub use permissions::SwarmTermPermissionMode;

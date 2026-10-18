@@ -7,7 +7,9 @@
 //! `swarm_term_resume_deliveries` (after the usage limit), the Changes
 //! panel's `swarm_term_changes` / `swarm_term_change_diff` /
 //! `swarm_term_revert_changes` / `swarm_term_keep_changes` (see
-//! `swarm_term::checkpoint`), and `swarm_term_run_update`
+//! `swarm_term::checkpoint`), the cost controls `swarm_term_get_team` /
+//! `swarm_term_set_team` (see `swarm_term::team`), `swarm_term_set_paused`
+//! and `swarm_term_extend_budget`, and `swarm_term_run_update`
 //! (update the host `claude` CLI). Inter-agent routing is event-driven via the
 //! file-IPC bridge (`swarm_term::bridge`), emitted as `swarm-term:route`
 //! / `swarm-term:lifecycle` events — not a command.
@@ -25,6 +27,7 @@ use crate::error::AppError;
 use crate::swarm::binding::{resolve_claude_spawn, subscription_env};
 use crate::swarm::ProfileRegistry;
 use crate::swarm_term::checkpoint::{self, SwarmTermChanges};
+use crate::swarm_term::team::{self, SwarmTermTeam};
 use crate::swarm_term::TerminalSwarmSessionHandle;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
@@ -156,6 +159,52 @@ pub async fn swarm_term_resume_deliveries<R: Runtime>(
         .inner()
         .clone();
     registry.resume_deliveries(&app)
+}
+
+/// The user's cost controls: team, models, message budget (Settings →
+/// Models). They apply from the next session start.
+#[tauri::command]
+#[specta::specta]
+pub async fn swarm_term_get_team<R: Runtime>(app: AppHandle<R>) -> Result<SwarmTermTeam, AppError> {
+    let pool = app.state::<crate::db::DbPool>().inner().clone();
+    team::load(&pool).await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn swarm_term_set_team<R: Runtime>(
+    app: AppHandle<R>,
+    team: SwarmTermTeam,
+) -> Result<(), AppError> {
+    let pool = app.state::<crate::db::DbPool>().inner().clone();
+    team::save(&pool, &team).await
+}
+
+/// Pause / resume the running swarm (the toolbar button).
+#[tauri::command]
+#[specta::specta]
+pub async fn swarm_term_set_paused<R: Runtime>(
+    app: AppHandle<R>,
+    paused: bool,
+) -> Result<TerminalSwarmSessionHandle, AppError> {
+    let registry = app
+        .state::<std::sync::Arc<crate::swarm_term::TerminalSwarmRegistry>>()
+        .inner()
+        .clone();
+    registry.set_paused(&app, paused)
+}
+
+/// More messages for the running session once its budget is used up.
+#[tauri::command]
+#[specta::specta]
+pub async fn swarm_term_extend_budget<R: Runtime>(
+    app: AppHandle<R>,
+) -> Result<TerminalSwarmSessionHandle, AppError> {
+    let registry = app
+        .state::<std::sync::Arc<crate::swarm_term::TerminalSwarmRegistry>>()
+        .inner()
+        .clone();
+    registry.extend_budget(&app)
 }
 
 /// The folder a Changes-panel command is about, and Neuron's data dir

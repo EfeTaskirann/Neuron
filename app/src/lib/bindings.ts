@@ -448,6 +448,18 @@ export const commands = {
 	 *  its snapshots leave out (see `checkpoint`).
 	 */
 	changesNote: string | null,
+	// The session runs the Lite team (see `team`).
+	liteTeam: boolean,
+	// The user paused the swarm: no message is delivered.
+	paused: boolean,
+	/**
+	 *  Agent-to-agent messages delivered so far, and the session's budget
+	 *  (`0`: no limit). `budget_reached`: the swarm holds until the user
+	 *  gives it more.
+	 */
+	messagesDelivered: number,
+	messageBudget: number,
+	budgetReached: boolean,
 } | null, AppErrorWire>(__TAURI_INVOKE("swarm_term_session_status")),
 	swarmTermStartSession: (projectDir: string) => typedError<TerminalSwarmSessionHandle, AppErrorWire>(__TAURI_INVOKE("swarm_term_start_session", { projectDir })),
 	/**
@@ -482,6 +494,16 @@ export const commands = {
 	swarmTermRevertChanges: (projectDir: string, paths: string[] | null) => typedError<SwarmTermChanges, AppErrorWire>(__TAURI_INVOKE("swarm_term_revert_changes", { projectDir, paths })),
 	// Keep what changed: the checkpoint moves to now.
 	swarmTermKeepChanges: (projectDir: string) => typedError<SwarmTermChanges, AppErrorWire>(__TAURI_INVOKE("swarm_term_keep_changes", { projectDir })),
+	/**
+	 *  The user's cost controls: team, models, message budget (Settings →
+	 *  Models). They apply from the next session start.
+	 */
+	swarmTermGetTeam: () => typedError<SwarmTermTeam, AppErrorWire>(__TAURI_INVOKE("swarm_term_get_team")),
+	swarmTermSetTeam: (team: SwarmTermTeam) => typedError<null, AppErrorWire>(__TAURI_INVOKE("swarm_term_set_team", { team })),
+	// Pause / resume the running swarm (the toolbar button).
+	swarmTermSetPaused: (paused: boolean) => typedError<TerminalSwarmSessionHandle, AppErrorWire>(__TAURI_INVOKE("swarm_term_set_paused", { paused })),
+	// More messages for the running session once its budget is used up.
+	swarmTermExtendBudget: () => typedError<TerminalSwarmSessionHandle, AppErrorWire>(__TAURI_INVOKE("swarm_term_extend_budget")),
 	/**
 	 *  Update the host's `claude` CLI to the latest version. Rejects while a
 	 *  swarm-term session is running so the binary on disk isn't swapped
@@ -1729,6 +1751,21 @@ export type SwarmTermPersona = {
 	allowedDestinations: string[],
 };
 
+export type SwarmTermTeam = {
+	// Run the Lite team ([`LITE_TEAM`]) instead of all nine agents.
+	lite: boolean,
+	/**
+	 *  Agent id → model alias ([`MODEL_ALIASES`]). An agent not named
+	 *  runs claude's default model.
+	 */
+	models: { [key in string]: string },
+	/**
+	 *  Agent-to-agent messages a session may deliver before it holds;
+	 *  `0`: no limit.
+	 */
+	messageBudget: number,
+};
+
 export type TerminalSwarmPane = {
 	agentId: string,
 	paneId: string,
@@ -1774,6 +1811,18 @@ export type TerminalSwarmSessionHandle = {
 	 *  its snapshots leave out (see `checkpoint`).
 	 */
 	changesNote: string | null,
+	// The session runs the Lite team (see `team`).
+	liteTeam: boolean,
+	// The user paused the swarm: no message is delivered.
+	paused: boolean,
+	/**
+	 *  Agent-to-agent messages delivered so far, and the session's budget
+	 *  (`0`: no limit). `budget_reached`: the swarm holds until the user
+	 *  gives it more.
+	 */
+	messagesDelivered: number,
+	messageBudget: number,
+	budgetReached: boolean,
 };
 
 /**

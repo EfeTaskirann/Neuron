@@ -19,6 +19,8 @@ vi.mock('../lib/bindings', () => ({
     swarmTermChangeDiff: vi.fn(),
     swarmTermRevertChanges: vi.fn(),
     swarmTermKeepChanges: vi.fn(),
+    swarmTermSetPaused: vi.fn(),
+    swarmTermExtendBudget: vi.fn(),
     swarmTermRunUpdate: vi.fn(),
     terminalLines: vi.fn(),
     terminalWrite: vi.fn(),
@@ -103,6 +105,11 @@ const SESSION: TerminalSwarmSessionHandle = {
   usageLimited: false,
   limitResetsAt: null,
   changesNote: null,
+  liteTeam: false,
+  paused: false,
+  messagesDelivered: 12,
+  messageBudget: 300,
+  budgetReached: false,
 };
 
 beforeEach(async () => {
@@ -484,6 +491,59 @@ describe('TerminalSwarmRoute', () => {
     // One drawer at a time.
     fireEvent.click(screen.getByRole('button', { name: /routing log/i }));
     expect(screen.queryByRole('complementary', { name: 'Değişiklikler' })).not.toBeInTheDocument();
+  });
+
+  it('pauses the swarm from the toolbar and says what a pause does', async () => {
+    const { commands } = await import('../lib/bindings');
+    vi.mocked(commands.swarmTermSessionStatus).mockResolvedValue({ status: 'ok', data: SESSION });
+    vi.mocked(commands.swarmTermSetPaused).mockResolvedValue({
+      status: 'ok',
+      data: { ...SESSION, paused: true },
+    });
+    renderRoute();
+    const pause = await screen.findByRole('button', { name: 'Duraklat' });
+    expect(pause).toHaveAttribute('aria-pressed', 'false');
+    fireEvent.click(pause);
+    await waitFor(() => expect(commands.swarmTermSetPaused).toHaveBeenCalledWith(true));
+  });
+
+  it('shows a paused swarm and offers to resume it', async () => {
+    const { commands } = await import('../lib/bindings');
+    vi.mocked(commands.swarmTermSessionStatus).mockResolvedValue({
+      status: 'ok',
+      data: { ...SESSION, paused: true },
+    });
+    vi.mocked(commands.swarmTermSetPaused).mockResolvedValue({ status: 'ok', data: SESSION });
+    renderRoute();
+    expect(await screen.findByText(/Swarm duraklatıldı/)).toHaveAttribute('role', 'status');
+    fireEvent.click(screen.getByRole('button', { name: 'Sürdür' }));
+    await waitFor(() => expect(commands.swarmTermSetPaused).toHaveBeenCalledWith(false));
+  });
+
+  it('holds at the message budget until the user raises it', async () => {
+    const { commands } = await import('../lib/bindings');
+    vi.mocked(commands.swarmTermSessionStatus).mockResolvedValue({
+      status: 'ok',
+      data: { ...SESSION, budgetReached: true, messagesDelivered: 300 },
+    });
+    vi.mocked(commands.swarmTermExtendBudget).mockResolvedValue({ status: 'ok', data: SESSION });
+    renderRoute();
+    const banner = await screen.findByRole('alert');
+    expect(banner).toHaveTextContent('Mesaj bütçesi doldu');
+    expect(banner).toHaveTextContent('300/300');
+    fireEvent.click(screen.getByRole('button', { name: 'Bütçeyi artır, sürdür' }));
+    await waitFor(() => expect(commands.swarmTermExtendBudget).toHaveBeenCalled());
+  });
+
+  it('marks the agents a Lite session leaves out', async () => {
+    const { commands } = await import('../lib/bindings');
+    vi.mocked(commands.swarmTermSessionStatus).mockResolvedValue({
+      status: 'ok',
+      data: { ...SESSION, liteTeam: true },
+    });
+    renderRoute();
+    // SESSION has 2 panes: the other 7 slots are not in this session.
+    expect(await screen.findAllByText('Bu oturumda yok (Lite takım)')).toHaveLength(7);
   });
 
   it('says when the session runs without a checkpoint', async () => {

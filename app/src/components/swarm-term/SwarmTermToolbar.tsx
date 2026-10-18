@@ -19,6 +19,9 @@ interface SwarmTermToolbarProps {
   /** Whether the Changes panel is open, and how many files it lists. */
   changesOpen: boolean;
   changesCount: number | null;
+  /** The user paused the running swarm (and a pause / resume is on its way). */
+  paused: boolean;
+  pausePending: boolean;
   /** Every pane's readiness while a session runs (empty otherwise). */
   paneStates: TerminalSwarmPaneState[];
   onLaunch: () => void;
@@ -26,6 +29,7 @@ interface SwarmTermToolbarProps {
   onStop: () => void;
   onToggleLog: () => void;
   onToggleChanges: () => void;
+  onTogglePause: () => void;
 }
 
 export function SwarmTermToolbar({
@@ -39,12 +43,15 @@ export function SwarmTermToolbar({
   logOpen,
   changesOpen,
   changesCount,
+  paused,
+  pausePending,
   paneStates,
   onLaunch,
   onRestart,
   onStop,
   onToggleLog,
   onToggleChanges,
+  onTogglePause,
 }: SwarmTermToolbarProps): JSX.Element {
   return (
     <div className="swarm-term-toolbar">
@@ -88,6 +95,20 @@ export function SwarmTermToolbar({
             disabled={stopPending}
           >
             {stopPending ? 'Stopping…' : 'Stop swarm'}
+          </button>
+          <button
+            type="button"
+            className="btn ghost sm swarm-term-log-toggle"
+            aria-pressed={paused}
+            onClick={onTogglePause}
+            disabled={pausePending}
+            title={
+              paused
+                ? 'Mesaj teslimini ve hatırlatmaları sürdür'
+                : 'Mesaj teslimini ve hatırlatmaları duraklat (çalışan tur biter)'
+            }
+          >
+            {paused ? 'Sürdür' : 'Duraklat'}
           </button>
         </>
       )}

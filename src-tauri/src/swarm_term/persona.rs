@@ -22,7 +22,7 @@
 
 use std::path::Path;
 
-use crate::swarm_term::hierarchy::allowed_for;
+use crate::swarm_term::hierarchy::{allowed_for, AGENT_IDS};
 use crate::swarm_term::lifecycle::MAX_REWORK_ROUNDS;
 use crate::swarm_term::project_facts::ProjectFacts;
 
@@ -77,6 +77,7 @@ pub(crate) fn build_restart_kickoff(agent_id: &str) -> String {
 ///   * how received messages arrive (bracketed-paste signed with
 ///     `— from @<sender> [routed by Neuron]`),
 ///   * the project's stack and verification commands (`facts`),
+///   * the session's team, when it is not all nine agents (`team`),
 ///   * the first-response convention (`@<agent_id> READY`).
 ///
 /// `bridge_root` is the absolute path to the per-session
@@ -88,8 +89,11 @@ pub(crate) fn build_persona_prompt(
     body: &str,
     bridge_root: &Path,
     facts: &ProjectFacts,
+    team: &[&str],
 ) -> String {
-    let allowed: Vec<&str> = allowed_for(agent_id).to_vec();
+    // Only the agents this session runs are destinations.
+    let allowed: Vec<&str> =
+        allowed_for(agent_id).iter().copied().filter(|dst| team.contains(dst)).collect();
     let bridge_root_str = path_as_forward_slashes(bridge_root);
 
     // Allowed-destinations block: the values the envelope's `to` field
@@ -109,6 +113,8 @@ pub(crate) fn build_persona_prompt(
     // to "orchestrator" when the agent has no allowed destinations
     // (shouldn't happen in the canonical graph, but defensive).
     let example_dst: &str = allowed.first().copied().unwrap_or("orchestrator");
+
+    let team_block = team_block(team);
 
     let quoted = |items: &[String]| {
         items.iter().map(|i| format!("`{i}`")).collect::<Vec<_>>().join(", ")
@@ -157,6 +163,7 @@ pub(crate) fn build_persona_prompt(
          ### Proje bilgisi\n\n\
          Çalışma dizinin projenin kökü.\n\
          {project_block}\n\n\
+         {team_block}\
          ### Araç izinlerin (backend zorunlu kılar)\n\n\
          {perms}\n\
          İzin dışı bir araç çağrısı onay sorulmadan reddedilir; aynı çağrıyı tekrar\n\
@@ -286,12 +293,44 @@ pub(crate) fn build_persona_prompt(
         restart = RESTART_PREFIX,
         ready = READY_TOKEN,
         project_block = project_block,
+        team_block = team_block,
         perms = crate::swarm_term::permissions::describe_for_persona(agent_id, &facts.commands),
         max_rework = MAX_REWORK_ROUNDS,
         max_rework_plus = MAX_REWORK_ROUNDS + 1,
     );
 
     format!("{body}{footer}")
+}
+
+/// The footer's "Takım" section for a session that does not run all nine
+/// agents (empty otherwise): who is there, and who does the missing
+/// agents' work. Ends with a blank line.
+fn team_block(team: &[&str]) -> String {
+    if AGENT_IDS.iter().all(|a| team.contains(a)) {
+        return String::new();
+    }
+    let has = |a: &str| team.contains(&a);
+    let members = team.iter().map(|a| format!("`{a}`")).collect::<Vec<_>>().join(", ");
+    let mut lines = vec![format!(
+        "### Takım (bu oturum)\n\n\
+         Bu oturum küçük takımla çalışıyor; yalnız şu ajanlar var: {members}. Persona'nda \
+         adı geçen öteki ajanlar bu oturumda yok: onlara mesaj atma (Neuron geri çevirir), \
+         işlerini şöyle böl:"
+    )];
+    if !has("scout") && !has("planner") && has("orchestrator") {
+        lines.push("- Araştırma ve planlama (scout, planner) orchestrator'da.".into());
+    }
+    if !has("frontend-builder") && has("backend-builder") {
+        lines.push("- Frontend dahil bütün kod işleri `backend-builder`'da.".into());
+    }
+    if !has("frontend-reviewer") && !has("integration-tester") && has("backend-reviewer") {
+        lines.push(
+            "- Bütün review'lar `backend-reviewer`'da; ayrı smoke testi yok, reviewer'ın \
+             `APPROVED`'ı görevi kapatır."
+                .into(),
+        );
+    }
+    format!("{}\n\n", lines.join("\n"))
 }
 
 /// True when `text` (an assistant turn) is `agent_id`'s readiness
@@ -338,7 +377,7 @@ mod tests {
     fn prompt_is_plain_text_without_paste_framing() {
         // System-prompt file content: any terminal escape would end up
         // verbatim in claude's system prompt.
-        let p = build_persona_prompt("scout", "Hello body", &dummy_bridge_root(), &facts());
+        let p = build_persona_prompt("scout", "Hello body", &dummy_bridge_root(), &facts(), AGENT_IDS);
         assert!(p.starts_with("Hello body"));
         assert!(!p.contains('\x1b'));
         assert!(!p.contains('\r'));
@@ -363,21 +402,42 @@ mod tests {
         assert!(k.contains("İlk yanıt"));
         assert!(!is_ready_answer("builder", &k));
         // The footer has the rule it points at.
-        let p = build_persona_prompt("builder", "x", &dummy_bridge_root(), &facts());
+        let p = build_persona_prompt("builder", "x", &dummy_bridge_root(), &facts(), AGENT_IDS);
         assert!(p.contains(RESTART_PREFIX));
     }
 
     #[test]
     fn prompt_tells_the_agent_how_to_answer_the_kickoff() {
-        let p = build_persona_prompt("scout", "x", &dummy_bridge_root(), &facts());
+        let p = build_persona_prompt("scout", "x", &dummy_bridge_root(), &facts(), AGENT_IDS);
         assert!(p.contains(KICKOFF_PREFIX));
         assert!(p.contains("`@scout READY`"));
         assert!(!p.contains("hazır."), "the old Turkish answer is no longer taught");
     }
 
     #[test]
+    fn a_lite_session_tells_each_agent_who_is_there() {
+        let lite = crate::swarm_term::team::LITE_TEAM;
+        let o = build_persona_prompt("orchestrator", "x", &dummy_bridge_root(), &facts(), lite);
+        let section = &o[o.find("### Takım (bu oturum)").expect("team section")..];
+        assert!(section.contains("`orchestrator`, `coordinator`, `backend-builder`, `backend-reviewer`"));
+        assert!(section.contains("orchestrator'da") && section.contains("`backend-builder`'da"));
+        // Destinations are the agents that are there.
+        let start = o.find("### İzinli hedeflerin").unwrap();
+        let end = o[start + 4..].find("###").map_or(o.len(), |i| start + 4 + i);
+        let dests = &o[start..end];
+        assert!(dests.contains("`@coordinator`") && dests.contains("`@backend-builder`"));
+        for gone in ["`@scout`", "`@integration-tester`", "`@frontend-builder`"] {
+            assert!(!dests.contains(gone), "{gone} in {dests}");
+        }
+        // The full team needs no such section.
+        let full = build_persona_prompt("orchestrator", "x", &dummy_bridge_root(), &facts(), AGENT_IDS);
+        assert!(!full.contains("### Takım (bu oturum)"));
+        assert!(full.contains("`@scout`"));
+    }
+
+    #[test]
     fn the_footer_carries_the_project_facts_or_says_to_ask() {
-        let p = build_persona_prompt("backend-reviewer", "x", &dummy_bridge_root(), &facts());
+        let p = build_persona_prompt("backend-reviewer", "x", &dummy_bridge_root(), &facts(), AGENT_IDS);
         assert!(p.contains("### Proje bilgisi"));
         assert!(p.contains("Rust (Cargo), Node (pnpm)"));
         assert!(p.contains("`cargo test`, `pnpm -C web test`"));
@@ -385,7 +445,7 @@ mod tests {
         let perms = &p[p.find("### Araç izinlerin").unwrap()..];
         assert!(perms.contains("pnpm -C web test"));
         let unknown =
-            build_persona_prompt("scout", "x", &dummy_bridge_root(), &ProjectFacts::default());
+            build_persona_prompt("scout", "x", &dummy_bridge_root(), &ProjectFacts::default(), AGENT_IDS);
         assert!(unknown.contains("algılayamadı") && unknown.contains("scout'a sor"));
     }
 
@@ -422,7 +482,7 @@ mod tests {
         // Live runs: the orchestrator followed the repo CLAUDE.md
         // ("announce, wait for approval") — analysed the task itself and
         // asked the user "devam edeyim mi?" instead of dispatching.
-        let p = build_persona_prompt("orchestrator", "x", &dummy_bridge_root(), &facts());
+        let p = build_persona_prompt("orchestrator", "x", &dummy_bridge_root(), &facts(), AGENT_IDS);
         assert!(p.contains("### Yetki ve öncelik"));
         assert!(p.contains("CLAUDE.md"));
         assert!(p.contains("\"devam edeyim mi?\" diye SORMA"));
@@ -447,7 +507,7 @@ mod tests {
     fn prompt_message_id_rule_is_not_a_copyable_literal() {
         // A fixed example id (`1747300000000-a4f2`) was copied verbatim
         // by agents in live runs; the rule must be per-agent + counter.
-        let p = build_persona_prompt("scout", "x", &dummy_bridge_root(), &facts());
+        let p = build_persona_prompt("scout", "x", &dummy_bridge_root(), &facts(), AGENT_IDS);
         assert!(!p.contains("1747300000000"));
         assert!(p.contains("scout-001-"));
     }
@@ -455,13 +515,13 @@ mod tests {
     #[test]
     fn payload_carries_persona_body_verbatim() {
         let body = "# Scout\n\nFind things.\n";
-        let p = build_persona_prompt("scout", body, &dummy_bridge_root(), &facts());
+        let p = build_persona_prompt("scout", body, &dummy_bridge_root(), &facts(), AGENT_IDS);
         assert!(p.contains(body));
     }
 
     #[test]
     fn payload_includes_bridge_protocol_and_allowed_destinations() {
-        let p = build_persona_prompt("scout", "x", &dummy_bridge_root(), &facts());
+        let p = build_persona_prompt("scout", "x", &dummy_bridge_root(), &facts(), AGENT_IDS);
         assert!(p.contains("## Mesajlaşma protokolü"));
         assert!(p.contains("`Write` tool"));
         assert!(p.contains("outbox/scout/<MSG_ID>.json"));
@@ -477,7 +537,7 @@ mod tests {
         // The persona must show the actual bridge path so claude can
         // use it in Write tool calls. Forward slashes on all platforms
         // — claude accepts them on Windows and they read cleanly.
-        let p = build_persona_prompt("scout", "x", &dummy_bridge_root(), &facts());
+        let p = build_persona_prompt("scout", "x", &dummy_bridge_root(), &facts(), AGENT_IDS);
         let expected_fragment = if cfg!(target_os = "windows") {
             "C:/Users/dev/proj/.bridgespace/swarm-term-01HZQ"
         } else {
@@ -494,7 +554,7 @@ mod tests {
         // Belt-and-suspenders: any column-0 `>> @<agent>:` in the
         // injected text would be useless legacy doc. Pin that the new
         // payload doesn't contain that pattern.
-        let p = build_persona_prompt("orchestrator", "x", &dummy_bridge_root(), &facts());
+        let p = build_persona_prompt("orchestrator", "x", &dummy_bridge_root(), &facts(), AGENT_IDS);
         for line in p.split('\n') {
             assert!(
                 !line.starts_with(">> @"),
@@ -505,7 +565,7 @@ mod tests {
 
     #[test]
     fn payload_includes_lifecycle_protocol() {
-        let p = build_persona_prompt("scout", "x", &dummy_bridge_root(), &facts());
+        let p = build_persona_prompt("scout", "x", &dummy_bridge_root(), &facts(), AGENT_IDS);
         assert!(p.contains("alındı"));
         assert!(p.contains("tamam"));
         assert!(p.contains("belirsiz"));
@@ -521,7 +581,7 @@ mod tests {
         let p = build_persona_prompt(
             "backend-builder",
             "x",
-            &dummy_bridge_root(), &facts()
+            &dummy_bridge_root(), &facts(), AGENT_IDS
         );
         assert!(p.contains("DONE <task_id>"));
         assert!(p.contains("APPROVED <task_id>"));
@@ -534,7 +594,7 @@ mod tests {
         // line's 9-space indent; 4+ leading spaces turn a markdown line
         // into a code block (the message-id example rendered as code).
         for &agent in crate::swarm_term::hierarchy::AGENT_IDS {
-            let p = build_persona_prompt(agent, "x", &dummy_bridge_root(), &facts());
+            let p = build_persona_prompt(agent, "x", &dummy_bridge_root(), &facts(), AGENT_IDS);
             for line in p.lines() {
                 let indent = line.len() - line.trim_start_matches(' ').len();
                 assert!(indent < 4, "{agent}: over-indented footer line: {line:?}");
@@ -546,12 +606,12 @@ mod tests {
     fn footer_states_one_retry_limit_and_the_failure_signal() {
         // B2: the retry limit has one source (MAX_REWORK_ROUNDS) and the
         // old "3 kez denersen reviewer reject sayar" wording is gone.
-        let p = build_persona_prompt("coordinator", "x", &dummy_bridge_root(), &facts());
+        let p = build_persona_prompt("coordinator", "x", &dummy_bridge_root(), &facts(), AGENT_IDS);
         assert!(p.contains(&format!("en fazla {MAX_REWORK_ROUNDS} düzeltme turu")));
         assert!(p.contains("TASK_FAILED <task_id>"));
         assert!(!p.contains("3 kez denersen"));
         // Tester verdicts use the same tokens and go to the coordinator.
-        let t = build_persona_prompt("integration-tester", "x", &dummy_bridge_root(), &facts());
+        let t = build_persona_prompt("integration-tester", "x", &dummy_bridge_root(), &facts(), AGENT_IDS);
         assert!(t.contains("Reviewer / integration-tester ise"));
         assert!(t.contains("HER ZAMAN coordinator'a gönder"));
     }
@@ -587,7 +647,7 @@ mod tests {
         // must still be defensible against an unknown id.
         let allowed = allowed_for("nobody");
         assert!(allowed.is_empty());
-        let p = build_persona_prompt("nobody", "x", &dummy_bridge_root(), &facts());
+        let p = build_persona_prompt("nobody", "x", &dummy_bridge_root(), &facts(), AGENT_IDS);
         assert!(p.contains("(yok"));
     }
 }

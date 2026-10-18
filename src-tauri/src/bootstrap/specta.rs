@@ -105,6 +105,10 @@ pub fn specta_builder_for_export() -> tauri_specta::Builder<tauri::Wry> {
             commands::swarm_term::swarm_term_change_diff::<tauri::Wry>,
             commands::swarm_term::swarm_term_revert_changes::<tauri::Wry>,
             commands::swarm_term::swarm_term_keep_changes::<tauri::Wry>,
+            commands::swarm_term::swarm_term_get_team::<tauri::Wry>,
+            commands::swarm_term::swarm_term_set_team::<tauri::Wry>,
+            commands::swarm_term::swarm_term_set_paused::<tauri::Wry>,
+            commands::swarm_term::swarm_term_extend_budget::<tauri::Wry>,
             commands::swarm_term::swarm_term_run_update::<tauri::Wry>,
         ])
         // Register the AppError once on the builder so the type lands

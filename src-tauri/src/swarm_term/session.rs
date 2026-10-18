@@ -1,7 +1,8 @@
 //! `TerminalSwarmSession` lifecycle.
 //!
-//! `start()` spawns 9 PTY panes (one per agent in `hierarchy::AGENT_IDS`)
-//! through `TerminalRegistry::spawn_pane`, each running interactive
+//! `start()` spawns one PTY pane per agent of the session's team (all nine
+//! of `hierarchy::AGENT_IDS`, or the Lite team — see [`team`]) through
+//! `TerminalRegistry::spawn_pane`, each running interactive
 //! `claude` with the user-selected project as `cwd` — in a folder the
 //! user has trusted ([`trust`]) and on the user's own Claude
 //! configuration ([`pane_config`]). Before the spawn loop it prepares
@@ -11,8 +12,8 @@
 //! drop outbound messages. Each pane's persona + bridge protocol is its
 //! appended system prompt (`--append-system-prompt-file`); a short
 //! kickoff turn is then pasted and the pane counts as ready once claude
-//! answers `@<id> READY` in its transcript (named by the pane's
-//! `--session-id`). The [`bridge::watcher::watcher_loop`] picks up the
+//! has answered it (asked for `@<id> READY`) in its transcript, named by
+//! the pane's `--session-id`. The [`bridge::watcher::watcher_loop`] picks up the
 //! JSON envelopes those drops create and delivers their body into the
 //! appropriate target pane via bracketed paste.
 //!
@@ -23,7 +24,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -54,6 +55,7 @@ use crate::swarm_term::persona::{
 };
 use crate::swarm_term::preflight;
 use crate::swarm_term::project_facts;
+use crate::swarm_term::team;
 use crate::swarm_term::trust;
 
 const READY_DELAY_MS: u64 = 1500;
@@ -145,6 +147,16 @@ pub struct TerminalSwarmSessionHandle {
     /// Why the session has no checkpoint (a folder without git), or what
     /// its snapshots leave out (see `checkpoint`).
     pub changes_note: Option<String>,
+    /// The session runs the Lite team (see `team`).
+    pub lite_team: bool,
+    /// The user paused the swarm: no message is delivered.
+    pub paused: bool,
+    /// Agent-to-agent messages delivered so far, and the session's budget
+    /// (`0`: no limit). `budget_reached`: the swarm holds until the user
+    /// gives it more.
+    pub messages_delivered: u32,
+    pub message_budget: u32,
+    pub budget_reached: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
@@ -188,6 +200,8 @@ pub(crate) struct PaneSpawnSpec {
     pub program: String,
     /// The project's verification commands (permission allowlist).
     pub project_commands: Vec<String>,
+    /// Agent id → its `--model` alias (see `team`).
+    pub models: BTreeMap<String, String>,
 }
 
 pub(crate) struct ActiveSession {
@@ -231,6 +245,14 @@ pub(crate) struct ActiveSession {
     pub preflight_note: Option<String>,
     /// See [`TerminalSwarmSessionHandle::changes_note`].
     pub changes_note: Option<String>,
+    /// See [`TerminalSwarmSessionHandle::lite_team`].
+    pub lite_team: bool,
+    /// The message budget (the user may raise it) and the deliveries so
+    /// far, counted by [`monitor_session`]; `budget_step` is the budget
+    /// the settings gave, by which the user raises it.
+    pub budget: Arc<AtomicU32>,
+    pub delivered: Arc<AtomicU32>,
+    pub budget_step: u32,
     /// Every pane's readiness, published by the kickoff task.
     pub pane_states: Arc<PaneStates>,
     /// Pane ids that have answered their kickoff and are safe targets for
@@ -327,6 +349,9 @@ impl TerminalSwarmRegistry {
         if let Some(note) = &preflight.note {
             tracing::warn!("swarm-term pre-flight: {note}");
         }
+        // The user's cost controls: the team, its models, the message budget.
+        let team_settings = team::load(&pool).await?;
+        let agents = team_settings.agents();
         let project_str = project_dir.display().to_string();
         let mut parts: Vec<String> =
             vec![format!("\"{}\"", spawn.program.display())];
@@ -340,7 +365,7 @@ impl TerminalSwarmRegistry {
         tracing::info!(
             project_dir = %project_str,
             cmd = %cmd,
-            "swarm-term: spawning 9 claude REPLs"
+            "swarm-term: spawning the team's claude REPLs"
         );
         // Read once: the same mode drives every pane's flags and is
         // what the session reports to the UI.
@@ -435,7 +460,7 @@ impl TerminalSwarmRegistry {
         // on disk before any pane runs, so even after a crash the next
         // start knows which transcripts to delete.
         let session_dir = pane_config::session_dir(&app_data, &session_id);
-        let claude_sessions: BTreeMap<String, String> = AGENT_IDS
+        let claude_sessions: BTreeMap<String, String> = agents
             .iter()
             .map(|agent| (agent.to_string(), pane_config::new_claude_session_id()))
             .collect();
@@ -461,7 +486,11 @@ impl TerminalSwarmRegistry {
             "swarm-term: project facts"
         );
         // Every pane's claude command is made of these (a restart, too).
-        let spec = PaneSpawnSpec { program: cmd.clone(), project_commands: facts.commands.clone() };
+        let spec = PaneSpawnSpec {
+            program: cmd.clone(),
+            project_commands: facts.commands.clone(),
+            models: team_settings.models.clone(),
+        };
         // Personas are loaded BEFORE spawning: each pane gets its
         // persona + bridge protocol as an appended SYSTEM prompt
         // (`--append-system-prompt-file`), so it must exist on disk
@@ -488,7 +517,7 @@ impl TerminalSwarmRegistry {
 
         let mut panes_by_agent: HashMap<String, String> = HashMap::new();
         let mut spawned: Vec<String> = Vec::new();
-        for (idx, &agent_id) in AGENT_IDS.iter().enumerate() {
+        for (idx, &agent_id) in agents.iter().enumerate() {
             if idx > 0 {
                 tokio::time::sleep(Duration::from_millis(SPAWN_STAGGER_MS)).await;
             }
@@ -504,6 +533,7 @@ impl TerminalSwarmRegistry {
                         &profile.body,
                         &bridgespace_root,
                         &facts,
+                        &agents,
                     );
                     #[cfg(test)]
                     let prompt = tests::with_injection(agent_id, prompt);
@@ -587,7 +617,9 @@ impl TerminalSwarmRegistry {
         );
 
         let alive = Arc::new(AtomicBool::new(true));
-        let pane_states = Arc::new(PaneStates::new(AGENT_IDS.iter().copied()));
+        let pane_states = Arc::new(PaneStates::new(agents.iter().copied()));
+        let budget = Arc::new(AtomicU32::new(team_settings.message_budget));
+        let delivered = Arc::new(AtomicU32::new(0));
         let limit = Arc::new(Mutex::new(UsageLimit::default()));
         let restarting = Arc::new(Mutex::new(HashSet::new()));
         let session = ActiveSession {
@@ -608,6 +640,10 @@ impl TerminalSwarmRegistry {
             claude_version: preflight.version.map(|v| v.to_string()),
             preflight_note: preflight.note.clone(),
             changes_note,
+            lite_team: team_settings.lite,
+            budget: Arc::clone(&budget),
+            delivered: Arc::clone(&delivered),
+            budget_step: team_settings.message_budget,
             pane_states: Arc::clone(&pane_states),
             ready_panes: Arc::clone(&ready_panes),
             alive: Arc::clone(&alive),
@@ -722,6 +758,9 @@ impl TerminalSwarmRegistry {
             lifecycle: Arc::clone(&lifecycle),
             limit: Arc::clone(&limit),
             restarting,
+            bridgespace_root: bridgespace_root.clone(),
+            budget,
+            delivered,
         }));
 
         // Session upkeep, ends with the session: heartbeat both on-disk
@@ -833,6 +872,7 @@ impl TerminalSwarmRegistry {
         if !AGENT_IDS.contains(&agent_id) {
             return Err(AppError::InvalidInput(format!("unknown agent `{agent_id}`")));
         }
+        // (An agent the session's team leaves out has no pane: NotFound.)
         let (ctx, _restarting) = {
             let guard = self.inner.lock().map_err(|_| {
                 AppError::Internal("swarm-term registry poisoned".into())
@@ -987,6 +1027,58 @@ impl TerminalSwarmRegistry {
         }
         Ok(handle_from(s))
     }
+
+    /// The user's Pause / Resume: while paused no message is delivered —
+    /// they wait in the outboxes, in order — and the stall clocks stand
+    /// still. An agent in the middle of a turn finishes it.
+    pub fn set_paused<R: Runtime>(
+        &self,
+        app: &AppHandle<R>,
+        paused: bool,
+    ) -> Result<TerminalSwarmSessionHandle, AppError> {
+        let guard = self.inner.lock().map_err(|_| {
+            AppError::Internal("swarm-term registry poisoned".into())
+        })?;
+        let s = guard.as_ref().ok_or_else(no_session)?;
+        {
+            // Every hold changes under the limit's lock (see `monitor_session`).
+            let _holds = s.limit.lock().unwrap_or_else(|p| p.into_inner());
+            if s.control.paused_by(PauseReason::User) != paused {
+                hold_deliveries(&s.control, &s.lifecycle, PauseReason::User, paused);
+                tracing::info!(paused, "swarm-term: the user paused / resumed the swarm");
+                emit_session_state(app, &s.session_id, if paused { "paused" } else { "running" });
+            }
+        }
+        Ok(handle_from(s))
+    }
+
+    /// The user's "more messages": the budget grows by its configured size
+    /// from what was delivered, and the swarm runs again.
+    pub fn extend_budget<R: Runtime>(
+        &self,
+        app: &AppHandle<R>,
+    ) -> Result<TerminalSwarmSessionHandle, AppError> {
+        let guard = self.inner.lock().map_err(|_| {
+            AppError::Internal("swarm-term registry poisoned".into())
+        })?;
+        let s = guard.as_ref().ok_or_else(no_session)?;
+        {
+            let _holds = s.limit.lock().unwrap_or_else(|p| p.into_inner());
+            if s.budget_step > 0 {
+                let delivered = s.delivered.load(Ordering::SeqCst);
+                s.budget.store(delivered.saturating_add(s.budget_step), Ordering::SeqCst);
+            }
+            if s.control.paused_by(PauseReason::Budget) {
+                hold_deliveries(&s.control, &s.lifecycle, PauseReason::Budget, false);
+                tracing::info!(
+                    budget = s.budget.load(Ordering::SeqCst),
+                    "swarm-term: the user raised the message budget"
+                );
+                emit_session_state(app, &s.session_id, "running");
+            }
+        }
+        Ok(handle_from(s))
+    }
 }
 
 fn no_session() -> AppError {
@@ -1044,6 +1136,9 @@ fn agent_command(
 ) -> String {
     let mut args =
         permissions::claude_permission_args(mode, agent_id, session_id, &spec.project_commands);
+    if let Some(model) = spec.models.get(agent_id) {
+        args.extend(["--model".to_string(), model.clone()]);
+    }
     args.extend(session_args);
     format!("{} {}", spec.program, permissions::join_quoted(&args))
 }
@@ -1090,6 +1185,34 @@ fn hold_deliveries(control: &BridgeControl, lifecycle: &LifecycleStore, reason: 
     }
 }
 
+/// `swarm-term:session` with a hold's state change (`paused`, `budget`,
+/// `running`), for the UI.
+fn emit_session_state<R: Runtime>(app: &AppHandle<R>, session_id: &str, state: &str) {
+    let _ = tauri::Emitter::emit(
+        app,
+        crate::events::SWARM_TERM_SESSION,
+        serde_json::json!({ "sessionId": session_id, "state": state }),
+    );
+}
+
+/// What the bridge has delivered in this session: one envelope in
+/// `processed/<target>/` per agent-to-agent message.
+fn count_delivered(bridgespace_root: &Path) -> u32 {
+    let Ok(targets) = std::fs::read_dir(bridgespace_root.join("processed")) else {
+        return 0;
+    };
+    targets
+        .flatten()
+        .filter_map(|target| std::fs::read_dir(target.path()).ok())
+        .map(|files| {
+            files
+                .flatten()
+                .filter(|f| f.path().extension().is_some_and(|e| e == "json"))
+                .count() as u32
+        })
+        .sum()
+}
+
 /// `swarm-term:session` with the usage limit's state, for the UI's banner.
 fn emit_limit<R: Runtime>(app: &AppHandle<R>, session_id: &str, limit: &UsageLimit) {
     let _ = tauri::Emitter::emit(
@@ -1122,12 +1245,19 @@ struct SessionMonitor<R: Runtime> {
     limit: Arc<Mutex<UsageLimit>>,
     /// Agents being restarted: their old pane is killed on purpose.
     restarting: Arc<Mutex<HashSet<String>>>,
+    bridgespace_root: PathBuf,
+    /// The message budget (`0`: no limit) and the deliveries counted.
+    budget: Arc<AtomicU32>,
+    delivered: Arc<AtomicU32>,
 }
 
 /// Watch the session until it stops:
 ///
 /// * A pane whose claude process ended leaves the delivery targets and
 ///   shows as exited — the UI offers to restart it.
+/// * The message budget: once the bridge has delivered that many
+///   agent-to-agent messages, it holds every delivery (one tick late at
+///   most) until the user gives the session more.
 /// * The account's usage limit, read from the transcripts
 ///   ([`limit_signal`]): at the first limit error the bridge holds every
 ///   delivery and the stall clocks stand still. A message pasted then
@@ -1158,6 +1288,16 @@ async fn monitor_session<R: Runtime>(m: SessionMonitor<R>) {
             }
             (m.publish)(agent, pane, PaneReadiness::Exited, Some(PANE_EXITED.into()));
             tracing::warn!(agent_id = %agent, pane_id = %pane, "swarm-term: a pane's claude process ended");
+        }
+
+        let delivered = count_delivered(&m.bridgespace_root);
+        m.delivered.store(delivered, Ordering::SeqCst);
+        let budget = m.budget.load(Ordering::SeqCst);
+        if budget > 0 && delivered >= budget && !m.control.paused_by(PauseReason::Budget) {
+            let _holds = m.limit.lock().unwrap_or_else(|p| p.into_inner());
+            hold_deliveries(&m.control, &m.lifecycle, PauseReason::Budget, true);
+            tracing::warn!(delivered, budget, "swarm-term: message budget used up — deliveries held");
+            emit_session_state(&m.app, &m.session_id, "budget");
         }
 
         let mut signals: Vec<(String, LimitSignal)> = Vec::new();
@@ -1695,21 +1835,16 @@ async fn wait_for_ready_answers(
             return late;
         }
         pending.retain(|agent| w.is_current(agent, &awaited[*agent].pane));
-        let answered: Vec<&str> = pending
+        let answered: Vec<(&str, bool)> = pending
             .iter()
             .copied()
-            .filter(|agent| {
-                w.claude_sessions.get(*agent).is_some_and(|claude_session| {
-                    transcript_has_ready_answer(
-                        &w.projects_dirs,
-                        claude_session,
-                        agent,
-                        awaited[*agent].from_byte,
-                    )
-                })
+            .filter_map(|agent| {
+                let claude_session = w.claude_sessions.get(agent)?;
+                kickoff_answer(&w.projects_dirs, claude_session, agent, awaited[agent].from_byte)
+                    .map(|exact| (agent, exact))
             })
             .collect();
-        for agent in answered {
+        for (agent, exact) in answered {
             pending.remove(agent);
             let pane = &awaited[agent].pane;
             if let Ok(mut g) = w.ready.lock() {
@@ -1718,6 +1853,7 @@ async fn wait_for_ready_answers(
             (w.publish)(agent, pane, PaneReadiness::Ready, None);
             tracing::info!(
                 agent_id = %agent,
+                exact,
                 waited_ms = started.elapsed().as_millis() as u64,
                 "swarm-term: pane answered kickoff — ready"
             );
@@ -1854,7 +1990,7 @@ async fn watch_late_answers(w: &ReadyWait, awaited: &HashMap<String, Awaited>, m
                 continue;
             }
             let answered = w.claude_sessions.get(&agent).is_some_and(|id| {
-                transcript_has_ready_answer(&w.projects_dirs, id, &agent, *from_byte)
+                kickoff_answer(&w.projects_dirs, id, &agent, *from_byte).is_some()
             });
             if answered {
                 if let Ok(mut g) = w.ready.lock() {
@@ -1888,48 +2024,50 @@ fn blocked_reason(screen_tail: &str) -> &'static str {
     }
 }
 
-/// True when the pane's claude transcript — the one named by its
-/// `--session-id` — holds an assistant turn that is `agent_id`'s
-/// readiness answer, at or after byte `from_byte` (a restarted pane's
-/// resumed transcript holds its earlier answer).
-fn transcript_has_ready_answer(
+/// How the pane's claude has answered its kickoff, read from its
+/// transcript (the one named by its `--session-id`) at or after byte
+/// `from_byte` — a restarted pane's resumed transcript holds its earlier
+/// answer. `None`: no answer yet; `Some(exact)`: the model answered, in
+/// the requested `@<id> READY` form when `exact`. Any answer of the model
+/// counts — in its own pane's transcript it can only be this pane's, and
+/// a model that words it otherwise (claude-haiku answers a bare `READY`)
+/// has answered all the same. claude's own notices and API errors are no
+/// answer.
+fn kickoff_answer(
     projects_dirs: &[PathBuf],
     claude_session: &str,
     agent_id: &str,
     from_byte: u64,
-) -> bool {
-    let Some(file) = pane_config::find_transcript(projects_dirs, claude_session) else {
-        return false;
-    };
-    let Ok(mut f) = std::fs::File::open(file) else {
-        return false;
-    };
+) -> Option<bool> {
+    let file = pane_config::find_transcript(projects_dirs, claude_session)?;
+    let mut f = std::fs::File::open(file).ok()?;
     let mut bytes = Vec::new();
-    if f.seek(SeekFrom::Start(from_byte)).is_err() || f.read_to_end(&mut bytes).is_err() {
-        return false;
-    }
-    String::from_utf8_lossy(&bytes).lines().any(|l| line_is_ready_answer(l, agent_id))
+    f.seek(SeekFrom::Start(from_byte)).ok()?;
+    f.read_to_end(&mut bytes).ok()?;
+    String::from_utf8_lossy(&bytes)
+        .lines()
+        .filter_map(|l| line_answer(l, agent_id))
+        .reduce(|a, b| a || b)
 }
 
-fn line_is_ready_answer(line: &str, agent_id: &str) -> bool {
+/// Pure: one transcript line as a kickoff answer (see [`kickoff_answer`]).
+fn line_answer(line: &str, agent_id: &str) -> Option<bool> {
     use serde_json::Value;
-    let Ok(v) = serde_json::from_str::<Value>(line) else {
-        return false;
-    };
-    if v.get("type").and_then(Value::as_str) != Some("assistant") {
-        return false;
+    let v: Value = serde_json::from_str(line).ok()?;
+    if v.get("type").and_then(Value::as_str) != Some("assistant")
+        || v.get("isApiErrorMessage").and_then(Value::as_bool) == Some(true)
+        || v.pointer("/message/model").and_then(Value::as_str) == Some("<synthetic>")
+    {
+        return None;
     }
-    match v.pointer("/message/content") {
+    Some(match v.pointer("/message/content") {
         Some(Value::String(s)) => is_ready_answer(agent_id, s),
         Some(Value::Array(parts)) => parts.iter().any(|p| {
             p.get("type").and_then(Value::as_str) == Some("text")
-                && p
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .is_some_and(|t| is_ready_answer(agent_id, t))
+                && p.get("text").and_then(Value::as_str).is_some_and(|t| is_ready_answer(agent_id, t))
         }),
         _ => false,
-    }
+    })
 }
 
 fn handle_from(s: &ActiveSession) -> TerminalSwarmSessionHandle {
@@ -1956,6 +2094,11 @@ fn handle_from(s: &ActiveSession) -> TerminalSwarmSessionHandle {
         usage_limited: limit.limited,
         limit_resets_at: limit.resets_at,
         changes_note: s.changes_note.clone(),
+        lite_team: s.lite_team,
+        paused: s.control.paused_by(PauseReason::User),
+        messages_delivered: s.delivered.load(Ordering::SeqCst),
+        message_budget: s.budget.load(Ordering::SeqCst),
+        budget_reached: s.control.paused_by(PauseReason::Budget),
     }
 }
 
@@ -2036,13 +2179,20 @@ mod tests {
         assert!(!screen_is_blocking(""));
     }
 
+    /// claude-haiku's kickoff answer, as a live Lite run wrote it.
+    const BARE_READY: &str = r#"{"type":"assistant","message":{"model":"claude-haiku-5-5","role":"assistant","content":[{"type":"text","text":"READY"}]}}"#;
+
     #[test]
-    fn ready_answer_is_read_from_assistant_turns_only() {
-        assert!(line_is_ready_answer(READY_LINE, "scout"));
-        assert!(!line_is_ready_answer(READY_LINE, "planner"));
-        // A user turn (e.g. the kickoff echo) never counts.
-        assert!(!line_is_ready_answer(KICKOFF_ECHO, "scout"));
-        assert!(!line_is_ready_answer("not json", "scout"));
+    fn any_answer_of_the_model_makes_a_pane_ready() {
+        assert_eq!(line_answer(READY_LINE, "scout"), Some(true));
+        // Another wording is an answer all the same — just not the exact one.
+        assert_eq!(line_answer(BARE_READY, "orchestrator"), Some(false));
+        assert_eq!(line_answer(ANSWER, "scout"), Some(false));
+        // The kickoff echo, claude's own notices and API errors are not.
+        assert_eq!(line_answer(KICKOFF_ECHO, "scout"), None);
+        assert_eq!(line_answer(LIMIT_HIT, "scout"), None);
+        assert_eq!(line_answer(LOGGED_OUT, "scout"), None);
+        assert_eq!(line_answer("not json", "scout"), None);
     }
 
     #[test]
@@ -2050,7 +2200,7 @@ mod tests {
         let base = tempfile::tempdir().expect("tempdir");
         let projects = base.path().join("projects");
         let dirs = vec![projects.clone()];
-        assert!(!transcript_has_ready_answer(&dirs, "mine", "scout", 0));
+        assert_eq!(kickoff_answer(&dirs, "mine", "scout", 0), None);
         let dir = projects.join("C--proj");
         std::fs::create_dir_all(&dir).unwrap();
         // Another session in the same project — e.g. the user's own —
@@ -2058,18 +2208,18 @@ mod tests {
         std::fs::write(dir.join("theirs.jsonl"), format!("{READY_LINE}\n")).unwrap();
         let mine = dir.join("mine.jsonl");
         std::fs::write(&mine, format!("{KICKOFF_ECHO}\n")).unwrap();
-        assert!(!transcript_has_ready_answer(&dirs, "mine", "scout", 0));
+        assert_eq!(kickoff_answer(&dirs, "mine", "scout", 0), None);
         std::fs::write(&mine, format!("{KICKOFF_ECHO}\n{READY_LINE}\n")).unwrap();
-        assert!(transcript_has_ready_answer(&dirs, "mine", "scout", 0));
+        assert_eq!(kickoff_answer(&dirs, "mine", "scout", 0), Some(true));
         // A restarted pane resumes the conversation: only an answer after
         // the restart counts.
         let restart_at = std::fs::metadata(&mine).unwrap().len();
-        assert!(!transcript_has_ready_answer(&dirs, "mine", "scout", restart_at));
+        assert_eq!(kickoff_answer(&dirs, "mine", "scout", restart_at), None);
         std::fs::write(&mine, format!("{KICKOFF_ECHO}\n{READY_LINE}\n{KICKOFF_ECHO}\n")).unwrap();
-        assert!(!transcript_has_ready_answer(&dirs, "mine", "scout", restart_at));
-        std::fs::write(&mine, format!("{KICKOFF_ECHO}\n{READY_LINE}\n{KICKOFF_ECHO}\n{READY_LINE}\n"))
+        assert_eq!(kickoff_answer(&dirs, "mine", "scout", restart_at), None);
+        std::fs::write(&mine, format!("{KICKOFF_ECHO}\n{READY_LINE}\n{KICKOFF_ECHO}\n{BARE_READY}\n"))
             .unwrap();
-        assert!(transcript_has_ready_answer(&dirs, "mine", "scout", restart_at));
+        assert_eq!(kickoff_answer(&dirs, "mine", "scout", restart_at), Some(false));
     }
 
     /// claude's API-error entries, as 2.1.296 writes them (trimmed).
@@ -2277,6 +2427,14 @@ mod tests {
                 );
             });
         }
+        // `NEURON_LIVE_TEAM` = a `SwarmTermTeam` JSON (team, models,
+        // message budget), saved like Settings → Models does.
+        if let Ok(raw) = std::env::var("NEURON_LIVE_TEAM") {
+            let settings: team::SwarmTermTeam =
+                serde_json::from_str(&raw).expect("NEURON_LIVE_TEAM must be a SwarmTermTeam");
+            println!("TEAM: {settings:?}");
+            team::save(&_pool, &settings).await.expect("save the team settings");
+        }
         let swarm = Arc::new(TerminalSwarmRegistry::new());
         swarm.start(app.handle().clone(), project.clone()).await.expect("start");
         let (panes, ready, root, claude_sessions) = {
@@ -2409,6 +2567,9 @@ mod tests {
         let mut seen: BTreeMap<PathBuf, ()> = BTreeMap::new();
         let mut task_done = 0usize;
         let mut last_message = Instant::now();
+        // The message budget holding the swarm, and the user raising it.
+        let mut budget_holds = 0usize;
+        let mut held_since: Option<Instant> = None;
         while started.elapsed() < timeout {
             for kind in ["processed", "rejected"] {
                 for target in AGENT_IDS {
@@ -2457,6 +2618,30 @@ mod tests {
             // Every expected terminal signal arrived and the swarm has been
             // quiet for a minute (a retry may add signals): the
             // orchestrator has written its final summary.
+            let handle = swarm.current().expect("session");
+            match (handle.budget_reached, held_since) {
+                (true, None) => {
+                    budget_holds += 1;
+                    held_since = Some(Instant::now());
+                    println!(
+                        "[{}] BUDGET reached: {}/{} delivered — the swarm holds",
+                        stamp(Instant::now()),
+                        handle.messages_delivered,
+                        handle.message_budget
+                    );
+                }
+                (true, Some(t)) if t.elapsed() > Duration::from_secs(3) => {
+                    let after = swarm.extend_budget(app.handle()).expect("extend the budget");
+                    held_since = None;
+                    println!(
+                        "[{}] BUDGET raised to {} — the swarm runs again",
+                        stamp(Instant::now()),
+                        after.message_budget
+                    );
+                    assert!(!after.budget_reached);
+                }
+                _ => {}
+            }
             if task_done >= expect && last_message.elapsed() > Duration::from_secs(60) {
                 break;
             }
@@ -2466,6 +2651,9 @@ mod tests {
             "[{}] TASK_DONE/TASK_FAILED received by orchestrator: {task_done}/{expect}",
             stamp(Instant::now())
         );
+        if budget_holds > 0 {
+            println!("BUDGET holds during the run: {budget_holds}");
+        }
 
         // What the Changes panel shows of the run (see `checkpoint`);
         // `NEURON_LIVE_REVERT=1` puts all of it back.
@@ -2486,8 +2674,8 @@ mod tests {
         // transcripts.
         let projects_dirs = pane_config::claude_projects_dirs();
         std::fs::create_dir_all(&out).ok();
-        for agent in AGENT_IDS {
-            let Some(file) = pane_config::find_transcript(&projects_dirs, &claude_sessions[*agent])
+        for (agent, claude_session) in &claude_sessions {
+            let Some(file) = pane_config::find_transcript(&projects_dirs, claude_session)
             else {
                 println!("NO TRANSCRIPT [{agent}]");
                 continue;
@@ -2495,7 +2683,7 @@ mod tests {
             let Ok(text) = std::fs::read_to_string(&file) else { continue };
             std::fs::write(out.join(format!("{agent}.jsonl")), &text).ok();
             // The orchestrator's last words are the run's summary.
-            if *agent == "orchestrator" {
+            if agent == "orchestrator" {
                 let last = text
                     .lines()
                     .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
