@@ -49,6 +49,11 @@ jobs:
       - name: PTY end-to-end (fake agents)
         run: cargo test --lib --locked swarm_term::bridge::e2e_tests -- --ignored
 
+      # The H3 reference projects: each task's checks fail on the project
+      # as seeded and pass once it is solved (their own cargo / node).
+      - name: Reference task fixtures
+        run: cargo test --lib --locked -- --ignored --exact swarm_term::reference::tests::fixtures_fail_as_seeded_and_pass_when_solved
+
       # Only the Terminal Swarm is gated: the rest of the crate carries
       # older warnings, which are counted but do not fail the build.
       - name: Clippy (swarm_term stays clean)

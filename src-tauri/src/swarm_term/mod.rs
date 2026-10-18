@@ -42,6 +42,8 @@ pub mod persona;
 pub(crate) mod preflight;
 pub(crate) mod project_facts;
 pub(crate) mod project_guard;
+#[cfg(test)]
+mod reference;
 pub mod session;
 pub mod team;
 pub(crate) mod trust;
