@@ -43,6 +43,12 @@ jobs:
       - name: Unit tests
         run: cargo test --lib --locked
 
+      # The bridge and the task lifecycle through 9 real consoles with
+      # PowerShell fake agents (no claude, no tokens). `#[ignore]` keeps
+      # them out of the quick local run.
+      - name: PTY end-to-end (fake agents)
+        run: cargo test --lib --locked swarm_term::bridge::e2e_tests -- --ignored
+
       # Only the Terminal Swarm is gated: the rest of the crate carries
       # older warnings, which are counted but do not fail the build.
       - name: Clippy (swarm_term stays clean)
