@@ -41,6 +41,7 @@ const APP_ERROR_COPY: Record<string, string> = {
   workspace_busy: 'Bu çalışma alanında zaten devam eden bir iş var.',
   cancelled: 'İptal edildi.',
   feature_disabled: 'Geliştirici özelliği kapalı.',
+  consent_required: 'Bu işlem için önce onayın gerekiyor.',
   internal: 'Beklenmedik bir iç hata oluştu.',
 };
 

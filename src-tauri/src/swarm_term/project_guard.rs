@@ -4,7 +4,7 @@
 //! `Edit(./**)` (see `permissions`), so the project folder is the
 //! agents' reach. A drive root, the user's home (or anything above it),
 //! a per-user app-data root (browser profiles, other apps' tokens,
-//! Neuron's own pane homes with their credential copies), a credential
+//! Neuron's own data), a credential
 //! store (`~/.ssh`, `~/.claude`, …) or an OS folder would put far more
 //! than a project in that reach — in either direction: the project may
 //! neither sit inside such a folder nor contain one.
@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Manager, Runtime};
 
 use crate::error::AppError;
-use crate::swarm_term::home_isolation::real_user_home;
+use crate::swarm_term::pane_config::real_user_home;
 
 /// Folders under the user's home that hold credentials.
 const CREDENTIAL_DIRS: &[&str] = &[".ssh", ".claude", ".aws", ".azure", ".gnupg", ".kube", ".docker"];
@@ -129,7 +129,7 @@ fn message(rejection: &Rejection, project: &Path) -> String {
 
 /// Canonical Windows paths carry the verbatim prefix; show them the way
 /// the user writes them (`\\?\C:\x` → `C:\x`, `\\?\UNC\srv\s` → `\\srv\s`).
-fn display_path(p: &Path) -> String {
+pub(crate) fn display_path(p: &Path) -> String {
     let s = p.display().to_string();
     if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
         format!(r"\\{rest}")

@@ -30,6 +30,14 @@ export function useStartSwarmTermSession() {
   });
 }
 
+/** The user's yes to running the swarm in a folder (see `consent_required`). */
+export function useTrustSwarmTermProject() {
+  return useMutation({
+    mutationFn: (projectDir: string) =>
+      unwrap(commands.swarmTermTrustProject(projectDir)),
+  });
+}
+
 export function useStopSwarmTermSession() {
   const qc = useQueryClient();
   return useMutation({

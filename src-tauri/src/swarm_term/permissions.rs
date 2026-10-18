@@ -264,11 +264,13 @@ pub(crate) fn describe_for_persona(agent_id: &str) -> String {
 }
 
 /// Quote `args` for the pane command string (`sidecar::terminal`'s
-/// POSIX-style tokenizer). Rules contain spaces / parentheses but never
-/// `"` or `\`.
+/// POSIX-style tokenizer): each in double quotes, with `\` and `"`
+/// escaped — the tokenizer reads `\\` and `\"` inside double quotes as
+/// one literal character, so a Windows path (`\\?\C:\…`, a trailing
+/// `\`) arrives intact. Rules contain neither character.
 pub(crate) fn join_quoted(args: &[String]) -> String {
     args.iter()
-        .map(|a| format!("\"{a}\""))
+        .map(|a| format!("\"{}\"", a.replace('\\', "\\\\").replace('"', "\\\"")))
         .collect::<Vec<_>>()
         .join(" ")
 }
@@ -322,6 +324,19 @@ mod tests {
         let joined = join_quoted(&args);
         assert!(joined.contains("\"Read(./**)\""));
         assert!(!args.iter().any(|a| a.contains('"') || a.contains('\\')));
+    }
+
+    #[test]
+    fn quoting_keeps_windows_paths_and_quotes_intact() {
+        let args = vec![
+            r"C:\Users\x\AppData\Roaming\app\sessions\s\scout.persona.md".to_string(),
+            r"\\?\C:\dir\".to_string(),
+            r#"say "hi""#.to_string(),
+        ];
+        assert_eq!(
+            join_quoted(&args),
+            r#""C:\\Users\\x\\AppData\\Roaming\\app\\sessions\\s\\scout.persona.md" "\\\\?\\C:\\dir\\" "say \"hi\"""#
+        );
     }
 
     #[test]

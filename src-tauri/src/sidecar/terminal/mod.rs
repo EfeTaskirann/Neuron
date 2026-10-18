@@ -284,12 +284,10 @@ impl TerminalRegistry {
             }
         }
         // Apply caller-supplied env overrides AFTER the scrub list,
-        // so `extra_env` can re-set anything we just removed AND can
-        // point the spawned process at a private HOME / USERPROFILE.
-        // Used by `swarm-term::session` to give each claude REPL its
-        // own `~/.claude.json` (preventing the 9-way concurrent-write
-        // race that progressively truncated the user's shared config
-        // in the 2026-05-12 23:46Z smoke).
+        // so `extra_env` can re-set anything we just removed. Used by
+        // `swarm-term::session` for its pane settings (auto-update and
+        // auto-memory off, the bridge paths — see
+        // `swarm_term::pane_config::pane_env`).
         if let Some(extra) = &opts.extra_env {
             for (k, v) in extra {
                 builder.env(k, v);

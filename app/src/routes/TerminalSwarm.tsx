@@ -1,4 +1,5 @@
 import { useMemo, useRef, useState } from 'react';
+import { ask } from '@tauri-apps/plugin-dialog';
 import { HierarchyDiagram } from '../components/SwarmHierarchy';
 import { ClaudeUpdateCorner } from '../components/swarm-term/ClaudeUpdateCorner';
 import { OrchestratorChatBar } from '../components/swarm-term/OrchestratorChatBar';
@@ -13,15 +14,38 @@ import {
   useStopSwarmTermSession,
   useSwarmTermPersonas,
   useSwarmTermSessionStatus,
+  useTrustSwarmTermProject,
 } from '../hooks/useTerminalSwarmSession';
 import { useClaudeUpdateProgress } from '../hooks/useClaudeUpdateProgress';
 import { useRoutingEvents } from '../hooks/useRoutingEvents';
 import { useActiveEdge, useAgentLifecycle } from '../hooks/useAgentLifecycle';
-import { describeError } from '../lib/unwrap';
+import { AppErrorClient, describeError } from '../lib/unwrap';
 import { RoutingLogRoute } from './RoutingLogRoute';
 
 /** Gap between the pasted chat message and its submitting CR. */
 const SUBMIT_DELAY_MS = 200;
+
+/**
+ * Asked once per folder, before the first launch there (the backend
+ * answers `consent_required`). A yes is recorded; the session then
+ * answers Claude Code's own "do you trust this folder?" for the panes.
+ */
+function askToTrustFolder(folder: string): Promise<boolean> {
+  return ask(
+    `Swarm şu klasörde çalışacak:\n${folder}\n\n` +
+      '9 ajan buradaki dosyaları okur, builder’lar değiştirir. Testleri ve build’i ' +
+      'çalıştırmak projenin kendi kodunu senin yetkilerinle çalıştırır. Yalnız güvendiğin ' +
+      'bir projede devam et.\n\n' +
+      'Onaylarsan Claude Code’un bu klasör için sorduğu “güveniyor musun?” ' +
+      'sorusu ajanlar için senin adına “evet” diye yanıtlanır.',
+    {
+      title: 'Bu klasöre güveniyor musun?',
+      kind: 'warning',
+      okLabel: 'Güveniyorum, başlat',
+      cancelLabel: 'Vazgeç',
+    },
+  );
+}
 
 /**
  * Make chat text safe inside a bracketed paste (mirrors the backend's
@@ -64,6 +88,7 @@ export function TerminalSwarmRoute(): JSX.Element {
     error: sessionProbeError,
   } = useSwarmTermSessionStatus();
   const startMut = useStartSwarmTermSession();
+  const trustMut = useTrustSwarmTermProject();
   const stopMut = useStopSwarmTermSession();
   const updateMut = useRunClaudeUpdate();
   const updateProgress = useClaudeUpdateProgress(updateMut.isPending);
@@ -74,13 +99,30 @@ export function TerminalSwarmRoute(): JSX.Element {
   // yet know whether a session exists — launching then would only
   // bounce off the backend's Conflict guard.
   const canLaunch =
-    projectDir != null && !sessionActive && !sessionLoading && !startMut.isPending;
+    projectDir != null &&
+    !sessionActive &&
+    !sessionLoading &&
+    !startMut.isPending &&
+    !trustMut.isPending;
+
+  // Start, asking first if the user has not trusted the folder yet. A
+  // "no" is not an error: nothing starts and nothing is reported.
+  const startWithConsent = async (dir: string) => {
+    try {
+      await startMut.mutateAsync(dir);
+    } catch (err) {
+      if (!(err instanceof AppErrorClient) || err.kind !== 'consent_required') throw err;
+      if (!(await askToTrustFolder(err.detail || dir))) return;
+      await trustMut.mutateAsync(dir);
+      await startMut.mutateAsync(dir);
+    }
+  };
 
   const launch = async () => {
     if (!projectDir) return;
     setLaunchError(null);
     try {
-      await startMut.mutateAsync(projectDir);
+      await startWithConsent(projectDir);
     } catch (err) {
       setLaunchError(describeError(err));
     }
@@ -100,7 +142,7 @@ export function TerminalSwarmRoute(): JSX.Element {
     setLaunchError(null);
     try {
       await stopMut.mutateAsync();
-      await startMut.mutateAsync(dir);
+      await startWithConsent(dir);
     } catch (err) {
       setLaunchError(describeError(err));
     }

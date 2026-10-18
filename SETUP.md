@@ -218,6 +218,19 @@ Neuron/
    Yeni şema değişiklikleri için **yeni** numaralı bir migration ekle,
    uygulanmış bir migration'ı asla düzenleme.
 
+6. **Terminal Swarm ortak Claude config'iyle çalışır (2026-10-18)**:
+   9 pane senin kendi `claude` girişini ve `~/.claude` config'ini
+   paylaşır; Neuron hiçbir token dosyasını kopyalamaz ya da yazmaz.
+   Kişisel ayarların (kullanıcı ve proje-yerel `settings*.json`,
+   hook'lar, eklentiler, `tui`), MCP sunucuların ve otomatik hafıza
+   pane'lere geçmez (`--setting-sources project`,
+   `--strict-mcp-config`); projenin commit'li ayarları ve `CLAUDE.md`
+   geçer. Bir klasörde ilk başlatmada Neuron güven onayı sorar; "evet"
+   sonrası Claude Code'un "bu klasöre güveniyor musun?" ekranı ajanlar
+   için senin adına yanıtlanır. Pane'lere giden mesajlar (kickoff,
+   yönlendirilen mesajlar) o projedeki `claude` prompt geçmişinde
+   (yukarı ok) görünür; transcript'leri oturum kapanınca silinir.
+
 ---
 
 ## 9. Mevcut durum (2026-05-07 itibarıyla)

@@ -97,6 +97,7 @@ pub fn specta_builder_for_export() -> tauri_specta::Builder<tauri::Wry> {
             commands::swarm_term::swarm_term_list_personas::<tauri::Wry>,
             commands::swarm_term::swarm_term_session_status::<tauri::Wry>,
             commands::swarm_term::swarm_term_start_session::<tauri::Wry>,
+            commands::swarm_term::swarm_term_trust_project::<tauri::Wry>,
             commands::swarm_term::swarm_term_stop_session::<tauri::Wry>,
             commands::swarm_term::swarm_term_run_update::<tauri::Wry>,
         ])

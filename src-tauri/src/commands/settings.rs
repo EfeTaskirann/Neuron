@@ -41,6 +41,23 @@ pub async fn read(pool: &DbPool, key: &str) -> Result<Option<String>, AppError> 
     Ok(row)
 }
 
+/// Internal upsert, the write-side counterpart of [`read`] (same
+/// rules as `settings_set`, minus the `tauri::State`).
+pub async fn write(pool: &DbPool, key: &str, value: &str) -> Result<(), AppError> {
+    sqlx::query(
+        "INSERT INTO settings (key, value, updated_at) \
+         VALUES (?, ?, CAST(strftime('%s','now') AS INTEGER)) \
+         ON CONFLICT(key) DO UPDATE SET \
+            value = excluded.value, \
+            updated_at = CAST(strftime('%s','now') AS INTEGER)",
+    )
+    .bind(key)
+    .bind(value)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 #[tauri::command(rename_all = "camelCase")]
 #[specta::specta]
 pub async fn settings_get(
@@ -68,18 +85,7 @@ pub async fn settings_set(
             "value must not be empty (use settings:delete to clear)".into(),
         ));
     }
-    sqlx::query(
-        "INSERT INTO settings (key, value, updated_at) \
-         VALUES (?, ?, CAST(strftime('%s','now') AS INTEGER)) \
-         ON CONFLICT(key) DO UPDATE SET \
-            value = excluded.value, \
-            updated_at = CAST(strftime('%s','now') AS INTEGER)",
-    )
-    .bind(&key)
-    .bind(&value)
-    .execute(pool.inner())
-    .await?;
-    Ok(())
+    write(pool.inner(), &key, &value).await
 }
 
 #[tauri::command(rename_all = "camelCase")]

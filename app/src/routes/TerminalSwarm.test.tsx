@@ -11,6 +11,7 @@ vi.mock('../lib/bindings', () => ({
     swarmTermListPersonas: vi.fn(),
     swarmTermSessionStatus: vi.fn(),
     swarmTermStartSession: vi.fn(),
+    swarmTermTrustProject: vi.fn(),
     swarmTermStopSession: vi.fn(),
     swarmTermRunUpdate: vi.fn(),
     terminalLines: vi.fn(),
@@ -21,6 +22,10 @@ vi.mock('../lib/bindings', () => ({
 
 vi.mock('@tauri-apps/api/event', () => ({
   listen: () => Promise.resolve(() => {}),
+}));
+
+vi.mock('@tauri-apps/plugin-dialog', () => ({
+  ask: vi.fn(),
 }));
 
 // xterm can't host in jsdom — same stub shape as App.test.tsx.
@@ -243,6 +248,53 @@ describe('TerminalSwarmRoute', () => {
     fireEvent.click(launch);
     const alert = await screen.findByRole('alert');
     expect(alert).toHaveTextContent('Girilen değer geçersiz. `C:\\` bir sürücü kökü.');
+  });
+
+  it('asks to trust a new folder once, records the yes and launches', async () => {
+    const { commands } = await import('../lib/bindings');
+    const { ask } = await import('@tauri-apps/plugin-dialog');
+    vi.mocked(commands.swarmTermStartSession)
+      .mockResolvedValueOnce({
+        status: 'error',
+        error: { kind: 'consent_required', message: 'C:\\test-project' },
+      })
+      .mockResolvedValueOnce({ status: 'ok', data: SESSION });
+    vi.mocked(commands.swarmTermTrustProject).mockResolvedValue({ status: 'ok', data: null });
+    vi.mocked(ask).mockResolvedValue(true);
+    renderRoute();
+    const launch = await screen.findByRole('button', { name: /launch swarm/i });
+    await waitFor(() => expect(launch).toBeEnabled());
+    fireEvent.click(launch);
+    await waitFor(() => expect(commands.swarmTermStartSession).toHaveBeenCalledTimes(2));
+    expect(ask).toHaveBeenCalledTimes(1);
+    const [message, options] = vi.mocked(ask).mock.calls[0];
+    expect(message).toContain('C:\\test-project');
+    expect(message).toContain('senin yetkilerinle');
+    expect(options).toMatchObject({ title: 'Bu klasöre güveniyor musun?', kind: 'warning' });
+    expect(commands.swarmTermTrustProject).toHaveBeenCalledWith('C:\\test-project');
+    expect(vi.mocked(commands.swarmTermTrustProject).mock.invocationCallOrder[0]).toBeLessThan(
+      vi.mocked(commands.swarmTermStartSession).mock.invocationCallOrder[1],
+    );
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
+
+  it('a no to the trust question starts nothing and reports nothing', async () => {
+    const { commands } = await import('../lib/bindings');
+    const { ask } = await import('@tauri-apps/plugin-dialog');
+    vi.mocked(commands.swarmTermStartSession).mockResolvedValue({
+      status: 'error',
+      error: { kind: 'consent_required', message: 'C:\\test-project' },
+    });
+    vi.mocked(ask).mockResolvedValue(false);
+    renderRoute();
+    const launch = await screen.findByRole('button', { name: /launch swarm/i });
+    await waitFor(() => expect(launch).toBeEnabled());
+    fireEvent.click(launch);
+    await waitFor(() => expect(ask).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(launch).toBeEnabled());
+    expect(commands.swarmTermStartSession).toHaveBeenCalledTimes(1);
+    expect(commands.swarmTermTrustProject).not.toHaveBeenCalled();
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
   });
 
   it('describeError keeps the backend detail and handles plain errors', async () => {

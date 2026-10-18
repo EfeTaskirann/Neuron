@@ -423,6 +423,13 @@ export const commands = {
 	permissionMode: SwarmTermPermissionMode,
 } | null, AppErrorWire>(__TAURI_INVOKE("swarm_term_session_status")),
 	swarmTermStartSession: (projectDir: string) => typedError<TerminalSwarmSessionHandle, AppErrorWire>(__TAURI_INVOKE("swarm_term_start_session", { projectDir })),
+	/**
+	 *  Record the user's trust in `project_dir` — their "yes" in the dialog
+	 *  the UI shows when `swarm_term_start_session` answers
+	 *  `consent_required`. Only a folder the swarm may run in at all can be
+	 *  trusted (the same checks as the start).
+	 */
+	swarmTermTrustProject: (projectDir: string) => typedError<null, AppErrorWire>(__TAURI_INVOKE("swarm_term_trust_project", { projectDir })),
 	swarmTermStopSession: () => typedError<null, AppErrorWire>(__TAURI_INVOKE("swarm_term_stop_session")),
 	/**
 	 *  Update the host's `claude` CLI to the latest version. Rejects while a

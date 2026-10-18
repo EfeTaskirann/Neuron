@@ -2,8 +2,9 @@
 //!
 //! Commands: `swarm_term_list_personas` (bundled persona metadata),
 //! `swarm_term_session_status`, `swarm_term_start_session`,
-//! `swarm_term_stop_session`, and `swarm_term_run_update` (update the
-//! host `claude` CLI). Inter-agent routing is event-driven via the
+//! `swarm_term_trust_project` (the user's yes to running the swarm in a
+//! folder), `swarm_term_stop_session`, and `swarm_term_run_update`
+//! (update the host `claude` CLI). Inter-agent routing is event-driven via the
 //! file-IPC bridge (`swarm_term::bridge`), emitted as `swarm-term:route`
 //! / `swarm-term:lifecycle` events — not a command.
 
@@ -82,6 +83,33 @@ pub async fn swarm_term_start_session<R: Runtime>(
         .clone();
     let path = std::path::PathBuf::from(project_dir.trim());
     registry.start(app.clone(), path).await
+}
+
+/// Record the user's trust in `project_dir` — their "yes" in the dialog
+/// the UI shows when `swarm_term_start_session` answers
+/// `consent_required`. Only a folder the swarm may run in at all can be
+/// trusted (the same checks as the start).
+#[tauri::command(rename_all = "camelCase")]
+#[specta::specta]
+pub async fn swarm_term_trust_project<R: Runtime>(
+    app: AppHandle<R>,
+    project_dir: String,
+) -> Result<(), AppError> {
+    let path = std::path::PathBuf::from(project_dir.trim());
+    if path.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+        return Err(AppError::InvalidInput(
+            "project_dir must not contain '..' path segments".into(),
+        ));
+    }
+    if !path.is_dir() {
+        return Err(AppError::InvalidInput(format!(
+            "project_dir {} does not exist or is not a directory",
+            path.display()
+        )));
+    }
+    crate::swarm_term::project_guard::check(&app, &path)?;
+    let pool = app.state::<crate::db::DbPool>().inner().clone();
+    crate::swarm_term::trust::trust(&pool, &path).await
 }
 
 #[tauri::command]
