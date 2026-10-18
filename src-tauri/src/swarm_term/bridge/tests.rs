@@ -468,7 +468,8 @@ fn success_and_idle_panes_are_valid_delivery_targets() {
     assert!(!is_delivery_blocked(Some("running")));
     assert!(!is_delivery_blocked(Some("starting")));
     assert!(!is_delivery_blocked(None));
-    // swarm-term panes run bypassPermissions: `awaiting_approval` can
+    // swarm-term panes run dontAsk (bypassPermissions when opted out)
+    // and never show a real approval prompt: `awaiting_approval` can
     // only be a regex false positive that never clears, so it must not
     // freeze the inbox.
     assert!(!is_delivery_blocked(Some("awaiting_approval")));

@@ -18,17 +18,31 @@
 //!     outbox; builders may write inside the project.
 //!   * `Bash(<prefix>:*)` — only the listed verification commands;
 //!     nobody gets an unrestricted shell. (claude still auto-allows its
-//!     own read-only commands such as `echo`, scoped to the project.)
+//!     own read-only commands such as `git status`, scoped to the
+//!     project — so the roles without a shell deny the tool outright.)
+//!
+//! A deny list ([`denied_tools`], `--disallowedTools`) wins over every
+//! allow rule, including ones from settings files: nobody writes
+//! `.git` / `.claude` / editor config, the bridge's bookkeeping or
+//! another agent's outbox, nobody uses the web tools, and the git
+//! options that write or read outside the project are refused. Live
+//! probes against claude 2.1.296 (`permissions/live_tests.rs`) found
+//! `git diff --output=../x` writing outside the project and a builder
+//! forging a message in `outbox/coordinator/` before these rules.
 //!
 //! Residual risk, by design: running a project's tests / build executes
-//! that project's code, and an agent can still write into another
-//! agent's outbox inside `.bridgespace` (builders) — see the bridge's
-//! trust model. Setting [`PERMISSIONS_ENV`]`=bypass` restores the old
-//! unrestricted mode for every pane (logged as a warning and reported
-//! to the UI through [`SwarmTermPermissionMode`]).
+//! that project's code — see the bridge's trust model. Setting
+//! [`PERMISSIONS_ENV`]`=bypass` restores the old unrestricted mode for
+//! every pane (logged as a warning and reported to the UI through
+//! [`SwarmTermPermissionMode`]).
 
 use serde::{Deserialize, Serialize};
 use specta::Type;
+
+use super::hierarchy::AGENT_IDS;
+
+#[cfg(test)]
+mod live_tests;
 
 /// Opt-out: `NEURON_TERM_PERMISSIONS=bypass` → every pane runs with
 /// `bypassPermissions` again.
@@ -114,6 +128,29 @@ const VERIFY_COMMANDS: &[&str] = &[
     "git show",
 ];
 
+/// Project directories no pane may write, whatever its role: `.git` (a
+/// planted `config` — `core.fsmonitor`, `diff.external` — or hook runs
+/// on the next `git status` / commit, as the user), `.claude` (settings
+/// and commands a later Claude session runs), `.vscode` / `.idea`
+/// (editor tasks and run configurations). claude 2.1.296 already
+/// refuses these writes on its own; the rules keep that true across
+/// claude versions.
+const PROTECTED_DIRS: &[&str] = &[".git", ".claude", ".vscode", ".idea"];
+
+/// Options that turn an allowed read-only git command into a write or a
+/// read outside the project: `--output` writes the result to any path,
+/// `--no-index` diffs arbitrary files, `--ext-diff` runs the configured
+/// external diff program.
+const GIT_ESCAPES: &[(&str, &str)] = &[
+    ("git diff", "--output"),
+    ("git log", "--output"),
+    ("git show", "--output"),
+    ("git diff", "--no-index"),
+    ("git diff", "--ext-diff"),
+    ("git log", "--ext-diff"),
+    ("git show", "--ext-diff"),
+];
+
 /// The `claude` CLI arguments that set `agent_id`'s permissions under
 /// `mode`, for a session whose bridge root is `.bridgespace/<session_id>/`
 /// under the pane's working directory (the project).
@@ -127,7 +164,42 @@ pub(crate) fn claude_permission_args(
     }
     let mut args = vec!["--permission-mode".into(), "dontAsk".into(), "--allowedTools".into()];
     args.extend(allowed_tools(agent_id, session_id));
+    args.push("--disallowedTools".into());
+    args.extend(denied_tools(agent_id, session_id));
     args
+}
+
+/// Pure: the deny list for one agent. A deny rule beats every allow rule
+/// (claude's own and any settings file's), so these hold even where an
+/// allow rule such as a builder's `Edit(./**)` covers the path.
+pub(crate) fn denied_tools(agent_id: &str, session_id: &str) -> Vec<String> {
+    let mut rules: Vec<String> = PROTECTED_DIRS
+        .iter()
+        .map(|dir| format!("Edit(./{dir}/**)"))
+        .collect();
+    // The bridge's own bookkeeping, and every OTHER agent's outbox: a
+    // file there is delivered as that agent's message (the sender is the
+    // directory), so writing one forges a message.
+    rules.push("Edit(./.bridgespace/.gitignore)".into());
+    rules.push("Edit(./.bridgespace/_archive/**)".into());
+    rules.push(format!("Edit(./.bridgespace/{session_id}/processed/**)"));
+    rules.push(format!("Edit(./.bridgespace/{session_id}/rejected/**)"));
+    for other in AGENT_IDS.iter().filter(|other| **other != agent_id) {
+        rules.push(format!("Edit(./.bridgespace/{session_id}/outbox/{other}/**)"));
+    }
+    // No pane talks to the network.
+    rules.push("WebFetch".into());
+    rules.push("WebSearch".into());
+    if role_of(agent_id) == Role::Coordinate {
+        rules.push("Bash".into());
+        rules.push("PowerShell".into());
+    } else {
+        for (cmd, opt) in GIT_ESCAPES {
+            rules.push(format!("Bash({cmd} *{opt}*)"));
+            rules.push(format!("PowerShell({cmd} *{opt}*)"));
+        }
+    }
+    rules
 }
 
 /// Pure: the allowlist for one agent.
@@ -166,7 +238,11 @@ const NO_CD: &str = "Shell zaten proje kökünde açılır: komutu doğrudan ça
 /// limits up front instead of discovering them through denied calls.
 pub(crate) fn describe_for_persona(agent_id: &str) -> String {
     let base = "Proje dosyalarını OKUYABİLİRSİN (yalnızca proje klasörü içinde; \
-                dışarısı reddedilir). Mesajlarını yalnızca KENDİ outbox'una yazabilirsin.";
+                dışarısı reddedilir). Mesajlarını yalnızca KENDİ outbox'una yazabilirsin; \
+                başka bir ajanın outbox'u, `.git/`, `.claude/`, `.vscode/` ve `.idea/` \
+                reddedilir. Web araçları kapalı.";
+    let git = "`git diff` / `git log` / `git show` içinde `--output`, `--no-index` ve \
+               `--ext-diff` seçenekleri reddedilir.";
     match role_of(agent_id) {
         Role::Coordinate => format!(
             "{base} Proje dosyalarını değiştiremez, shell (`Bash`) komutu ve web \
@@ -174,13 +250,13 @@ pub(crate) fn describe_for_persona(agent_id: &str) -> String {
         ),
         Role::Verify => format!(
             "{base} Proje dosyalarını değiştiremezsin. `Bash` ile yalnızca doğrulama \
-             komutlarını çalıştırabilirsin: {}. {NO_CD}",
+             komutlarını çalıştırabilirsin: {}. {git} {NO_CD}",
             VERIFY_COMMANDS.join(", ")
         ),
         Role::Build => format!(
             "{base} Proje klasörü içindeki dosyaları değiştirebilirsin (dışarısı \
              reddedilir). `Bash` ile yalnızca doğrulama komutlarını çalıştırabilirsin: \
-             {}. {NO_CD} Paket kurmak / başka bir komut gerekiyorsa coordinator'a \
+             {}. {git} {NO_CD} Paket kurmak / başka bir komut gerekiyorsa coordinator'a \
              `hata —` ile bildir.",
             VERIFY_COMMANDS.join(", ")
         ),
@@ -249,6 +325,94 @@ mod tests {
     }
 
     #[test]
+    fn the_deny_list_follows_the_allow_list() {
+        for &agent in AGENT_IDS {
+            let args = claude_permission_args(SwarmTermPermissionMode::Restricted, agent, "s");
+            let deny_at = args.iter().position(|a| a == "--disallowedTools").expect(agent);
+            assert_eq!(args.iter().filter(|a| *a == "--disallowedTools").count(), 1, "{agent}");
+            assert_eq!(&args[3..deny_at], allowed_tools(agent, "s").as_slice(), "{agent}");
+            assert_eq!(&args[deny_at + 1..], denied_tools(agent, "s").as_slice(), "{agent}");
+        }
+    }
+
+    #[test]
+    fn nobody_writes_vcs_or_tool_config_or_the_bridge_bookkeeping() {
+        for &agent in AGENT_IDS {
+            let deny = denied_tools(agent, "swarm-term-01X");
+            for rule in [
+                "Edit(./.git/**)",
+                "Edit(./.claude/**)",
+                "Edit(./.vscode/**)",
+                "Edit(./.idea/**)",
+                "Edit(./.bridgespace/.gitignore)",
+                "Edit(./.bridgespace/_archive/**)",
+                "Edit(./.bridgespace/swarm-term-01X/processed/**)",
+                "Edit(./.bridgespace/swarm-term-01X/rejected/**)",
+                "WebFetch",
+                "WebSearch",
+            ] {
+                assert!(deny.iter().any(|r| r == rule), "{agent} lacks {rule}");
+            }
+        }
+    }
+
+    #[test]
+    fn every_other_outbox_is_denied_and_the_own_one_never() {
+        use std::collections::BTreeSet;
+        for &agent in AGENT_IDS {
+            // The exact set of bridge rules: nothing broader may swallow
+            // the agent's own outbox (deny beats allow, so it would
+            // silence the agent), and every other outbox is covered.
+            let bridge: BTreeSet<String> = denied_tools(agent, "s")
+                .into_iter()
+                .filter(|r| r.contains(".bridgespace"))
+                .collect();
+            let mut expected: BTreeSet<String> =
+                [".gitignore", "_archive/**", "s/processed/**", "s/rejected/**"]
+                    .iter()
+                    .map(|p| format!("Edit(./.bridgespace/{p})"))
+                    .collect();
+            for other in AGENT_IDS.iter().filter(|other| **other != agent) {
+                expected.insert(format!("Edit(./.bridgespace/s/outbox/{other}/**)"));
+            }
+            assert_eq!(bridge, expected, "{agent}");
+        }
+    }
+
+    #[test]
+    fn shell_roles_lose_the_escaping_git_options_coordinators_lose_the_shell() {
+        for &agent in AGENT_IDS {
+            let deny = denied_tools(agent, "s");
+            let has = |r: &str| deny.iter().any(|d| d == r);
+            if role_of(agent) == Role::Coordinate {
+                assert!(has("Bash") && has("PowerShell"), "{agent}");
+            } else {
+                assert!(!has("Bash") && !has("PowerShell"), "{agent}");
+                for rule in [
+                    "Bash(git diff *--output*)",
+                    "Bash(git log *--output*)",
+                    "Bash(git show *--output*)",
+                    "Bash(git diff *--no-index*)",
+                    "Bash(git diff *--ext-diff*)",
+                    "PowerShell(git diff *--output*)",
+                    "PowerShell(git diff *--no-index*)",
+                ] {
+                    assert!(has(rule), "{agent} lacks {rule}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn no_rule_needs_quoting_the_pane_tokenizer_cannot_do() {
+        for &agent in AGENT_IDS {
+            for rule in allowed_tools(agent, "s").iter().chain(denied_tools(agent, "s").iter()) {
+                assert!(!rule.contains('"') && !rule.contains('\\'), "{agent}: {rule}");
+            }
+        }
+    }
+
+    #[test]
     fn bypass_mode_drops_the_allowlist() {
         assert_eq!(
             claude_permission_args(SwarmTermPermissionMode::Bypass, "backend-builder", "s"),
@@ -289,5 +453,12 @@ mod tests {
         // In-project subdirectories stay usable (review finding).
         assert!(tester.contains("`cd <alt-klasör> && <komut>`"));
         assert!(!describe_for_persona("scout").contains("DIŞINA `cd`"));
+        // The deny list is announced, so agents don't learn it by denial.
+        for &agent in AGENT_IDS {
+            let text = describe_for_persona(agent);
+            assert!(text.contains("başka bir ajanın outbox'u"), "{agent}");
+            assert!(text.contains("`.git/`"), "{agent}");
+            assert_eq!(text.contains("`--output`"), role_of(agent) != Role::Coordinate, "{agent}");
+        }
     }
 }
