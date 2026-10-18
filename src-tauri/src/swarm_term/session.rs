@@ -683,6 +683,7 @@ impl TerminalSwarmRegistry {
             projects_dirs: projects_dirs.clone(),
             ready: Arc::clone(&ready_panes),
             alive: Arc::clone(&alive),
+            restarting: Arc::clone(&restarting),
             publish: Arc::clone(&publish),
         };
         let awaited: HashMap<String, Awaited> = panes_by_agent
@@ -915,6 +916,7 @@ impl TerminalSwarmRegistry {
                 lifecycle: Arc::clone(&s.lifecycle),
                 pane_states: Arc::clone(&s.pane_states),
                 ready: Arc::clone(&s.ready_panes),
+                restarting: Arc::clone(&s.restarting),
                 alive: Arc::clone(&s.alive),
             };
             (ctx, restarting)
@@ -922,15 +924,16 @@ impl TerminalSwarmRegistry {
         let registry = app.state::<TerminalRegistry>().inner().clone();
         let pool = app.state::<DbPool>().inner().clone();
 
-        // How far the transcript the new pane resumes has come: its new
-        // `READY` must come after that (the conversation holds the first).
-        let transcript_len = pane_config::find_transcript(&ctx.projects_dirs, &ctx.claude_session)
-            .and_then(|file| std::fs::metadata(file).ok())
-            .map(|m| m.len());
         if let Ok(mut g) = ctx.ready.lock() {
             g.remove(&ctx.old_pane);
         }
         let _ = registry.kill_pane(&ctx.old_pane, &pool).await;
+        // How far the transcript the new pane resumes has come, read AFTER
+        // the old process is gone: anything it wrote on the way out then
+        // counts as the old turn, not as the restarted pane's `READY`.
+        let transcript_len = pane_config::find_transcript(&ctx.projects_dirs, &ctx.claude_session)
+            .and_then(|file| std::fs::metadata(file).ok())
+            .map(|m| m.len());
 
         let persona_file = pane_config::persona_file(&ctx.session_dir, agent_id);
         let session_args = match transcript_len {
@@ -948,15 +951,11 @@ impl TerminalSwarmRegistry {
         );
         let new_pane = match registry.clone().spawn_pane(input, app.clone(), pool.clone()).await {
             Ok(pane) => pane.id,
-            Err(e) => {
-                publish(
-                    agent_id,
-                    &ctx.old_pane,
-                    PaneReadiness::Exited,
-                    Some(format!("Yeniden başlatılamadı: {e}")),
-                );
-                return Err(AppError::Internal(format!("restart agent `{agent_id}`: {e}")));
-            }
+            // The old pane is still the agent's in the map; the session
+            // monitor reports its exit once (with the generic reason),
+            // and the command's Err carries the restart failure to the
+            // UI's error banner — so no second, reason-losing toast here.
+            Err(e) => return Err(AppError::Internal(format!("restart agent `{agent_id}`: {e}"))),
         };
         let swapped = {
             let mut panes = ctx.panes.write().unwrap_or_else(|p| p.into_inner());
@@ -991,6 +990,7 @@ impl TerminalSwarmRegistry {
             projects_dirs: ctx.projects_dirs.clone(),
             ready: Arc::clone(&ctx.ready),
             alive: Arc::clone(&ctx.alive),
+            restarting: Arc::clone(&ctx.restarting),
             publish,
         };
         let awaited = HashMap::from([(
@@ -1101,6 +1101,7 @@ struct RestartCtx {
     lifecycle: Arc<LifecycleStore>,
     pane_states: Arc<PaneStates>,
     ready: Arc<Mutex<HashSet<String>>>,
+    restarting: Arc<Mutex<HashSet<String>>>,
     alive: Arc<AtomicBool>,
 }
 
@@ -1292,12 +1293,18 @@ async fn monitor_session<R: Runtime>(m: SessionMonitor<R>) {
 
         let delivered = count_delivered(&m.bridgespace_root);
         m.delivered.store(delivered, Ordering::SeqCst);
-        let budget = m.budget.load(Ordering::SeqCst);
-        if budget > 0 && delivered >= budget && !m.control.paused_by(PauseReason::Budget) {
+        {
+            // Read the budget and the hold state UNDER the limit lock that
+            // `extend_budget` also takes: otherwise the monitor could read
+            // a stale budget and re-apply the hold the user just cleared,
+            // which nothing would then lift.
             let _holds = m.limit.lock().unwrap_or_else(|p| p.into_inner());
-            hold_deliveries(&m.control, &m.lifecycle, PauseReason::Budget, true);
-            tracing::warn!(delivered, budget, "swarm-term: message budget used up — deliveries held");
-            emit_session_state(&m.app, &m.session_id, "budget");
+            let budget = m.budget.load(Ordering::SeqCst);
+            if budget > 0 && delivered >= budget && !m.control.paused_by(PauseReason::Budget) {
+                hold_deliveries(&m.control, &m.lifecycle, PauseReason::Budget, true);
+                tracing::warn!(delivered, budget, "swarm-term: message budget used up — deliveries held");
+                emit_session_state(&m.app, &m.session_id, "budget");
+            }
         }
 
         let mut signals: Vec<(String, LimitSignal)> = Vec::new();
@@ -1761,6 +1768,11 @@ fn pane_publisher<R: Runtime>(
 /// Detail for a pane whose claude process ended.
 const PANE_EXITED: &str = "Pane'in claude süreci kapandı.";
 
+/// Detail for a pane stuck on claude's folder-trust screen that the
+/// session's auto-answer could not clear.
+const TRUST_UNANSWERED: &str =
+    "Claude'un güven ekranı otomatik yanıtlanamadı: pane'e tıklayıp \"Yes, I trust this folder\" seç.";
+
 /// How often the panes that gave no answer in time are re-checked.
 const LATE_ANSWER_POLL: Duration = Duration::from_secs(5);
 
@@ -1776,6 +1788,10 @@ struct ReadyWait {
     projects_dirs: Vec<PathBuf>,
     ready: Arc<Mutex<HashSet<String>>>,
     alive: Arc<AtomicBool>,
+    /// Agents whose pane is being replaced right now (see
+    /// [`TerminalSwarmRegistry::restart_agent`]): a wait on the old pane
+    /// must not report it Exited in that window.
+    restarting: Arc<Mutex<HashSet<String>>>,
     publish: Publisher,
 }
 
@@ -1784,6 +1800,10 @@ impl ReadyWait {
     fn is_current(&self, agent: &str, pane: &str) -> bool {
         self.panes.read().unwrap_or_else(|p| p.into_inner()).get(agent).map(String::as_str)
             == Some(pane)
+    }
+
+    fn is_restarting(&self, agent: &str) -> bool {
+        self.restarting.lock().map(|g| g.contains(agent)).unwrap_or(false)
     }
 }
 
@@ -1869,6 +1889,11 @@ async fn wait_for_ready_answers(
             let pane = awaited[agent].pane.as_str();
             // The registry drops a pane once its process has ended.
             if check_screens && w.registry.pane_status(pane).await.is_none() {
+                // A restart kills the old pane on purpose: leave it to the
+                // swap (then `is_current` drops it), don't report Exited.
+                if w.is_restarting(agent) {
+                    continue;
+                }
                 (w.publish)(agent, pane, PaneReadiness::Exited, Some(PANE_EXITED.into()));
                 exited.push(agent);
                 continue;
@@ -1898,6 +1923,10 @@ async fn wait_for_ready_answers(
                             if tries < TRUST_ANSWER_ATTEMPTS && last.elapsed() >= TRUST_ANSWER_EVERY {
                                 press_trust_keys(&w.registry, agent, pane, keys).await;
                                 trust_answers.insert(agent.to_string(), (tries + 1, Instant::now()));
+                            } else if tries >= TRUST_ANSWER_ATTEMPTS {
+                                // The auto-answer didn't clear it: say so, instead
+                                // of sitting on "starting" until the 30-min give-up.
+                                (w.publish)(agent, pane, PaneReadiness::Blocked, Some(TRUST_UNANSWERED.into()));
                             }
                             continue;
                         }
@@ -1963,6 +1992,10 @@ async fn wait_for_ready_answers(
                  (messages to it are returned to the sender; a late answer still counts)"
             );
         }
+        // Keep the already-late panes polled WHILE others are still
+        // pending: one pane stuck on a screen must not hold a late READY
+        // from another unseen for up to BLOCKED_SCREEN_WAIT.
+        late = check_late_once(w, awaited, late).await;
         if pending.is_empty() {
             return late;
         }
@@ -1980,32 +2013,51 @@ async fn watch_late_answers(w: &ReadyWait, awaited: &HashMap<String, Awaited>, m
         if !w.alive.load(Ordering::SeqCst) {
             return;
         }
-        let mut still: Vec<String> = Vec::new();
-        for agent in late {
-            let Some(Awaited { pane, from_byte }) = awaited.get(&agent) else {
-                continue;
-            };
-            // Restarted meanwhile: the new pane's wait has it.
-            if !w.is_current(&agent, pane) {
-                continue;
+        late = check_late_once(w, awaited, late).await;
+    }
+}
+
+/// One pass over the panes that missed their kickoff deadline: a late
+/// `READY` makes a still-live pane a delivery target; a pane that has
+/// since exited is dropped (the session monitor reports the exit — a
+/// late answer must not resurrect it). An agent being restarted, or
+/// whose pane was replaced, is kept for its new pane's wait. Returns the
+/// ones still waiting.
+async fn check_late_once(
+    w: &ReadyWait,
+    awaited: &HashMap<String, Awaited>,
+    late: Vec<String>,
+) -> Vec<String> {
+    let mut still: Vec<String> = Vec::new();
+    for agent in late {
+        let Some(Awaited { pane, from_byte }) = awaited.get(&agent) else {
+            continue;
+        };
+        // Restarted meanwhile: the new pane's wait has it.
+        if !w.is_current(&agent, pane) {
+            continue;
+        }
+        let answered = w.claude_sessions.get(&agent).is_some_and(|id| {
+            kickoff_answer(&w.projects_dirs, id, &agent, *from_byte).is_some()
+        });
+        let alive = w.registry.pane_status(pane).await.is_some();
+        if answered && alive {
+            if let Ok(mut g) = w.ready.lock() {
+                g.insert(pane.clone());
             }
-            let answered = w.claude_sessions.get(&agent).is_some_and(|id| {
-                kickoff_answer(&w.projects_dirs, id, &agent, *from_byte).is_some()
-            });
-            if answered {
-                if let Ok(mut g) = w.ready.lock() {
-                    g.insert(pane.clone());
-                }
-                (w.publish)(&agent, pane, PaneReadiness::Ready, None);
-                tracing::info!(agent_id = %agent, "swarm-term: pane answered the kickoff late — ready");
-            } else if w.registry.pane_status(pane).await.is_none() {
-                (w.publish)(&agent, pane, PaneReadiness::Exited, Some(PANE_EXITED.into()));
-            } else {
+            (w.publish)(&agent, pane, PaneReadiness::Ready, None);
+            tracing::info!(agent_id = %agent, "swarm-term: pane answered the kickoff late — ready");
+        } else if !alive {
+            // A restart kills the old pane on purpose — keep watching for
+            // the new one; otherwise the exit is the monitor's to report.
+            if w.is_restarting(&agent) {
                 still.push(agent);
             }
+        } else {
+            still.push(agent);
         }
-        late = still;
     }
+    still
 }
 
 /// Pure: what a blocking (non-trust) screen asks of the user, for the UI.
