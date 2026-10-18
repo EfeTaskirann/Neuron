@@ -8,7 +8,6 @@ import { parseSwarmTermStartMs } from '../components/swarm-term/constants';
 import { useActiveProject } from '../hooks/useActiveProject';
 import { useTerminalWrite } from '../hooks/mutations';
 import {
-  useAutonomousMode,
   useRunClaudeUpdate,
   useStartSwarmTermSession,
   useStopSwarmTermSession,
@@ -51,9 +50,6 @@ export function TerminalSwarmRoute(): JSX.Element {
   const { project } = useActiveProject();
   const projectDir = project?.path ?? null;
   const [launchError, setLaunchError] = useState<string | null>(null);
-  // Lifted out of <OrchestratorChatBar> (which is session-gated) so the
-  // localStorage/body-attr mirror stays live for the whole route.
-  const [autonomous, setAutonomous] = useAutonomousMode();
   const { events: routeEvents } = useRoutingEvents(500);
   const activeEdge = useActiveEdge(routeEvents, 3_000);
   const lifecycle = useAgentLifecycle(routeEvents);
@@ -187,8 +183,7 @@ export function TerminalSwarmRoute(): JSX.Element {
       {sessionActive && orchestratorPaneId && (
         <OrchestratorChatBar
           onSend={sendToOrchestrator}
-          autonomous={autonomous}
-          setAutonomous={setAutonomous}
+          permissionMode={session.permissionMode}
         />
       )}
 

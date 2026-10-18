@@ -38,4 +38,5 @@ pub(crate) mod permissions;
 pub mod persona;
 pub mod session;
 
+pub use permissions::SwarmTermPermissionMode;
 pub use session::{TerminalSwarmRegistry, TerminalSwarmSessionHandle};

@@ -45,7 +45,7 @@ use crate::swarm_term::home_isolation::{
     sweep_orphan_homes, sync_credentials,
 };
 use crate::swarm_term::lifecycle::LifecycleStore;
-use crate::swarm_term::permissions;
+use crate::swarm_term::permissions::{self, SwarmTermPermissionMode};
 use crate::swarm_term::persona::{
     build_kickoff_message, build_persona_prompt, is_ready_answer,
 };
@@ -123,6 +123,8 @@ pub struct TerminalSwarmSessionHandle {
     pub session_id: String,
     pub project_dir: String,
     pub panes: Vec<TerminalSwarmPane>,
+    /// What the panes may do — the mode they were spawned with.
+    pub permission_mode: SwarmTermPermissionMode,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
@@ -162,6 +164,8 @@ pub(crate) struct ActiveSession {
     pub session_id: String,
     pub project_dir: PathBuf,
     pub panes_by_agent: HashMap<String, String>,
+    /// Permission mode every pane of this session was spawned with.
+    pub permission_mode: SwarmTermPermissionMode,
     /// Bridge watcher handle. Holding it keeps the watcher task alive;
     /// `bridge::uninstall` in `stop()` cancels the task. Optional only
     /// to keep the construction order flexible — once the session is
@@ -276,7 +280,10 @@ impl TerminalSwarmRegistry {
             cmd = %cmd,
             "swarm-term: spawning 9 claude REPLs"
         );
-        if permissions::bypass_active() {
+        // Read once: the same mode drives every pane's flags and is
+        // what the session reports to the UI.
+        let permission_mode = permissions::current_mode();
+        if permission_mode == SwarmTermPermissionMode::Bypass {
             tracing::warn!(
                 "swarm-term: {}=bypass — all panes run with bypassPermissions \
                  (unrestricted shell + file access)",
@@ -426,6 +433,7 @@ impl TerminalSwarmRegistry {
             let agent_cmd = format!(
                 "{cmd} {} --append-system-prompt-file \"{}\"",
                 permissions::join_quoted(&permissions::claude_permission_args(
+                    permission_mode,
                     agent_id,
                     &session_id,
                 )),
@@ -535,6 +543,7 @@ impl TerminalSwarmRegistry {
             session_id,
             project_dir: project_dir.clone(),
             panes_by_agent: panes_by_agent.clone(),
+            permission_mode,
             bridge: Some(bridge_handle),
             bridgespace_root: Some(bridgespace_root.clone()),
             homes_root: Some(homes_root.clone()),
@@ -1070,6 +1079,7 @@ fn handle_from(s: &ActiveSession) -> TerminalSwarmSessionHandle {
         session_id: s.session_id.clone(),
         project_dir: s.project_dir.display().to_string(),
         panes,
+        permission_mode: s.permission_mode,
     }
 }
 

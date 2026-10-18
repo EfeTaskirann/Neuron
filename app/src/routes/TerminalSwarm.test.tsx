@@ -82,6 +82,7 @@ const SESSION: TerminalSwarmSessionHandle = {
     { agentId: 'orchestrator', paneId: 'p-orch' },
     { agentId: 'coordinator', paneId: 'p-coord' },
   ],
+  permissionMode: 'restricted',
 };
 
 beforeEach(async () => {
@@ -136,6 +137,40 @@ describe('TerminalSwarmRoute', () => {
     expect(
       screen.getAllByText(/idle — pick a project and launch/i),
     ).toHaveLength(7);
+  });
+
+  it('states the restricted permission mode instead of offering a fake autonomy switch', async () => {
+    const { commands } = await import('../lib/bindings');
+    vi.mocked(commands.swarmTermSessionStatus).mockResolvedValue({
+      status: 'ok',
+      data: SESSION,
+    });
+    renderRoute();
+    const chip = await screen.findByText(/no approval prompts · role allowlists/i);
+    expect(chip).toHaveAttribute(
+      'title',
+      expect.stringMatching(/builders can edit files inside this project/i),
+    );
+    // The old toggle changed nothing in the backend — it must stay gone.
+    expect(screen.queryByRole('checkbox')).not.toBeInTheDocument();
+    expect(screen.queryByText(/run autonomously/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/permissions bypassed/i)).not.toBeInTheDocument();
+  });
+
+  it('flags a bypass-mode session as unrestricted', async () => {
+    const { commands } = await import('../lib/bindings');
+    vi.mocked(commands.swarmTermSessionStatus).mockResolvedValue({
+      status: 'ok',
+      data: { ...SESSION, permissionMode: 'bypass' },
+    });
+    renderRoute();
+    const chip = await screen.findByText(/permissions bypassed · unrestricted/i);
+    expect(chip).toHaveClass('swarm-term-perm-chip--bypass');
+    expect(chip).toHaveAttribute(
+      'title',
+      expect.stringMatching(/NEURON_TERM_PERMISSIONS=bypass/),
+    );
+    expect(screen.queryByText(/no approval prompts/i)).not.toBeInTheDocument();
   });
 
   it('sends a chat message as a bracketed paste followed by a separate CR', async () => {

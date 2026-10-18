@@ -418,6 +418,8 @@ export const commands = {
 	sessionId: string,
 	projectDir: string,
 	panes: TerminalSwarmPane[],
+	// What the panes may do — the mode they were spawned with.
+	permissionMode: SwarmTermPermissionMode,
 } | null, AppErrorWire>(__TAURI_INVOKE("swarm_term_session_status")),
 	swarmTermStartSession: (projectDir: string) => typedError<TerminalSwarmSessionHandle, AppErrorWire>(__TAURI_INVOKE("swarm_term_start_session", { projectDir })),
 	swarmTermStopSession: () => typedError<null, AppErrorWire>(__TAURI_INVOKE("swarm_term_stop_session")),
@@ -1600,6 +1602,20 @@ export type SwarmJobEvent =
  */
 { kind: "decision_made"; job_id: string; decision: CoordinatorDecision };
 
+/**
+ *  The permission mode a session's panes were spawned with. Captured
+ *  once at session start, so what the UI reports is exactly what the
+ *  panes run with.
+ */
+export type SwarmTermPermissionMode = 
+// `dontAsk` + the per-role allowlist ([`allowed_tools`]).
+"restricted" | 
+/**
+ *  [`PERMISSIONS_ENV`]`=bypass`: every pane runs with
+ *  `bypassPermissions` (unrestricted shell + file access).
+ */
+"bypass";
+
 export type SwarmTermPersona = {
 	id: string,
 	role: string,
@@ -1616,6 +1632,8 @@ export type TerminalSwarmSessionHandle = {
 	sessionId: string,
 	projectDir: string,
 	panes: TerminalSwarmPane[],
+	// What the panes may do — the mode they were spawned with.
+	permissionMode: SwarmTermPermissionMode,
 };
 
 /**
