@@ -90,6 +90,17 @@ pub(crate) fn claude_args(claude_session: &str, persona_file: &Path) -> Vec<Stri
     ]
 }
 
+/// [`claude_args`] for a restarted pane: the same flags, but `--resume`
+/// instead of `--session-id` — the agent's conversation goes on in the
+/// same transcript.
+pub(crate) fn claude_resume_args(claude_session: &str, persona_file: &Path) -> Vec<String> {
+    let mut args = claude_args(claude_session, persona_file);
+    if let Some(flag) = args.iter_mut().find(|a| *a == "--session-id") {
+        *flag = "--resume".into();
+    }
+    args
+}
+
 /// The environment every pane gets on top of Neuron's own (which the
 /// terminal registry has already scrubbed of a parent Claude session's
 /// variables).
@@ -312,6 +323,21 @@ mod tests {
         for var in ["HOME", "USERPROFILE", "CLAUDE_CONFIG_DIR"] {
             assert!(!env.contains_key(var), "{var}");
         }
+    }
+
+    #[test]
+    fn a_restarted_pane_resumes_the_same_conversation() {
+        let id = "11111111-2222-4333-8444-555555555555";
+        let fresh = claude_args(id, Path::new("p.md"));
+        let resumed = claude_resume_args(id, Path::new("p.md"));
+        assert!(!resumed.iter().any(|a| a == "--session-id"));
+        let at = resumed.iter().position(|a| a == "--resume").expect("--resume");
+        assert_eq!(resumed[at + 1], id);
+        // Every other flag is the fresh pane's.
+        let rest = |args: &[String]| {
+            args.iter().filter(|a| *a != "--resume" && *a != "--session-id").cloned().collect::<Vec<_>>()
+        };
+        assert_eq!(rest(&resumed), rest(&fresh));
     }
 
     #[test]

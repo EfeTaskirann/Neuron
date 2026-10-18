@@ -3,7 +3,9 @@
 //! Commands: `swarm_term_list_personas` (bundled persona metadata),
 //! `swarm_term_session_status`, `swarm_term_start_session`,
 //! `swarm_term_trust_project` (the user's yes to running the swarm in a
-//! folder), `swarm_term_stop_session`, and `swarm_term_run_update`
+//! folder), `swarm_term_stop_session`, `swarm_term_restart_agent`,
+//! `swarm_term_resume_deliveries` (after the usage limit), and
+//! `swarm_term_run_update`
 //! (update the host `claude` CLI). Inter-agent routing is event-driven via the
 //! file-IPC bridge (`swarm_term::bridge`), emitted as `swarm-term:route`
 //! / `swarm-term:lifecycle` events — not a command.
@@ -122,6 +124,35 @@ pub async fn swarm_term_stop_session<R: Runtime>(
         .inner()
         .clone();
     registry.stop(app.clone()).await
+}
+
+/// Restart one agent of the running session in a new pane, on the same
+/// conversation — after its claude exited, or when it never got ready.
+#[tauri::command(rename_all = "camelCase")]
+#[specta::specta]
+pub async fn swarm_term_restart_agent<R: Runtime>(
+    app: AppHandle<R>,
+    agent_id: String,
+) -> Result<TerminalSwarmSessionHandle, AppError> {
+    let registry = app
+        .state::<std::sync::Arc<crate::swarm_term::TerminalSwarmRegistry>>()
+        .inner()
+        .clone();
+    registry.restart_agent(app.clone(), agent_id.trim()).await
+}
+
+/// The user's "go on" while the usage limit holds the swarm: deliveries
+/// and the stall clocks run again.
+#[tauri::command]
+#[specta::specta]
+pub async fn swarm_term_resume_deliveries<R: Runtime>(
+    app: AppHandle<R>,
+) -> Result<TerminalSwarmSessionHandle, AppError> {
+    let registry = app
+        .state::<std::sync::Arc<crate::swarm_term::TerminalSwarmRegistry>>()
+        .inner()
+        .clone();
+    registry.resume_deliveries(&app)
 }
 
 /// Result returned by `swarm_term_run_update` once the update child has

@@ -6,7 +6,13 @@ vi.mock('@tauri-apps/api/window', () => ({
   UserAttentionType: { Critical: 1, Informational: 2 },
 }));
 
-import { notifyTaskSignal, taskSignal } from './swarmNotify';
+import {
+  formatResetTime,
+  notifyPaneExited,
+  notifyTaskSignal,
+  notifyUsageLimit,
+  taskSignal,
+} from './swarmNotify';
 import { dismissToast, subscribeToasts, type Toast } from './toast';
 
 function currentToasts(): readonly Toast[] {
@@ -41,6 +47,27 @@ describe('taskSignal', () => {
     expect(taskSignal('review fix-1 — README eklendi')).toBeNull();
     expect(taskSignal('retest p1 — düzeltildi')).toBeNull();
     expect(taskSignal('the TASK_DONE p1 arrived')).toBeNull();
+  });
+});
+
+describe('session alerts', () => {
+  it('toasts the usage limit with its reset time, and an exited agent', () => {
+    const resetsAt = Date.UTC(2026, 9, 18, 13, 50) / 1000;
+    notifyUsageLimit(resetsAt);
+    notifyUsageLimit(null);
+    notifyPaneExited('backend-builder');
+    expect(currentToasts().map((t) => [t.variant, t.body])).toEqual([
+      [
+        'error',
+        `Claude kullanım limitine ulaşıldı; swarm duraklatıldı (sıfırlanma: ${formatResetTime(resetsAt)}).`,
+      ],
+      ['error', 'Claude kullanım limitine ulaşıldı; swarm duraklatıldı.'],
+      ['error', '@backend-builder kapandı: pane başlığındaki ↻ onu aynı konuşmayla yeniden başlatır.'],
+    ]);
+  });
+
+  it('formats the reset time as hours and minutes', () => {
+    expect(formatResetTime(Date.UTC(2026, 9, 18, 13, 50) / 1000)).toMatch(/^\d{2}[:.]\d{2}$/);
   });
 });
 

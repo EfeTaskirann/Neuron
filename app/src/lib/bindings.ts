@@ -436,6 +436,13 @@ export const commands = {
 	 *  `swarm-term:pane-state` events.
 	 */
 	paneStates: TerminalSwarmPaneState[],
+	/**
+	 *  The account's usage limit is hit: deliveries and the stall clocks
+	 *  are held until an agent gets through again (or the user resumes).
+	 */
+	usageLimited: boolean,
+	// When claude said the limit resets (unix seconds), if it did.
+	limitResetsAt: number | null,
 } | null, AppErrorWire>(__TAURI_INVOKE("swarm_term_session_status")),
 	swarmTermStartSession: (projectDir: string) => typedError<TerminalSwarmSessionHandle, AppErrorWire>(__TAURI_INVOKE("swarm_term_start_session", { projectDir })),
 	/**
@@ -446,6 +453,16 @@ export const commands = {
 	 */
 	swarmTermTrustProject: (projectDir: string) => typedError<null, AppErrorWire>(__TAURI_INVOKE("swarm_term_trust_project", { projectDir })),
 	swarmTermStopSession: () => typedError<null, AppErrorWire>(__TAURI_INVOKE("swarm_term_stop_session")),
+	/**
+	 *  Restart one agent of the running session in a new pane, on the same
+	 *  conversation — after its claude exited, or when it never got ready.
+	 */
+	swarmTermRestartAgent: (agentId: string) => typedError<TerminalSwarmSessionHandle, AppErrorWire>(__TAURI_INVOKE("swarm_term_restart_agent", { agentId })),
+	/**
+	 *  The user's "go on" while the usage limit holds the swarm: deliveries
+	 *  and the stall clocks run again.
+	 */
+	swarmTermResumeDeliveries: () => typedError<TerminalSwarmSessionHandle, AppErrorWire>(__TAURI_INVOKE("swarm_term_resume_deliveries")),
 	/**
 	 *  Update the host's `claude` CLI to the latest version. Rejects while a
 	 *  swarm-term session is running so the binary on disk isn't swapped
@@ -1698,6 +1715,13 @@ export type TerminalSwarmSessionHandle = {
 	 *  `swarm-term:pane-state` events.
 	 */
 	paneStates: TerminalSwarmPaneState[],
+	/**
+	 *  The account's usage limit is hit: deliveries and the stall clocks
+	 *  are held until an agent gets through again (or the user resumes).
+	 */
+	usageLimited: boolean,
+	// When claude said the limit resets (unix seconds), if it did.
+	limitResetsAt: number | null,
 };
 
 /**

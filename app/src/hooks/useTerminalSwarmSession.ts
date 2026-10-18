@@ -1,8 +1,25 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { commands, type SwarmTermPersona } from '../lib/bindings';
+import { commands, type PaneReadiness, type SwarmTermPersona } from '../lib/bindings';
 import { unwrap } from '../lib/unwrap';
+import { notifyPaneExited, notifyUsageLimit } from '../lib/swarmNotify';
 import { dismissToast, showToast } from '../lib/toast';
 import { useTauriEvent } from './useTauriEvent';
+
+/** `swarm-term:session` payload (see `session.rs`). */
+interface SessionEvent {
+  sessionId: string;
+  state: 'started' | 'stopped' | 'limited' | 'running';
+  /** With `limited`: when claude said the limit resets (unix seconds). */
+  resetsAt?: number | null;
+}
+
+/** `swarm-term:pane-state` payload (see `pane_state.rs`). */
+interface PaneStateEvent {
+  sessionId: string;
+  agentId: string;
+  readiness: PaneReadiness;
+  detail: string | null;
+}
 
 export function useSwarmTermPersonas() {
   return useQuery<SwarmTermPersona[]>({
@@ -25,6 +42,19 @@ export function useSwarmTermSessionStatus() {
   return useQuery({
     queryKey: ['swarm-term', 'status'],
     queryFn: () => unwrap(commands.swarmTermSessionStatus()),
+  });
+}
+
+/**
+ * Tell the user, also when the window is in the background, that the
+ * usage limit holds the swarm or that an agent's claude exited. Mount once.
+ */
+export function useSwarmTermAlerts(): void {
+  useTauriEvent<SessionEvent>('swarm-term:session', (e) => {
+    if (e.state === 'limited') notifyUsageLimit(e.resetsAt ?? null);
+  });
+  useTauriEvent<PaneStateEvent>('swarm-term:pane-state', (e) => {
+    if (e.readiness === 'exited') notifyPaneExited(e.agentId);
   });
 }
 
@@ -55,6 +85,29 @@ export function useStopSwarmTermSession() {
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['swarm-term', 'status'] });
       qc.invalidateQueries({ queryKey: ['panes'] });
+    },
+  });
+}
+
+/** Run one agent again in a new pane, on the same conversation. */
+export function useRestartSwarmTermAgent() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (agentId: string) => unwrap(commands.swarmTermRestartAgent(agentId)),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['swarm-term', 'status'] });
+      qc.invalidateQueries({ queryKey: ['panes'] });
+    },
+  });
+}
+
+/** The user's "go on" while the usage limit holds the swarm. */
+export function useResumeSwarmTermDeliveries() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: () => unwrap(commands.swarmTermResumeDeliveries()),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['swarm-term', 'status'] });
     },
   });
 }

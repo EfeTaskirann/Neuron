@@ -151,13 +151,15 @@ fn retry_stuck_moves(root: &Path, stuck: &mut StuckMoves) {
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn watcher_loop<R: Runtime>(
     app: AppHandle<R>,
     registry: TerminalRegistry,
     root: PathBuf,
-    panes_by_agent: Arc<HashMap<String, String>>,
+    shared_panes: super::SharedPanes,
     ready_panes: Arc<Mutex<HashSet<String>>>,
     lifecycle: Arc<LifecycleStore>,
+    control: Arc<super::BridgeControl>,
     cancel: Arc<Notify>,
 ) {
     tracing::info!(
@@ -170,6 +172,21 @@ pub(super) async fn watcher_loop<R: Runtime>(
     let mut stall_every_read = Instant::now();
     let mut stuck = StuckMoves::new();
     loop {
+        // Paused (usage limit, the user): every message waits in its
+        // outbox, in order, until the bridge runs again.
+        if control.is_paused() {
+            tokio::select! {
+                _ = cancel.notified() => {
+                    tracing::info!("swarm-term bridge: watcher cancelled");
+                    return;
+                }
+                _ = tokio::time::sleep(Duration::from_millis(WATCH_POLL_MS)) => {}
+            }
+            continue;
+        }
+        // The current agent → pane map (a restarted agent has a new pane).
+        let panes_by_agent: Arc<HashMap<String, String>> =
+            Arc::new(shared_panes.read().unwrap_or_else(|p| p.into_inner()).clone());
         process_pending(
             &app,
             &registry,

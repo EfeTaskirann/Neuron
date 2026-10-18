@@ -9,9 +9,12 @@ import { parseSwarmTermStartMs } from '../components/swarm-term/constants';
 import { useActiveProject } from '../hooks/useActiveProject';
 import { useTerminalWrite } from '../hooks/mutations';
 import {
+  useRestartSwarmTermAgent,
+  useResumeSwarmTermDeliveries,
   useRunClaudeUpdate,
   useStartSwarmTermSession,
   useStopSwarmTermSession,
+  useSwarmTermAlerts,
   useSwarmTermPersonas,
   useSwarmTermSessionStatus,
   useTrustSwarmTermProject,
@@ -19,6 +22,7 @@ import {
 import { useClaudeUpdateProgress } from '../hooks/useClaudeUpdateProgress';
 import { useRoutingEvents } from '../hooks/useRoutingEvents';
 import { useActiveEdge, useAgentLifecycle } from '../hooks/useAgentLifecycle';
+import { formatResetTime } from '../lib/swarmNotify';
 import { AppErrorClient, describeError } from '../lib/unwrap';
 import type { TerminalSwarmPaneState } from '../lib/bindings';
 import { RoutingLogRoute } from './RoutingLogRoute';
@@ -38,7 +42,7 @@ function chatWaitReason(state: TerminalSwarmPaneState | undefined): string | nul
     case 'not_ready':
       return '@orchestrator did not answer its kickoff — check its pane';
     case 'exited':
-      return "@orchestrator's claude exited — restart the swarm";
+      return "@orchestrator's claude exited — restart it with ↻ on its pane";
     default:
       return null;
   }
@@ -106,6 +110,7 @@ export function TerminalSwarmRoute(): JSX.Element {
     error: sessionProbeError,
   } = useSwarmTermSessionStatus();
   const lifecycle = useAgentLifecycle(routeEvents, session?.sessionId ?? null);
+  useSwarmTermAlerts();
   const paneStates = useMemo(() => session?.paneStates ?? [], [session]);
   const paneStatesByAgent = useMemo(
     () => new Map(paneStates.map((p) => [p.agentId, p])),
@@ -115,6 +120,8 @@ export function TerminalSwarmRoute(): JSX.Element {
   const startMut = useStartSwarmTermSession();
   const trustMut = useTrustSwarmTermProject();
   const stopMut = useStopSwarmTermSession();
+  const restartAgentMut = useRestartSwarmTermAgent();
+  const resumeMut = useResumeSwarmTermDeliveries();
   const updateMut = useRunClaudeUpdate();
   const updateProgress = useClaudeUpdateProgress(updateMut.isPending);
   const writeMut = useTerminalWrite();
@@ -168,6 +175,24 @@ export function TerminalSwarmRoute(): JSX.Element {
     try {
       await stopMut.mutateAsync();
       await startWithConsent(dir);
+    } catch (err) {
+      setLaunchError(describeError(err));
+    }
+  };
+
+  const restartAgent = async (agentId: string) => {
+    setLaunchError(null);
+    try {
+      await restartAgentMut.mutateAsync(agentId);
+    } catch (err) {
+      setLaunchError(describeError(err));
+    }
+  };
+
+  const resumeDeliveries = async () => {
+    setLaunchError(null);
+    try {
+      await resumeMut.mutateAsync();
     } catch (err) {
       setLaunchError(describeError(err));
     }
@@ -246,6 +271,26 @@ export function TerminalSwarmRoute(): JSX.Element {
             {session.preflightNote}
           </div>
         )}
+        {session?.usageLimited && (
+          <div className="swarm-term-limit" role="alert">
+            <p>
+              <strong>Claude kullanım limitine ulaşıldı</strong>
+              {session.limitResetsAt != null &&
+                ` (sıfırlanma: ${formatResetTime(session.limitResetsAt)})`}
+              . Mesaj teslimi ve takılma hatırlatmaları duraklatıldı. Limit sıfırlanınca
+              claude genelde kendiliğinden sürer; bir ajan yeniden yanıt verince swarm da
+              devam eder.
+            </p>
+            <button
+              type="button"
+              className="btn"
+              onClick={resumeDeliveries}
+              disabled={resumeMut.isPending}
+            >
+              Şimdi sürdür
+            </button>
+          </div>
+        )}
 
         <HierarchyDiagram
           lifecycle={lifecycle}
@@ -269,6 +314,8 @@ export function TerminalSwarmRoute(): JSX.Element {
           lifecycle={lifecycle}
           activeEdge={activeEdge}
           paneStates={paneStatesByAgent}
+          onRestartAgent={restartAgent}
+          restartingAgent={restartAgentMut.isPending ? (restartAgentMut.variables ?? null) : null}
         />
       </div>
 

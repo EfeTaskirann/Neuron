@@ -1,11 +1,12 @@
 import { getCurrentWindow, UserAttentionType } from '@tauri-apps/api/window';
 import { showToast } from './toast';
 
-// "Task done / failed" notifications for the terminal swarm. The bridge
-// reports every closed task to the orchestrator as a synthesised
-// `TASK_DONE <id> — …` / `TASK_FAILED <id> — …` message; the routing
-// store hands each one here. A toast says it in the app, and the
-// taskbar flashes when the window is in the background.
+// Notifications for the terminal swarm. The bridge reports every closed
+// task to the orchestrator as a synthesised `TASK_DONE <id> — …` /
+// `TASK_FAILED <id> — …` message; the routing store hands each one here.
+// The usage limit and an agent's exit come from the session's events. A
+// toast says it in the app, and the taskbar flashes when the window is
+// in the background.
 
 export interface TaskSignal {
   kind: 'done' | 'failed';
@@ -44,6 +45,42 @@ export function notifyTaskSignal(body: string): void {
           durationMs: 12000,
         },
   );
+  requestAttention();
+}
+
+/** "HH:MM" of a reset time given in unix seconds, on the user's clock. */
+export function formatResetTime(resetsAt: number): string {
+  return new Date(resetsAt * 1000).toLocaleTimeString('tr-TR', {
+    hour: '2-digit',
+    minute: '2-digit',
+  });
+}
+
+/** Toast (and taskbar flash) when the usage limit holds the swarm. */
+export function notifyUsageLimit(resetsAt: number | null): void {
+  showToast({
+    variant: 'error',
+    body:
+      'Claude kullanım limitine ulaşıldı; swarm duraklatıldı' +
+      (resetsAt != null ? ` (sıfırlanma: ${formatResetTime(resetsAt)})` : '') +
+      '.',
+    durationMs: 12000,
+  });
+  requestAttention();
+}
+
+/** Toast (and taskbar flash) when an agent's claude process ended. */
+export function notifyPaneExited(agentId: string): void {
+  showToast({
+    variant: 'error',
+    body: `@${agentId} kapandı: pane başlığındaki ↻ onu aynı konuşmayla yeniden başlatır.`,
+    durationMs: 10000,
+  });
+  requestAttention();
+}
+
+/** Flash the taskbar while the window is in the background. */
+function requestAttention(): void {
   if (typeof document !== 'undefined' && !document.hasFocus()) {
     try {
       void getCurrentWindow()

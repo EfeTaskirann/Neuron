@@ -13,6 +13,8 @@ vi.mock('../lib/bindings', () => ({
     swarmTermStartSession: vi.fn(),
     swarmTermTrustProject: vi.fn(),
     swarmTermStopSession: vi.fn(),
+    swarmTermRestartAgent: vi.fn(),
+    swarmTermResumeDeliveries: vi.fn(),
     swarmTermRunUpdate: vi.fn(),
     terminalLines: vi.fn(),
     terminalWrite: vi.fn(),
@@ -94,6 +96,8 @@ const SESSION: TerminalSwarmSessionHandle = {
     { agentId: 'coordinator', readiness: 'ready', detail: null },
     { agentId: 'orchestrator', readiness: 'ready', detail: null },
   ],
+  usageLimited: false,
+  limitResetsAt: null,
 };
 
 beforeEach(async () => {
@@ -298,6 +302,46 @@ describe('TerminalSwarmRoute', () => {
     expect(screen.getByLabelText(`coordinator: needs you — ${detail}`)).toBeInTheDocument();
     // The orchestrator is ready: the chat is open.
     expect(screen.getByLabelText(/message to orchestrator/i)).toBeEnabled();
+  });
+
+  it('offers a restart for an exited agent and restarts that one', async () => {
+    const { commands } = await import('../lib/bindings');
+    const exited: TerminalSwarmSessionHandle = {
+      ...SESSION,
+      paneStates: [
+        { agentId: 'coordinator', readiness: 'exited', detail: "Pane'in claude süreci kapandı." },
+        { agentId: 'orchestrator', readiness: 'ready', detail: null },
+      ],
+    };
+    vi.mocked(commands.swarmTermSessionStatus).mockResolvedValue({ status: 'ok', data: exited });
+    vi.mocked(commands.swarmTermRestartAgent).mockResolvedValue({ status: 'ok', data: SESSION });
+    renderRoute();
+    const restart = await screen.findByRole('button', { name: 'Restart Coordinator' });
+    // A ready pane has nothing to restart.
+    expect(screen.queryByRole('button', { name: 'Restart Orchestrator' })).not.toBeInTheDocument();
+    fireEvent.click(restart);
+    await waitFor(() => expect(commands.swarmTermRestartAgent).toHaveBeenCalledWith('coordinator'));
+  });
+
+  it('says the usage limit holds the swarm, and resumes it on request', async () => {
+    const { commands } = await import('../lib/bindings');
+    // 13:50 UTC — shown on the user's clock, whatever the zone.
+    const resetsAt = Date.UTC(2026, 9, 18, 13, 50) / 1000;
+    vi.mocked(commands.swarmTermSessionStatus).mockResolvedValue({
+      status: 'ok',
+      data: { ...SESSION, usageLimited: true, limitResetsAt: resetsAt },
+    });
+    vi.mocked(commands.swarmTermResumeDeliveries).mockResolvedValue({ status: 'ok', data: SESSION });
+    renderRoute();
+    const banner = await screen.findByRole('alert');
+    expect(banner).toHaveTextContent('Claude kullanım limitine ulaşıldı');
+    const shown = new Date(resetsAt * 1000).toLocaleTimeString('tr-TR', {
+      hour: '2-digit',
+      minute: '2-digit',
+    });
+    expect(banner).toHaveTextContent(`sıfırlanma: ${shown}`);
+    fireEvent.click(screen.getByRole('button', { name: 'Şimdi sürdür' }));
+    await waitFor(() => expect(commands.swarmTermResumeDeliveries).toHaveBeenCalled());
   });
 
   it('shows a pre-flight note without blocking the session', async () => {

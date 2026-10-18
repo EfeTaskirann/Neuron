@@ -160,6 +160,26 @@
   color: var(--accent-strong);
 }
 
+/* Restart for an exited / never-ready agent, next to its readiness chip. */
+.swarm-term-pane-restart {
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 2px 6px;
+  font-size: 13px;
+  line-height: 1;
+  color: var(--foreground);
+  cursor: pointer;
+}
+.swarm-term-pane-restart:hover:not(:disabled) {
+  color: var(--accent-strong);
+  background: var(--surface-1);
+}
+.swarm-term-pane-restart:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
 /* Grid in expanded mode: one row × one column, only the .expanded
  * tile is visible. The xterm wrapper inside re-fits via the
  * existing ResizeObserver in SwarmPane.tsx, so claude REPL's
@@ -213,6 +233,22 @@
   border-radius: 6px;
   font-size: 12px;
   font-family: var(--font-mono, ui-monospace, monospace);
+}
+
+/* The usage limit holds the swarm: what happens, and the user's resume. */
+.swarm-term-limit {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  background: color-mix(in oklab, var(--surface-1) 80%, var(--destructive));
+  color: var(--foreground);
+  padding: 8px 12px;
+  border-radius: 6px;
+  font-size: 12px;
+}
+.swarm-term-limit p {
+  margin: 0;
+  flex: 1;
 }
 
 /* A pre-flight finding that did not block the start. */

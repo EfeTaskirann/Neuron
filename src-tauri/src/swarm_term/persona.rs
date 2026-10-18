@@ -33,6 +33,11 @@ pub(crate) const KICKOFF_PREFIX: &str = "[Neuron] Oturum başladı.";
 /// The readiness token (see [`is_ready_answer`]).
 pub(crate) const READY_TOKEN: &str = "READY";
 
+/// First line of a restarted agent's kickoff (see
+/// [`build_restart_kickoff`]); the footer tells the agent to answer it
+/// like the first kickoff, then go back to its unfinished work.
+pub(crate) const RESTART_PREFIX: &str = "[Neuron] Pane yeniden başlatıldı.";
+
 /// The pasted first turn of every swarm-term pane (bracketed paste, no
 /// submitting CR — the caller uses `paste_then_submit`). Deliberately
 /// does NOT contain the readiness phrase itself, so the echo of this
@@ -42,6 +47,18 @@ pub(crate) fn build_kickoff_message(agent_id: &str) -> String {
         "\x1b[200~{KICKOFF_PREFIX} Sen `{agent_id}` ajanısın; persona'n ve \
          Mesajlaşma protokolü sistem prompt'unda. Protokoldeki \"İlk yanıt\" \
          kuralını uygula.\x1b[201~"
+    )
+}
+
+/// The pasted first turn of a RESTARTED agent's pane: its conversation
+/// goes on (`--resume`), so the agent answers like on the first kickoff
+/// and then picks up what the restart interrupted. Like
+/// [`build_kickoff_message`] it never contains the readiness phrase.
+pub(crate) fn build_restart_kickoff(agent_id: &str) -> String {
+    format!(
+        "\x1b[200~{RESTART_PREFIX} Sen `{agent_id}` ajanısın; önceki claude sürecin \
+         kapandı, konuşman kaldığı yerden sürüyor. Protokoldeki \"İlk yanıt\" \
+         kuralının yeniden başlatma maddesini uygula.\x1b[201~"
     )
 }
 
@@ -256,12 +273,17 @@ pub(crate) fn build_persona_prompt(
          ve dur: `@{agent_id} {ready}` (bu iki kelime, hangi dilde çalışırsan çalış\n\
          aynen böyle). Başka tek karakter yazma, tool çağırma. Backend bu cevabı\n\
          görünce pane'ini mesaj almaya hazır sayar. Sonra bir sonraki user/route\n\
-         mesajını bekle.",
+         mesajını bekle.\n\n\
+         Pane'in yeniden başlatılırsa konuşman kaldığı yerden sürer ve bir mesaj\n\
+         `{restart}` ile başlar: ona da önce aynı iki kelimeyi tek başına yaz;\n\
+         sonra yarım kalan bir işin varsa kaldığın yerden sürdür, yoksa bir sonraki\n\
+         mesajı bekle.",
         agent_id = agent_id,
         bridge_root_str = bridge_root_str,
         dest_block = dest_block,
         example_dst = example_dst,
         kickoff = KICKOFF_PREFIX,
+        restart = RESTART_PREFIX,
         ready = READY_TOKEN,
         project_block = project_block,
         perms = crate::swarm_term::permissions::describe_for_persona(agent_id, &facts.commands),
@@ -330,6 +352,19 @@ mod tests {
         assert!(k.contains(KICKOFF_PREFIX));
         // The echo of the kickoff must never satisfy the readiness check.
         assert!(!is_ready_answer("scout", &k));
+    }
+
+    #[test]
+    fn the_restart_kickoff_points_at_the_rule_without_the_ready_phrase() {
+        let k = build_restart_kickoff("builder");
+        assert!(k.starts_with("\x1b[200~"));
+        assert!(k.ends_with("\x1b[201~"));
+        assert!(k.contains(RESTART_PREFIX));
+        assert!(k.contains("İlk yanıt"));
+        assert!(!is_ready_answer("builder", &k));
+        // The footer has the rule it points at.
+        let p = build_persona_prompt("builder", "x", &dummy_bridge_root(), &facts());
+        assert!(p.contains(RESTART_PREFIX));
     }
 
     #[test]
