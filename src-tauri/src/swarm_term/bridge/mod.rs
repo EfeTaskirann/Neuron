@@ -60,9 +60,9 @@
 //!   * [`stall`]     — reminders for tasks stuck in `Building` /
 //!                     `AwaitingReview` (escalated to the coordinator).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use tauri::{AppHandle, Manager, Runtime};
 use tokio::sync::Notify;
@@ -101,15 +101,63 @@ pub struct BridgeHandle {
     cancel: Arc<Notify>,
 }
 
+/// Agent id → pane id, shared with the session: a restarted agent runs
+/// in a new pane, and the watcher reads the current map every tick.
+pub type SharedPanes = Arc<RwLock<HashMap<String, String>>>;
+
+/// Why the bridge holds every delivery (see [`BridgeControl`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PauseReason {
+    /// The account's usage limit is hit: no agent can answer.
+    UsageLimit,
+    /// The agents used up the session's message budget.
+    Budget,
+    /// The user paused the swarm.
+    User,
+}
+
+/// Holds deliveries while any reason is set. Messages stay in their
+/// outboxes in order and go out once the last reason is cleared; the
+/// stall clocks are paused alongside by the caller.
+#[derive(Debug, Default)]
+pub struct BridgeControl {
+    paused_by: Mutex<BTreeSet<PauseReason>>,
+}
+
+impl BridgeControl {
+    /// Set or clear `reason`; true when the bridge's paused state
+    /// changed (paused ⇄ running).
+    pub fn set_paused(&self, reason: PauseReason, on: bool) -> bool {
+        let mut g = self.paused_by.lock().unwrap_or_else(|p| p.into_inner());
+        let was_paused = !g.is_empty();
+        if on {
+            g.insert(reason);
+        } else {
+            g.remove(&reason);
+        }
+        let paused = !g.is_empty();
+        was_paused != paused
+    }
+
+    pub fn is_paused(&self) -> bool {
+        !self.paused_by.lock().unwrap_or_else(|p| p.into_inner()).is_empty()
+    }
+
+    pub fn paused_by(&self, reason: PauseReason) -> bool {
+        self.paused_by.lock().unwrap_or_else(|p| p.into_inner()).contains(&reason)
+    }
+}
+
 /// Spawn the watcher task for the given session and return a handle
 /// that uninstall takes ownership of. Layout under `root` must already
 /// exist (call [`prepare_layout`] first).
 pub fn install<R: Runtime>(
     app: AppHandle<R>,
     root: PathBuf,
-    panes_by_agent: HashMap<String, String>,
+    panes_by_agent: SharedPanes,
     ready_panes: Arc<Mutex<HashSet<String>>>,
     lifecycle: Arc<LifecycleStore>,
+    control: Arc<BridgeControl>,
 ) -> BridgeHandle {
     let cancel = Arc::new(Notify::new());
     let cancel_for_task = Arc::clone(&cancel);
@@ -119,9 +167,10 @@ pub fn install<R: Runtime>(
         app,
         registry,
         root_for_task,
-        Arc::new(panes_by_agent),
+        panes_by_agent,
         ready_panes,
         lifecycle,
+        control,
         cancel_for_task,
     ));
     BridgeHandle { root, cancel }

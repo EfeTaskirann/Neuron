@@ -421,9 +421,89 @@ export const commands = {
 	panes: TerminalSwarmPane[],
 	// What the panes may do — the mode they were spawned with.
 	permissionMode: SwarmTermPermissionMode,
+	/**
+	 *  The `claude` CLI version the panes run (pre-flight check), when
+	 *  it could be read.
+	 */
+	claudeVersion: string | null,
+	/**
+	 *  A pre-flight finding that did not block the start (an untested
+	 *  newer claude, a check that could not run) — for the UI to show.
+	 */
+	preflightNote: string | null,
+	/**
+	 *  Every pane's readiness (see `pane_state`); updates arrive as
+	 *  `swarm-term:pane-state` events.
+	 */
+	paneStates: TerminalSwarmPaneState[],
+	/**
+	 *  The account's usage limit is hit: deliveries and the stall clocks
+	 *  are held until an agent gets through again (or the user resumes).
+	 */
+	usageLimited: boolean,
+	// When claude said the limit resets (unix seconds), if it did.
+	limitResetsAt: number | null,
+	/**
+	 *  Why the session has no checkpoint (a folder without git), or what
+	 *  its snapshots leave out (see `checkpoint`).
+	 */
+	changesNote: string | null,
+	// The session runs the Lite team (see `team`).
+	liteTeam: boolean,
+	// The user paused the swarm: no message is delivered.
+	paused: boolean,
+	/**
+	 *  Agent-to-agent messages delivered so far, and the session's budget
+	 *  (`0`: no limit). `budget_reached`: the swarm holds until the user
+	 *  gives it more.
+	 */
+	messagesDelivered: number,
+	messageBudget: number,
+	budgetReached: boolean,
 } | null, AppErrorWire>(__TAURI_INVOKE("swarm_term_session_status")),
 	swarmTermStartSession: (projectDir: string) => typedError<TerminalSwarmSessionHandle, AppErrorWire>(__TAURI_INVOKE("swarm_term_start_session", { projectDir })),
+	/**
+	 *  Record the user's trust in `project_dir` — their "yes" in the dialog
+	 *  the UI shows when `swarm_term_start_session` answers
+	 *  `consent_required`. Only a folder the swarm may run in at all can be
+	 *  trusted (the same checks as the start).
+	 */
+	swarmTermTrustProject: (projectDir: string) => typedError<null, AppErrorWire>(__TAURI_INVOKE("swarm_term_trust_project", { projectDir })),
 	swarmTermStopSession: () => typedError<null, AppErrorWire>(__TAURI_INVOKE("swarm_term_stop_session")),
+	/**
+	 *  Restart one agent of the running session in a new pane, on the same
+	 *  conversation — after its claude exited, or when it never got ready.
+	 */
+	swarmTermRestartAgent: (agentId: string) => typedError<TerminalSwarmSessionHandle, AppErrorWire>(__TAURI_INVOKE("swarm_term_restart_agent", { agentId })),
+	/**
+	 *  The user's "go on" while the usage limit holds the swarm: deliveries
+	 *  and the stall clocks run again.
+	 */
+	swarmTermResumeDeliveries: () => typedError<TerminalSwarmSessionHandle, AppErrorWire>(__TAURI_INVOKE("swarm_term_resume_deliveries")),
+	/**
+	 *  What changed in `project_dir` since its checkpoint — taken when the
+	 *  swarm started there.
+	 */
+	swarmTermChanges: (projectDir: string) => typedError<SwarmTermChanges, AppErrorWire>(__TAURI_INVOKE("swarm_term_changes", { projectDir })),
+	// One changed file's diff against the checkpoint.
+	swarmTermChangeDiff: (projectDir: string, path: string) => typedError<string, AppErrorWire>(__TAURI_INVOKE("swarm_term_change_diff", { projectDir, path })),
+	/**
+	 *  Put changed files back as they were at the checkpoint (`paths`, or
+	 *  every changed file).
+	 */
+	swarmTermRevertChanges: (projectDir: string, paths: string[] | null) => typedError<SwarmTermChanges, AppErrorWire>(__TAURI_INVOKE("swarm_term_revert_changes", { projectDir, paths })),
+	// Keep what changed: the checkpoint moves to now.
+	swarmTermKeepChanges: (projectDir: string) => typedError<SwarmTermChanges, AppErrorWire>(__TAURI_INVOKE("swarm_term_keep_changes", { projectDir })),
+	/**
+	 *  The user's cost controls: team, models, message budget (Settings →
+	 *  Models). They apply from the next session start.
+	 */
+	swarmTermGetTeam: () => typedError<SwarmTermTeam, AppErrorWire>(__TAURI_INVOKE("swarm_term_get_team")),
+	swarmTermSetTeam: (team: SwarmTermTeam) => typedError<null, AppErrorWire>(__TAURI_INVOKE("swarm_term_set_team", { team })),
+	// Pause / resume the running swarm (the toolbar button).
+	swarmTermSetPaused: (paused: boolean) => typedError<TerminalSwarmSessionHandle, AppErrorWire>(__TAURI_INVOKE("swarm_term_set_paused", { paused })),
+	// More messages for the running session once its budget is used up.
+	swarmTermExtendBudget: () => typedError<TerminalSwarmSessionHandle, AppErrorWire>(__TAURI_INVOKE("swarm_term_extend_budget")),
 	/**
 	 *  Update the host's `claude` CLI to the latest version. Rejects while a
 	 *  swarm-term session is running so the binary on disk isn't swapped
@@ -619,6 +699,11 @@ export type CallToolResult = {
 	content: ToolContent[],
 	isError: boolean,
 };
+
+// How a file differs from its checkpoint.
+export type ChangeKind = "added" | "modified" | "deleted" | 
+// A file became a link, or the other way round.
+"type_changed";
 
 /**
  *  Result returned by `swarm_term_run_update` once the update child has
@@ -1229,6 +1314,20 @@ export type PaneLine = {
 	text: string,
 };
 
+export type PaneReadiness = 
+// Spawned; claude is booting or its screen is still settling.
+"starting" | 
+// On a screen only the user can answer (login, first-run).
+"blocked" | 
+// The kickoff went out; waiting for `@<id> READY`.
+"kickoff_sent" | 
+// Answered the kickoff: a delivery target.
+"ready" | 
+// No answer in time. Still watched — a late answer makes it ready.
+"not_ready" | 
+// The pane's process ended.
+"exited";
+
 /**
  *  Input shape for `terminal:spawn`. Fields chosen to match what the
  *  WP-06 PTY supervisor needs; `cwd` is the only strictly-required
@@ -1608,6 +1707,29 @@ export type SwarmJobEvent =
  */
 { kind: "decision_made"; job_id: string; decision: CoordinatorDecision };
 
+export type SwarmTermChangedFile = {
+	// Relative to the project folder, `/`-separated.
+	path: string,
+	kind: ChangeKind,
+	// Lines added / removed; `None` for a binary file.
+	additions: number | null,
+	deletions: number | null,
+};
+
+// What changed in a project since its checkpoint.
+export type SwarmTermChanges = {
+	/**
+	 *  When the checkpoint was taken (unix seconds); `None`: there is
+	 *  none for this folder (yet).
+	 */
+	checkpointAt: number | null,
+	files: SwarmTermChangedFile[],
+	// More files changed than are listed.
+	truncated: boolean,
+	// Why nothing can be shown, or what the snapshots leave out.
+	note: string | null,
+};
+
 /**
  *  The permission mode a session's panes were spawned with. Captured
  *  once at session start, so what the UI reports is exactly what the
@@ -1629,9 +1751,31 @@ export type SwarmTermPersona = {
 	allowedDestinations: string[],
 };
 
+export type SwarmTermTeam = {
+	// Run the Lite team ([`LITE_TEAM`]) instead of all nine agents.
+	lite: boolean,
+	/**
+	 *  Agent id → model alias ([`MODEL_ALIASES`]). An agent not named
+	 *  runs claude's default model.
+	 */
+	models: { [key in string]: string },
+	/**
+	 *  Agent-to-agent messages a session may deliver before it holds;
+	 *  `0`: no limit.
+	 */
+	messageBudget: number,
+};
+
 export type TerminalSwarmPane = {
 	agentId: string,
 	paneId: string,
+};
+
+export type TerminalSwarmPaneState = {
+	agentId: string,
+	readiness: PaneReadiness,
+	// Why, for the states the user may need to act on (Turkish).
+	detail: string | null,
 };
 
 export type TerminalSwarmSessionHandle = {
@@ -1640,6 +1784,45 @@ export type TerminalSwarmSessionHandle = {
 	panes: TerminalSwarmPane[],
 	// What the panes may do — the mode they were spawned with.
 	permissionMode: SwarmTermPermissionMode,
+	/**
+	 *  The `claude` CLI version the panes run (pre-flight check), when
+	 *  it could be read.
+	 */
+	claudeVersion: string | null,
+	/**
+	 *  A pre-flight finding that did not block the start (an untested
+	 *  newer claude, a check that could not run) — for the UI to show.
+	 */
+	preflightNote: string | null,
+	/**
+	 *  Every pane's readiness (see `pane_state`); updates arrive as
+	 *  `swarm-term:pane-state` events.
+	 */
+	paneStates: TerminalSwarmPaneState[],
+	/**
+	 *  The account's usage limit is hit: deliveries and the stall clocks
+	 *  are held until an agent gets through again (or the user resumes).
+	 */
+	usageLimited: boolean,
+	// When claude said the limit resets (unix seconds), if it did.
+	limitResetsAt: number | null,
+	/**
+	 *  Why the session has no checkpoint (a folder without git), or what
+	 *  its snapshots leave out (see `checkpoint`).
+	 */
+	changesNote: string | null,
+	// The session runs the Lite team (see `team`).
+	liteTeam: boolean,
+	// The user paused the swarm: no message is delivered.
+	paused: boolean,
+	/**
+	 *  Agent-to-agent messages delivered so far, and the session's budget
+	 *  (`0`: no limit). `budget_reached`: the swarm holds until the user
+	 *  gives it more.
+	 */
+	messagesDelivered: number,
+	messageBudget: number,
+	budgetReached: boolean,
 };
 
 /**

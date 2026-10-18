@@ -1,6 +1,7 @@
 //! Terminal-Hierarchy Swarm — 9 visible PTY panes (via
-//! `sidecar::terminal::TerminalRegistry`), each running an isolated
-//! `claude` REPL, communicating through a file-system based IPC bridge.
+//! `sidecar::terminal::TerminalRegistry`), each running a `claude` REPL
+//! on the user's own Claude configuration (see [`pane_config`]),
+//! communicating through a file-system based IPC bridge.
 //!
 //! ## How inter-agent messaging works
 //!
@@ -30,14 +31,20 @@
 //! repaint dedupe.
 
 pub mod bridge;
+pub mod checkpoint;
 pub(crate) mod heartbeat;
 pub mod hierarchy;
-pub mod home_isolation;
 pub mod lifecycle;
+pub(crate) mod pane_config;
+pub mod pane_state;
 pub(crate) mod permissions;
 pub mod persona;
+pub(crate) mod preflight;
+pub(crate) mod project_facts;
 pub(crate) mod project_guard;
 pub mod session;
+pub mod team;
+pub(crate) mod trust;
 
 pub use permissions::SwarmTermPermissionMode;
 pub use session::{TerminalSwarmRegistry, TerminalSwarmSessionHandle};

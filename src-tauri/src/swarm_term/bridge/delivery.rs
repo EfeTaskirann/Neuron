@@ -169,6 +169,18 @@ pub(crate) fn format_routed_message(
     task_id: Option<&str>,
 ) -> String {
     let safe = neutralize_bridge_markers(&sanitize_for_paste(body));
+    // A body whose first non-space character is a claude REPL trigger —
+    // `/` (slash command), `!` (bash), `#` (memory) — would act on the
+    // shared session when this is pasted and submitted. A zero-width space
+    // in front keeps it from being the first character; it is invisible to
+    // the agent and survives `sanitize_for_paste` (U+200B is a format
+    // char, not a control one), and the routed signature appended below
+    // makes the whole paste multi-line regardless.
+    let safe = if safe.trim_start().starts_with(['/', '!', '#']) {
+        format!("\u{200B}{safe}")
+    } else {
+        safe
+    };
     let task = task_id
         .map(|id| {
             let printable: String = id.chars().filter(|c| !c.is_control()).collect();

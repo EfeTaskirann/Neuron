@@ -9,6 +9,8 @@ export interface Toast {
   id: number;
   variant: ToastVariant;
   body: string;
+  /** More about it — an error's backend detail — shown on request. */
+  detail?: string;
   // `null` = persistent (caller dismisses by id); number in ms = auto-dismiss.
   durationMs: number | null;
 }

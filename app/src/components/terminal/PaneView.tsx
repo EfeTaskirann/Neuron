@@ -8,16 +8,19 @@ import {
   metaFor,
   STATUS_LABEL,
   TERMINAL_STATUSES,
+  isLiveSwarmPane,
   type AgentInfo,
 } from './agentMeta';
 
 interface PaneViewProps {
   pane: Pane;
+  /** Pane ids the running swarm session owns (stopped from Terminal Swarm). */
+  liveSwarmPaneIds: ReadonlySet<string>;
   active: boolean;
   onActivate: () => void;
 }
 
-export function PaneView({ pane, active, onActivate }: PaneViewProps): JSX.Element {
+export function PaneView({ pane, active, liveSwarmPaneIds, onActivate }: PaneViewProps): JSX.Element {
   const agent = metaFor(pane.agent);
   // PaneBody owns the xterm instance; it registers its `clear()` here so
   // the header's Clear button (a sibling component) can invoke it without
@@ -32,6 +35,7 @@ export function PaneView({ pane, active, onActivate }: PaneViewProps): JSX.Eleme
       <PaneHeader
         pane={pane}
         agent={agent}
+        swarmOwned={isLiveSwarmPane(pane, liveSwarmPaneIds, pane.id)}
         onClear={() => clearRef.current?.()}
       />
       {pane.approval && (
@@ -45,9 +49,11 @@ export function PaneView({ pane, active, onActivate }: PaneViewProps): JSX.Eleme
 function PaneHeader({
   pane,
   agent,
+  swarmOwned,
   onClear,
 }: {
   pane: Pane;
+  swarmOwned: boolean;
   agent: AgentInfo;
   onClear: () => void;
 }): JSX.Element {
@@ -79,18 +85,24 @@ function PaneHeader({
         {/* Restart / Pop-out stubs removed: no backend command exists
             for either yet — fake controls on a real pane erode trust.
             Re-add alongside the real IPCs. */}
-        <button
-          className="icon-btn sm"
-          title="Close pane"
-          aria-label="Close pane"
-          disabled={kill.isPending}
-          onClick={(e) => {
-            e.stopPropagation();
-            kill.mutate(pane.id);
-          }}
-        >
-          <NIcon name="close" size={12} />
-        </button>
+        {swarmOwned ? (
+          <span className="pane-status" title="Bu pane Terminal Swarm’ın; oradan durdurulur">
+            swarm
+          </span>
+        ) : (
+          <button
+            className="icon-btn sm"
+            title="Close pane"
+            aria-label="Close pane"
+            disabled={kill.isPending}
+            onClick={(e) => {
+              e.stopPropagation();
+              kill.mutate(pane.id);
+            }}
+          >
+            <NIcon name="close" size={12} />
+          </button>
+        )}
       </div>
     </div>
   );

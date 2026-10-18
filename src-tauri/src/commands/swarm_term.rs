@@ -2,8 +2,15 @@
 //!
 //! Commands: `swarm_term_list_personas` (bundled persona metadata),
 //! `swarm_term_session_status`, `swarm_term_start_session`,
-//! `swarm_term_stop_session`, and `swarm_term_run_update` (update the
-//! host `claude` CLI). Inter-agent routing is event-driven via the
+//! `swarm_term_trust_project` (the user's yes to running the swarm in a
+//! folder), `swarm_term_stop_session`, `swarm_term_restart_agent`,
+//! `swarm_term_resume_deliveries` (after the usage limit), the Changes
+//! panel's `swarm_term_changes` / `swarm_term_change_diff` /
+//! `swarm_term_revert_changes` / `swarm_term_keep_changes` (see
+//! `swarm_term::checkpoint`), the cost controls `swarm_term_get_team` /
+//! `swarm_term_set_team` (see `swarm_term::team`), `swarm_term_set_paused`
+//! and `swarm_term_extend_budget`, and `swarm_term_run_update`
+//! (update the host `claude` CLI). Inter-agent routing is event-driven via the
 //! file-IPC bridge (`swarm_term::bridge`), emitted as `swarm-term:route`
 //! / `swarm-term:lifecycle` events — not a command.
 
@@ -19,6 +26,8 @@ use tokio::process::Command;
 use crate::error::AppError;
 use crate::swarm::binding::{resolve_claude_spawn, subscription_env};
 use crate::swarm::ProfileRegistry;
+use crate::swarm_term::checkpoint::{self, SwarmTermChanges};
+use crate::swarm_term::team::{self, SwarmTermTeam};
 use crate::swarm_term::TerminalSwarmSessionHandle;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
@@ -84,6 +93,45 @@ pub async fn swarm_term_start_session<R: Runtime>(
     registry.start(app.clone(), path).await
 }
 
+/// Validate a user-supplied project folder for the swarm commands: no
+/// `..` segment, a real directory, and within the guard's allowed roots
+/// — the same gate `TerminalSwarmRegistry::start` applies. Returns the
+/// path.
+fn validated_project_dir<R: Runtime>(
+    app: &AppHandle<R>,
+    project_dir: &str,
+) -> Result<std::path::PathBuf, AppError> {
+    let path = std::path::PathBuf::from(project_dir.trim());
+    if path.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+        return Err(AppError::InvalidInput(
+            "project_dir must not contain '..' path segments".into(),
+        ));
+    }
+    if !path.is_dir() {
+        return Err(AppError::InvalidInput(format!(
+            "project_dir {} does not exist or is not a directory",
+            path.display()
+        )));
+    }
+    crate::swarm_term::project_guard::check(app, &path)?;
+    Ok(path)
+}
+
+/// Record the user's trust in `project_dir` — their "yes" in the dialog
+/// the UI shows when `swarm_term_start_session` answers
+/// `consent_required`. Only a folder the swarm may run in at all can be
+/// trusted (the same checks as the start).
+#[tauri::command(rename_all = "camelCase")]
+#[specta::specta]
+pub async fn swarm_term_trust_project<R: Runtime>(
+    app: AppHandle<R>,
+    project_dir: String,
+) -> Result<(), AppError> {
+    let path = validated_project_dir(&app, &project_dir)?;
+    let pool = app.state::<crate::db::DbPool>().inner().clone();
+    crate::swarm_term::trust::trust(&pool, &path).await
+}
+
 #[tauri::command]
 #[specta::specta]
 pub async fn swarm_term_stop_session<R: Runtime>(
@@ -94,6 +142,153 @@ pub async fn swarm_term_stop_session<R: Runtime>(
         .inner()
         .clone();
     registry.stop(app.clone()).await
+}
+
+/// Restart one agent of the running session in a new pane, on the same
+/// conversation — after its claude exited, or when it never got ready.
+#[tauri::command(rename_all = "camelCase")]
+#[specta::specta]
+pub async fn swarm_term_restart_agent<R: Runtime>(
+    app: AppHandle<R>,
+    agent_id: String,
+) -> Result<TerminalSwarmSessionHandle, AppError> {
+    let registry = app
+        .state::<std::sync::Arc<crate::swarm_term::TerminalSwarmRegistry>>()
+        .inner()
+        .clone();
+    registry.restart_agent(app.clone(), agent_id.trim()).await
+}
+
+/// The user's "go on" while the usage limit holds the swarm: deliveries
+/// and the stall clocks run again.
+#[tauri::command]
+#[specta::specta]
+pub async fn swarm_term_resume_deliveries<R: Runtime>(
+    app: AppHandle<R>,
+) -> Result<TerminalSwarmSessionHandle, AppError> {
+    let registry = app
+        .state::<std::sync::Arc<crate::swarm_term::TerminalSwarmRegistry>>()
+        .inner()
+        .clone();
+    registry.resume_deliveries(&app)
+}
+
+/// The user's cost controls: team, models, message budget (Settings →
+/// Models). They apply from the next session start.
+#[tauri::command]
+#[specta::specta]
+pub async fn swarm_term_get_team<R: Runtime>(app: AppHandle<R>) -> Result<SwarmTermTeam, AppError> {
+    let pool = app.state::<crate::db::DbPool>().inner().clone();
+    team::load(&pool).await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn swarm_term_set_team<R: Runtime>(
+    app: AppHandle<R>,
+    team: SwarmTermTeam,
+) -> Result<(), AppError> {
+    let pool = app.state::<crate::db::DbPool>().inner().clone();
+    team::save(&pool, &team).await
+}
+
+/// Pause / resume the running swarm (the toolbar button).
+#[tauri::command]
+#[specta::specta]
+pub async fn swarm_term_set_paused<R: Runtime>(
+    app: AppHandle<R>,
+    paused: bool,
+) -> Result<TerminalSwarmSessionHandle, AppError> {
+    let registry = app
+        .state::<std::sync::Arc<crate::swarm_term::TerminalSwarmRegistry>>()
+        .inner()
+        .clone();
+    registry.set_paused(&app, paused)
+}
+
+/// More messages for the running session once its budget is used up.
+#[tauri::command]
+#[specta::specta]
+pub async fn swarm_term_extend_budget<R: Runtime>(
+    app: AppHandle<R>,
+) -> Result<TerminalSwarmSessionHandle, AppError> {
+    let registry = app
+        .state::<std::sync::Arc<crate::swarm_term::TerminalSwarmRegistry>>()
+        .inner()
+        .clone();
+    registry.extend_budget(&app)
+}
+
+/// The folder a Changes-panel command is about, and Neuron's data dir
+/// (where the folder's checkpoint is kept).
+fn changes_target<R: Runtime>(
+    app: &AppHandle<R>,
+    project_dir: &str,
+) -> Result<(std::path::PathBuf, std::path::PathBuf), AppError> {
+    let project = validated_project_dir(app, project_dir)?;
+    let app_data = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| AppError::Internal(format!("app_data_dir: {e}")))?;
+    Ok((app_data, project))
+}
+
+/// Run git work off the async runtime; its complaint becomes the error.
+async fn run_git<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, AppError> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?
+        .map_err(AppError::Internal)
+}
+
+/// What changed in `project_dir` since its checkpoint — taken when the
+/// swarm started there.
+#[tauri::command(rename_all = "camelCase")]
+#[specta::specta]
+pub async fn swarm_term_changes<R: Runtime>(
+    app: AppHandle<R>,
+    project_dir: String,
+) -> Result<SwarmTermChanges, AppError> {
+    let (app_data, project) = changes_target(&app, &project_dir)?;
+    run_git(move || Ok(checkpoint::changes(&app_data, &project))).await
+}
+
+/// One changed file's diff against the checkpoint.
+#[tauri::command(rename_all = "camelCase")]
+#[specta::specta]
+pub async fn swarm_term_change_diff<R: Runtime>(
+    app: AppHandle<R>,
+    project_dir: String,
+    path: String,
+) -> Result<String, AppError> {
+    let (app_data, project) = changes_target(&app, &project_dir)?;
+    run_git(move || checkpoint::file_diff(&app_data, &project, &path)).await
+}
+
+/// Put changed files back as they were at the checkpoint (`paths`, or
+/// every changed file).
+#[tauri::command(rename_all = "camelCase")]
+#[specta::specta]
+pub async fn swarm_term_revert_changes<R: Runtime>(
+    app: AppHandle<R>,
+    project_dir: String,
+    paths: Option<Vec<String>>,
+) -> Result<SwarmTermChanges, AppError> {
+    let (app_data, project) = changes_target(&app, &project_dir)?;
+    run_git(move || checkpoint::revert(&app_data, &project, paths.as_deref())).await
+}
+
+/// Keep what changed: the checkpoint moves to now.
+#[tauri::command(rename_all = "camelCase")]
+#[specta::specta]
+pub async fn swarm_term_keep_changes<R: Runtime>(
+    app: AppHandle<R>,
+    project_dir: String,
+) -> Result<SwarmTermChanges, AppError> {
+    let (app_data, project) = changes_target(&app, &project_dir)?;
+    run_git(move || checkpoint::keep(&app_data, &project)).await
 }
 
 /// Result returned by `swarm_term_run_update` once the update child has

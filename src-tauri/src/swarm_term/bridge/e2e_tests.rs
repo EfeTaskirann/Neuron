@@ -13,7 +13,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use tauri::Manager;
@@ -24,7 +24,7 @@ use crate::swarm_term::hierarchy::AGENT_IDS;
 use crate::swarm_term::lifecycle::LifecycleStore;
 use crate::test_support::mock_app_with_pool_and_terminal_registry;
 
-use super::{install, prepare_layout, uninstall};
+use super::{install, prepare_layout, uninstall, BridgeControl};
 
 /// Fake agent: optional banner line (argv[2]) on stdout, then append
 /// every received character to argv[1]. `msvcrt.getwch` reads the
@@ -166,9 +166,10 @@ async fn bridge_end_to_end_with_fake_agents() {
     let handle = install(
         app.handle().clone(),
         root.clone(),
-        panes_by_agent.clone(),
+        Arc::new(RwLock::new(panes_by_agent.clone())),
         Arc::new(Mutex::new(ready)),
         Arc::new(LifecycleStore::new()),
+        Arc::new(BridgeControl::default()),
     );
 
     // H1: hierarchy denial → sender must be told.
@@ -358,9 +359,10 @@ async fn lifecycle_failure_paths_with_fake_agents() {
     let handle = install(
         app.handle().clone(),
         root.clone(),
-        panes_by_agent.clone(),
+        Arc::new(RwLock::new(panes_by_agent.clone())),
         Arc::new(Mutex::new(ready)),
         Arc::new(LifecycleStore::new()),
+        Arc::new(BridgeControl::default()),
     );
 
     let seq = std::cell::Cell::new(0u32);

@@ -11,7 +11,16 @@ vi.mock('../lib/bindings', () => ({
     swarmTermListPersonas: vi.fn(),
     swarmTermSessionStatus: vi.fn(),
     swarmTermStartSession: vi.fn(),
+    swarmTermTrustProject: vi.fn(),
     swarmTermStopSession: vi.fn(),
+    swarmTermRestartAgent: vi.fn(),
+    swarmTermResumeDeliveries: vi.fn(),
+    swarmTermChanges: vi.fn(),
+    swarmTermChangeDiff: vi.fn(),
+    swarmTermRevertChanges: vi.fn(),
+    swarmTermKeepChanges: vi.fn(),
+    swarmTermSetPaused: vi.fn(),
+    swarmTermExtendBudget: vi.fn(),
     swarmTermRunUpdate: vi.fn(),
     terminalLines: vi.fn(),
     terminalWrite: vi.fn(),
@@ -21,6 +30,10 @@ vi.mock('../lib/bindings', () => ({
 
 vi.mock('@tauri-apps/api/event', () => ({
   listen: () => Promise.resolve(() => {}),
+}));
+
+vi.mock('@tauri-apps/plugin-dialog', () => ({
+  ask: vi.fn(),
 }));
 
 // xterm can't host in jsdom — same stub shape as App.test.tsx.
@@ -47,6 +60,7 @@ vi.mock('@xterm/xterm/css/xterm.css', () => ({}));
 
 import { TerminalSwarmRoute } from './TerminalSwarm';
 import { setActiveProject } from '../hooks/useActiveProject';
+import { formatResetTime } from '../lib/swarmNotify';
 import type { SwarmTermPersona, TerminalSwarmSessionHandle } from '../lib/bindings';
 
 function renderRoute(): void {
@@ -83,6 +97,20 @@ const SESSION: TerminalSwarmSessionHandle = {
     { agentId: 'coordinator', paneId: 'p-coord' },
   ],
   permissionMode: 'restricted',
+  claudeVersion: '2.1.296',
+  preflightNote: null,
+  paneStates: [
+    { agentId: 'coordinator', readiness: 'ready', detail: null },
+    { agentId: 'orchestrator', readiness: 'ready', detail: null },
+  ],
+  usageLimited: false,
+  limitResetsAt: null,
+  changesNote: null,
+  liteTeam: false,
+  paused: false,
+  messagesDelivered: 12,
+  messageBudget: 300,
+  budgetReached: false,
 };
 
 beforeEach(async () => {
@@ -94,6 +122,10 @@ beforeEach(async () => {
   vi.mocked(commands.swarmTermSessionStatus).mockResolvedValue({
     status: 'ok',
     data: null,
+  });
+  vi.mocked(commands.swarmTermChanges).mockResolvedValue({
+    status: 'ok',
+    data: { checkpointAt: null, files: [], truncated: false, note: null },
   });
   vi.mocked(commands.terminalLines).mockResolvedValue({ status: 'ok', data: [] });
   vi.mocked(commands.terminalWrite).mockResolvedValue({ status: 'ok', data: null });
@@ -245,6 +277,165 @@ describe('TerminalSwarmRoute', () => {
     expect(alert).toHaveTextContent('Girilen değer geçersiz. `C:\\` bir sürücü kökü.');
   });
 
+  it('locks the chat until @orchestrator has answered its kickoff', async () => {
+    const { commands } = await import('../lib/bindings');
+    vi.mocked(commands.swarmTermSessionStatus).mockResolvedValue({
+      status: 'ok',
+      data: {
+        ...SESSION,
+        paneStates: [
+          { agentId: 'coordinator', readiness: 'ready', detail: null },
+          { agentId: 'orchestrator', readiness: 'kickoff_sent', detail: null },
+        ],
+      },
+    });
+    renderRoute();
+    const input = await screen.findByLabelText(/message to orchestrator/i);
+    expect(input).toBeDisabled();
+    expect(input).toHaveAttribute('placeholder', 'Waiting for @orchestrator to answer its kickoff…');
+    expect(screen.getByRole('button', { name: /^send$/i })).toBeDisabled();
+    // The badge counts the ready panes; the grid marks the waiting one.
+    expect(screen.getByText('1/2 ready')).toBeInTheDocument();
+    expect(screen.getByLabelText('orchestrator: warming up')).toBeInTheDocument();
+  });
+
+  it('says why a pane needs the user, on the badge and the pane', async () => {
+    const { commands } = await import('../lib/bindings');
+    const detail = "Claude giriş istiyor: bu pane'de giriş yap.";
+    vi.mocked(commands.swarmTermSessionStatus).mockResolvedValue({
+      status: 'ok',
+      data: {
+        ...SESSION,
+        paneStates: [
+          { agentId: 'coordinator', readiness: 'blocked', detail },
+          { agentId: 'orchestrator', readiness: 'ready', detail: null },
+        ],
+      },
+    });
+    renderRoute();
+    const badge = await screen.findByText('1/2 ready');
+    expect(badge).toHaveAttribute('title', `@coordinator: needs you — ${detail}`);
+    expect(badge.className).toContain('swarm-term-ready--problem');
+    expect(screen.getByLabelText(`coordinator: needs you — ${detail}`)).toBeInTheDocument();
+    // The orchestrator is ready: the chat is open.
+    expect(screen.getByLabelText(/message to orchestrator/i)).toBeEnabled();
+  });
+
+  it('offers a restart for an exited agent and restarts that one', async () => {
+    const { commands } = await import('../lib/bindings');
+    const exited: TerminalSwarmSessionHandle = {
+      ...SESSION,
+      paneStates: [
+        { agentId: 'coordinator', readiness: 'exited', detail: "Pane'in claude süreci kapandı." },
+        { agentId: 'orchestrator', readiness: 'ready', detail: null },
+      ],
+    };
+    vi.mocked(commands.swarmTermSessionStatus).mockResolvedValue({ status: 'ok', data: exited });
+    vi.mocked(commands.swarmTermRestartAgent).mockResolvedValue({ status: 'ok', data: SESSION });
+    renderRoute();
+    const restart = await screen.findByRole('button', { name: 'Restart Coordinator' });
+    // A ready pane has nothing to restart.
+    expect(screen.queryByRole('button', { name: 'Restart Orchestrator' })).not.toBeInTheDocument();
+    fireEvent.click(restart);
+    await waitFor(() => expect(commands.swarmTermRestartAgent).toHaveBeenCalledWith('coordinator'));
+  });
+
+  it('says the usage limit holds the swarm, and resumes it on request', async () => {
+    const { commands } = await import('../lib/bindings');
+    // 13:50 UTC — shown on the user's clock, whatever the zone.
+    const resetsAt = Date.UTC(2026, 9, 18, 13, 50) / 1000;
+    vi.mocked(commands.swarmTermSessionStatus).mockResolvedValue({
+      status: 'ok',
+      data: { ...SESSION, usageLimited: true, limitResetsAt: resetsAt },
+    });
+    vi.mocked(commands.swarmTermResumeDeliveries).mockResolvedValue({ status: 'ok', data: SESSION });
+    renderRoute();
+    const banner = await screen.findByRole('alert');
+    expect(banner).toHaveTextContent('Claude kullanım limitine ulaşıldı');
+    expect(banner).toHaveTextContent(`sıfırlanma: ${formatResetTime(resetsAt)}`);
+    fireEvent.click(screen.getByRole('button', { name: 'Şimdi sürdür' }));
+    await waitFor(() => expect(commands.swarmTermResumeDeliveries).toHaveBeenCalled());
+  });
+
+  it('shows a pre-flight note without blocking the session', async () => {
+    const { commands } = await import('../lib/bindings');
+    vi.mocked(commands.swarmTermSessionStatus).mockResolvedValue({
+      status: 'ok',
+      data: { ...SESSION, preflightNote: 'claude 2.1.300 bu Neuron sürümüyle test edilmedi' },
+    });
+    renderRoute();
+    const note = await screen.findByText(/2\.1\.300 bu Neuron sürümüyle test edilmedi/);
+    expect(note).toHaveAttribute('role', 'status');
+    // The session runs: its chrome is there, no error banner.
+    expect(screen.getByRole('button', { name: /stop swarm/i })).toBeInTheDocument();
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
+
+  it('says how to log in when claude has no login', async () => {
+    const { commands } = await import('../lib/bindings');
+    vi.mocked(commands.swarmTermStartSession).mockResolvedValue({
+      status: 'error',
+      error: {
+        kind: 'claude_login_required',
+        message: "Bir terminalde `claude` çalıştırıp `/login` ile giriş yap, sonra swarm'ı yeniden başlat.",
+      },
+    });
+    renderRoute();
+    const launch = await screen.findByRole('button', { name: /launch swarm/i });
+    await waitFor(() => expect(launch).toBeEnabled());
+    fireEvent.click(launch);
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent('Claude Code’a giriş yapılmamış.');
+    expect(alert).toHaveTextContent('/login');
+  });
+
+  it('asks to trust a new folder once, records the yes and launches', async () => {
+    const { commands } = await import('../lib/bindings');
+    const { ask } = await import('@tauri-apps/plugin-dialog');
+    vi.mocked(commands.swarmTermStartSession)
+      .mockResolvedValueOnce({
+        status: 'error',
+        error: { kind: 'consent_required', message: 'C:\\test-project' },
+      })
+      .mockResolvedValueOnce({ status: 'ok', data: SESSION });
+    vi.mocked(commands.swarmTermTrustProject).mockResolvedValue({ status: 'ok', data: null });
+    vi.mocked(ask).mockResolvedValue(true);
+    renderRoute();
+    const launch = await screen.findByRole('button', { name: /launch swarm/i });
+    await waitFor(() => expect(launch).toBeEnabled());
+    fireEvent.click(launch);
+    await waitFor(() => expect(commands.swarmTermStartSession).toHaveBeenCalledTimes(2));
+    expect(ask).toHaveBeenCalledTimes(1);
+    const [message, options] = vi.mocked(ask).mock.calls[0];
+    expect(message).toContain('C:\\test-project');
+    expect(message).toContain('senin yetkilerinle');
+    expect(options).toMatchObject({ title: 'Bu klasöre güveniyor musun?', kind: 'warning' });
+    expect(commands.swarmTermTrustProject).toHaveBeenCalledWith('C:\\test-project');
+    expect(vi.mocked(commands.swarmTermTrustProject).mock.invocationCallOrder[0]).toBeLessThan(
+      vi.mocked(commands.swarmTermStartSession).mock.invocationCallOrder[1],
+    );
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
+
+  it('a no to the trust question starts nothing and reports nothing', async () => {
+    const { commands } = await import('../lib/bindings');
+    const { ask } = await import('@tauri-apps/plugin-dialog');
+    vi.mocked(commands.swarmTermStartSession).mockResolvedValue({
+      status: 'error',
+      error: { kind: 'consent_required', message: 'C:\\test-project' },
+    });
+    vi.mocked(ask).mockResolvedValue(false);
+    renderRoute();
+    const launch = await screen.findByRole('button', { name: /launch swarm/i });
+    await waitFor(() => expect(launch).toBeEnabled());
+    fireEvent.click(launch);
+    await waitFor(() => expect(ask).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(launch).toBeEnabled());
+    expect(commands.swarmTermStartSession).toHaveBeenCalledTimes(1);
+    expect(commands.swarmTermTrustProject).not.toHaveBeenCalled();
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
+
   it('describeError keeps the backend detail and handles plain errors', async () => {
     const { AppErrorClient, describeError } = await import('../lib/unwrap');
     expect(describeError(new AppErrorClient('internal', 'spawn agent `scout`: boom'))).toBe(
@@ -270,6 +461,150 @@ describe('TerminalSwarmRoute', () => {
 
     fireEvent.click(toggle);
     expect(screen.queryByRole('complementary', { name: /routing log/i })).not.toBeInTheDocument();
+  });
+
+  it('counts the changed files on the toolbar and opens the Changes panel', async () => {
+    const { commands } = await import('../lib/bindings');
+    vi.mocked(commands.swarmTermSessionStatus).mockResolvedValue({ status: 'ok', data: SESSION });
+    vi.mocked(commands.swarmTermChanges).mockResolvedValue({
+      status: 'ok',
+      data: {
+        checkpointAt: 1_790_000_000,
+        files: [
+          { path: 'src/orders.rs', kind: 'modified', additions: 1, deletions: 1 },
+          { path: 'src/new.rs', kind: 'added', additions: 4, deletions: 0 },
+        ],
+        truncated: false,
+        note: null,
+      },
+    });
+    renderRoute();
+    const toggle = await screen.findByRole('button', { name: 'Değişiklikler (2)' });
+    expect(commands.swarmTermChanges).toHaveBeenCalledWith('C:\\test-project');
+    fireEvent.click(toggle);
+    const panel = screen.getByRole('complementary', { name: 'Değişiklikler' });
+    expect(panel).toHaveTextContent('src/orders.rs');
+    expect(panel).toHaveTextContent('+4 −0');
+    // One drawer at a time.
+    fireEvent.click(screen.getByRole('button', { name: /routing log/i }));
+    expect(screen.queryByRole('complementary', { name: 'Değişiklikler' })).not.toBeInTheDocument();
+  });
+
+  it('pauses the swarm from the toolbar and says what a pause does', async () => {
+    const { commands } = await import('../lib/bindings');
+    vi.mocked(commands.swarmTermSessionStatus).mockResolvedValue({ status: 'ok', data: SESSION });
+    vi.mocked(commands.swarmTermSetPaused).mockResolvedValue({
+      status: 'ok',
+      data: { ...SESSION, paused: true },
+    });
+    renderRoute();
+    const pause = await screen.findByRole('button', { name: 'Duraklat' });
+    expect(pause).toHaveAttribute('aria-pressed', 'false');
+    fireEvent.click(pause);
+    await waitFor(() => expect(commands.swarmTermSetPaused).toHaveBeenCalledWith(true));
+  });
+
+  it('locks the orchestrator chat while a usage-limit hold is on', async () => {
+    const { commands } = await import('../lib/bindings');
+    vi.mocked(commands.swarmTermSessionStatus).mockResolvedValue({
+      status: 'ok',
+      data: { ...SESSION, usageLimited: true, limitResetsAt: null },
+    });
+    renderRoute();
+    const input = await screen.findByLabelText(/message to orchestrator/i);
+    expect(input).toBeDisabled();
+    expect(input).toHaveAttribute('placeholder', expect.stringMatching(/Kullanım limiti/));
+  });
+
+  it('shows a paused swarm and offers to resume it', async () => {
+    const { commands } = await import('../lib/bindings');
+    vi.mocked(commands.swarmTermSessionStatus).mockResolvedValue({
+      status: 'ok',
+      data: { ...SESSION, paused: true },
+    });
+    vi.mocked(commands.swarmTermSetPaused).mockResolvedValue({ status: 'ok', data: SESSION });
+    renderRoute();
+    expect(await screen.findByText(/Swarm duraklatıldı/)).toHaveAttribute('role', 'status');
+    fireEvent.click(screen.getByRole('button', { name: 'Sürdür' }));
+    await waitFor(() => expect(commands.swarmTermSetPaused).toHaveBeenCalledWith(false));
+  });
+
+  it('holds at the message budget until the user raises it', async () => {
+    const { commands } = await import('../lib/bindings');
+    vi.mocked(commands.swarmTermSessionStatus).mockResolvedValue({
+      status: 'ok',
+      data: { ...SESSION, budgetReached: true, messagesDelivered: 300 },
+    });
+    vi.mocked(commands.swarmTermExtendBudget).mockResolvedValue({ status: 'ok', data: SESSION });
+    renderRoute();
+    const banner = await screen.findByRole('alert');
+    expect(banner).toHaveTextContent('Mesaj bütçesi doldu');
+    expect(banner).toHaveTextContent('300/300');
+    fireEvent.click(screen.getByRole('button', { name: 'Bütçeyi artır, sürdür' }));
+    await waitFor(() => expect(commands.swarmTermExtendBudget).toHaveBeenCalled());
+  });
+
+  it('marks the agents a Lite session leaves out', async () => {
+    const { commands } = await import('../lib/bindings');
+    vi.mocked(commands.swarmTermSessionStatus).mockResolvedValue({
+      status: 'ok',
+      data: { ...SESSION, liteTeam: true },
+    });
+    renderRoute();
+    // SESSION has 2 panes: the other 7 slots are not in this session.
+    expect(await screen.findAllByText('Bu oturumda yok (Lite takım)')).toHaveLength(7);
+  });
+
+  it('stops the swarm only after the user confirms', async () => {
+    const { commands } = await import('../lib/bindings');
+    const { ask } = await import('@tauri-apps/plugin-dialog');
+    vi.mocked(commands.swarmTermSessionStatus).mockResolvedValue({ status: 'ok', data: SESSION });
+    vi.mocked(commands.swarmTermStopSession).mockResolvedValue({ status: 'ok', data: null });
+    vi.mocked(ask).mockResolvedValueOnce(false).mockResolvedValueOnce(true);
+    renderRoute();
+    const stop = await screen.findByRole('button', { name: /stop swarm/i });
+    fireEvent.click(stop);
+    await waitFor(() => expect(ask).toHaveBeenCalledTimes(1));
+    expect(vi.mocked(ask).mock.calls[0]![0]).toContain('2 ajanın');
+    expect(commands.swarmTermStopSession).not.toHaveBeenCalled();
+    fireEvent.click(stop);
+    await waitFor(() => expect(commands.swarmTermStopSession).toHaveBeenCalled());
+  });
+
+  it('warns before a launch would replace an unreviewed checkpoint', async () => {
+    const { commands } = await import('../lib/bindings');
+    const { ask } = await import('@tauri-apps/plugin-dialog');
+    vi.mocked(commands.swarmTermChanges).mockResolvedValue({
+      status: 'ok',
+      data: {
+        checkpointAt: 1_790_000_000,
+        files: [{ path: 'src/a.rs', kind: 'modified', additions: 1, deletions: 0 }],
+        truncated: false,
+        note: null,
+      },
+    });
+    vi.mocked(commands.swarmTermStartSession).mockResolvedValue({ status: 'ok', data: SESSION });
+    vi.mocked(ask).mockResolvedValueOnce(false).mockResolvedValueOnce(true);
+    renderRoute();
+    const launch = await screen.findByRole('button', { name: /launch swarm/i });
+    await waitFor(() => expect(launch).toBeEnabled());
+    fireEvent.click(launch);
+    await waitFor(() => expect(ask).toHaveBeenCalledTimes(1));
+    expect(vi.mocked(ask).mock.calls[0]![0]).toContain('1 dosyalık değişikliği');
+    expect(commands.swarmTermStartSession).not.toHaveBeenCalled();
+    fireEvent.click(launch);
+    await waitFor(() => expect(commands.swarmTermStartSession).toHaveBeenCalled());
+  });
+
+  it('says when the session runs without a checkpoint', async () => {
+    const { commands } = await import('../lib/bindings');
+    const note = 'Bu klasör bir git deposu değil: Neuron ajanların değişikliklerini gösteremez ve geri alamaz.';
+    vi.mocked(commands.swarmTermSessionStatus).mockResolvedValue({
+      status: 'ok',
+      data: { ...SESSION, changesNote: note },
+    });
+    renderRoute();
+    expect(await screen.findByText(note)).toHaveAttribute('role', 'status');
   });
 
   it('surfaces a session-status probe failure instead of silently showing the idle grid', async () => {

@@ -42,6 +42,9 @@ use thiserror::Error;
 /// | `Sidecar`     | `sidecar`      | LangGraph Python sidecar pipe / spawn fail |
 /// | `NoApiKey`    | `no_api_key`   | provider key missing from OS keychain      |
 /// | `FeatureDisabled` | `feature_disabled` | developer feature called without `NEURON_DEV_FEATURES=1` |
+/// | `ConsentRequired` | `consent_required` | the user has not agreed yet (e.g. to run the swarm in a folder) |
+/// | `ClaudeVersionUnsupported` | `claude_version_unsupported` | installed `claude` CLI is too old for the terminal swarm |
+/// | `ClaudeLoginRequired` | `claude_login_required` | `claude` CLI is not logged in |
 #[derive(Debug, Clone, Error, Deserialize)]
 #[serde(tag = "kind", content = "message", rename_all = "snake_case")]
 pub enum AppError {
@@ -150,6 +153,25 @@ pub enum AppError {
     #[error("feature disabled: {0}")]
     FeatureDisabled(String),
 
+    /// The action needs the user's explicit agreement first — e.g. the
+    /// terminal swarm in a folder the user has not trusted yet (see
+    /// `crate::swarm_term::trust`). The message names what to agree to
+    /// (for the swarm: the project folder); the UI asks and retries.
+    #[error("consent required: {0}")]
+    ConsentRequired(String),
+
+    /// The installed `claude` CLI is older than the oldest version the
+    /// terminal swarm runs (see `crate::swarm_term::preflight`). The
+    /// message names both versions and how to update.
+    #[error("claude version unsupported: {0}")]
+    ClaudeVersionUnsupported(String),
+
+    /// The `claude` CLI is not logged in (`claude auth status`). The
+    /// message says how to log in; the swarm does not start nine login
+    /// screens.
+    #[error("claude login required: {0}")]
+    ClaudeLoginRequired(String),
+
     /// Catch-all for unclassified failures (panics-in-tasks, missing
     /// env, etc.). Frontend treats `internal` as a developer bug.
     #[error("internal error: {0}")]
@@ -177,6 +199,9 @@ impl AppError {
             Self::WorkspaceBusy { .. } => "workspace_busy",
             Self::Cancelled(_) => "cancelled",
             Self::FeatureDisabled(_) => "feature_disabled",
+            Self::ConsentRequired(_) => "consent_required",
+            Self::ClaudeVersionUnsupported(_) => "claude_version_unsupported",
+            Self::ClaudeLoginRequired(_) => "claude_login_required",
             Self::Internal(_) => "internal",
         }
     }
@@ -203,6 +228,9 @@ impl AppError {
             | Self::Timeout(m)
             | Self::Cancelled(m)
             | Self::FeatureDisabled(m)
+            | Self::ConsentRequired(m)
+            | Self::ClaudeVersionUnsupported(m)
+            | Self::ClaudeLoginRequired(m)
             | Self::Internal(m) => Cow::Borrowed(m.as_str()),
             Self::WorkspaceBusy {
                 workspace_id,
@@ -313,6 +341,12 @@ mod tests {
         assert_eq!(AppError::InvalidInput("x".into()).kind(), "invalid_input");
         assert_eq!(AppError::DbError("x".into()).kind(), "db_error");
         assert_eq!(AppError::FeatureDisabled("x".into()).kind(), "feature_disabled");
+        assert_eq!(AppError::ConsentRequired("x".into()).kind(), "consent_required");
+        assert_eq!(
+            AppError::ClaudeVersionUnsupported("x".into()).kind(),
+            "claude_version_unsupported"
+        );
+        assert_eq!(AppError::ClaudeLoginRequired("x".into()).kind(), "claude_login_required");
         assert_eq!(AppError::Internal("x".into()).kind(), "internal");
     }
 

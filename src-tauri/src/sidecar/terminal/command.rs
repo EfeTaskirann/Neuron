@@ -19,15 +19,14 @@ use std::path::PathBuf;
 ///    `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`,
 ///    `ANTHROPIC_BASE_URL`, `ANTHROPIC_API_URL`,
 ///    `ANTHROPIC_CUSTOM_HEADERS`) — any of these, when inherited from
-///    the parent process, override the per-pane `.credentials.json` we
-///    seed into each isolated HOME. The 2026-05-13 `/login` regression
-///    pinned this to `CLAUDE_CODE_OAUTH_TOKEN`: when Neuron is launched
-///    from inside a Claude Code shell (the user's typical dev loop),
-///    Claude Code exports its session token here for nested processes.
-///    Each spawned pane then prefers the parent's token over its own
-///    seeded credentials, finds it scoped to a different session, and
-///    drops into `/login`. Stripping all six forces the pane to use
-///    the local `.credentials.json` we control.
+///    the parent process, override the user's own stored login. The
+///    2026-05-13 `/login` regression pinned this to
+///    `CLAUDE_CODE_OAUTH_TOKEN`: when Neuron is launched from inside a
+///    Claude Code shell (the user's typical dev loop), Claude Code
+///    exports its session token here for nested processes. Each spawned
+///    pane then prefers the parent's token over the stored login, finds
+///    it scoped to a different session, and drops into `/login`.
+///    Stripping all six makes the pane use the user's stored login.
 ///
 /// 3. **Provider-routing toggles** (`USE_BEDROCK`, `USE_VERTEX`,
 ///    `USE_FOUNDRY`, `CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_VERTEX`,
@@ -37,10 +36,11 @@ use std::path::PathBuf;
 ///    subscription-only contract mirrored from
 ///    `swarm::binding::STRIPPED_ENV_VARS`.
 ///
-/// 4. **Config-dir override** (`CLAUDE_CONFIG_DIR`) — if set in the
-///    parent, every pane ignores its per-pane HOME and races on the
-///    shared real config dir, undoing the isolation that prevents
-///    `.claude.json` truncation under 9-way concurrent writes.
+/// 4. **Config-dir override** (`CLAUDE_CONFIG_DIR`) — swarm-term panes
+///    run on the user's default configuration (`~/.claude`), which is
+///    where the session finds their transcripts; one inherited from a
+///    parent Claude session would point them at another config dir
+///    (and login).
 pub(super) const CLAUDE_AGENT_STRIPPED_ENV: &[&str] = &[
     // Nested-instance signals.
     "CLAUDECODE",

@@ -1,5 +1,8 @@
 import { useMemo, useRef, useState } from 'react';
+import { useQueryClient } from '@tanstack/react-query';
+import { confirmWarning } from '../lib/confirm';
 import { HierarchyDiagram } from '../components/SwarmHierarchy';
+import { ChangesDrawer } from '../components/swarm-term/ChangesDrawer';
 import { ClaudeUpdateCorner } from '../components/swarm-term/ClaudeUpdateCorner';
 import { OrchestratorChatBar } from '../components/swarm-term/OrchestratorChatBar';
 import { SwarmTermGrid } from '../components/swarm-term/SwarmTermGrid';
@@ -8,20 +11,105 @@ import { parseSwarmTermStartMs } from '../components/swarm-term/constants';
 import { useActiveProject } from '../hooks/useActiveProject';
 import { useTerminalWrite } from '../hooks/mutations';
 import {
+  useExtendSwarmTermBudget,
+  useRestartSwarmTermAgent,
+  useResumeSwarmTermDeliveries,
   useRunClaudeUpdate,
+  useSetSwarmTermPaused,
   useStartSwarmTermSession,
   useStopSwarmTermSession,
   useSwarmTermPersonas,
   useSwarmTermSessionStatus,
+  useTrustSwarmTermProject,
 } from '../hooks/useTerminalSwarmSession';
 import { useClaudeUpdateProgress } from '../hooks/useClaudeUpdateProgress';
+import { fetchSwarmTermChanges, useSwarmTermChanges } from '../hooks/useSwarmTermChanges';
 import { useRoutingEvents } from '../hooks/useRoutingEvents';
 import { useActiveEdge, useAgentLifecycle } from '../hooks/useAgentLifecycle';
-import { describeError } from '../lib/unwrap';
+import { formatResetTime } from '../lib/swarmNotify';
+import { AppErrorClient, describeError } from '../lib/unwrap';
+import type { TerminalSwarmPaneState } from '../lib/bindings';
 import { RoutingLogRoute } from './RoutingLogRoute';
 
 /** Gap between the pasted chat message and its submitting CR. */
 const SUBMIT_DELAY_MS = 200;
+
+/** Why @orchestrator cannot take a task yet, or `null` when it can. */
+function chatWaitReason(state: TerminalSwarmPaneState | undefined): string | null {
+  switch (state?.readiness) {
+    case 'starting':
+      return 'Waiting for @orchestrator to start…';
+    case 'kickoff_sent':
+      return 'Waiting for @orchestrator to answer its kickoff…';
+    case 'blocked':
+      return `@orchestrator needs you: ${state.detail ?? 'answer the screen in its pane'}`;
+    case 'not_ready':
+      return '@orchestrator did not answer its kickoff — check its pane';
+    case 'exited':
+      return "@orchestrator's claude exited — restart it with ↻ on its pane";
+    default:
+      return null;
+  }
+}
+
+/**
+ * Asked once per folder, before the first launch there (the backend
+ * answers `consent_required`). A yes is recorded; the session then
+ * answers Claude Code's own "do you trust this folder?" for the panes.
+ */
+function askToTrustFolder(folder: string): Promise<boolean> {
+  return confirmWarning({
+    title: 'Bu klasöre güveniyor musun?',
+    okLabel: 'Güveniyorum, başlat',
+    message:
+      `Swarm şu klasörde çalışacak:\n${folder}\n\n` +
+      'Ajanlar buradaki dosyaları okur, builder’lar değiştirir. Testleri ve build’i ' +
+      'çalıştırmak projenin kendi kodunu senin yetkilerinle çalıştırır. Projenin commit’li ' +
+      '`.claude/` ayarları da (hook’lar, izinler) bu yetkilerle çalışabilir. Yalnız ' +
+      'güvendiğin bir projede devam et.\n\n' +
+      'Her başlangıçta klasörün o anki hali bir git checkpoint’i olarak saklanır: ' +
+      'ajanların değişikliklerini Değişiklikler panelinde görüp geri alabilirsin ' +
+      '(git deposu olmayan bir klasörde bu yapılamaz).\n\n' +
+      'Ajanlar senin Claude girişini paylaştığı için, onaylarsan Claude Code’un bu ' +
+      'klasör için sorduğu “güveniyor musun?” sorusu senin adına “evet” yanıtlanır; bu ' +
+      'güven kalıcıdır ve bu klasörde kendi `claude` oturumların da bir daha sormaz.',
+  });
+}
+
+/** Stop asks first: every agent's claude session ends with it. */
+function confirmStop(agents: number): Promise<boolean> {
+  return confirmWarning({
+    title: 'Swarm’ı durdur',
+    okLabel: 'Durdur',
+    message:
+      `Swarm durdurulsun mu?\n\n${agents} ajanın claude oturumu kapanır; yarım kalan işleri ` +
+      'kaybolur. Değişiklikler panelindeki checkpoint kalır.',
+  });
+}
+
+/** Restart asks first: the agents start over, and so does the checkpoint. */
+function confirmRestart(agents: number): Promise<boolean> {
+  return confirmWarning({
+    title: 'Swarm’ı yeniden başlat',
+    okLabel: 'Yeniden başlat',
+    message:
+      `Swarm yeniden başlatılsın mı?\n\n${agents} ajan kapanıp sıfırdan açılır; konuşmaları ve ` +
+      'yarım kalan işleri kaybolur. Yeni oturum yeni bir checkpoint alır: şimdiye kadarki ' +
+      'değişiklikler artık Değişiklikler panelinden geri alınamaz.',
+  });
+}
+
+/** A launch over changes the user has not kept or reverted asks first. */
+function confirmNewCheckpoint(files: number): Promise<boolean> {
+  return confirmWarning({
+    title: 'Swarm’ı başlat',
+    okLabel: 'Başlat',
+    message:
+      `Önceki oturumun ${files} dosyalık değişikliği henüz tutulmadı ya da geri alınmadı.\n\n` +
+      'Yeni başlangıç yeni bir checkpoint alır: bu değişiklikler artık Değişiklikler ' +
+      'panelinden geri alınamaz. Yine de başlatılsın mı?',
+  });
+}
 
 /**
  * Make chat text safe inside a bracketed paste (mirrors the backend's
@@ -49,12 +137,13 @@ export function TerminalSwarmRoute(): JSX.Element {
   const { project } = useActiveProject();
   const projectDir = project?.path ?? null;
   const [launchError, setLaunchError] = useState<string | null>(null);
-  // The Routing Log keeps its history in a module store, so closing the
-  // drawer loses nothing.
-  const [logOpen, setLogOpen] = useState(false);
+  // One drawer at a time: the Routing Log (its history lives in a module
+  // store, so closing it loses nothing) or the Changes panel.
+  const [drawer, setDrawer] = useState<'log' | 'changes' | null>(null);
+  const toggleDrawer = (which: 'log' | 'changes') =>
+    setDrawer((open) => (open === which ? null : which));
   const { events: routeEvents } = useRoutingEvents(500);
   const activeEdge = useActiveEdge(routeEvents, 3_000);
-  const lifecycle = useAgentLifecycle(routeEvents);
 
   const { data: personas = [] } = useSwarmTermPersonas();
   const {
@@ -63,44 +152,156 @@ export function TerminalSwarmRoute(): JSX.Element {
     isError: sessionProbeFailed,
     error: sessionProbeError,
   } = useSwarmTermSessionStatus();
+  const lifecycle = useAgentLifecycle(routeEvents, session?.sessionId ?? null);
+  const paneStates = useMemo(() => session?.paneStates ?? [], [session]);
+  const paneStatesByAgent = useMemo(
+    () => new Map(paneStates.map((p) => [p.agentId, p])),
+    [paneStates],
+  );
+  // A hold (usage limit, budget, the user's pause) stops the bridge, but
+  // the chat writes straight to the orchestrator pane — so lock it too, or
+  // its submitting CR lands on claude's limit menu / a wasted turn.
+  const chatHoldReason = session?.usageLimited
+    ? 'Kullanım limiti: swarm duraklatıldı. Limit kalkınca ya da “Şimdi sürdür” ile devam.'
+    : session?.budgetReached
+      ? 'Mesaj bütçesi doldu. “Bütçeyi artır, sürdür” ile devam.'
+      : session?.paused
+        ? 'Duraklatıldı: araç çubuğundaki “Sürdür” ile devam.'
+        : null;
+  const chatDisabledReason =
+    chatHoldReason ?? chatWaitReason(paneStatesByAgent.get('orchestrator'));
   const startMut = useStartSwarmTermSession();
+  const trustMut = useTrustSwarmTermProject();
   const stopMut = useStopSwarmTermSession();
+  const restartAgentMut = useRestartSwarmTermAgent();
+  const resumeMut = useResumeSwarmTermDeliveries();
+  const pauseMut = useSetSwarmTermPaused();
+  const budgetMut = useExtendSwarmTermBudget();
   const updateMut = useRunClaudeUpdate();
   const updateProgress = useClaudeUpdateProgress(updateMut.isPending);
-  const writeMut = useTerminalWrite();
+  // Send failures land in this route's error banner.
+  const writeMut = useTerminalWrite({ errorsShownInline: true });
+  const qc = useQueryClient();
 
   const sessionActive = session != null;
+  // The running session's folder, else the active project (its last
+  // session's checkpoint): polled while the agents work.
+  const changesProject = session?.projectDir ?? projectDir;
+  const changesQuery = useSwarmTermChanges(changesProject, {
+    enabled: sessionActive || drawer === 'changes',
+    // Snapshot only while the drawer is open: each poll walks the tree and
+    // writes git objects, so polling all session long for a toolbar count
+    // isn't worth it (the count refreshes when the drawer is opened).
+    live: drawer === 'changes',
+  });
   // `!sessionLoading`: while the status probe is in flight we don't
   // yet know whether a session exists — launching then would only
   // bounce off the backend's Conflict guard.
   const canLaunch =
-    projectDir != null && !sessionActive && !sessionLoading && !startMut.isPending;
+    projectDir != null &&
+    !sessionActive &&
+    !sessionLoading &&
+    !startMut.isPending &&
+    !trustMut.isPending;
+
+  // Start, asking first if the user has not trusted the folder yet. A
+  // "no" is not an error: nothing starts and nothing is reported.
+  const startWithConsent = async (dir: string) => {
+    try {
+      await startMut.mutateAsync(dir);
+    } catch (err) {
+      if (!(err instanceof AppErrorClient) || err.kind !== 'consent_required') throw err;
+      if (!(await askToTrustFolder(err.detail || dir))) return;
+      await trustMut.mutateAsync(dir);
+      await startMut.mutateAsync(dir);
+    }
+  };
+
+  // Launch / Stop / Restart await a dialog (and, for launch, a change-list
+  // read) before their mutation turns pending, so `canLaunch` / `isPending`
+  // don't cover that window — this guard stops a second click starting a
+  // second action.
+  const actionInFlight = useRef(false);
 
   const launch = async () => {
-    if (!projectDir) return;
-    setLaunchError(null);
+    if (!projectDir || actionInFlight.current) return;
+    actionInFlight.current = true;
     try {
-      await startMut.mutateAsync(projectDir);
+      setLaunchError(null);
+      // A start takes a new checkpoint: changes since the last one would
+      // no longer be revertible from the panel. A failed read does not block.
+      const pending = await fetchSwarmTermChanges(qc, projectDir)
+        .then((c) => c.files.length)
+        .catch(() => 0);
+      if (pending > 0 && !(await confirmNewCheckpoint(pending))) return;
+      await startWithConsent(projectDir);
     } catch (err) {
       setLaunchError(describeError(err));
+    } finally {
+      actionInFlight.current = false;
     }
   };
 
   const stop = async () => {
+    if (actionInFlight.current) return;
+    actionInFlight.current = true;
     try {
+      if (!(await confirmStop(session?.panes.length ?? 0))) return;
       await stopMut.mutateAsync();
+    } catch (err) {
+      setLaunchError(describeError(err));
+    } finally {
+      actionInFlight.current = false;
+    }
+  };
+
+  const restart = async () => {
+    if (!sessionActive || actionInFlight.current) return;
+    actionInFlight.current = true;
+    try {
+      if (!(await confirmRestart(session.panes.length))) return;
+      setLaunchError(null);
+      await stopMut.mutateAsync();
+      await startWithConsent(session.projectDir);
+    } catch (err) {
+      setLaunchError(describeError(err));
+    } finally {
+      actionInFlight.current = false;
+    }
+  };
+
+  const restartAgent = async (agentId: string) => {
+    setLaunchError(null);
+    try {
+      await restartAgentMut.mutateAsync(agentId);
     } catch (err) {
       setLaunchError(describeError(err));
     }
   };
 
-  const restart = async () => {
+  const togglePause = async () => {
     if (!sessionActive) return;
-    const dir = session.projectDir;
     setLaunchError(null);
     try {
-      await stopMut.mutateAsync();
-      await startMut.mutateAsync(dir);
+      await pauseMut.mutateAsync(!session.paused);
+    } catch (err) {
+      setLaunchError(describeError(err));
+    }
+  };
+
+  const extendBudget = async () => {
+    setLaunchError(null);
+    try {
+      await budgetMut.mutateAsync();
+    } catch (err) {
+      setLaunchError(describeError(err));
+    }
+  };
+
+  const resumeDeliveries = async () => {
+    setLaunchError(null);
+    try {
+      await resumeMut.mutateAsync();
     } catch (err) {
       setLaunchError(describeError(err));
     }
@@ -156,11 +357,18 @@ export function TerminalSwarmRoute(): JSX.Element {
           startPending={startMut.isPending}
           stopPending={stopMut.isPending}
           sessionStartMs={sessionStartMs}
-          logOpen={logOpen}
+          logOpen={drawer === 'log'}
+          changesOpen={drawer === 'changes'}
+          changesCount={changesQuery.data?.files.length ?? null}
+          paused={session?.paused ?? false}
+          pausePending={pauseMut.isPending}
+          paneStates={paneStates}
           onLaunch={launch}
           onRestart={restart}
           onStop={stop}
-          onToggleLog={() => setLogOpen((open) => !open)}
+          onToggleLog={() => toggleDrawer('log')}
+          onToggleChanges={() => toggleDrawer('changes')}
+          onTogglePause={togglePause}
         />
 
         {launchError && (
@@ -171,6 +379,59 @@ export function TerminalSwarmRoute(): JSX.Element {
         {sessionProbeFailed && (
           <div className="swarm-term-error" role="alert">
             Session status unavailable: {describeError(sessionProbeError)}
+          </div>
+        )}
+        {session?.preflightNote && (
+          <div className="swarm-term-note" role="status">
+            {session.preflightNote}
+          </div>
+        )}
+        {session?.changesNote && (
+          <div className="swarm-term-note" role="status">
+            {session.changesNote}
+          </div>
+        )}
+        {session?.paused && (
+          <div className="swarm-term-note" role="status">
+            Swarm duraklatıldı: mesajlar outbox’larda sırayla bekliyor, takılma hatırlatmaları
+            durdu. Çalışan bir ajan elindeki turu bitirir.
+          </div>
+        )}
+        {session?.budgetReached && (
+          <div className="swarm-term-limit" role="alert">
+            <p>
+              <strong>Mesaj bütçesi doldu</strong> ({session.messagesDelivered}/
+              {session.messageBudget}). Ajanlar arası mesaj teslimi ve takılma hatırlatmaları
+              durdu.
+            </p>
+            <button
+              type="button"
+              className="btn"
+              onClick={extendBudget}
+              disabled={budgetMut.isPending}
+            >
+              Bütçeyi artır, sürdür
+            </button>
+          </div>
+        )}
+        {session?.usageLimited && (
+          <div className="swarm-term-limit" role="alert">
+            <p>
+              <strong>Claude kullanım limitine ulaşıldı</strong>
+              {session.limitResetsAt != null &&
+                ` (sıfırlanma: ${formatResetTime(session.limitResetsAt)})`}
+              . Mesaj teslimi ve takılma hatırlatmaları duraklatıldı. Limit sıfırlanınca
+              claude genelde kendiliğinden sürer; bir ajan yeniden yanıt verince swarm da
+              devam eder.
+            </p>
+            <button
+              type="button"
+              className="btn"
+              onClick={resumeDeliveries}
+              disabled={resumeMut.isPending}
+            >
+              Şimdi sürdür
+            </button>
           </div>
         )}
 
@@ -186,6 +447,7 @@ export function TerminalSwarmRoute(): JSX.Element {
           <OrchestratorChatBar
             onSend={sendToOrchestrator}
             permissionMode={session.permissionMode}
+            disabledReason={chatDisabledReason}
           />
         )}
 
@@ -194,12 +456,28 @@ export function TerminalSwarmRoute(): JSX.Element {
           panesByAgent={panesByAgent}
           lifecycle={lifecycle}
           activeEdge={activeEdge}
+          paneStates={paneStatesByAgent}
+          onRestartAgent={restartAgent}
+          liteTeam={session?.liteTeam ?? false}
+          restartingAgent={restartAgentMut.isPending ? (restartAgentMut.variables ?? null) : null}
         />
       </div>
 
-      {logOpen && (
+      {drawer === 'log' && (
         <aside className="swarm-term-log-drawer" aria-label="Routing Log">
           <RoutingLogRoute />
+        </aside>
+      )}
+      {drawer === 'changes' && changesProject && (
+        <aside className="swarm-term-log-drawer" aria-label="Değişiklikler">
+          <ChangesDrawer
+            projectDir={changesProject}
+            changes={changesQuery.data}
+            updatedAt={changesQuery.dataUpdatedAt}
+            fetching={changesQuery.isFetching}
+            error={changesQuery.error}
+            onRefresh={() => void changesQuery.refetch()}
+          />
         </aside>
       )}
 

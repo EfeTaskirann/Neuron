@@ -14,6 +14,10 @@ vi.mock('../lib/bindings', () => ({
   },
 }));
 
+vi.mock('@tauri-apps/plugin-dialog', () => ({
+  ask: vi.fn(),
+}));
+
 import { MCPRoute } from './MCPRoute';
 import type { Server } from '../lib/bindings';
 
@@ -100,6 +104,21 @@ describe('MCPRoute', () => {
     });
     expect(screen.getByText('Git')).toBeInTheDocument();
     expect(screen.queryByText('Filesystem')).not.toBeInTheDocument();
+  });
+
+  it('uninstalls a server only after the user confirms', async () => {
+    const { commands } = await import('../lib/bindings');
+    const { ask } = await import('@tauri-apps/plugin-dialog');
+    vi.mocked(commands.mcpUninstall).mockResolvedValue({ status: 'ok', data: FS_SERVER });
+    vi.mocked(ask).mockResolvedValueOnce(false).mockResolvedValueOnce(true);
+    renderRoute();
+    await waitFor(() => expect(installedChip()).toBeInTheDocument());
+    const uninstall = screen.getByTitle('Uninstall server');
+    fireEvent.click(uninstall);
+    await waitFor(() => expect(ask).toHaveBeenCalledTimes(1));
+    expect(commands.mcpUninstall).not.toHaveBeenCalled();
+    fireEvent.click(uninstall);
+    await waitFor(() => expect(commands.mcpUninstall).toHaveBeenCalled());
   });
 
   it('filters the catalog to installed servers', async () => {

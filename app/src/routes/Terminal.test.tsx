@@ -20,6 +20,7 @@ vi.mock('../lib/bindings', () => ({
     terminalPurgeClosed: vi.fn(),
     terminalDelete: vi.fn(),
     mailboxList: vi.fn(),
+    swarmTermSessionStatus: vi.fn(),
   },
 }));
 
@@ -112,6 +113,7 @@ beforeEach(async () => {
     data: [{ seq: 1, k: 'out', text: 'hello from the PTY' }],
   });
   vi.mocked(commands.mailboxList).mockResolvedValue({ status: 'ok', data: [] });
+  vi.mocked(commands.swarmTermSessionStatus).mockResolvedValue({ status: 'ok', data: null });
   vi.mocked(commands.terminalSpawn).mockResolvedValue({
     status: 'ok',
     data: RUNNING_PANE,
@@ -151,6 +153,42 @@ describe('TerminalRoute', () => {
     expect(
       screen.getByRole('button', { name: /clean closed \(1\)/i }),
     ).not.toBeDisabled();
+  });
+
+  it('offers no close for a live Terminal Swarm pane', async () => {
+    const { commands } = await import('../lib/bindings');
+    vi.mocked(commands.terminalList).mockResolvedValue({
+      status: 'ok',
+      data: [{ ...RUNNING_PANE, workspace: 'swarm-term', role: 'scout' }, CLOSED_PANE],
+    });
+    // The running swarm session owns the pane (same id), so it is live.
+    vi.mocked(commands.swarmTermSessionStatus).mockResolvedValue({
+      status: 'ok',
+      data: {
+        sessionId: 'swarm-term-01HV4Q2J9GXKWX8Z3M5T7BCDEF',
+        projectDir: 'C:\\p',
+        panes: [{ agentId: 'scout', paneId: RUNNING_PANE.id }],
+        permissionMode: 'restricted',
+        claudeVersion: null,
+        preflightNote: null,
+        paneStates: [],
+        usageLimited: false,
+        limitResetsAt: null,
+        changesNote: null,
+        liteTeam: false,
+        paused: false,
+        messagesDelivered: 0,
+        messageBudget: 0,
+        budgetReached: false,
+      },
+    });
+    renderRoute();
+    await waitFor(() => expect(screen.getAllByRole('tab')).toHaveLength(2));
+    // The swarm's pane is stopped from Terminal Swarm; the closed shell
+    // pane can still be removed here.
+    expect(screen.queryByRole('button', { name: /close claude pane/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /^close pane$/i })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /close shell pane/i })).toBeInTheDocument();
   });
 
   it('renders the empty state with the New pane button when no panes exist', async () => {

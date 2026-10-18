@@ -72,6 +72,18 @@ use command::{
 };
 use reader::{flush_ring_to_db, run_reader, run_waiter};
 
+/// The variables a `claude` child must not inherit: the known auth /
+/// provider / nesting ones ([`CLAUDE_AGENT_STRIPPED_ENV`]) plus every
+/// variable of a Claude Code session Neuron itself was launched from.
+/// Shared by the PTY spawn and the swarm's pre-flight checks, so a
+/// check sees exactly the login a pane sees.
+pub(crate) fn claude_child_env_removals() -> Vec<String> {
+    let mut vars: Vec<String> =
+        CLAUDE_AGENT_STRIPPED_ENV.iter().map(|v| v.to_string()).collect();
+    vars.extend(inherited_claude_session_env(std::env::vars()));
+    vars
+}
+
 // Tunables (RING_BUFFER_CAP, RING_BUFFER_DROP, APPROVAL_WINDOW_LINES,
 // READ_CHUNK_BYTES, KILL_GRACE, WAIT_POLL, MAX_PENDING_BYTES) live in
 // `crate::tuning` so the runtime profile is editable in one place.
@@ -274,22 +286,15 @@ impl TerminalRegistry {
         // subscription_env()` — they'd silently flip the spawn
         // off the user's Pro/Max OAuth channel onto BYOK billing.
         if agent_kind == "claude-code" {
-            for var in CLAUDE_AGENT_STRIPPED_ENV {
-                builder.env_remove(var);
-            }
-            // Launched from inside a Claude Code session: drop ALL of
-            // that host session's variables, not just the known ones.
-            for var in inherited_claude_session_env(std::env::vars()) {
+            for var in claude_child_env_removals() {
                 builder.env_remove(var);
             }
         }
         // Apply caller-supplied env overrides AFTER the scrub list,
-        // so `extra_env` can re-set anything we just removed AND can
-        // point the spawned process at a private HOME / USERPROFILE.
-        // Used by `swarm-term::session` to give each claude REPL its
-        // own `~/.claude.json` (preventing the 9-way concurrent-write
-        // race that progressively truncated the user's shared config
-        // in the 2026-05-12 23:46Z smoke).
+        // so `extra_env` can re-set anything we just removed. Used by
+        // `swarm-term::session` for its pane settings (auto-update and
+        // auto-memory off, the bridge paths — see
+        // `swarm_term::pane_config::pane_env`).
         if let Some(extra) = &opts.extra_env {
             for (k, v) in extra {
                 builder.env(k, v);

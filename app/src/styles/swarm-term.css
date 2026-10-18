@@ -10,6 +10,8 @@
   --phase-building: var(--syn-warning);
   --phase-review:   var(--syn-running);
   --phase-done:     var(--syn-success);
+  --phase-rework:   color-mix(in oklab, var(--syn-warning) 50%, var(--syn-error));
+  --phase-failed:   var(--syn-error);
 }
 
 /* Row: the swarm column, then the optional Routing Log drawer. */
@@ -40,6 +42,126 @@
 }
 .swarm-term-log-drawer .route-routing-log {
   padding: 0 0 0 12px;
+}
+
+/* The Changes panel (ChangesDrawer.tsx): files, actions, one diff. */
+.swarm-term-changes {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  height: 100%;
+  min-height: 0;
+  padding: 0 0 0 12px;
+  font-size: 12px;
+}
+.swarm-term-changes-head,
+.swarm-term-changes-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.swarm-term-changes-head h2 {
+  margin: 0;
+  flex: 1;
+  font-size: 14px;
+}
+.swarm-term-changes-since,
+.swarm-term-changes-actions span,
+.swarm-term-changes-empty,
+.swarm-term-change-counts {
+  color: var(--muted-foreground);
+}
+.swarm-term-changes-actions span {
+  flex: 1;
+}
+.swarm-term-changes-empty {
+  margin: 0;
+}
+.swarm-term-changes-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 40%;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.swarm-term-changes-list li {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 4px;
+  border-bottom: 1px solid var(--border);
+}
+.swarm-term-changes-list li:last-child {
+  border-bottom: none;
+}
+.swarm-term-changes-list li.selected {
+  background: var(--surface-2);
+}
+.swarm-term-change-file {
+  display: flex;
+  flex: 1;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  padding: 4px;
+  background: transparent;
+  border: none;
+  color: var(--foreground);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.swarm-term-change-path {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.swarm-term-change-path,
+.swarm-term-change-counts,
+.swarm-term-change-kind,
+.swarm-term-diff {
+  font-family: var(--font-mono, ui-monospace, monospace);
+}
+.swarm-term-change-kind {
+  width: 1.2em;
+  font-weight: 600;
+  text-align: center;
+}
+.swarm-term-change-kind--added {
+  color: var(--syn-success);
+}
+.swarm-term-change-kind--deleted {
+  color: var(--syn-error);
+}
+.swarm-term-change-kind--modified,
+.swarm-term-change-kind--type_changed {
+  color: var(--syn-warning);
+}
+.swarm-term-diff-box {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.swarm-term-diff {
+  margin: 0;
+  padding: 8px;
+  font-size: 11px;
+  line-height: 1.45;
+  white-space: pre;
+}
+.swarm-term-diff-add {
+  background: color-mix(in oklab, var(--background) 82%, var(--syn-success));
+}
+.swarm-term-diff-del {
+  background: color-mix(in oklab, var(--background) 82%, var(--syn-error));
+}
+.swarm-term-diff-hunk {
+  color: var(--muted-foreground);
 }
 
 .swarm-term-log-toggle[aria-pressed='true'] {
@@ -158,6 +280,26 @@
   color: var(--accent-strong);
 }
 
+/* Restart for an exited / never-ready agent, next to its readiness chip. */
+.swarm-term-pane-restart {
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 2px 6px;
+  font-size: 13px;
+  line-height: 1;
+  color: var(--foreground);
+  cursor: pointer;
+}
+.swarm-term-pane-restart:hover:not(:disabled) {
+  color: var(--accent-strong);
+  background: var(--surface-1);
+}
+.swarm-term-pane-restart:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
 /* Grid in expanded mode: one row × one column, only the .expanded
  * tile is visible. The xterm wrapper inside re-fits via the
  * existing ResizeObserver in SwarmPane.tsx, so claude REPL's
@@ -211,6 +353,31 @@
   border-radius: 6px;
   font-size: 12px;
   font-family: var(--font-mono, ui-monospace, monospace);
+}
+
+/* The usage limit holds the swarm: what happens, and the user's resume. */
+.swarm-term-limit {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  background: color-mix(in oklab, var(--surface-1) 80%, var(--destructive));
+  color: var(--foreground);
+  padding: 8px 12px;
+  border-radius: 6px;
+  font-size: 12px;
+}
+.swarm-term-limit p {
+  margin: 0;
+  flex: 1;
+}
+
+/* A pre-flight finding that did not block the start. */
+.swarm-term-note {
+  background: color-mix(in oklab, var(--surface-1) 85%, var(--syn-warning));
+  color: var(--foreground);
+  padding: 8px 12px;
+  border-radius: 6px;
+  font-size: 12px;
 }
 
 .swarm-term-chat {
@@ -348,6 +515,14 @@
   background: color-mix(in oklab, var(--background) 72%, var(--phase-done));
   border-color: color-mix(in oklab, var(--border) 50%, var(--phase-done));
 }
+.swarm-term-hier-chip[data-phase='rework'] {
+  background: color-mix(in oklab, var(--background) 72%, var(--phase-rework));
+  border-color: color-mix(in oklab, var(--border) 50%, var(--phase-rework));
+}
+.swarm-term-hier-chip[data-phase='failed'] {
+  background: color-mix(in oklab, var(--background) 72%, var(--phase-failed));
+  border-color: color-mix(in oklab, var(--border) 50%, var(--phase-failed));
+}
 
 /* Active edge: source and target both glow with a pulsing outline
  * so the operator can spot the live conversation at a glance. */
@@ -424,6 +599,64 @@
   background: color-mix(in oklab, var(--background) 70%, var(--phase-done));
   border-color: color-mix(in oklab, var(--border) 40%, var(--phase-done));
   color: var(--foreground);
+}
+.swarm-term-pane-phase--rework {
+  background: color-mix(in oklab, var(--background) 70%, var(--phase-rework));
+  border-color: color-mix(in oklab, var(--border) 40%, var(--phase-rework));
+  color: var(--foreground);
+}
+.swarm-term-pane-phase--failed {
+  background: color-mix(in oklab, var(--background) 70%, var(--phase-failed));
+  border-color: color-mix(in oklab, var(--border) 40%, var(--phase-failed));
+  color: var(--foreground);
+}
+
+/* A pane that is not (yet / any longer) ready: shown next to its
+ * lifecycle pill until it answers the kickoff. */
+.swarm-term-pane-ready {
+  display: inline-flex;
+  align-items: center;
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  padding: 2px 7px;
+  border-radius: 999px;
+  border: 1px dashed var(--border);
+  background: var(--surface-1);
+  color: var(--muted-foreground);
+  flex: 0 0 auto;
+}
+.swarm-term-pane-ready--blocked,
+.swarm-term-pane-ready--not_ready {
+  border-style: solid;
+  background: color-mix(in oklab, var(--background) 70%, var(--syn-warning));
+  border-color: color-mix(in oklab, var(--border) 40%, var(--syn-warning));
+  color: var(--foreground);
+}
+.swarm-term-pane-ready--exited {
+  border-style: solid;
+  background: color-mix(in oklab, var(--background) 70%, var(--syn-error));
+  border-color: color-mix(in oklab, var(--border) 40%, var(--syn-error));
+  color: var(--foreground);
+}
+
+/* Toolbar "n/9 ready". */
+.swarm-term-ready {
+  font-size: 12px;
+  padding: 2px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--surface-1);
+  color: var(--foreground);
+  white-space: nowrap;
+}
+.swarm-term-ready--all {
+  background: color-mix(in oklab, var(--background) 75%, var(--syn-success));
+  border-color: color-mix(in oklab, var(--border) 50%, var(--syn-success));
+}
+.swarm-term-ready--problem {
+  background: color-mix(in oklab, var(--background) 72%, var(--syn-warning));
+  border-color: color-mix(in oklab, var(--border) 50%, var(--syn-warning));
 }
 
 /* Active pane outline — visually reinforces the hierarchy chip glow

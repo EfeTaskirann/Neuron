@@ -1,3 +1,5 @@
+import type { TerminalSwarmPaneState } from '../../lib/bindings';
+import { READINESS_LABEL } from './constants';
 import { SessionTimer } from './SessionTimer';
 
 interface SwarmTermToolbarProps {
@@ -14,10 +16,20 @@ interface SwarmTermToolbarProps {
   sessionStartMs: number | null;
   /** Whether the Routing Log drawer is open. */
   logOpen: boolean;
+  /** Whether the Changes panel is open, and how many files it lists. */
+  changesOpen: boolean;
+  changesCount: number | null;
+  /** The user paused the running swarm (and a pause / resume is on its way). */
+  paused: boolean;
+  pausePending: boolean;
+  /** Every pane's readiness while a session runs (empty otherwise). */
+  paneStates: TerminalSwarmPaneState[];
   onLaunch: () => void;
   onRestart: () => void;
   onStop: () => void;
   onToggleLog: () => void;
+  onToggleChanges: () => void;
+  onTogglePause: () => void;
 }
 
 export function SwarmTermToolbar({
@@ -29,10 +41,17 @@ export function SwarmTermToolbar({
   stopPending,
   sessionStartMs,
   logOpen,
+  changesOpen,
+  changesCount,
+  paused,
+  pausePending,
+  paneStates,
   onLaunch,
   onRestart,
   onStop,
   onToggleLog,
+  onToggleChanges,
+  onTogglePause,
 }: SwarmTermToolbarProps): JSX.Element {
   return (
     <div className="swarm-term-toolbar">
@@ -77,9 +96,24 @@ export function SwarmTermToolbar({
           >
             {stopPending ? 'Stopping…' : 'Stop swarm'}
           </button>
+          <button
+            type="button"
+            className="btn ghost sm swarm-term-log-toggle"
+            aria-pressed={paused}
+            onClick={onTogglePause}
+            disabled={pausePending}
+            title={
+              paused
+                ? 'Mesaj teslimini ve hatırlatmaları sürdür'
+                : 'Mesaj teslimini ve hatırlatmaları duraklat (çalışan tur biter)'
+            }
+          >
+            {paused ? 'Sürdür' : 'Duraklat'}
+          </button>
         </>
       )}
       {sessionStartMs != null && <SessionTimer startMs={sessionStartMs} />}
+      {sessionActive && paneStates.length > 0 && <ReadyBadge paneStates={paneStates} />}
       <button
         type="button"
         className="btn ghost sm swarm-term-log-toggle"
@@ -89,6 +123,44 @@ export function SwarmTermToolbar({
       >
         Routing Log
       </button>
+      <button
+        type="button"
+        className="btn ghost sm swarm-term-log-toggle"
+        aria-pressed={changesOpen}
+        onClick={onToggleChanges}
+        title={
+          changesOpen
+            ? 'Değişiklikler panelini kapat'
+            : 'Ajanların checkpoint’ten beri değiştirdiği dosyalar'
+        }
+      >
+        {changesCount ? `Değişiklikler (${changesCount})` : 'Değişiklikler'}
+      </button>
     </div>
+  );
+}
+
+const PROBLEM_STATES = ['blocked', 'not_ready', 'exited'];
+
+/** "n/9 ready", with who is not and why in the tooltip / description. */
+function ReadyBadge({ paneStates }: { paneStates: TerminalSwarmPaneState[] }): JSX.Element {
+  const ready = paneStates.filter((p) => p.readiness === 'ready').length;
+  const waiting = paneStates.filter((p) => p.readiness !== 'ready');
+  const all = waiting.length === 0;
+  const problem = waiting.some((p) => PROBLEM_STATES.includes(p.readiness));
+  const details = waiting
+    .map((p) => `@${p.agentId}: ${READINESS_LABEL[p.readiness]}${p.detail ? ` — ${p.detail}` : ''}`)
+    .join('\n');
+  return (
+    <span
+      className={`swarm-term-ready${all ? ' swarm-term-ready--all' : ''}${
+        problem ? ' swarm-term-ready--problem' : ''
+      }`}
+      role="status"
+      title={details || 'Every agent answered the kickoff'}
+      aria-label={`${ready} of ${paneStates.length} agents ready${details ? `. ${details}` : ''}`}
+    >
+      {ready}/{paneStates.length} ready
+    </span>
   );
 }

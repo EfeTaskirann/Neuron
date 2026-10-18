@@ -5,14 +5,17 @@
 // gated behind `ProjectPickerRoute` until an active project is picked
 // (folder = cwd for Terminal / Terminal Swarm spawns). User/workspace
 // strings come from `useMe()`.
-import { Fragment, useState } from 'react';
-import { open } from '@tauri-apps/plugin-dialog';
+import { Fragment, useEffect, useRef, useState } from 'react';
+import { getCurrentWindow } from '@tauri-apps/api/window';
+import { ask, open } from '@tauri-apps/plugin-dialog';
+import { confirmWarning } from './lib/confirm';
 import { Brandmark, NIcon, type IconName } from './components/icons';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { useMe } from './hooks/useMe';
 import { useRuns } from './hooks/useRuns';
 import { useRunCreate } from './hooks/mutations';
 import { useActiveProject } from './hooks/useActiveProject';
+import { useSwarmTermAlerts, useSwarmTermSessionSnapshot } from './hooks/useTerminalSwarmSession';
 import { useAppFeatures } from './hooks/useAppFeatures';
 import { ProjectPickerRoute } from './routes/ProjectPickerRoute';
 import { AgentsRoute } from './routes/AgentsRoute';
@@ -150,7 +153,58 @@ function Sidebar({
   );
 }
 
-function Topbar({ route }: { route: Route }): JSX.Element {
+/**
+ * While the swarm runs, closing the window stops every agent — ask first.
+ * (A JS close listener makes the window wait for it, then closes it
+ * itself unless prevented: `core:window:allow-destroy`.)
+ */
+function useConfirmCloseWhileSwarmRuns(running: boolean): void {
+  const runningRef = useRef(running);
+  useEffect(() => {
+    runningRef.current = running;
+  }, [running]);
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let cancelled = false;
+    try {
+      getCurrentWindow()
+        .onCloseRequested(async (event) => {
+          if (!runningRef.current) return;
+          let close = true;
+          try {
+            close = await ask(
+              'Swarm çalışıyor. Pencere kapanırsa bütün ajanlar durur ve yarım kalan işleri ' +
+                'kaybolur. Kapatılsın mı?',
+              { title: 'Neuron’u kapat', kind: 'warning', okLabel: 'Kapat', cancelLabel: 'Vazgeç' },
+            );
+          } catch {
+            // The dialog failed: close as asked rather than trap the user.
+          }
+          if (!close) event.preventDefault();
+        })
+        .then((fn) => {
+          if (cancelled) fn();
+          else unlisten = fn;
+        })
+        .catch(() => {});
+    } catch {
+      // No Tauri window (tests, a plain browser).
+    }
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, []);
+}
+
+function Topbar({
+  route,
+  swarmProjectDir,
+}: {
+  route: Route;
+  /** The running swarm's folder, or `null`. */
+  swarmProjectDir: string | null;
+}): JSX.Element {
   const runCreate = useRunCreate();
   const { project, setProject } = useActiveProject();
   // "Change" opens the native folder picker directly instead of clearing
@@ -161,9 +215,22 @@ function Topbar({ route }: { route: Route }): JSX.Element {
   const changeProject = async () => {
     try {
       const selected = await open({ directory: true, multiple: false });
-      if (typeof selected === 'string' && selected.length > 0) {
-        setProject(selected);
+      if (typeof selected !== 'string' || selected.length === 0) return;
+      if (
+        swarmProjectDir != null &&
+        selected !== swarmProjectDir &&
+        !(await confirmWarning({
+          title: 'Projeyi değiştir',
+          okLabel: 'Değiştir',
+          message:
+            `Swarm şu an şu klasörde çalışıyor:\n${swarmProjectDir}\n\nProje değişince swarm ` +
+            'orada çalışmayı sürdürür; yeni projede çalıştırmak için onu durdurup orada başlatman ' +
+            'gerekir. Proje değiştirilsin mi?',
+        }))
+      ) {
+        return;
       }
+      setProject(selected);
     } catch {
       // Dialog plugin errors are non-fatal — keep the current project.
     }
@@ -282,6 +349,11 @@ export function App(): JSX.Element {
   const devFeatures = features?.devFeatures ?? false;
   const [showInspector, setShowInspector] = useState(true);
   const { project } = useActiveProject();
+  const { data: swarmSession } = useSwarmTermSessionSnapshot();
+  // App-wide: limit / budget / exit alerts fire whatever tab is open, and
+  // the shared session-status query stays fresh for the guards below.
+  useSwarmTermAlerts();
+  useConfirmCloseWhileSwarmRuns(swarmSession != null);
   const inspectorOpen = route === 'canvas' && showInspector;
   // Pick the most recent run as the inspector's default subject —
   // fetched only while the (developer) inspector is open. `runs:list`
@@ -308,7 +380,7 @@ export function App(): JSX.Element {
         onToggle={() => setCollapsed((c) => !c)}
         devFeatures={devFeatures}
       />
-      <Topbar route={route} />
+      <Topbar route={route} swarmProjectDir={swarmSession?.projectDir ?? null} />
       <main className="app-main">
         <RouteHost route={route} />
       </main>

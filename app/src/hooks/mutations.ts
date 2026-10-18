@@ -94,15 +94,17 @@ export function useTerminalKill() {
 // Skip the cache invalidation hop and rely on the live
 // `panes:{id}:data` raw stream to surface echoed output (the PTY
 // echoes each keystroke; the reader forwards those bytes verbatim).
-export function useTerminalWrite() {
+export function useTerminalWrite({ errorsShownInline = false }: { errorsShownInline?: boolean } = {}) {
   return useMutation<null, Error, { paneId: string; data: string }>({
+    meta: { errorsShownInline },
     mutationFn: ({ paneId, data }) =>
       unwrap(commands.terminalWrite(paneId, data)),
   });
 }
 
-export function useTerminalResize() {
+export function useTerminalResize({ errorsShownInline = false }: { errorsShownInline?: boolean } = {}) {
   return useMutation<null, Error, { paneId: string; cols: number; rows: number }>({
+    meta: { errorsShownInline },
     mutationFn: ({ paneId, cols, rows }) =>
       unwrap(commands.terminalResize(paneId, cols, rows)),
   });

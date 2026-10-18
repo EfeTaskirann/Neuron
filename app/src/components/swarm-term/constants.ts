@@ -1,4 +1,5 @@
 import type { AgentLifecycle } from '../../hooks/useAgentLifecycle';
+import type { PaneReadiness } from '../../lib/bindings';
 
 // Fixed 3×3 slot order for the agent terminal grid. Both the grid
 // render and the arrow-key navigation index into this array, so the
@@ -21,6 +22,18 @@ export const LIFECYCLE_LABEL: Record<AgentLifecycle, string> = {
   building: 'building',
   review: 'review',
   done: 'done',
+  rework: 'rework',
+  failed: 'failed',
+};
+
+/** Short chip text for a pane that is not ready yet (or no longer). */
+export const READINESS_LABEL: Record<PaneReadiness, string> = {
+  starting: 'starting',
+  blocked: 'needs you',
+  kickoff_sent: 'warming up',
+  ready: 'ready',
+  not_ready: 'not ready',
+  exited: 'exited',
 };
 
 // session_id from the backend is `swarm-term-<26-char ULID>`. A ULID's

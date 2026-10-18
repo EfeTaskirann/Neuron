@@ -83,7 +83,8 @@ pub(super) fn lifecycle_synthesise<R: Runtime>(
                     task_id = %id,
                     "swarm-term bridge: task reported failed (hata) — closed"
                 );
-                emit_lifecycle(app, from_agent, &source_pane, id, "Abandoned", LifecycleState::Failed);
+                let owners = task_owners(lifecycle, panes_by_agent, id);
+                emit_lifecycle(app, from_agent, &source_pane, id, "Abandoned", LifecycleState::Failed, &owners);
                 let why = error_reason(body).unwrap_or_else(|| "sebep belirtilmedi".into());
                 enqueue_fanout(
                     app,
@@ -145,13 +146,24 @@ pub(super) fn lifecycle_synthesise<R: Runtime>(
     if let Some(closure) = rec.already_closed {
         return vec![closed_notice(from_agent, &id, closure)];
     }
+    // A CHANGES_NEEDED that used up the rework limit CLOSES the task as
+    // failed; both it and a normal within-limit rejection record
+    // `state: Failed` (lifecycle::apply_transition), so label the closing
+    // one "Failed" — otherwise the UI shows it as "rework" (a fix coming)
+    // instead of "failed".
+    let transition_label = if rec.limit_exceeded {
+        "Failed".to_string()
+    } else {
+        format!("{:?}", transition.kind)
+    };
     emit_lifecycle(
         app,
         from_agent,
         &source_pane,
         &id,
-        &format!("{:?}", transition.kind),
+        &transition_label,
         rec.state,
+        &task_owners(lifecycle, panes_by_agent, &id),
     );
 
     let Some((target, base)) = followup_for_coordinator_inbound(from_agent, &transition, &rec)
@@ -208,7 +220,15 @@ pub(super) fn note_dispatch<R: Runtime>(
         return;
     };
     if lifecycle.assign(target_pane, id) {
-        emit_lifecycle(app, to_agent, target_pane, id, "Assigned", LifecycleState::Assigned);
+        emit_lifecycle(
+            app,
+            to_agent,
+            target_pane,
+            id,
+            "Assigned",
+            LifecycleState::Assigned,
+            &[to_agent.to_string()],
+        );
     }
 }
 
@@ -287,7 +307,36 @@ pub(super) fn note_coordinator_report<R: Runtime>(
     if lifecycle.fail_task(id) {
         tracing::info!(task_id = %id, "swarm-term bridge: coordinator gave up a task — closed");
         let pane = panes_by_agent.get("coordinator").map(String::as_str).unwrap_or("");
-        emit_lifecycle(app, "coordinator", pane, id, "TaskFailed", LifecycleState::Failed);
+        let owners = task_owners(lifecycle, panes_by_agent, id);
+        emit_lifecycle(app, "coordinator", pane, id, "TaskFailed", LifecycleState::Failed, &owners);
+    }
+}
+
+/// The agents whose work `task_id` is: the panes holding it, minus the
+/// reviewers / tester that only judged it — unless nobody else holds it
+/// (the tester's own smoke task). Lets the UI show a reviewer's
+/// `CHANGES_NEEDED` on the BUILDER, not on the reviewer.
+pub(super) fn task_owners(
+    lifecycle: &LifecycleStore,
+    panes_by_agent: &HashMap<String, String>,
+    task_id: &str,
+) -> Vec<String> {
+    let mut agents: Vec<String> = lifecycle
+        .holders(task_id)
+        .iter()
+        .filter_map(|pane| {
+            panes_by_agent
+                .iter()
+                .find(|(_, p)| *p == pane)
+                .map(|(agent, _)| agent.clone())
+        })
+        .collect();
+    agents.sort();
+    let workers: Vec<String> = agents.iter().filter(|a| !is_reviewer(a)).cloned().collect();
+    if workers.is_empty() {
+        agents
+    } else {
+        workers
     }
 }
 
@@ -298,6 +347,7 @@ fn emit_lifecycle<R: Runtime>(
     task_id: &str,
     transition: &str,
     state: LifecycleState,
+    owners: &[String],
 ) {
     let _ = app.emit(
         crate::events::SWARM_TERM_LIFECYCLE,
@@ -307,6 +357,7 @@ fn emit_lifecycle<R: Runtime>(
             "task_id": task_id,
             "transition": transition,
             "state": format!("{state:?}"),
+            "owners": owners,
         }),
     );
 }

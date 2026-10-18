@@ -1554,8 +1554,58 @@ html[data-motion="off"] *::after {
 .toast--error {
   border-left: 3px solid oklch(0.62 0.18 25);
 }
+.toast-main {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
 .toast-body {
   flex: 1 1 auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.toast-detail summary {
+  cursor: pointer;
+  color: var(--muted-foreground);
+  font-size: 12px;
+}
+.toast-detail pre {
+  margin: 4px 0 0;
+  max-height: 160px;
+  overflow: auto;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 11px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* ErrorBoundary.tsx: a crashed route (or the shell) as a retry card. */
+.error-boundary {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 240px;
+  padding: 48px 24px;
+}
+.error-boundary-card {
+  max-width: 560px;
+  padding: 20px 24px;
+  border: 1px solid color-mix(in oklab, var(--border) 60%, var(--destructive));
+  border-radius: 10px;
+  background: color-mix(in oklab, var(--surface-1) 92%, var(--destructive));
+  color: var(--foreground);
+}
+.error-boundary-card h2 {
+  margin: 0 0 8px;
+  font-size: 16px;
+}
+.error-boundary-message {
+  margin: 0 0 16px;
+  color: var(--muted-foreground);
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 12px;
   white-space: pre-wrap;
   word-break: break-word;
 }

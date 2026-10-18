@@ -1,5 +1,6 @@
 import { useMemo, useSyncExternalStore } from 'react';
 import { listen } from '@tauri-apps/api/event';
+import { notifyTaskSignal } from '../lib/swarmNotify';
 
 // Shared event-collection hook for the swarm-term routing event
 // stream. The backend (`src-tauri/src/swarm_term/bridge/`) emits
@@ -10,7 +11,7 @@ import { listen } from '@tauri-apps/api/event';
 //   malformed            — envelope failed JSON parse / validation
 //   denied               — hierarchy graph forbids the edge
 //   unknown_target       — target agent has no pane in the session
-//   target_not_ready     — target pane hasn't answered the kickoff with "@<id> hazır."
+//   target_not_ready     — target pane hasn't answered the kickoff with "@<id> READY"
 //   target_locked        — target pane is in error state (wedged / no stdin)
 //   target_write_timeout — write_to_pane exceeded the 2 s cap (delivery.rs)
 //   lifecycle_fanout     — bridge-synthesised autonomy follow-up (review /
@@ -119,6 +120,18 @@ function pushRouteEvent(p: RawPayload): void {
   if (out.length > ROUTE_EVENT_CAP) out.length = ROUTE_EVENT_CAP;
   routeEvents = out;
   emitRouteStore();
+  // A closed task reaches the orchestrator either as a bridge fanout
+  // (Approved → TASK_DONE) or as the coordinator's own TASK_FAILED (a
+  // give-up / rework-limit), which is delivered as an ordinary route. We
+  // notify on both; notifyTaskSignal no-ops on anything that isn't a
+  // TASK_DONE / TASK_FAILED. This listener is app-lifetime, so the toast
+  // and taskbar flash fire whatever tab is open.
+  if (
+    next.target === 'orchestrator' &&
+    (next.outcome === 'lifecycle_fanout' || next.outcome === 'ok')
+  ) {
+    notifyTaskSignal(next.body);
+  }
 }
 
 export function clearRoutingEvents(): void {

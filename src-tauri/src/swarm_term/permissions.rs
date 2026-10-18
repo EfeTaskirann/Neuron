@@ -18,17 +18,43 @@
 //!     outbox; builders may write inside the project.
 //!   * `Bash(<prefix>:*)` — only the listed verification commands;
 //!     nobody gets an unrestricted shell. (claude still auto-allows its
-//!     own read-only commands such as `echo`, scoped to the project.)
+//!     own read-only commands such as `git status`, scoped to the
+//!     project — so the roles without a shell deny the tool outright.)
+//!
+//! A deny list ([`denied_tools`], `--disallowedTools`) wins over every
+//! allow rule, including ones from settings files: nobody writes
+//! `.git` / `.claude` / editor config, the bridge's bookkeeping or
+//! another agent's outbox or the bridge's legacy `inbox/`, nobody uses
+//! the web tools, nobody reads the usual secret files (`.env`, SSH /
+//! cloud keys), and the git options — and two-path forms — that write or
+//! read outside the project are refused. Live probes against claude
+//! 2.1.296 (`permissions/live_tests.rs`) found `git diff --output=../x`
+//! writing outside the project and a builder forging a message in
+//! `outbox/coordinator/` before these rules.
+//!
+//! Known residual (Windows-only, K3): the shell allowlist exposes exactly
+//! one command that can read an arbitrary path — `git diff <a> <b>`,
+//! which git runs in no-index mode when a path is outside the work tree.
+//! The deny rules below catch its out-of-project forms written with
+//! forward slashes (`C:/…`, `~/…`, `../…`); a PowerShell invocation using
+//! back-slashes cannot be matched by a glob rule (claude treats `\` as a
+//! glob escape — see the no-backslash invariant in the tests), so that
+//! form is the documented residual. The structural fix (run the agents'
+//! git through a Neuron wrapper pinned to the project) is a follow-up.
 //!
 //! Residual risk, by design: running a project's tests / build executes
-//! that project's code, and an agent can still write into another
-//! agent's outbox inside `.bridgespace` (builders) — see the bridge's
-//! trust model. Setting [`PERMISSIONS_ENV`]`=bypass` restores the old
-//! unrestricted mode for every pane (logged as a warning and reported
-//! to the UI through [`SwarmTermPermissionMode`]).
+//! that project's code — see the bridge's trust model. Setting
+//! [`PERMISSIONS_ENV`]`=bypass` restores the old unrestricted mode for
+//! every pane (logged as a warning and reported to the UI through
+//! [`SwarmTermPermissionMode`]).
 
 use serde::{Deserialize, Serialize};
 use specta::Type;
+
+use super::hierarchy::AGENT_IDS;
+
+#[cfg(test)]
+mod live_tests;
 
 /// Opt-out: `NEURON_TERM_PERMISSIONS=bypass` → every pane runs with
 /// `bypassPermissions` again.
@@ -84,7 +110,10 @@ pub(crate) fn role_of(agent_id: &str) -> Role {
 }
 
 /// Verification commands available to the Verify and Build roles
-/// (prefix match). Covers the common toolchains a swarm may meet.
+/// (prefix match) in every project. Covers the common toolchains a
+/// swarm may meet; the commands the project's own manifests name (e.g.
+/// a monorepo package's `pnpm -C app test`) are added per session —
+/// see `project_facts`.
 const VERIFY_COMMANDS: &[&str] = &[
     "cargo check",
     "cargo test",
@@ -94,9 +123,6 @@ const VERIFY_COMMANDS: &[&str] = &[
     "pnpm test",
     "pnpm typecheck",
     "pnpm lint",
-    "pnpm -C app test",
-    "pnpm -C app typecheck",
-    "pnpm -C app lint",
     "pnpm exec vitest run",
     "pnpm exec tsc --noEmit",
     "npm test",
@@ -114,24 +140,136 @@ const VERIFY_COMMANDS: &[&str] = &[
     "git show",
 ];
 
+/// Project directories no pane may write, whatever its role: `.git` (a
+/// planted `config` — `core.fsmonitor`, `diff.external` — or hook runs
+/// on the next `git status` / commit, as the user), `.claude` (settings
+/// and commands a later Claude session runs), `.vscode` / `.idea`
+/// (editor tasks and run configurations). claude 2.1.296 already
+/// refuses these writes on its own; the rules keep that true across
+/// claude versions.
+const PROTECTED_DIRS: &[&str] = &[".git", ".claude", ".vscode", ".idea"];
+
+/// Options that turn an allowed read-only git command into a write or a
+/// read outside the project: `--output` writes the result to any path,
+/// `--no-index` diffs arbitrary files, `--ext-diff` runs the configured
+/// external diff program.
+const GIT_ESCAPES: &[(&str, &str)] = &[
+    ("git diff", "--output"),
+    ("git log", "--output"),
+    ("git show", "--output"),
+    ("git diff", "--no-index"),
+    ("git diff", "--ext-diff"),
+    ("git log", "--ext-diff"),
+    ("git show", "--ext-diff"),
+    // `git diff <a> <b>` switches to no-index on its own when a path is
+    // outside the work tree, reading any file without `--no-index`. These
+    // match an out-of-project path ARGUMENT by its prefix. Forward-slash
+    // only, so they never collide with gitrevision syntax (`HEAD:file`,
+    // `a..b`, `HEAD~1`) and never need a backslash (see the tests).
+    ("git diff", ":/"),
+    ("git diff", "~/"),
+    ("git diff", "../"),
+];
+
+/// Secret files no pane may READ, whatever its role. The panes run on the
+/// shared Claude config with `--setting-sources project`, so the user's
+/// own `permissions.deny` rules no longer constrain them; this baseline
+/// keeps the common credential files out of the model even though the
+/// project-wide `Read(./**)` allow covers them (deny beats allow). A
+/// project that must read one can opt the whole session out with
+/// [`PERMISSIONS_ENV`]`=bypass`. `.env.example` / `.env.sample` stay
+/// readable (only the real-secret conventions are listed).
+const SECRET_READS: &[&str] = &[
+    "./.env",
+    "./.env.local",
+    "./**/.env",
+    "./**/.env.local",
+    "./**/.env.*.local",
+    "./**/*.pem",
+    "./**/id_rsa",
+    "./**/id_ed25519",
+    "./**/.ssh/**",
+    "./**/.aws/credentials",
+    "./**/.npmrc",
+    "./secrets/**",
+];
+
 /// The `claude` CLI arguments that set `agent_id`'s permissions under
 /// `mode`, for a session whose bridge root is `.bridgespace/<session_id>/`
-/// under the pane's working directory (the project).
+/// under the pane's working directory (the project). `project_commands`
+/// are the verification commands the project's manifests name.
 pub(crate) fn claude_permission_args(
     mode: SwarmTermPermissionMode,
     agent_id: &str,
     session_id: &str,
+    project_commands: &[String],
 ) -> Vec<String> {
     if mode == SwarmTermPermissionMode::Bypass {
         return vec!["--permission-mode".into(), "bypassPermissions".into()];
     }
     let mut args = vec!["--permission-mode".into(), "dontAsk".into(), "--allowedTools".into()];
-    args.extend(allowed_tools(agent_id, session_id));
+    args.extend(allowed_tools(agent_id, session_id, project_commands));
+    args.push("--disallowedTools".into());
+    args.extend(denied_tools(agent_id, session_id));
     args
 }
 
+/// The verification commands of a session: the generic ones, then the
+/// project's own (without repeats).
+fn verify_commands(project_commands: &[String]) -> Vec<&str> {
+    let mut all: Vec<&str> = VERIFY_COMMANDS.to_vec();
+    for c in project_commands {
+        if !all.contains(&c.as_str()) {
+            all.push(c);
+        }
+    }
+    all
+}
+
+/// Pure: the deny list for one agent. A deny rule beats every allow rule
+/// (claude's own and any settings file's), so these hold even where an
+/// allow rule such as a builder's `Edit(./**)` covers the path.
+pub(crate) fn denied_tools(agent_id: &str, session_id: &str) -> Vec<String> {
+    let mut rules: Vec<String> = PROTECTED_DIRS
+        .iter()
+        .map(|dir| format!("Edit(./{dir}/**)"))
+        .collect();
+    // The bridge's own bookkeeping, and every OTHER agent's outbox: a
+    // file there is delivered as that agent's message (the sender is the
+    // directory), so writing one forges a message.
+    rules.push("Edit(./.bridgespace/.gitignore)".into());
+    rules.push("Edit(./.bridgespace/_archive/**)".into());
+    rules.push(format!("Edit(./.bridgespace/{session_id}/processed/**)"));
+    rules.push(format!("Edit(./.bridgespace/{session_id}/rejected/**)"));
+    // The legacy `inbox/` drop path: the watcher still scans it and pastes
+    // a `[Neuron]` notice into the pane the file's own `from` field names,
+    // so a writable inbox lets a pane trigger a notice addressed as any
+    // agent. Nobody writes it (real messages go to the sender's outbox).
+    rules.push(format!("Edit(./.bridgespace/{session_id}/inbox/**)"));
+    for other in AGENT_IDS.iter().filter(|other| **other != agent_id) {
+        rules.push(format!("Edit(./.bridgespace/{session_id}/outbox/{other}/**)"));
+    }
+    // No pane talks to the network.
+    rules.push("WebFetch".into());
+    rules.push("WebSearch".into());
+    // The common secret files stay out of every pane (see `SECRET_READS`).
+    for secret in SECRET_READS {
+        rules.push(format!("Read({secret})"));
+    }
+    if role_of(agent_id) == Role::Coordinate {
+        rules.push("Bash".into());
+        rules.push("PowerShell".into());
+    } else {
+        for (cmd, opt) in GIT_ESCAPES {
+            rules.push(format!("Bash({cmd} *{opt}*)"));
+            rules.push(format!("PowerShell({cmd} *{opt}*)"));
+        }
+    }
+    rules
+}
+
 /// Pure: the allowlist for one agent.
-pub(crate) fn allowed_tools(agent_id: &str, session_id: &str) -> Vec<String> {
+pub(crate) fn allowed_tools(agent_id: &str, session_id: &str, project_commands: &[String]) -> Vec<String> {
     let mut rules = vec![
         "Read(./**)".to_string(),
         "TodoWrite".to_string(),
@@ -144,7 +282,7 @@ pub(crate) fn allowed_tools(agent_id: &str, session_id: &str) -> Vec<String> {
     if matches!(role, Role::Verify | Role::Build) {
         // claude has a separate PowerShell tool on Windows; the same
         // commands must be reachable through it, with the same limits.
-        for c in VERIFY_COMMANDS {
+        for c in verify_commands(project_commands) {
             rules.push(format!("Bash({c}:*)"));
             rules.push(format!("PowerShell({c})"));
             rules.push(format!("PowerShell({c} *)"));
@@ -164,9 +302,16 @@ const NO_CD: &str = "Shell zaten proje kökünde açılır: komutu doğrudan ça
 
 /// Human-readable summary for the persona footer, so an agent knows its
 /// limits up front instead of discovering them through denied calls.
-pub(crate) fn describe_for_persona(agent_id: &str) -> String {
+pub(crate) fn describe_for_persona(agent_id: &str, project_commands: &[String]) -> String {
+    let commands = verify_commands(project_commands).join(", ");
     let base = "Proje dosyalarını OKUYABİLİRSİN (yalnızca proje klasörü içinde; \
-                dışarısı reddedilir). Mesajlarını yalnızca KENDİ outbox'una yazabilirsin.";
+                dışarısı reddedilir). Gizli dosyalar (`.env`, SSH/bulut anahtarları, \
+                `.npmrc`) okunamaz. Mesajlarını yalnızca KENDİ outbox'una yazabilirsin; \
+                başka bir ajanın outbox'u, `.git/`, `.claude/`, `.vscode/` ve `.idea/` \
+                reddedilir. Web araçları kapalı.";
+    let git = "`git diff` / `git log` / `git show` içinde `--output`, `--no-index` ve \
+               `--ext-diff` seçenekleri reddedilir; `git diff` ile proje dışı bir yolu \
+               (`C:/…`, `~/…`, `../…`) okumak da reddedilir.";
     match role_of(agent_id) {
         Role::Coordinate => format!(
             "{base} Proje dosyalarını değiştiremez, shell (`Bash`) komutu ve web \
@@ -174,25 +319,27 @@ pub(crate) fn describe_for_persona(agent_id: &str) -> String {
         ),
         Role::Verify => format!(
             "{base} Proje dosyalarını değiştiremezsin. `Bash` ile yalnızca doğrulama \
-             komutlarını çalıştırabilirsin: {}. {NO_CD}",
-            VERIFY_COMMANDS.join(", ")
+             komutlarını çalıştırabilirsin: {}. {git} {NO_CD}",
+            commands
         ),
         Role::Build => format!(
             "{base} Proje klasörü içindeki dosyaları değiştirebilirsin (dışarısı \
              reddedilir). `Bash` ile yalnızca doğrulama komutlarını çalıştırabilirsin: \
-             {}. {NO_CD} Paket kurmak / başka bir komut gerekiyorsa coordinator'a \
+             {}. {git} {NO_CD} Paket kurmak / başka bir komut gerekiyorsa coordinator'a \
              `hata —` ile bildir.",
-            VERIFY_COMMANDS.join(", ")
+            commands
         ),
     }
 }
 
 /// Quote `args` for the pane command string (`sidecar::terminal`'s
-/// POSIX-style tokenizer). Rules contain spaces / parentheses but never
-/// `"` or `\`.
+/// POSIX-style tokenizer): each in double quotes, with `\` and `"`
+/// escaped — the tokenizer reads `\\` and `\"` inside double quotes as
+/// one literal character, so a Windows path (`\\?\C:\…`, a trailing
+/// `\`) arrives intact. Rules contain neither character.
 pub(crate) fn join_quoted(args: &[String]) -> String {
     args.iter()
-        .map(|a| format!("\"{a}\""))
+        .map(|a| format!("\"{}\"", a.replace('\\', "\\\\").replace('"', "\\\"")))
         .collect::<Vec<_>>()
         .join(" ")
 }
@@ -205,7 +352,7 @@ mod tests {
     #[test]
     fn every_agent_has_a_role_and_nobody_gets_an_unrestricted_shell() {
         for &agent in AGENT_IDS {
-            let rules = allowed_tools(agent, "swarm-term-01X");
+            let rules = allowed_tools(agent, "swarm-term-01X", &[]);
             assert!(
                 !rules.iter().any(|r| r == "Bash" || r == "PowerShell"),
                 "{agent} has an unrestricted shell rule"
@@ -221,27 +368,27 @@ mod tests {
     #[test]
     fn only_builders_may_write_the_project() {
         for &agent in AGENT_IDS {
-            let writes_project = allowed_tools(agent, "s").contains(&"Edit(./**)".to_string());
+            let writes_project = allowed_tools(agent, "s", &[]).contains(&"Edit(./**)".to_string());
             assert_eq!(writes_project, role_of(agent) == Role::Build, "{agent}");
         }
     }
 
     #[test]
     fn coordinators_have_no_shell_verifiers_do() {
-        let has_bash = |a: &str| allowed_tools(a, "s").iter().any(|r| r.starts_with("Bash("));
+        let has_bash = |a: &str| allowed_tools(a, "s", &[]).iter().any(|r| r.starts_with("Bash("));
         for a in ["orchestrator", "coordinator", "scout", "planner"] {
             assert!(!has_bash(a), "{a}");
         }
         for a in ["backend-reviewer", "frontend-reviewer", "integration-tester", "backend-builder"] {
             assert!(has_bash(a), "{a}");
         }
-        assert!(allowed_tools("integration-tester", "s").contains(&"Bash(cargo test:*)".to_string()));
+        assert!(allowed_tools("integration-tester", "s", &[]).contains(&"Bash(cargo test:*)".to_string()));
     }
 
     #[test]
     fn args_use_dont_ask_and_quote_cleanly() {
         let args =
-            claude_permission_args(SwarmTermPermissionMode::Restricted, "scout", "swarm-term-01X");
+            claude_permission_args(SwarmTermPermissionMode::Restricted, "scout", "swarm-term-01X", &[]);
         assert_eq!(&args[..3], &["--permission-mode", "dontAsk", "--allowedTools"]);
         let joined = join_quoted(&args);
         assert!(joined.contains("\"Read(./**)\""));
@@ -249,9 +396,133 @@ mod tests {
     }
 
     #[test]
+    fn quoting_keeps_windows_paths_and_quotes_intact() {
+        let args = vec![
+            r"C:\Users\x\AppData\Roaming\app\sessions\s\scout.persona.md".to_string(),
+            r"\\?\C:\dir\".to_string(),
+            r#"say "hi""#.to_string(),
+        ];
+        assert_eq!(
+            join_quoted(&args),
+            r#""C:\\Users\\x\\AppData\\Roaming\\app\\sessions\\s\\scout.persona.md" "\\\\?\\C:\\dir\\" "say \"hi\"""#
+        );
+    }
+
+    #[test]
+    fn the_deny_list_follows_the_allow_list() {
+        for &agent in AGENT_IDS {
+            let args = claude_permission_args(SwarmTermPermissionMode::Restricted, agent, "s", &[]);
+            let deny_at = args.iter().position(|a| a == "--disallowedTools").expect(agent);
+            assert_eq!(args.iter().filter(|a| *a == "--disallowedTools").count(), 1, "{agent}");
+            assert_eq!(&args[3..deny_at], allowed_tools(agent, "s", &[]).as_slice(), "{agent}");
+            assert_eq!(&args[deny_at + 1..], denied_tools(agent, "s").as_slice(), "{agent}");
+        }
+    }
+
+    #[test]
+    fn nobody_writes_vcs_or_tool_config_or_the_bridge_bookkeeping() {
+        for &agent in AGENT_IDS {
+            let deny = denied_tools(agent, "swarm-term-01X");
+            for rule in [
+                "Edit(./.git/**)",
+                "Edit(./.claude/**)",
+                "Edit(./.vscode/**)",
+                "Edit(./.idea/**)",
+                "Edit(./.bridgespace/.gitignore)",
+                "Edit(./.bridgespace/_archive/**)",
+                "Edit(./.bridgespace/swarm-term-01X/processed/**)",
+                "Edit(./.bridgespace/swarm-term-01X/rejected/**)",
+                "Edit(./.bridgespace/swarm-term-01X/inbox/**)",
+                "WebFetch",
+                "WebSearch",
+            ] {
+                assert!(deny.iter().any(|r| r == rule), "{agent} lacks {rule}");
+            }
+        }
+    }
+
+    #[test]
+    fn every_role_is_denied_the_common_secret_files() {
+        // Even the read-only coordinate roles (whose only write is their
+        // own outbox) must not read the user's secrets through Read(./**).
+        for &agent in AGENT_IDS {
+            let deny = denied_tools(agent, "s");
+            for rule in ["Read(./.env)", "Read(./**/.env.local)", "Read(./**/id_rsa)", "Read(./secrets/**)"] {
+                assert!(deny.iter().any(|r| r == rule), "{agent} lacks {rule}");
+            }
+        }
+    }
+
+    #[test]
+    fn every_other_outbox_is_denied_and_the_own_one_never() {
+        use std::collections::BTreeSet;
+        for &agent in AGENT_IDS {
+            // The exact set of bridge rules: nothing broader may swallow
+            // the agent's own outbox (deny beats allow, so it would
+            // silence the agent), and every other outbox is covered.
+            let bridge: BTreeSet<String> = denied_tools(agent, "s")
+                .into_iter()
+                .filter(|r| r.contains(".bridgespace"))
+                .collect();
+            let mut expected: BTreeSet<String> =
+                [".gitignore", "_archive/**", "s/processed/**", "s/rejected/**", "s/inbox/**"]
+                    .iter()
+                    .map(|p| format!("Edit(./.bridgespace/{p})"))
+                    .collect();
+            for other in AGENT_IDS.iter().filter(|other| **other != agent) {
+                expected.insert(format!("Edit(./.bridgespace/s/outbox/{other}/**)"));
+            }
+            assert_eq!(bridge, expected, "{agent}");
+        }
+    }
+
+    #[test]
+    fn shell_roles_lose_the_escaping_git_options_coordinators_lose_the_shell() {
+        for &agent in AGENT_IDS {
+            let deny = denied_tools(agent, "s");
+            let has = |r: &str| deny.iter().any(|d| d == r);
+            if role_of(agent) == Role::Coordinate {
+                assert!(has("Bash") && has("PowerShell"), "{agent}");
+            } else {
+                assert!(!has("Bash") && !has("PowerShell"), "{agent}");
+                for rule in [
+                    "Bash(git diff *--output*)",
+                    "Bash(git log *--output*)",
+                    "Bash(git show *--output*)",
+                    "Bash(git diff *--no-index*)",
+                    "Bash(git diff *--ext-diff*)",
+                    "PowerShell(git diff *--output*)",
+                    "PowerShell(git diff *--no-index*)",
+                    // The out-of-project two-path read forms.
+                    "Bash(git diff *:/*)",
+                    "Bash(git diff *~/*)",
+                    "Bash(git diff *../*)",
+                    "PowerShell(git diff *../*)",
+                ] {
+                    assert!(has(rule), "{agent} lacks {rule}");
+                }
+                // No deny rule carries a backslash (claude treats it as a
+                // glob escape; the pane tokenizer would also mangle it).
+                for rule in &deny {
+                    assert!(!rule.contains('\\'), "{agent}: backslash in {rule}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn no_rule_needs_quoting_the_pane_tokenizer_cannot_do() {
+        for &agent in AGENT_IDS {
+            for rule in allowed_tools(agent, "s", &[]).iter().chain(denied_tools(agent, "s").iter()) {
+                assert!(!rule.contains('"') && !rule.contains('\\'), "{agent}: {rule}");
+            }
+        }
+    }
+
+    #[test]
     fn bypass_mode_drops_the_allowlist() {
         assert_eq!(
-            claude_permission_args(SwarmTermPermissionMode::Bypass, "backend-builder", "s"),
+            claude_permission_args(SwarmTermPermissionMode::Bypass, "backend-builder", "s", &[]),
             ["--permission-mode", "bypassPermissions"]
         );
     }
@@ -281,13 +552,20 @@ mod tests {
 
     #[test]
     fn persona_summary_matches_the_role() {
-        assert!(describe_for_persona("scout").contains("shell (`Bash`) komutu"));
-        assert!(describe_for_persona("backend-reviewer").contains("cargo test"));
-        assert!(describe_for_persona("backend-builder").contains("değiştirebilirsin"));
-        let tester = describe_for_persona("integration-tester");
+        assert!(describe_for_persona("scout", &[]).contains("shell (`Bash`) komutu"));
+        assert!(describe_for_persona("backend-reviewer", &[]).contains("cargo test"));
+        assert!(describe_for_persona("backend-builder", &[]).contains("değiştirebilirsin"));
+        let tester = describe_for_persona("integration-tester", &[]);
         assert!(tester.contains("DIŞINA `cd` YAPMA"));
         // In-project subdirectories stay usable (review finding).
         assert!(tester.contains("`cd <alt-klasör> && <komut>`"));
-        assert!(!describe_for_persona("scout").contains("DIŞINA `cd`"));
+        assert!(!describe_for_persona("scout", &[]).contains("DIŞINA `cd`"));
+        // The deny list is announced, so agents don't learn it by denial.
+        for &agent in AGENT_IDS {
+            let text = describe_for_persona(agent, &[]);
+            assert!(text.contains("başka bir ajanın outbox'u"), "{agent}");
+            assert!(text.contains("`.git/`"), "{agent}");
+            assert_eq!(text.contains("`--output`"), role_of(agent) != Role::Coordinate, "{agent}");
+        }
     }
 }

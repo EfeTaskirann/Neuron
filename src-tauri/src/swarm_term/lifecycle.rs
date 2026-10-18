@@ -521,6 +521,9 @@ pub struct LifecycleStore {
 struct Inner {
     entries: HashMap<(String, String), Entry>,
     tasks: HashMap<String, TaskMeta>,
+    /// Set while the stall clocks stand still (see
+    /// [`LifecycleStore::pause_clocks`]).
+    paused_since: Option<Instant>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -926,7 +929,10 @@ impl LifecycleStore {
         build_after: Duration,
     ) -> Vec<Stall> {
         let mut g = self.lock();
-        let Inner { entries, tasks } = &mut *g;
+        if g.paused_since.is_some() {
+            return Vec::new();
+        }
+        let Inner { entries, tasks, .. } = &mut *g;
         let mut out = Vec::new();
         for ((pane, task_id), e) in entries.iter_mut() {
             let threshold = match e.state {
@@ -1025,6 +1031,76 @@ impl LifecycleStore {
     /// "no in-flight tasks" empty state without a `len() == 0` check.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Stop the stall clocks — e.g. while the account's usage limit is
+    /// hit: no agent can work, and every in-flight task would otherwise
+    /// be reminded, escalated and finally given up while the user is
+    /// away. Idempotent.
+    pub fn pause_clocks(&self) {
+        self.pause_clocks_at(Instant::now());
+    }
+
+    fn pause_clocks_at(&self, now: Instant) {
+        let mut g = self.lock();
+        if g.paused_since.is_none() {
+            g.paused_since = Some(now);
+        }
+    }
+
+    /// Restart the stall clocks where they stopped: every in-flight
+    /// entry (and pending rework) is credited the paused time, so no
+    /// task is closer to a reminder than before the pause.
+    pub fn resume_clocks(&self) {
+        self.resume_clocks_at(Instant::now());
+    }
+
+    fn resume_clocks_at(&self, now: Instant) {
+        let mut g = self.lock();
+        let Some(since) = g.paused_since.take() else {
+            return;
+        };
+        let paused = now.saturating_duration_since(since);
+        for e in g.entries.values_mut() {
+            e.since += paused;
+        }
+        for meta in g.tasks.values_mut() {
+            if let Some(w) = meta.rework.as_mut() {
+                w.since += paused;
+            }
+        }
+    }
+
+    /// The agent behind `old` runs in a new pane now (restarted): its
+    /// tasks move with it.
+    pub fn rename_pane(&self, old: &str, new: &str) {
+        let mut g = self.lock();
+        let moved: Vec<((String, String), Entry)> = g
+            .entries
+            .iter()
+            .filter(|((pane, _), _)| pane == old)
+            .map(|(k, e)| (k.clone(), *e))
+            .collect();
+        for ((_, task_id), e) in moved {
+            g.entries.remove(&(old.to_string(), task_id.clone()));
+            g.entries.insert((new.to_string(), task_id), e);
+        }
+    }
+
+    /// The panes holding an entry for `task_id`, in whatever state —
+    /// whose work the task is (closing a task keeps its entries).
+    /// Sorted, so an event built from it is stable.
+    pub fn holders(&self, task_id: &str) -> Vec<String> {
+        let mut panes: Vec<String> = self
+            .lock()
+            .entries
+            .keys()
+            .filter(|(_, id)| id == task_id)
+            .map(|(pane, _)| pane.clone())
+            .collect();
+        panes.sort();
+        panes.dedup();
+        panes
     }
 
     /// Mark `(source_pane, task_id)` as `Done` regardless of prior
@@ -1126,6 +1202,47 @@ mod tests {
 
     fn fresh() -> Recorded {
         Recorded::plain(LifecycleState::Assigned)
+    }
+
+    #[test]
+    fn paused_clocks_report_no_stalls_and_resume_where_they_stopped() {
+        let s = LifecycleStore::new();
+        let t0 = Instant::now();
+        s.assign_at("p-builder", "T1", t0);
+        let build_after = Duration::from_secs(60);
+        // Paused 10 s in: an hour passes, nothing is reported.
+        s.pause_clocks_at(t0 + Duration::from_secs(10));
+        assert!(s.take_stalls(t0 + Duration::from_secs(3600), build_after, build_after).is_empty());
+        // Resumed after that hour: the task is still 10 s old ...
+        s.resume_clocks_at(t0 + Duration::from_secs(3610));
+        assert!(s.take_stalls(t0 + Duration::from_secs(3620), build_after, build_after).is_empty());
+        // ... and stalls only once a minute of RUNNING time has passed.
+        let stalls = s.take_stalls(t0 + Duration::from_secs(3661), build_after, build_after);
+        assert_eq!(stalls.len(), 1);
+        assert_eq!(stalls[0].level, 1);
+        // Resuming a running clock changes nothing, and a second pause
+        // does not restart the paused time.
+        s.resume_clocks_at(t0 + Duration::from_secs(3661));
+        s.pause_clocks_at(t0 + Duration::from_secs(3662));
+        s.pause_clocks_at(t0 + Duration::from_secs(4000));
+        s.resume_clocks_at(t0 + Duration::from_secs(5000));
+        // 63 s of running time: no new level yet ...
+        assert!(s.take_stalls(t0 + Duration::from_secs(5001), build_after, build_after).is_empty());
+        // ... the second one comes at 120 s.
+        let stalls = s.take_stalls(t0 + Duration::from_secs(5058), build_after, build_after);
+        assert_eq!(stalls.iter().map(|s| s.level).collect::<Vec<_>>(), [2]);
+    }
+
+    #[test]
+    fn a_restarted_agent_keeps_its_tasks() {
+        let s = LifecycleStore::new();
+        s.assign("p-old", "T1");
+        s.assign("p-other", "T2");
+        s.rename_pane("p-old", "p-new");
+        assert_eq!(s.holders("T1"), ["p-new"]);
+        assert_eq!(s.state_of("p-new", "T1"), Some(LifecycleState::Assigned));
+        assert_eq!(s.state_of("p-old", "T1"), None);
+        assert_eq!(s.holders("T2"), ["p-other"]);
     }
 
     // -- parse_lifecycle_token --------------------------------------- //

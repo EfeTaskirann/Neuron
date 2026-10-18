@@ -10,16 +10,28 @@ import type {
   ActiveEdge,
   AgentLifecycle,
 } from '../../hooks/useAgentLifecycle';
-import type { SwarmTermPersona } from '../../lib/bindings';
+import type { SwarmTermPersona, TerminalSwarmPaneState } from '../../lib/bindings';
 import { LifecyclePill } from './LifecyclePill';
-import { SLOT_ORDER } from './constants';
+import { READINESS_LABEL, SLOT_ORDER } from './constants';
 
 interface SwarmTermGridProps {
   personasById: Map<string, SwarmTermPersona>;
   panesByAgent: Map<string, string>;
   lifecycle: Record<string, AgentLifecycle>;
   activeEdge: ActiveEdge | null;
+  /** Each pane's readiness (from the session handle). */
+  paneStates: Map<string, TerminalSwarmPaneState>;
+  /** Run an exited / never-ready agent again, on the same conversation. */
+  onRestartAgent?: (agentId: string) => void;
+  /** The agent whose restart is in flight. */
+  restartingAgent?: string | null;
+  /** The session runs the Lite team: a slot without a pane is an agent it
+   *  leaves out. */
+  liteTeam?: boolean;
 }
+
+/** Readiness from which an agent is offered a restart. */
+const RESTARTABLE: ReadonlySet<string> = new Set(['exited', 'not_ready']);
 
 // The 3×3 agent terminal grid. Owns the pane focus/expand interaction
 // state (roving tabindex, click-to-expand, ESC-to-restore, arrow-key
@@ -30,6 +42,10 @@ export function SwarmTermGrid({
   panesByAgent,
   lifecycle,
   activeEdge,
+  paneStates,
+  onRestartAgent,
+  restartingAgent = null,
+  liteTeam = false,
 }: SwarmTermGridProps): JSX.Element {
   // Click-to-expand: when an agent's pane is "expanded" the grid
   // hides the other 8 tiles and gives this one the full container.
@@ -145,6 +161,11 @@ export function SwarmTermGrid({
           (activeEdge.source === agentId || activeEdge.target === agentId);
         const isTabStop = agentId === focusedAgent;
         const roleLabel = persona?.role ?? agentId;
+        const paneState = paneStates.get(agentId);
+        const notReady =
+          paneId != null && paneState != null && paneState.readiness !== 'ready'
+            ? paneState
+            : null;
         return (
           <div
             key={agentId}
@@ -169,6 +190,30 @@ export function SwarmTermGrid({
               <span className="swarm-term-pane-id">@{agentId}</span>
               <span className="swarm-term-pane-role">{persona?.role ?? '—'}</span>
               <LifecyclePill phase={phase} agentId={agentId} />
+              {notReady && (
+                <span
+                  className={`swarm-term-pane-ready swarm-term-pane-ready--${notReady.readiness}`}
+                  role="status"
+                  title={notReady.detail ?? undefined}
+                  aria-label={`${agentId}: ${READINESS_LABEL[notReady.readiness]}${
+                    notReady.detail ? ` — ${notReady.detail}` : ''
+                  }`}
+                >
+                  {READINESS_LABEL[notReady.readiness]}
+                </span>
+              )}
+              {notReady && onRestartAgent && RESTARTABLE.has(notReady.readiness) && (
+                <button
+                  type="button"
+                  className="swarm-term-pane-restart"
+                  title="Restart this agent in a new pane (its conversation is kept)"
+                  aria-label={`Restart ${roleLabel}`}
+                  disabled={restartingAgent === agentId}
+                  onClick={() => onRestartAgent(agentId)}
+                >
+                  ↻
+                </button>
+              )}
               {paneId && (
                 <button
                   type="button"
@@ -189,6 +234,8 @@ export function SwarmTermGrid({
             <div className="swarm-term-pane-body">
               {paneId ? (
                 <SwarmPane paneId={paneId} agentId={agentId} />
+              ) : liteTeam ? (
+                <em>Bu oturumda yok (Lite takım)</em>
               ) : (
                 <em>idle — pick a project and launch</em>
               )}

@@ -48,6 +48,31 @@ fn a_normal_launch_keeps_the_users_claude_env() {
 /// segments. Required so `terminal:spawn({cmd: "/bin/sh -c \"echo
 /// hi\""})` actually spawns `/bin/sh` with two args, not a single
 /// nonsense program-name.
+/// The swarm builds pane commands with `permissions::join_quoted`; every
+/// argument — rules with spaces / `*`, Windows paths with backslashes,
+/// quotes — must come out of the tokenizer exactly as it went in.
+#[test]
+fn swarm_quoted_args_survive_the_tokenizer() {
+    let args: Vec<String> = [
+        "--allowedTools",
+        "Bash(git diff *--output*)",
+        r"C:\Users\x\AppData\Roaming\app\swarm-term\sessions\s\scout.persona.md",
+        r"\\?\C:\dir\",
+        r#"say "hi""#,
+        "",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    let line = format!(
+        "\"C:\\claude.exe\" {}",
+        crate::swarm_term::permissions::join_quoted(&args)
+    );
+    let mut expected = vec![r"C:\claude.exe".to_string()];
+    expected.extend(args);
+    assert_eq!(tokenize_command(&line), expected);
+}
+
 #[test]
 fn tokenize_command_handles_quotes_and_spaces() {
     assert_eq!(tokenize_command("pwsh.exe"), vec!["pwsh.exe"]);
