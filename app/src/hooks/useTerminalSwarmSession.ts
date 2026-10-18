@@ -2,6 +2,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { commands, type SwarmTermPersona } from '../lib/bindings';
 import { unwrap } from '../lib/unwrap';
 import { dismissToast, showToast } from '../lib/toast';
+import { useTauriEvent } from './useTauriEvent';
 
 export function useSwarmTermPersonas() {
   return useQuery<SwarmTermPersona[]>({
@@ -12,6 +13,15 @@ export function useSwarmTermPersonas() {
 }
 
 export function useSwarmTermSessionStatus() {
+  const qc = useQueryClient();
+  // The handle carries every pane's readiness: refetch it when a pane's
+  // state changes or a session starts / stops anywhere (not only after
+  // this window's own start / stop mutations).
+  const refresh = () => {
+    qc.invalidateQueries({ queryKey: ['swarm-term', 'status'] });
+  };
+  useTauriEvent('swarm-term:pane-state', refresh);
+  useTauriEvent('swarm-term:session', refresh);
   return useQuery({
     queryKey: ['swarm-term', 'status'],
     queryFn: () => unwrap(commands.swarmTermSessionStatus()),

@@ -78,8 +78,19 @@ pub const SWARM_TERM_ROUTE: &str = "swarm-term:route";
 
 /// `swarm-term:lifecycle` — a task-lifecycle transition recorded by
 /// `swarm_term::lifecycle::LifecycleStore`. Payload:
-/// `{ source, source_pane, task_id, transition, state }`.
+/// `{ source, source_pane, task_id, transition, state, owners }` —
+/// `source` sent the signal, `owners` are the agents whose work the
+/// task is (e.g. the builder a reviewer's verdict settles).
 pub const SWARM_TERM_LIFECYCLE: &str = "swarm-term:lifecycle";
+
+/// `swarm-term:pane-state` — a pane's readiness changed
+/// (`swarm_term::pane_state`). Payload:
+/// `{ sessionId, agentId, readiness, detail }`.
+pub const SWARM_TERM_PANE_STATE: &str = "swarm-term:pane-state";
+
+/// `swarm-term:session` — a terminal-swarm session started or stopped.
+/// Payload: `{ sessionId, state: "started" | "stopped" }`.
+pub const SWARM_TERM_SESSION: &str = "swarm-term:session";
 
 /// `swarm-term:update:log` — one stdout/stderr line from the bundled
 /// `claude` self-update child (`swarm_term_run_update`). Payload:

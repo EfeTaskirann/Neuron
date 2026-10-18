@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useState } from 'react';
-import { useTauriEvent } from './useTauriEvent';
+import { useEffect, useMemo, useState, useSyncExternalStore } from 'react';
+import { listen } from '@tauri-apps/api/event';
 import type { RouteEvent, RouteOutcome } from './useRoutingEvents';
 
 // Display-grade derivations over the swarm-term routing stream
@@ -13,7 +13,11 @@ export type AgentLifecycle =
   | 'assigned'
   | 'building'
   | 'review'
-  | 'done';
+  | 'done'
+  /** A reviewer / the tester sent the agent's work back (CHANGES_NEEDED). */
+  | 'rework'
+  /** The agent's task was closed as failed (`hata`, TASK_FAILED). */
+  | 'failed';
 
 export interface ActiveEdge {
   source: string;
@@ -87,6 +91,10 @@ export function useActiveEdge(
  * `lifecycle_synthesise` path). The backend state machine is the
  * source of truth; the body-text heuristic below can disagree with
  * it, so authoritative state wins on merge.
+ *
+ * `source` sent the signal; `owners` are the agents whose work the
+ * task is — a reviewer's `CHANGES_NEEDED` belongs on the BUILDER's
+ * pill. Older backends send no `owners`: the signal's sender then.
  */
 interface LifecyclePayload {
   source: string;
@@ -94,27 +102,101 @@ interface LifecyclePayload {
   task_id: string;
   transition: string;
   state: string;
+  owners?: string[];
 }
 
-const LIFECYCLE_STATE_TO_PHASE: Record<string, AgentLifecycle> = {
-  Assigned: 'assigned',
-  Building: 'building',
-  AwaitingReview: 'review',
-  Approved: 'done',
-  Done: 'done',
-  Failed: 'idle',
-};
+/** Pure: the phase a backend `(state, transition)` means for its owners. */
+export function lifecyclePhase(state: string, transition: string): AgentLifecycle | null {
+  switch (state) {
+    case 'Assigned':
+      return 'assigned';
+    case 'Building':
+      return 'building';
+    case 'AwaitingReview':
+      return 'review';
+    case 'Approved':
+    case 'Done':
+      return 'done';
+    case 'Failed':
+      return transition === 'ChangesNeeded' ? 'rework' : 'failed';
+    default:
+      return null;
+  }
+}
 
-export function useLifecycleEvents(): Record<string, AgentLifecycle> {
-  const [map, setMap] = useState<Record<string, AgentLifecycle>>({});
+const VERDICTS = new Set(['Approved', 'ChangesNeeded']);
 
-  useTauriEvent<LifecyclePayload>('swarm-term:lifecycle', (payload) => {
-    const phase = LIFECYCLE_STATE_TO_PHASE[payload.state];
-    if (!phase) return;
-    setMap((prev) => ({ ...prev, [payload.source]: phase }));
+// ── Module-level lifecycle store ───────────────────────────────────
+// App-lifetime, like the routing store: the pills keep their state
+// across tab switches, and events that arrive while another tab is
+// shown are not lost. Reset whenever the session changes.
+let lifecycleMap: Record<string, AgentLifecycle> = {};
+let lifecycleSession: string | null = null;
+const lifecycleListeners = new Set<() => void>();
+let lifecycleListenerStarted = false;
+
+function emitLifecycleStore(): void {
+  for (const l of lifecycleListeners) l();
+}
+
+/** Fold one backend lifecycle event into the store. */
+export function applyLifecycleEvent(payload: LifecyclePayload): void {
+  const phase = lifecyclePhase(payload.state, payload.transition);
+  if (!phase) return;
+  const owners = payload.owners?.length ? payload.owners : [payload.source];
+  const next = { ...lifecycleMap };
+  for (const agent of owners) next[agent] = phase;
+  // A reviewer / the tester that judged someone else's work is done
+  // with it, whatever the verdict.
+  if (VERDICTS.has(payload.transition) && !owners.includes(payload.source)) {
+    next[payload.source] = 'done';
+  }
+  lifecycleMap = next;
+  emitLifecycleStore();
+}
+
+function ensureLifecycleListener(): void {
+  if (lifecycleListenerStarted) return;
+  lifecycleListenerStarted = true;
+  listen<LifecyclePayload>('swarm-term:lifecycle', (event) => {
+    applyLifecycleEvent(event.payload);
+  }).catch((err) => {
+    console.warn('[useAgentLifecycle] subscribe failed', err);
   });
+}
 
-  return map;
+function subscribeLifecycleStore(cb: () => void): () => void {
+  lifecycleListeners.add(cb);
+  return () => {
+    lifecycleListeners.delete(cb);
+  };
+}
+
+function lifecycleSnapshot(): Record<string, AgentLifecycle> {
+  return lifecycleMap;
+}
+
+/** Test seam: forget every phase and the subscription. */
+export function resetLifecycleStore(): void {
+  lifecycleMap = {};
+  lifecycleSession = null;
+  lifecycleListenerStarted = false;
+  emitLifecycleStore();
+}
+
+/** The backend lifecycle phases of `sessionId`'s agents. */
+export function useLifecycleEvents(
+  sessionId: string | null = null,
+): Record<string, AgentLifecycle> {
+  ensureLifecycleListener();
+  useEffect(() => {
+    if (sessionId !== lifecycleSession) {
+      lifecycleSession = sessionId;
+      lifecycleMap = {};
+      emitLifecycleStore();
+    }
+  }, [sessionId]);
+  return useSyncExternalStore(subscribeLifecycleStore, lifecycleSnapshot, lifecycleSnapshot);
 }
 
 /**
@@ -141,8 +223,9 @@ export function useLifecycleEvents(): Record<string, AgentLifecycle> {
  */
 export function useAgentLifecycle(
   events: RouteEvent[],
+  sessionId: string | null = null,
 ): Record<string, AgentLifecycle> {
-  const authoritative = useLifecycleEvents();
+  const authoritative = useLifecycleEvents(sessionId);
   const [now, setNow] = useState<number>(() => Date.now());
   useEffect(() => {
     const id = window.setInterval(() => setNow(Date.now()), 5_000);

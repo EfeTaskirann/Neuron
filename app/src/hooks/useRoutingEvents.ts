@@ -1,5 +1,6 @@
 import { useMemo, useSyncExternalStore } from 'react';
 import { listen } from '@tauri-apps/api/event';
+import { notifyTaskSignal } from '../lib/swarmNotify';
 
 // Shared event-collection hook for the swarm-term routing event
 // stream. The backend (`src-tauri/src/swarm_term/bridge/`) emits
@@ -119,6 +120,11 @@ function pushRouteEvent(p: RawPayload): void {
   if (out.length > ROUTE_EVENT_CAP) out.length = ROUTE_EVENT_CAP;
   routeEvents = out;
   emitRouteStore();
+  // A closed task reaches the orchestrator as a bridge fanout — the one
+  // app-lifetime place that sees it whatever tab is open.
+  if (next.outcome === 'lifecycle_fanout' && next.target === 'orchestrator') {
+    notifyTaskSignal(next.body);
+  }
 }
 
 export function clearRoutingEvents(): void {

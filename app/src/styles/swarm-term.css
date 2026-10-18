@@ -10,6 +10,8 @@
   --phase-building: var(--syn-warning);
   --phase-review:   var(--syn-running);
   --phase-done:     var(--syn-success);
+  --phase-rework:   color-mix(in oklab, var(--syn-warning) 50%, var(--syn-error));
+  --phase-failed:   var(--syn-error);
 }
 
 /* Row: the swarm column, then the optional Routing Log drawer. */
@@ -357,6 +359,14 @@
   background: color-mix(in oklab, var(--background) 72%, var(--phase-done));
   border-color: color-mix(in oklab, var(--border) 50%, var(--phase-done));
 }
+.swarm-term-hier-chip[data-phase='rework'] {
+  background: color-mix(in oklab, var(--background) 72%, var(--phase-rework));
+  border-color: color-mix(in oklab, var(--border) 50%, var(--phase-rework));
+}
+.swarm-term-hier-chip[data-phase='failed'] {
+  background: color-mix(in oklab, var(--background) 72%, var(--phase-failed));
+  border-color: color-mix(in oklab, var(--border) 50%, var(--phase-failed));
+}
 
 /* Active edge: source and target both glow with a pulsing outline
  * so the operator can spot the live conversation at a glance. */
@@ -433,6 +443,64 @@
   background: color-mix(in oklab, var(--background) 70%, var(--phase-done));
   border-color: color-mix(in oklab, var(--border) 40%, var(--phase-done));
   color: var(--foreground);
+}
+.swarm-term-pane-phase--rework {
+  background: color-mix(in oklab, var(--background) 70%, var(--phase-rework));
+  border-color: color-mix(in oklab, var(--border) 40%, var(--phase-rework));
+  color: var(--foreground);
+}
+.swarm-term-pane-phase--failed {
+  background: color-mix(in oklab, var(--background) 70%, var(--phase-failed));
+  border-color: color-mix(in oklab, var(--border) 40%, var(--phase-failed));
+  color: var(--foreground);
+}
+
+/* A pane that is not (yet / any longer) ready: shown next to its
+ * lifecycle pill until it answers the kickoff. */
+.swarm-term-pane-ready {
+  display: inline-flex;
+  align-items: center;
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  padding: 2px 7px;
+  border-radius: 999px;
+  border: 1px dashed var(--border);
+  background: var(--surface-1);
+  color: var(--muted-foreground);
+  flex: 0 0 auto;
+}
+.swarm-term-pane-ready--blocked,
+.swarm-term-pane-ready--not_ready {
+  border-style: solid;
+  background: color-mix(in oklab, var(--background) 70%, var(--syn-warning));
+  border-color: color-mix(in oklab, var(--border) 40%, var(--syn-warning));
+  color: var(--foreground);
+}
+.swarm-term-pane-ready--exited {
+  border-style: solid;
+  background: color-mix(in oklab, var(--background) 70%, var(--syn-error));
+  border-color: color-mix(in oklab, var(--border) 40%, var(--syn-error));
+  color: var(--foreground);
+}
+
+/* Toolbar "n/9 ready". */
+.swarm-term-ready {
+  font-size: 12px;
+  padding: 2px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--surface-1);
+  color: var(--foreground);
+  white-space: nowrap;
+}
+.swarm-term-ready--all {
+  background: color-mix(in oklab, var(--background) 75%, var(--syn-success));
+  border-color: color-mix(in oklab, var(--border) 50%, var(--syn-success));
+}
+.swarm-term-ready--problem {
+  background: color-mix(in oklab, var(--background) 72%, var(--syn-warning));
+  border-color: color-mix(in oklab, var(--border) 50%, var(--syn-warning));
 }
 
 /* Active pane outline — visually reinforces the hierarchy chip glow

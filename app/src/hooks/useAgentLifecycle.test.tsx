@@ -14,11 +14,18 @@ vi.mock('@tauri-apps/api/event', () => ({
   }),
 }));
 
-import { useActiveEdge, useAgentLifecycle } from './useAgentLifecycle';
+import {
+  applyLifecycleEvent,
+  lifecyclePhase,
+  resetLifecycleStore,
+  useActiveEdge,
+  useAgentLifecycle,
+} from './useAgentLifecycle';
 import type { RouteEvent, RouteOutcome } from './useRoutingEvents';
 
 beforeEach(() => {
   handlers.clear();
+  resetLifecycleStore();
 });
 
 let nextId = 0;
@@ -79,6 +86,68 @@ describe('useAgentLifecycle', () => {
       });
     });
     expect(result.current['backend-builder']).toBe('review');
+  });
+});
+
+describe('backend lifecycle events', () => {
+  it('maps states to phases; a rejection is rework, a closed task failed', () => {
+    expect(lifecyclePhase('Assigned', 'Assigned')).toBe('assigned');
+    expect(lifecyclePhase('AwaitingReview', 'Done')).toBe('review');
+    expect(lifecyclePhase('Approved', 'Approved')).toBe('done');
+    expect(lifecyclePhase('Failed', 'ChangesNeeded')).toBe('rework');
+    expect(lifecyclePhase('Failed', 'TaskFailed')).toBe('failed');
+    expect(lifecyclePhase('Failed', 'Abandoned')).toBe('failed');
+    expect(lifecyclePhase('Nonsense', 'x')).toBeNull();
+  });
+
+  it("puts a verdict on the builder's pill, and the reviewer is done", () => {
+    const { result } = renderHook(() => useAgentLifecycle([], 's1'));
+    act(() => {
+      applyLifecycleEvent({
+        source: 'backend-reviewer',
+        source_pane: 'p-br',
+        task_id: 't1',
+        transition: 'ChangesNeeded',
+        state: 'Failed',
+        owners: ['backend-builder'],
+      });
+    });
+    expect(result.current['backend-builder']).toBe('rework');
+    expect(result.current['backend-reviewer']).toBe('done');
+    act(() => {
+      applyLifecycleEvent({
+        source: 'coordinator',
+        source_pane: 'p-c',
+        task_id: 't1',
+        transition: 'TaskFailed',
+        state: 'Failed',
+        owners: ['backend-builder'],
+      });
+    });
+    expect(result.current['backend-builder']).toBe('failed');
+    // The coordinator closed someone else's task: its own pill is untouched.
+    expect(result.current.coordinator).toBeUndefined();
+  });
+
+  it('keeps the phases across remounts and forgets them for a new session', () => {
+    const first = renderHook(() => useAgentLifecycle([], 's1'));
+    act(() => {
+      applyLifecycleEvent({
+        source: 'backend-builder',
+        source_pane: 'p-bb',
+        task_id: 't1',
+        transition: 'Building',
+        state: 'Building',
+      });
+    });
+    expect(first.result.current['backend-builder']).toBe('building');
+    first.unmount();
+    // Back on the tab: same session, same pills.
+    const again = renderHook(() => useAgentLifecycle([], 's1'));
+    expect(again.result.current['backend-builder']).toBe('building');
+    again.unmount();
+    const next = renderHook(() => useAgentLifecycle([], 's2'));
+    expect(next.result.current['backend-builder']).toBeUndefined();
   });
 });
 

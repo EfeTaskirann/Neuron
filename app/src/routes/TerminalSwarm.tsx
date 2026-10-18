@@ -20,10 +20,29 @@ import { useClaudeUpdateProgress } from '../hooks/useClaudeUpdateProgress';
 import { useRoutingEvents } from '../hooks/useRoutingEvents';
 import { useActiveEdge, useAgentLifecycle } from '../hooks/useAgentLifecycle';
 import { AppErrorClient, describeError } from '../lib/unwrap';
+import type { TerminalSwarmPaneState } from '../lib/bindings';
 import { RoutingLogRoute } from './RoutingLogRoute';
 
 /** Gap between the pasted chat message and its submitting CR. */
 const SUBMIT_DELAY_MS = 200;
+
+/** Why @orchestrator cannot take a task yet, or `null` when it can. */
+function chatWaitReason(state: TerminalSwarmPaneState | undefined): string | null {
+  switch (state?.readiness) {
+    case 'starting':
+      return 'Waiting for @orchestrator to start…';
+    case 'kickoff_sent':
+      return 'Waiting for @orchestrator to answer its kickoff…';
+    case 'blocked':
+      return `@orchestrator needs you: ${state.detail ?? 'answer the screen in its pane'}`;
+    case 'not_ready':
+      return '@orchestrator did not answer its kickoff — check its pane';
+    case 'exited':
+      return "@orchestrator's claude exited — restart the swarm";
+    default:
+      return null;
+  }
+}
 
 /**
  * Asked once per folder, before the first launch there (the backend
@@ -78,7 +97,6 @@ export function TerminalSwarmRoute(): JSX.Element {
   const [logOpen, setLogOpen] = useState(false);
   const { events: routeEvents } = useRoutingEvents(500);
   const activeEdge = useActiveEdge(routeEvents, 3_000);
-  const lifecycle = useAgentLifecycle(routeEvents);
 
   const { data: personas = [] } = useSwarmTermPersonas();
   const {
@@ -87,6 +105,13 @@ export function TerminalSwarmRoute(): JSX.Element {
     isError: sessionProbeFailed,
     error: sessionProbeError,
   } = useSwarmTermSessionStatus();
+  const lifecycle = useAgentLifecycle(routeEvents, session?.sessionId ?? null);
+  const paneStates = useMemo(() => session?.paneStates ?? [], [session]);
+  const paneStatesByAgent = useMemo(
+    () => new Map(paneStates.map((p) => [p.agentId, p])),
+    [paneStates],
+  );
+  const chatDisabledReason = chatWaitReason(paneStatesByAgent.get('orchestrator'));
   const startMut = useStartSwarmTermSession();
   const trustMut = useTrustSwarmTermProject();
   const stopMut = useStopSwarmTermSession();
@@ -199,6 +224,7 @@ export function TerminalSwarmRoute(): JSX.Element {
           stopPending={stopMut.isPending}
           sessionStartMs={sessionStartMs}
           logOpen={logOpen}
+          paneStates={paneStates}
           onLaunch={launch}
           onRestart={restart}
           onStop={stop}
@@ -233,6 +259,7 @@ export function TerminalSwarmRoute(): JSX.Element {
           <OrchestratorChatBar
             onSend={sendToOrchestrator}
             permissionMode={session.permissionMode}
+            disabledReason={chatDisabledReason}
           />
         )}
 
@@ -241,6 +268,7 @@ export function TerminalSwarmRoute(): JSX.Element {
           panesByAgent={panesByAgent}
           lifecycle={lifecycle}
           activeEdge={activeEdge}
+          paneStates={paneStatesByAgent}
         />
       </div>
 

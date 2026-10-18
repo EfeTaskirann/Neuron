@@ -555,3 +555,36 @@ fn move_to_rejected_writes_reason_sidecar() {
         "test reason"
     );
 }
+
+// ---- lifecycle event owners (C3) ---------------------------------- //
+
+#[test]
+fn a_verdict_is_shown_on_the_builder_and_a_smoke_on_the_tester() {
+    use crate::swarm_term::lifecycle::{LifecycleStore, Transition, TransitionKind};
+    use std::collections::HashMap;
+    let panes: HashMap<String, String> = [
+        ("backend-builder", "p-bb"),
+        ("backend-reviewer", "p-br"),
+        ("integration-tester", "p-t"),
+        ("coordinator", "p-c"),
+    ]
+    .into_iter()
+    .map(|(a, p)| (a.to_string(), p.to_string()))
+    .collect();
+    let store = LifecycleStore::new();
+    let t = |kind, id: &str| Transition { kind, task_id: id.to_string() };
+
+    // A builder's task, then the reviewer's CHANGES_NEEDED on it: the
+    // task is the builder's, whoever sent the signal.
+    store.assign("p-bb", "p1");
+    store.record("backend-builder", "p-bb", &t(TransitionKind::Done, "p1"), &[], None);
+    store.record("backend-reviewer", "p-br", &t(TransitionKind::ChangesNeeded, "p1"), &["p-bb"], None);
+    assert_eq!(super::synth::task_owners(&store, &panes, "p1"), ["backend-builder"]);
+
+    // The tester's own smoke task: nobody else holds it.
+    store.assign("p-t", "smoke-1");
+    assert_eq!(super::synth::task_owners(&store, &panes, "smoke-1"), ["integration-tester"]);
+
+    // Untracked: no owner (the UI falls back to the signal's sender).
+    assert!(super::synth::task_owners(&store, &panes, "nope-1").is_empty());
+}

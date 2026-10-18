@@ -90,6 +90,10 @@ const SESSION: TerminalSwarmSessionHandle = {
   permissionMode: 'restricted',
   claudeVersion: '2.1.296',
   preflightNote: null,
+  paneStates: [
+    { agentId: 'coordinator', readiness: 'ready', detail: null },
+    { agentId: 'orchestrator', readiness: 'ready', detail: null },
+  ],
 };
 
 beforeEach(async () => {
@@ -250,6 +254,50 @@ describe('TerminalSwarmRoute', () => {
     fireEvent.click(launch);
     const alert = await screen.findByRole('alert');
     expect(alert).toHaveTextContent('Girilen değer geçersiz. `C:\\` bir sürücü kökü.');
+  });
+
+  it('locks the chat until @orchestrator has answered its kickoff', async () => {
+    const { commands } = await import('../lib/bindings');
+    vi.mocked(commands.swarmTermSessionStatus).mockResolvedValue({
+      status: 'ok',
+      data: {
+        ...SESSION,
+        paneStates: [
+          { agentId: 'coordinator', readiness: 'ready', detail: null },
+          { agentId: 'orchestrator', readiness: 'kickoff_sent', detail: null },
+        ],
+      },
+    });
+    renderRoute();
+    const input = await screen.findByLabelText(/message to orchestrator/i);
+    expect(input).toBeDisabled();
+    expect(input).toHaveAttribute('placeholder', 'Waiting for @orchestrator to answer its kickoff…');
+    expect(screen.getByRole('button', { name: /^send$/i })).toBeDisabled();
+    // The badge counts the ready panes; the grid marks the waiting one.
+    expect(screen.getByText('1/2 ready')).toBeInTheDocument();
+    expect(screen.getByLabelText('orchestrator: warming up')).toBeInTheDocument();
+  });
+
+  it('says why a pane needs the user, on the badge and the pane', async () => {
+    const { commands } = await import('../lib/bindings');
+    const detail = "Claude giriş istiyor: bu pane'de giriş yap.";
+    vi.mocked(commands.swarmTermSessionStatus).mockResolvedValue({
+      status: 'ok',
+      data: {
+        ...SESSION,
+        paneStates: [
+          { agentId: 'coordinator', readiness: 'blocked', detail },
+          { agentId: 'orchestrator', readiness: 'ready', detail: null },
+        ],
+      },
+    });
+    renderRoute();
+    const badge = await screen.findByText('1/2 ready');
+    expect(badge).toHaveAttribute('title', `@coordinator: needs you — ${detail}`);
+    expect(badge.className).toContain('swarm-term-ready--problem');
+    expect(screen.getByLabelText(`coordinator: needs you — ${detail}`)).toBeInTheDocument();
+    // The orchestrator is ready: the chat is open.
+    expect(screen.getByLabelText(/message to orchestrator/i)).toBeEnabled();
   });
 
   it('shows a pre-flight note without blocking the session', async () => {

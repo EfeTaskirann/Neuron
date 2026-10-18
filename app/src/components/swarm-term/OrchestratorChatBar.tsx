@@ -7,6 +7,9 @@ interface OrchestratorChatBarProps {
   onSend: (message: string) => void;
   /** Mode the session's panes were spawned with (from the backend). */
   permissionMode: SwarmTermPermissionMode;
+  /** Set while @orchestrator cannot take a task yet: why. A message
+   *  sent before its kickoff answer could collide with the kickoff. */
+  disabledReason: string | null;
 }
 
 /** What the restricted mode (`dontAsk` + per-role allowlist) allows —
@@ -16,8 +19,10 @@ export const RESTRICTED_PERMISSIONS_DETAIL =
   'builders can edit files inside this project and run build, test, lint and ' +
   'git-inspection commands; reviewers and the integration tester can run those ' +
   'commands; the orchestrator, coordinator, scout and planner only read the ' +
-  'project and send messages. Anything else is denied without asking, unless ' +
-  "your own or this project's Claude settings already allow it.";
+  'project and send messages. Anything else is denied without asking, and nobody ' +
+  "writes .git, .claude, editor config or another agent's messages. Your own " +
+  'Claude settings, hooks and MCP servers are not loaded into the panes; this ' +
+  "project's committed settings and CLAUDE.md are.";
 
 export const BYPASS_PERMISSIONS_DETAIL =
   'NEURON_TERM_PERMISSIONS=bypass is set: every agent runs with ' +
@@ -25,6 +30,7 @@ export const BYPASS_PERMISSIONS_DETAIL =
   'account.';
 
 const PERMISSION_DETAIL_ID = 'swarm-term-perm-detail';
+const CHAT_WAIT_ID = 'swarm-term-chat-wait';
 
 // Chat bar for the `@orchestrator` pane: the session's permission mode +
 // text input. Owns its own draft state so the parent route doesn't
@@ -32,6 +38,7 @@ const PERMISSION_DETAIL_ID = 'swarm-term-perm-detail';
 export function OrchestratorChatBar({
   onSend,
   permissionMode,
+  disabledReason,
 }: OrchestratorChatBarProps): JSX.Element {
   const [chatInput, setChatInput] = useState('');
   const bypass = permissionMode === 'bypass';
@@ -42,7 +49,7 @@ export function OrchestratorChatBar({
   const submit = (e: FormEvent) => {
     e.preventDefault();
     const msg = chatInput.trim();
-    if (!msg) return;
+    if (!msg || disabledReason) return;
     onSend(msg);
     setChatInput('');
   };
@@ -66,12 +73,23 @@ export function OrchestratorChatBar({
       </span>
       <input
         type="text"
-        placeholder="Talk to @orchestrator — type your task and hit Enter"
+        placeholder={disabledReason ?? 'Talk to @orchestrator — type your task and hit Enter'}
         value={chatInput}
         onChange={(e) => setChatInput(e.target.value)}
         aria-label="Message to orchestrator"
+        disabled={disabledReason != null}
+        aria-describedby={disabledReason ? CHAT_WAIT_ID : undefined}
       />
-      <button type="submit" className="btn primary sm" disabled={!chatInput.trim()}>
+      {disabledReason && (
+        <span id={CHAT_WAIT_ID} className="sr-only">
+          {disabledReason}
+        </span>
+      )}
+      <button
+        type="submit"
+        className="btn primary sm"
+        disabled={!chatInput.trim() || disabledReason != null}
+      >
         Send
       </button>
     </form>

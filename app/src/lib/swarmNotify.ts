@@ -1,0 +1,56 @@
+import { getCurrentWindow, UserAttentionType } from '@tauri-apps/api/window';
+import { showToast } from './toast';
+
+// "Task done / failed" notifications for the terminal swarm. The bridge
+// reports every closed task to the orchestrator as a synthesised
+// `TASK_DONE <id> — …` / `TASK_FAILED <id> — …` message; the routing
+// store hands each one here. A toast says it in the app, and the
+// taskbar flashes when the window is in the background.
+
+export interface TaskSignal {
+  kind: 'done' | 'failed';
+  taskId: string;
+  /** What follows the id (the verdict / the reason), if anything. */
+  note: string;
+}
+
+const SIGNAL_RE = /^\s*(TASK_DONE|TASK_FAILED)\s+(\S+)\s*(?:[—–-]\s*([\s\S]*))?$/;
+
+/** Pure: the task signal at the start of a fanout body, if it is one. */
+export function taskSignal(body: string): TaskSignal | null {
+  const m = SIGNAL_RE.exec(body);
+  if (!m) return null;
+  return {
+    kind: m[1] === 'TASK_DONE' ? 'done' : 'failed',
+    taskId: m[2]!,
+    note: (m[3] ?? '').trim(),
+  };
+}
+
+const NOTE_MAX = 160;
+
+/** Toast (and, in the background, a taskbar flash) for a task signal. */
+export function notifyTaskSignal(body: string): void {
+  const signal = taskSignal(body);
+  if (!signal) return;
+  const note =
+    signal.note.length > NOTE_MAX ? `${signal.note.slice(0, NOTE_MAX - 1)}…` : signal.note;
+  showToast(
+    signal.kind === 'done'
+      ? { variant: 'success', body: `Görev tamamlandı: ${signal.taskId}`, durationMs: 8000 }
+      : {
+          variant: 'error',
+          body: `Görev başarısız: ${signal.taskId}${note ? ` — ${note}` : ''}`,
+          durationMs: 12000,
+        },
+  );
+  if (typeof document !== 'undefined' && !document.hasFocus()) {
+    try {
+      void getCurrentWindow()
+        .requestUserAttention(UserAttentionType.Informational)
+        .catch(() => {});
+    } catch {
+      // No Tauri window (tests, a plain browser): the toast is enough.
+    }
+  }
+}

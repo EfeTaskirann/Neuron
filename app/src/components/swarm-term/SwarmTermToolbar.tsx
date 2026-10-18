@@ -1,3 +1,5 @@
+import type { TerminalSwarmPaneState } from '../../lib/bindings';
+import { READINESS_LABEL } from './constants';
 import { SessionTimer } from './SessionTimer';
 
 interface SwarmTermToolbarProps {
@@ -14,6 +16,8 @@ interface SwarmTermToolbarProps {
   sessionStartMs: number | null;
   /** Whether the Routing Log drawer is open. */
   logOpen: boolean;
+  /** Every pane's readiness while a session runs (empty otherwise). */
+  paneStates: TerminalSwarmPaneState[];
   onLaunch: () => void;
   onRestart: () => void;
   onStop: () => void;
@@ -29,6 +33,7 @@ export function SwarmTermToolbar({
   stopPending,
   sessionStartMs,
   logOpen,
+  paneStates,
   onLaunch,
   onRestart,
   onStop,
@@ -80,6 +85,7 @@ export function SwarmTermToolbar({
         </>
       )}
       {sessionStartMs != null && <SessionTimer startMs={sessionStartMs} />}
+      {sessionActive && paneStates.length > 0 && <ReadyBadge paneStates={paneStates} />}
       <button
         type="button"
         className="btn ghost sm swarm-term-log-toggle"
@@ -90,5 +96,30 @@ export function SwarmTermToolbar({
         Routing Log
       </button>
     </div>
+  );
+}
+
+const PROBLEM_STATES = ['blocked', 'not_ready', 'exited'];
+
+/** "n/9 ready", with who is not and why in the tooltip / description. */
+function ReadyBadge({ paneStates }: { paneStates: TerminalSwarmPaneState[] }): JSX.Element {
+  const ready = paneStates.filter((p) => p.readiness === 'ready').length;
+  const waiting = paneStates.filter((p) => p.readiness !== 'ready');
+  const all = waiting.length === 0;
+  const problem = waiting.some((p) => PROBLEM_STATES.includes(p.readiness));
+  const details = waiting
+    .map((p) => `@${p.agentId}: ${READINESS_LABEL[p.readiness]}${p.detail ? ` — ${p.detail}` : ''}`)
+    .join('\n');
+  return (
+    <span
+      className={`swarm-term-ready${all ? ' swarm-term-ready--all' : ''}${
+        problem ? ' swarm-term-ready--problem' : ''
+      }`}
+      role="status"
+      title={details || 'Every agent answered the kickoff'}
+      aria-label={`${ready} of ${paneStates.length} agents ready${details ? `. ${details}` : ''}`}
+    >
+      {ready}/{paneStates.length} ready
+    </span>
   );
 }

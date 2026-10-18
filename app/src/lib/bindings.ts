@@ -431,6 +431,11 @@ export const commands = {
 	 *  newer claude, a check that could not run) — for the UI to show.
 	 */
 	preflightNote: string | null,
+	/**
+	 *  Every pane's readiness (see `pane_state`); updates arrive as
+	 *  `swarm-term:pane-state` events.
+	 */
+	paneStates: TerminalSwarmPaneState[],
 } | null, AppErrorWire>(__TAURI_INVOKE("swarm_term_session_status")),
 	swarmTermStartSession: (projectDir: string) => typedError<TerminalSwarmSessionHandle, AppErrorWire>(__TAURI_INVOKE("swarm_term_start_session", { projectDir })),
 	/**
@@ -1246,6 +1251,20 @@ export type PaneLine = {
 	text: string,
 };
 
+export type PaneReadiness = 
+// Spawned; claude is booting or its screen is still settling.
+"starting" | 
+// On a screen only the user can answer (login, first-run).
+"blocked" | 
+// The kickoff went out; waiting for `@<id> READY`.
+"kickoff_sent" | 
+// Answered the kickoff: a delivery target.
+"ready" | 
+// No answer in time. Still watched — a late answer makes it ready.
+"not_ready" | 
+// The pane's process ended.
+"exited";
+
 /**
  *  Input shape for `terminal:spawn`. Fields chosen to match what the
  *  WP-06 PTY supervisor needs; `cwd` is the only strictly-required
@@ -1651,6 +1670,13 @@ export type TerminalSwarmPane = {
 	paneId: string,
 };
 
+export type TerminalSwarmPaneState = {
+	agentId: string,
+	readiness: PaneReadiness,
+	// Why, for the states the user may need to act on (Turkish).
+	detail: string | null,
+};
+
 export type TerminalSwarmSessionHandle = {
 	sessionId: string,
 	projectDir: string,
@@ -1667,6 +1693,11 @@ export type TerminalSwarmSessionHandle = {
 	 *  newer claude, a check that could not run) — for the UI to show.
 	 */
 	preflightNote: string | null,
+	/**
+	 *  Every pane's readiness (see `pane_state`); updates arrive as
+	 *  `swarm-term:pane-state` events.
+	 */
+	paneStates: TerminalSwarmPaneState[],
 };
 
 /**

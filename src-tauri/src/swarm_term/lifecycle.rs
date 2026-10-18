@@ -1027,6 +1027,22 @@ impl LifecycleStore {
         self.len() == 0
     }
 
+    /// The panes holding an entry for `task_id`, in whatever state —
+    /// whose work the task is (closing a task keeps its entries).
+    /// Sorted, so an event built from it is stable.
+    pub fn holders(&self, task_id: &str) -> Vec<String> {
+        let mut panes: Vec<String> = self
+            .lock()
+            .entries
+            .keys()
+            .filter(|(_, id)| id == task_id)
+            .map(|(pane, _)| pane.clone())
+            .collect();
+        panes.sort();
+        panes.dedup();
+        panes
+    }
+
     /// Mark `(source_pane, task_id)` as `Done` regardless of prior
     /// state. Used by the bridge after the synthesised `TASK_DONE`
     /// fanout to the orchestrator has been emitted.

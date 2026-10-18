@@ -10,15 +10,17 @@ import type {
   ActiveEdge,
   AgentLifecycle,
 } from '../../hooks/useAgentLifecycle';
-import type { SwarmTermPersona } from '../../lib/bindings';
+import type { SwarmTermPersona, TerminalSwarmPaneState } from '../../lib/bindings';
 import { LifecyclePill } from './LifecyclePill';
-import { SLOT_ORDER } from './constants';
+import { READINESS_LABEL, SLOT_ORDER } from './constants';
 
 interface SwarmTermGridProps {
   personasById: Map<string, SwarmTermPersona>;
   panesByAgent: Map<string, string>;
   lifecycle: Record<string, AgentLifecycle>;
   activeEdge: ActiveEdge | null;
+  /** Each pane's readiness (from the session handle). */
+  paneStates: Map<string, TerminalSwarmPaneState>;
 }
 
 // The 3×3 agent terminal grid. Owns the pane focus/expand interaction
@@ -30,6 +32,7 @@ export function SwarmTermGrid({
   panesByAgent,
   lifecycle,
   activeEdge,
+  paneStates,
 }: SwarmTermGridProps): JSX.Element {
   // Click-to-expand: when an agent's pane is "expanded" the grid
   // hides the other 8 tiles and gives this one the full container.
@@ -145,6 +148,11 @@ export function SwarmTermGrid({
           (activeEdge.source === agentId || activeEdge.target === agentId);
         const isTabStop = agentId === focusedAgent;
         const roleLabel = persona?.role ?? agentId;
+        const paneState = paneStates.get(agentId);
+        const notReady =
+          paneId != null && paneState != null && paneState.readiness !== 'ready'
+            ? paneState
+            : null;
         return (
           <div
             key={agentId}
@@ -169,6 +177,18 @@ export function SwarmTermGrid({
               <span className="swarm-term-pane-id">@{agentId}</span>
               <span className="swarm-term-pane-role">{persona?.role ?? '—'}</span>
               <LifecyclePill phase={phase} agentId={agentId} />
+              {notReady && (
+                <span
+                  className={`swarm-term-pane-ready swarm-term-pane-ready--${notReady.readiness}`}
+                  role="status"
+                  title={notReady.detail ?? undefined}
+                  aria-label={`${agentId}: ${READINESS_LABEL[notReady.readiness]}${
+                    notReady.detail ? ` — ${notReady.detail}` : ''
+                  }`}
+                >
+                  {READINESS_LABEL[notReady.readiness]}
+                </span>
+              )}
               {paneId && (
                 <button
                   type="button"

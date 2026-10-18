@@ -44,6 +44,7 @@ use crate::swarm_term::heartbeat;
 use crate::swarm_term::hierarchy::AGENT_IDS;
 use crate::swarm_term::lifecycle::LifecycleStore;
 use crate::swarm_term::pane_config::{self, PaneManifest};
+use crate::swarm_term::pane_state::{PaneReadiness, PaneStates, TerminalSwarmPaneState};
 use crate::swarm_term::permissions::{self, SwarmTermPermissionMode};
 use crate::swarm_term::project_guard;
 use crate::swarm_term::persona::{
@@ -131,6 +132,9 @@ pub struct TerminalSwarmSessionHandle {
     /// A pre-flight finding that did not block the start (an untested
     /// newer claude, a check that could not run) — for the UI to show.
     pub preflight_note: Option<String>,
+    /// Every pane's readiness (see `pane_state`); updates arrive as
+    /// `swarm-term:pane-state` events.
+    pub pane_states: Vec<TerminalSwarmPaneState>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
@@ -191,6 +195,8 @@ pub(crate) struct ActiveSession {
     /// [`TerminalSwarmSessionHandle::preflight_note`].
     pub claude_version: Option<String>,
     pub preflight_note: Option<String>,
+    /// Every pane's readiness, published by the kickoff task.
+    pub pane_states: Arc<PaneStates>,
     /// Pane ids that have completed persona injection and are safe
     /// targets for inter-agent routes. Populated by the persona-inject
     /// async task as each `write_to_pane` call returns Ok; read by
@@ -561,8 +567,9 @@ impl TerminalSwarmRegistry {
         );
 
         let alive = Arc::new(AtomicBool::new(true));
+        let pane_states = Arc::new(PaneStates::new(AGENT_IDS.iter().copied()));
         let session = ActiveSession {
-            session_id,
+            session_id: session_id.clone(),
             project_dir: project_dir.clone(),
             panes_by_agent: panes_by_agent.clone(),
             permission_mode,
@@ -572,6 +579,7 @@ impl TerminalSwarmRegistry {
             projects_dirs: projects_dirs.clone(),
             claude_version: preflight.version.map(|v| v.to_string()),
             preflight_note: preflight.note.clone(),
+            pane_states: Arc::clone(&pane_states),
             ready_panes: Arc::clone(&ready_panes),
             alive: Arc::clone(&alive),
         };
@@ -582,6 +590,11 @@ impl TerminalSwarmRegistry {
             })?;
             *guard = Some(session);
         }
+        let _ = tauri::Emitter::emit(
+            &app,
+            crate::events::SWARM_TERM_SESSION,
+            serde_json::json!({ "sessionId": session_id, "state": "started" }),
+        );
 
         // Fire-and-forget kickoff: wait for the claude REPLs to settle,
         // paste the short kickoff turn into every pane, then mark each
@@ -595,7 +608,24 @@ impl TerminalSwarmRegistry {
         let ready_panes_for_inject = Arc::clone(&ready_panes);
         let alive_for_inject = Arc::clone(&alive);
         let pool_for_inject = pool.clone();
+        let app_for_state = app.clone();
+        let states_for_inject = Arc::clone(&pane_states);
+        let session_for_state = session_id.clone();
         tauri::async_runtime::spawn(async move {
+            let publish = move |agent: &str, readiness: PaneReadiness, detail: Option<String>| {
+                if states_for_inject.set(agent, readiness, detail.clone()) {
+                    let _ = tauri::Emitter::emit(
+                        &app_for_state,
+                        crate::events::SWARM_TERM_PANE_STATE,
+                        serde_json::json!({
+                            "sessionId": session_for_state,
+                            "agentId": agent,
+                            "readiness": readiness,
+                            "detail": detail,
+                        }),
+                    );
+                }
+            };
             tokio::time::sleep(Duration::from_millis(READY_DELAY_MS)).await;
             if !alive_for_inject.load(Ordering::SeqCst) {
                 return;
@@ -604,7 +634,7 @@ impl TerminalSwarmRegistry {
             // that pane's screen has settled (see `SETTLED_CHECKS`).
             let kicked: HashMap<String, Option<Instant>> =
                 panes_by_agent.keys().map(|a| (a.clone(), None)).collect();
-            wait_for_ready_answers(
+            let late = wait_for_ready_answers(
                 &registry_for_inject,
                 &pool_for_inject,
                 &panes_by_agent,
@@ -612,6 +642,7 @@ impl TerminalSwarmRegistry {
                 &projects_dirs,
                 &ready_panes_for_inject,
                 &alive_for_inject,
+                &publish,
                 kicked,
             )
             .await;
@@ -652,6 +683,17 @@ impl TerminalSwarmRegistry {
                     }
                 }
             }
+            watch_late_answers(
+                &registry_for_inject,
+                &panes_by_agent,
+                &claude_sessions,
+                &projects_dirs,
+                &ready_panes_for_inject,
+                &alive_for_inject,
+                &publish,
+                late,
+            )
+            .await;
             drop(app_for_inject);
         });
 
@@ -680,7 +722,8 @@ impl TerminalSwarmRegistry {
         &self,
         app: AppHandle<R>,
     ) -> Result<(), AppError> {
-        let (pane_ids, bridge, session_dir, projects_dirs, bridgespace_root): (
+        let (session_id, pane_ids, bridge, session_dir, projects_dirs, bridgespace_root): (
+            String,
             Vec<String>,
             Option<BridgeHandle>,
             Option<PathBuf>,
@@ -694,6 +737,7 @@ impl TerminalSwarmRegistry {
                 Some(s) => {
                     s.alive.store(false, Ordering::SeqCst);
                     (
+                        s.session_id,
                         s.panes_by_agent.into_values().collect(),
                         s.bridge,
                         s.session_dir,
@@ -745,6 +789,11 @@ impl TerminalSwarmRegistry {
                 );
             }
         }
+        let _ = tauri::Emitter::emit(
+            &app,
+            crate::events::SWARM_TERM_SESSION,
+            serde_json::json!({ "sessionId": session_id, "state": "stopped" }),
+        );
         Ok(())
     }
 }
@@ -1035,6 +1084,16 @@ async fn send_kickoff(
 ///
 /// Returns as soon as every pane is settled or the session is stopped
 /// (`alive` cleared).
+/// Records a pane's readiness and, when it changed, emits
+/// `swarm-term:pane-state` (see `pane_state`).
+type PublishState<'a> = &'a (dyn Fn(&str, PaneReadiness, Option<String>) + Send + Sync);
+
+/// Detail for a pane whose claude process ended.
+const PANE_EXITED: &str = "Pane'in claude süreci kapandı.";
+
+/// How often the panes that gave no answer in time are re-checked.
+const LATE_ANSWER_POLL: Duration = Duration::from_secs(5);
+
 #[allow(clippy::too_many_arguments)]
 async fn wait_for_ready_answers(
     registry: &TerminalRegistry,
@@ -1044,18 +1103,20 @@ async fn wait_for_ready_answers(
     projects_dirs: &[PathBuf],
     ready: &Arc<Mutex<HashSet<String>>>,
     alive: &AtomicBool,
+    publish: PublishState<'_>,
     mut kicked: HashMap<String, Option<Instant>>,
-) {
+) -> Vec<String> {
     let started = Instant::now();
     let mut pending: HashSet<&str> =
         panes_by_agent.keys().map(String::as_str).collect();
+    let mut late: Vec<String> = Vec::new();
     let mut resent: HashSet<String> = HashSet::new();
     let mut settle: HashMap<String, ScreenSettle> = HashMap::new();
     let mut trust_answers: HashMap<String, (u32, Instant)> = HashMap::new();
     let mut last_screen_check = Instant::now() - BLOCKED_SCREEN_POLL;
     loop {
         if !alive.load(Ordering::SeqCst) {
-            return;
+            return late;
         }
         let answered: Vec<&str> = pending
             .iter()
@@ -1071,6 +1132,7 @@ async fn wait_for_ready_answers(
             if let (Some(pane), Ok(mut g)) = (panes_by_agent.get(agent), ready.lock()) {
                 g.insert(pane.clone());
             }
+            publish(agent, PaneReadiness::Ready, None);
             tracing::info!(
                 agent_id = %agent,
                 waited_ms = started.elapsed().as_millis() as u64,
@@ -1083,15 +1145,30 @@ async fn wait_for_ready_answers(
             last_screen_check = Instant::now();
         }
         let mut gave_up: Vec<&str> = Vec::new();
+        let mut exited: Vec<&str> = Vec::new();
         for &agent in &pending {
             let Some(pane) = panes_by_agent.get(agent) else {
                 continue;
             };
+            // The registry drops a pane once its process has ended.
+            if check_screens && registry.pane_status(pane).await.is_none() {
+                publish(agent, PaneReadiness::Exited, Some(PANE_EXITED.into()));
+                exited.push(agent);
+                continue;
+            }
             match kicked.get(agent).copied().flatten() {
                 // Not sent yet: send it once the screen has settled on
                 // something that is not a login / trust screen.
                 None => {
                     if started.elapsed() >= BLOCKED_SCREEN_WAIT {
+                        publish(
+                            agent,
+                            PaneReadiness::NotReady,
+                            Some(format!(
+                                "Pane {} dakika boyunca bir ekranda bekledi.",
+                                BLOCKED_SCREEN_WAIT.as_secs() / 60
+                            )),
+                        );
                         gave_up.push(agent);
                     } else if check_screens {
                         let screen = pane_screen_tail(registry, pool, pane).await.unwrap_or_default();
@@ -1106,6 +1183,11 @@ async fn wait_for_ready_answers(
                             }
                             continue;
                         }
+                        if screen_is_blocking(&screen) {
+                            publish(agent, PaneReadiness::Blocked, Some(blocked_reason(&screen).into()));
+                        } else {
+                            publish(agent, PaneReadiness::Starting, None);
+                        }
                         let settled = settle.entry(agent.to_string()).or_default().observe(&screen);
                         let fallback = started.elapsed() >= SETTLE_FALLBACK
                             && !screen.trim().is_empty()
@@ -1117,12 +1199,22 @@ async fn wait_for_ready_answers(
                                 "swarm-term: pane screen settled — kickoff sent"
                             );
                             kicked.insert(agent.to_string(), Some(Instant::now()));
+                            publish(agent, PaneReadiness::KickoffSent, None);
                         }
                     }
                 }
                 Some(sent_at) => {
                     let since = sent_at.elapsed();
                     if since >= READY_TIMEOUT {
+                        publish(
+                            agent,
+                            PaneReadiness::NotReady,
+                            Some(format!(
+                                "Kickoff'a {} sn içinde yanıt vermedi; ona giden mesajlar \
+                                 gönderene iade ediliyor. Yanıt verirse hazır sayılır.",
+                                READY_TIMEOUT.as_secs()
+                            )),
+                        );
                         gave_up.push(agent);
                     } else if since >= KICKOFF_RESEND_AFTER && resent.insert(agent.to_string()) {
                         tracing::warn!(
@@ -1137,18 +1229,80 @@ async fn wait_for_ready_answers(
                 }
             }
         }
+        for agent in exited {
+            pending.remove(agent);
+            tracing::warn!(agent_id = %agent, "swarm-term: pane exited before it was ready");
+        }
         for agent in gave_up {
             pending.remove(agent);
+            late.push(agent.to_string());
             tracing::warn!(
                 agent_id = %agent,
-                "swarm-term: pane never answered the kickoff; left not-ready \
-                 (messages to it are returned to the sender)"
+                "swarm-term: pane never answered the kickoff; not ready for now \
+                 (messages to it are returned to the sender; a late answer still counts)"
             );
         }
         if pending.is_empty() {
-            return;
+            return late;
         }
         tokio::time::sleep(READY_POLL).await;
+    }
+}
+
+/// Keep watching the panes that gave no answer in time: a late `READY`
+/// still makes a pane a delivery target (it used to stay not-ready for
+/// the whole session), and an exit is reported. Ends with the session,
+/// or once none is left.
+#[allow(clippy::too_many_arguments)]
+async fn watch_late_answers(
+    registry: &TerminalRegistry,
+    panes_by_agent: &HashMap<String, String>,
+    claude_sessions: &BTreeMap<String, String>,
+    projects_dirs: &[PathBuf],
+    ready: &Arc<Mutex<HashSet<String>>>,
+    alive: &AtomicBool,
+    publish: PublishState<'_>,
+    mut late: Vec<String>,
+) {
+    while !late.is_empty() && alive.load(Ordering::SeqCst) {
+        tokio::time::sleep(LATE_ANSWER_POLL).await;
+        if !alive.load(Ordering::SeqCst) {
+            return;
+        }
+        let mut still: Vec<String> = Vec::new();
+        for agent in late {
+            let Some(pane) = panes_by_agent.get(&agent) else {
+                continue;
+            };
+            let answered = claude_sessions
+                .get(&agent)
+                .is_some_and(|id| transcript_has_ready_answer(projects_dirs, id, &agent));
+            if answered {
+                if let Ok(mut g) = ready.lock() {
+                    g.insert(pane.clone());
+                }
+                publish(&agent, PaneReadiness::Ready, None);
+                tracing::info!(agent_id = %agent, "swarm-term: pane answered the kickoff late — ready");
+            } else if registry.pane_status(pane).await.is_none() {
+                publish(&agent, PaneReadiness::Exited, Some(PANE_EXITED.into()));
+            } else {
+                still.push(agent);
+            }
+        }
+        late = still;
+    }
+}
+
+/// Pure: what a blocking (non-trust) screen asks of the user, for the UI.
+fn blocked_reason(screen_tail: &str) -> &'static str {
+    let screen = squash(screen_tail);
+    let has = |m: &str| screen.contains(&squash(m));
+    if has("select login method") || has("please run /login") {
+        "Claude giriş istiyor: bu pane'de giriş yap ya da bir terminalde `claude` ile `/login` yap."
+    } else if has("choose the text style") {
+        "Claude'un ilk açılış ekranı açık: pane'e tıklayıp yanıtla."
+    } else {
+        "Pane bir onay ekranında bekliyor: pane'e tıklayıp yanıtla."
     }
 }
 
@@ -1199,6 +1353,7 @@ fn handle_from(s: &ActiveSession) -> TerminalSwarmSessionHandle {
         permission_mode: s.permission_mode,
         claude_version: s.claude_version.clone(),
         preflight_note: s.preflight_note.clone(),
+        pane_states: s.pane_states.snapshot(),
     }
 }
 
@@ -1301,6 +1456,15 @@ mod tests {
         assert!(!transcript_has_ready_answer(&dirs, "mine", "scout"));
         std::fs::write(&mine, format!("{KICKOFF_ECHO}\n{READY_LINE}\n")).unwrap();
         assert!(transcript_has_ready_answer(&dirs, "mine", "scout"));
+    }
+
+    #[test]
+    fn blocked_screens_say_what_the_user_must_do() {
+        assert!(blocked_reason("Select login method:
+❯ 1. Claude account").contains("/login"));
+        assert!(blocked_reason("OAuth token has expired. Please run /login").contains("giriş"));
+        assert!(blocked_reason("Choose the text style that looks best").contains("ilk açılış"));
+        assert!(blocked_reason("Press Enter to continue").contains("onay ekranında"));
     }
 
     #[test]
@@ -1409,12 +1573,24 @@ mod tests {
                 let v: serde_json::Value =
                     serde_json::from_str(e.payload()).unwrap_or_default();
                 println!(
-                    "[{:>5.1}s] LIFECYCLE {} [{}] {} → {}",
+                    "[{:>5.1}s] LIFECYCLE {} [{}] {} → {} owners={}",
                     t0.elapsed().as_secs_f32(),
                     v["source"].as_str().unwrap_or("?"),
                     v["task_id"].as_str().unwrap_or("?"),
                     v["transition"].as_str().unwrap_or("?"),
                     v["state"].as_str().unwrap_or("?"),
+                    v["owners"],
+                );
+            });
+            app.listen_any(crate::events::SWARM_TERM_PANE_STATE, move |e| {
+                let v: serde_json::Value =
+                    serde_json::from_str(e.payload()).unwrap_or_default();
+                println!(
+                    "[{:>5.1}s] PANE {} → {}{}",
+                    t0.elapsed().as_secs_f32(),
+                    v["agentId"].as_str().unwrap_or("?"),
+                    v["readiness"].as_str().unwrap_or("?"),
+                    v["detail"].as_str().map(|d| format!(" ({d})")).unwrap_or_default(),
                 );
             });
         }
@@ -1459,6 +1635,13 @@ mod tests {
             let n = ready.lock().map(|g| g.len()).unwrap_or(0);
             if n == panes.len() || Instant::now() > ready_deadline {
                 println!("[{}] ready panes: {n}/{}", stamp(Instant::now()), panes.len());
+                // What the UI is shown must agree with the delivery gate.
+                let states = swarm.current().expect("session").pane_states;
+                let shown_ready = states
+                    .iter()
+                    .filter(|s| s.readiness == crate::swarm_term::pane_state::PaneReadiness::Ready)
+                    .count();
+                assert_eq!(shown_ready, n, "pane states disagree with the ready set: {states:?}");
                 break;
             }
             if !screen_shown && screen_at.is_some_and(|d| started.elapsed() >= d) {

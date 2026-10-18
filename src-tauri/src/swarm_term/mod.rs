@@ -35,6 +35,7 @@ pub(crate) mod heartbeat;
 pub mod hierarchy;
 pub mod lifecycle;
 pub(crate) mod pane_config;
+pub mod pane_state;
 pub(crate) mod permissions;
 pub mod persona;
 pub(crate) mod preflight;
