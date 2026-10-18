@@ -171,7 +171,8 @@ export function ModelsPane(): JSX.Element {
           <div>
             <div className="set-row-title">Bütün ajanlar</div>
             <div className="set-row-sub">
-              Varsayılan: Claude’un kendi ayarındaki model. Haiku en ucuzu, Opus en yeteneklisi.
+              Varsayılan: Claude Code’un yerleşik modeli (paylaşılan config’te senin `/model`
+              seçimin pane’lere geçmez). Haiku en ucuzu, Opus en yeteneklisi.
             </div>
           </div>
           <ModelChoice

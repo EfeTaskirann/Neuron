@@ -24,11 +24,23 @@
 //! A deny list ([`denied_tools`], `--disallowedTools`) wins over every
 //! allow rule, including ones from settings files: nobody writes
 //! `.git` / `.claude` / editor config, the bridge's bookkeeping or
-//! another agent's outbox, nobody uses the web tools, and the git
-//! options that write or read outside the project are refused. Live
-//! probes against claude 2.1.296 (`permissions/live_tests.rs`) found
-//! `git diff --output=../x` writing outside the project and a builder
-//! forging a message in `outbox/coordinator/` before these rules.
+//! another agent's outbox or the bridge's legacy `inbox/`, nobody uses
+//! the web tools, nobody reads the usual secret files (`.env`, SSH /
+//! cloud keys), and the git options — and two-path forms — that write or
+//! read outside the project are refused. Live probes against claude
+//! 2.1.296 (`permissions/live_tests.rs`) found `git diff --output=../x`
+//! writing outside the project and a builder forging a message in
+//! `outbox/coordinator/` before these rules.
+//!
+//! Known residual (Windows-only, K3): the shell allowlist exposes exactly
+//! one command that can read an arbitrary path — `git diff <a> <b>`,
+//! which git runs in no-index mode when a path is outside the work tree.
+//! The deny rules below catch its out-of-project forms written with
+//! forward slashes (`C:/…`, `~/…`, `../…`); a PowerShell invocation using
+//! back-slashes cannot be matched by a glob rule (claude treats `\` as a
+//! glob escape — see the no-backslash invariant in the tests), so that
+//! form is the documented residual. The structural fix (run the agents'
+//! git through a Neuron wrapper pinned to the project) is a follow-up.
 //!
 //! Residual risk, by design: running a project's tests / build executes
 //! that project's code — see the bridge's trust model. Setting
@@ -149,6 +161,37 @@ const GIT_ESCAPES: &[(&str, &str)] = &[
     ("git diff", "--ext-diff"),
     ("git log", "--ext-diff"),
     ("git show", "--ext-diff"),
+    // `git diff <a> <b>` switches to no-index on its own when a path is
+    // outside the work tree, reading any file without `--no-index`. These
+    // match an out-of-project path ARGUMENT by its prefix. Forward-slash
+    // only, so they never collide with gitrevision syntax (`HEAD:file`,
+    // `a..b`, `HEAD~1`) and never need a backslash (see the tests).
+    ("git diff", ":/"),
+    ("git diff", "~/"),
+    ("git diff", "../"),
+];
+
+/// Secret files no pane may READ, whatever its role. The panes run on the
+/// shared Claude config with `--setting-sources project`, so the user's
+/// own `permissions.deny` rules no longer constrain them; this baseline
+/// keeps the common credential files out of the model even though the
+/// project-wide `Read(./**)` allow covers them (deny beats allow). A
+/// project that must read one can opt the whole session out with
+/// [`PERMISSIONS_ENV`]`=bypass`. `.env.example` / `.env.sample` stay
+/// readable (only the real-secret conventions are listed).
+const SECRET_READS: &[&str] = &[
+    "./.env",
+    "./.env.local",
+    "./**/.env",
+    "./**/.env.local",
+    "./**/.env.*.local",
+    "./**/*.pem",
+    "./**/id_rsa",
+    "./**/id_ed25519",
+    "./**/.ssh/**",
+    "./**/.aws/credentials",
+    "./**/.npmrc",
+    "./secrets/**",
 ];
 
 /// The `claude` CLI arguments that set `agent_id`'s permissions under
@@ -198,12 +241,21 @@ pub(crate) fn denied_tools(agent_id: &str, session_id: &str) -> Vec<String> {
     rules.push("Edit(./.bridgespace/_archive/**)".into());
     rules.push(format!("Edit(./.bridgespace/{session_id}/processed/**)"));
     rules.push(format!("Edit(./.bridgespace/{session_id}/rejected/**)"));
+    // The legacy `inbox/` drop path: the watcher still scans it and pastes
+    // a `[Neuron]` notice into the pane the file's own `from` field names,
+    // so a writable inbox lets a pane trigger a notice addressed as any
+    // agent. Nobody writes it (real messages go to the sender's outbox).
+    rules.push(format!("Edit(./.bridgespace/{session_id}/inbox/**)"));
     for other in AGENT_IDS.iter().filter(|other| **other != agent_id) {
         rules.push(format!("Edit(./.bridgespace/{session_id}/outbox/{other}/**)"));
     }
     // No pane talks to the network.
     rules.push("WebFetch".into());
     rules.push("WebSearch".into());
+    // The common secret files stay out of every pane (see `SECRET_READS`).
+    for secret in SECRET_READS {
+        rules.push(format!("Read({secret})"));
+    }
     if role_of(agent_id) == Role::Coordinate {
         rules.push("Bash".into());
         rules.push("PowerShell".into());
@@ -253,11 +305,13 @@ const NO_CD: &str = "Shell zaten proje kökünde açılır: komutu doğrudan ça
 pub(crate) fn describe_for_persona(agent_id: &str, project_commands: &[String]) -> String {
     let commands = verify_commands(project_commands).join(", ");
     let base = "Proje dosyalarını OKUYABİLİRSİN (yalnızca proje klasörü içinde; \
-                dışarısı reddedilir). Mesajlarını yalnızca KENDİ outbox'una yazabilirsin; \
+                dışarısı reddedilir). Gizli dosyalar (`.env`, SSH/bulut anahtarları, \
+                `.npmrc`) okunamaz. Mesajlarını yalnızca KENDİ outbox'una yazabilirsin; \
                 başka bir ajanın outbox'u, `.git/`, `.claude/`, `.vscode/` ve `.idea/` \
                 reddedilir. Web araçları kapalı.";
     let git = "`git diff` / `git log` / `git show` içinde `--output`, `--no-index` ve \
-               `--ext-diff` seçenekleri reddedilir.";
+               `--ext-diff` seçenekleri reddedilir; `git diff` ile proje dışı bir yolu \
+               (`C:/…`, `~/…`, `../…`) okumak da reddedilir.";
     match role_of(agent_id) {
         Role::Coordinate => format!(
             "{base} Proje dosyalarını değiştiremez, shell (`Bash`) komutu ve web \
@@ -378,9 +432,22 @@ mod tests {
                 "Edit(./.bridgespace/_archive/**)",
                 "Edit(./.bridgespace/swarm-term-01X/processed/**)",
                 "Edit(./.bridgespace/swarm-term-01X/rejected/**)",
+                "Edit(./.bridgespace/swarm-term-01X/inbox/**)",
                 "WebFetch",
                 "WebSearch",
             ] {
+                assert!(deny.iter().any(|r| r == rule), "{agent} lacks {rule}");
+            }
+        }
+    }
+
+    #[test]
+    fn every_role_is_denied_the_common_secret_files() {
+        // Even the read-only coordinate roles (whose only write is their
+        // own outbox) must not read the user's secrets through Read(./**).
+        for &agent in AGENT_IDS {
+            let deny = denied_tools(agent, "s");
+            for rule in ["Read(./.env)", "Read(./**/.env.local)", "Read(./**/id_rsa)", "Read(./secrets/**)"] {
                 assert!(deny.iter().any(|r| r == rule), "{agent} lacks {rule}");
             }
         }
@@ -398,7 +465,7 @@ mod tests {
                 .filter(|r| r.contains(".bridgespace"))
                 .collect();
             let mut expected: BTreeSet<String> =
-                [".gitignore", "_archive/**", "s/processed/**", "s/rejected/**"]
+                [".gitignore", "_archive/**", "s/processed/**", "s/rejected/**", "s/inbox/**"]
                     .iter()
                     .map(|p| format!("Edit(./.bridgespace/{p})"))
                     .collect();
@@ -426,8 +493,18 @@ mod tests {
                     "Bash(git diff *--ext-diff*)",
                     "PowerShell(git diff *--output*)",
                     "PowerShell(git diff *--no-index*)",
+                    // The out-of-project two-path read forms.
+                    "Bash(git diff *:/*)",
+                    "Bash(git diff *~/*)",
+                    "Bash(git diff *../*)",
+                    "PowerShell(git diff *../*)",
                 ] {
                     assert!(has(rule), "{agent} lacks {rule}");
+                }
+                // No deny rule carries a backslash (claude treats it as a
+                // glob escape; the pane tokenizer would also mangle it).
+                for rule in &deny {
+                    assert!(!rule.contains('\\'), "{agent}: backslash in {rule}");
                 }
             }
         }

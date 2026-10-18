@@ -61,14 +61,16 @@ function chatWaitReason(state: TerminalSwarmPaneState | undefined): string | nul
 function askToTrustFolder(folder: string): Promise<boolean> {
   return ask(
     `Swarm şu klasörde çalışacak:\n${folder}\n\n` +
-      '9 ajan buradaki dosyaları okur, builder’lar değiştirir. Testleri ve build’i ' +
-      'çalıştırmak projenin kendi kodunu senin yetkilerinle çalıştırır. Yalnız güvendiğin ' +
-      'bir projede devam et.\n\n' +
+      'Ajanlar buradaki dosyaları okur, builder’lar değiştirir. Testleri ve build’i ' +
+      'çalıştırmak projenin kendi kodunu senin yetkilerinle çalıştırır. Projenin commit’li ' +
+      '`.claude/` ayarları da (hook’lar, izinler) bu yetkilerle çalışabilir. Yalnız ' +
+      'güvendiğin bir projede devam et.\n\n' +
       'Her başlangıçta klasörün o anki hali bir git checkpoint’i olarak saklanır: ' +
       'ajanların değişikliklerini Değişiklikler panelinde görüp geri alabilirsin ' +
       '(git deposu olmayan bir klasörde bu yapılamaz).\n\n' +
-      'Onaylarsan Claude Code’un bu klasör için sorduğu “güveniyor musun?” ' +
-      'sorusu ajanlar için senin adına “evet” diye yanıtlanır.',
+      'Ajanlar senin Claude girişini paylaştığı için, onaylarsan Claude Code’un bu ' +
+      'klasör için sorduğu “güveniyor musun?” sorusu senin adına “evet” yanıtlanır; bu ' +
+      'güven kalıcıdır ve bu klasörde kendi `claude` oturumların da bir daha sormaz.',
     {
       title: 'Bu klasöre güveniyor musun?',
       kind: 'warning',
