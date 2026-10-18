@@ -9,7 +9,15 @@ export function ToastHost(): JSX.Element {
     <div className="toast-host" role="status" aria-live="polite">
       {toasts.map((t) => (
         <div key={t.id} className={`toast toast--${t.variant}`}>
-          <span className="toast-body">{t.body}</span>
+          <div className="toast-main">
+            <span className="toast-body">{t.body}</span>
+            {t.detail && (
+              <details className="toast-detail">
+                <summary>Ayrıntı</summary>
+                <pre>{t.detail}</pre>
+              </details>
+            )}
+          </div>
           <button
             type="button"
             className="toast-close"

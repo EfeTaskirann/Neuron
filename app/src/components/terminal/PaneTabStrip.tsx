@@ -1,7 +1,7 @@
 import { NIcon } from '../icons';
 import { useTerminalDelete } from '../../hooks/mutations';
 import type { Pane } from '../../lib/bindings';
-import { metaFor } from './agentMeta';
+import { isLiveSwarmPane, metaFor } from './agentMeta';
 
 // Horizontal tab strip — every pane gets a chip with status dot,
 // agent name, optional role, and a kill button. Only one pane is
@@ -29,6 +29,9 @@ export function PaneTabStrip({
       {panes.map((p) => {
         const meta = metaFor(p.agent);
         const isActive = p.id === activeId;
+        // A live pane of the Terminal Swarm is stopped from there: closing
+        // it here would take one agent out from under the running session.
+        const swarmOwned = isLiveSwarmPane(p);
         return (
           // div, not button: the close affordance nested inside must be
           // a REAL <button> (it's the only caller of terminal:delete —
@@ -48,24 +51,26 @@ export function PaneTabStrip({
                 onSelect(p.id);
               }
             }}
-            title={`${meta.name} · ${p.cwd}`}
+            title={`${meta.name} · ${p.cwd}${swarmOwned ? ' · Terminal Swarm’ın pane’i' : ''}`}
           >
             <span className={`pane-tab-dot status-${p.status}`} />
             <span className="pane-tab-name">{meta.name}</span>
             {p.role && <span className="pane-tab-role">· {p.role}</span>}
-            <button
-              type="button"
-              className="pane-tab-close"
-              title="Close pane"
-              aria-label={`Close ${meta.name} pane`}
-              disabled={del.isPending}
-              onClick={(e) => {
-                e.stopPropagation();
-                del.mutate(p.id);
-              }}
-            >
-              <NIcon name="close" size={10} />
-            </button>
+            {!swarmOwned && (
+              <button
+                type="button"
+                className="pane-tab-close"
+                title="Close pane"
+                aria-label={`Close ${meta.name} pane`}
+                disabled={del.isPending}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  del.mutate(p.id);
+                }}
+              >
+                <NIcon name="close" size={10} />
+              </button>
+            )}
           </div>
         );
       })}

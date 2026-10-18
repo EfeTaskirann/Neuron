@@ -2,6 +2,7 @@ import React from 'react';
 import ReactDOM from 'react-dom/client';
 import { QueryClientProvider } from '@tanstack/react-query';
 import { App } from './App';
+import { ErrorBoundary } from './components/ErrorBoundary';
 import { ToastHost } from './components/ToastHost';
 import { queryClient } from './lib/queryClient';
 // Side-effect import: applies persisted theme/density/motion/accent
@@ -21,7 +22,11 @@ if (!rootEl) {
 ReactDOM.createRoot(rootEl).render(
   <React.StrictMode>
     <QueryClientProvider client={queryClient}>
-      <App />
+      {/* The routes have their own boundaries; this one catches the shell
+          (sidebar, topbar), so a crash there is a card, not a blank window. */}
+      <ErrorBoundary fallbackTitle="Neuron bir hatayla karşılaştı">
+        <App />
+      </ErrorBoundary>
       <ToastHost />
     </QueryClientProvider>
   </React.StrictMode>,

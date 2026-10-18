@@ -1,4 +1,4 @@
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useMutation, useQuery, useQueryClient, type QueryClient } from '@tanstack/react-query';
 import { commands } from '../lib/bindings';
 import { unwrap } from '../lib/unwrap';
 
@@ -10,6 +10,14 @@ import { unwrap } from '../lib/unwrap';
 const CHANGES_POLL_MS = 15_000;
 
 const changesKey = (projectDir: string | null) => ['swarm-term', 'changes', projectDir] as const;
+
+/** The change list, read now (shared with the hook's cache). */
+export function fetchSwarmTermChanges(qc: QueryClient, projectDir: string) {
+  return qc.fetchQuery({
+    queryKey: changesKey(projectDir),
+    queryFn: () => unwrap(commands.swarmTermChanges(projectDir)),
+  });
+}
 
 /** What changed since the checkpoint; polled while the agents work (`live`). */
 export function useSwarmTermChanges(
@@ -41,6 +49,8 @@ export function useSwarmTermChangeDiff(
 export function useRevertSwarmTermChanges(projectDir: string | null) {
   const qc = useQueryClient();
   return useMutation({
+    // The Changes panel shows the failure in its own error line.
+    meta: { errorsShownInline: true },
     mutationFn: (paths: string[] | null) =>
       unwrap(commands.swarmTermRevertChanges(projectDir!, paths)),
     onSuccess: (left) => {
@@ -54,6 +64,7 @@ export function useRevertSwarmTermChanges(projectDir: string | null) {
 export function useKeepSwarmTermChanges(projectDir: string | null) {
   const qc = useQueryClient();
   return useMutation({
+    meta: { errorsShownInline: true },
     mutationFn: () => unwrap(commands.swarmTermKeepChanges(projectDir!)),
     onSuccess: (left) => {
       qc.setQueryData(changesKey(projectDir), left);

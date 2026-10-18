@@ -3,6 +3,7 @@
 // launch recipe — no invented install counts, ratings or "featured"
 // curation. ServerRow is an internal helper kept in this file.
 import { useState } from 'react';
+import { ask } from '@tauri-apps/plugin-dialog';
 import { NIcon, NodeGlyph } from '../components/icons';
 import { useServers } from '../hooks/useServers';
 import { useMcpInstall, useMcpUninstall } from '../hooks/mutations';
@@ -99,7 +100,13 @@ function ServerRow({ s }: { s: Server }): JSX.Element {
         <button
           className="btn ghost sm"
           disabled={busy}
-          onClick={() => uninstall.mutate(s.id)}
+          onClick={async () => {
+            const remove = await ask(
+              `"${s.name}" kaldırılsın mı? Araçları ajanlara artık sunulmaz.`,
+              { title: 'Sunucuyu kaldır', kind: 'warning', okLabel: 'Kaldır', cancelLabel: 'Vazgeç' },
+            );
+            if (remove) uninstall.mutate(s.id);
+          }}
           title="Uninstall server"
         >
           <span className="pill st-installed">installed</span>

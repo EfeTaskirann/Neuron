@@ -44,7 +44,7 @@ export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundarySt
           <div className="error-boundary-card">
             <h2>{fallbackTitle}</h2>
             <p className="error-boundary-message">{describeError(error) || String(error)}</p>
-            <button type="button" className="btn-primary" onClick={this.handleRetry}>
+            <button type="button" className="btn primary" onClick={this.handleRetry}>
               Retry
             </button>
           </div>

@@ -546,6 +546,47 @@ describe('TerminalSwarmRoute', () => {
     expect(await screen.findAllByText('Bu oturumda yok (Lite takım)')).toHaveLength(7);
   });
 
+  it('stops the swarm only after the user confirms', async () => {
+    const { commands } = await import('../lib/bindings');
+    const { ask } = await import('@tauri-apps/plugin-dialog');
+    vi.mocked(commands.swarmTermSessionStatus).mockResolvedValue({ status: 'ok', data: SESSION });
+    vi.mocked(commands.swarmTermStopSession).mockResolvedValue({ status: 'ok', data: null });
+    vi.mocked(ask).mockResolvedValueOnce(false).mockResolvedValueOnce(true);
+    renderRoute();
+    const stop = await screen.findByRole('button', { name: /stop swarm/i });
+    fireEvent.click(stop);
+    await waitFor(() => expect(ask).toHaveBeenCalledTimes(1));
+    expect(vi.mocked(ask).mock.calls[0]![0]).toContain('2 ajanın');
+    expect(commands.swarmTermStopSession).not.toHaveBeenCalled();
+    fireEvent.click(stop);
+    await waitFor(() => expect(commands.swarmTermStopSession).toHaveBeenCalled());
+  });
+
+  it('warns before a launch would replace an unreviewed checkpoint', async () => {
+    const { commands } = await import('../lib/bindings');
+    const { ask } = await import('@tauri-apps/plugin-dialog');
+    vi.mocked(commands.swarmTermChanges).mockResolvedValue({
+      status: 'ok',
+      data: {
+        checkpointAt: 1_790_000_000,
+        files: [{ path: 'src/a.rs', kind: 'modified', additions: 1, deletions: 0 }],
+        truncated: false,
+        note: null,
+      },
+    });
+    vi.mocked(commands.swarmTermStartSession).mockResolvedValue({ status: 'ok', data: SESSION });
+    vi.mocked(ask).mockResolvedValueOnce(false).mockResolvedValueOnce(true);
+    renderRoute();
+    const launch = await screen.findByRole('button', { name: /launch swarm/i });
+    await waitFor(() => expect(launch).toBeEnabled());
+    fireEvent.click(launch);
+    await waitFor(() => expect(ask).toHaveBeenCalledTimes(1));
+    expect(vi.mocked(ask).mock.calls[0]![0]).toContain('1 dosyalık değişikliği');
+    expect(commands.swarmTermStartSession).not.toHaveBeenCalled();
+    fireEvent.click(launch);
+    await waitFor(() => expect(commands.swarmTermStartSession).toHaveBeenCalled());
+  });
+
   it('says when the session runs without a checkpoint', async () => {
     const { commands } = await import('../lib/bindings');
     const note = 'Bu klasör bir git deposu değil: Neuron ajanların değişikliklerini gösteremez ve geri alamaz.';

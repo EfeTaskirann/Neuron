@@ -1,4 +1,5 @@
 import { useMemo, useRef, useState } from 'react';
+import { useQueryClient } from '@tanstack/react-query';
 import { ask } from '@tauri-apps/plugin-dialog';
 import { HierarchyDiagram } from '../components/SwarmHierarchy';
 import { ChangesDrawer } from '../components/swarm-term/ChangesDrawer';
@@ -23,7 +24,7 @@ import {
   useTrustSwarmTermProject,
 } from '../hooks/useTerminalSwarmSession';
 import { useClaudeUpdateProgress } from '../hooks/useClaudeUpdateProgress';
-import { useSwarmTermChanges } from '../hooks/useSwarmTermChanges';
+import { fetchSwarmTermChanges, useSwarmTermChanges } from '../hooks/useSwarmTermChanges';
 import { useRoutingEvents } from '../hooks/useRoutingEvents';
 import { useActiveEdge, useAgentLifecycle } from '../hooks/useAgentLifecycle';
 import { formatResetTime } from '../lib/swarmNotify';
@@ -74,6 +75,35 @@ function askToTrustFolder(folder: string): Promise<boolean> {
       okLabel: 'Güveniyorum, başlat',
       cancelLabel: 'Vazgeç',
     },
+  );
+}
+
+/** Stop asks first: every agent's claude session ends with it. */
+function confirmStop(agents: number): Promise<boolean> {
+  return ask(
+    `Swarm durdurulsun mu?\n\n${agents} ajanın claude oturumu kapanır; yarım kalan işleri ` +
+      'kaybolur. Değişiklikler panelindeki checkpoint kalır.',
+    { title: 'Swarm’ı durdur', kind: 'warning', okLabel: 'Durdur', cancelLabel: 'Vazgeç' },
+  );
+}
+
+/** Restart asks first: the agents start over, and so does the checkpoint. */
+function confirmRestart(agents: number): Promise<boolean> {
+  return ask(
+    `Swarm yeniden başlatılsın mı?\n\n${agents} ajan kapanıp sıfırdan açılır; konuşmaları ve ` +
+      'yarım kalan işleri kaybolur. Yeni oturum yeni bir checkpoint alır: şimdiye kadarki ' +
+      'değişiklikler artık Değişiklikler panelinden geri alınamaz.',
+    { title: 'Swarm’ı yeniden başlat', kind: 'warning', okLabel: 'Yeniden başlat', cancelLabel: 'Vazgeç' },
+  );
+}
+
+/** A launch over changes the user has not kept or reverted asks first. */
+function confirmNewCheckpoint(files: number): Promise<boolean> {
+  return ask(
+    `Önceki oturumun ${files} dosyalık değişikliği henüz tutulmadı ya da geri alınmadı.\n\n` +
+      'Yeni başlangıç yeni bir checkpoint alır: bu değişiklikler artık Değişiklikler ' +
+      'panelinden geri alınamaz. Yine de başlatılsın mı?',
+    { title: 'Swarm’ı başlat', kind: 'warning', okLabel: 'Başlat', cancelLabel: 'Vazgeç' },
   );
 }
 
@@ -135,7 +165,9 @@ export function TerminalSwarmRoute(): JSX.Element {
   const budgetMut = useExtendSwarmTermBudget();
   const updateMut = useRunClaudeUpdate();
   const updateProgress = useClaudeUpdateProgress(updateMut.isPending);
-  const writeMut = useTerminalWrite();
+  // Send failures land in this route's error banner.
+  const writeMut = useTerminalWrite({ errorsShownInline: true });
+  const qc = useQueryClient();
 
   const sessionActive = session != null;
   // The running session's folder, else the active project (its last
@@ -171,6 +203,12 @@ export function TerminalSwarmRoute(): JSX.Element {
   const launch = async () => {
     if (!projectDir) return;
     setLaunchError(null);
+    // A start takes a new checkpoint: changes since the last one would no
+    // longer be revertible from the panel. A failed read does not block.
+    const pending = await fetchSwarmTermChanges(qc, projectDir)
+      .then((c) => c.files.length)
+      .catch(() => 0);
+    if (pending > 0 && !(await confirmNewCheckpoint(pending))) return;
     try {
       await startWithConsent(projectDir);
     } catch (err) {
@@ -179,6 +217,7 @@ export function TerminalSwarmRoute(): JSX.Element {
   };
 
   const stop = async () => {
+    if (!(await confirmStop(session?.panes.length ?? 0))) return;
     try {
       await stopMut.mutateAsync();
     } catch (err) {
@@ -188,6 +227,7 @@ export function TerminalSwarmRoute(): JSX.Element {
 
   const restart = async () => {
     if (!sessionActive) return;
+    if (!(await confirmRestart(session.panes.length))) return;
     const dir = session.projectDir;
     setLaunchError(null);
     try {

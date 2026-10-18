@@ -8,6 +8,7 @@ import {
   metaFor,
   STATUS_LABEL,
   TERMINAL_STATUSES,
+  isLiveSwarmPane,
   type AgentInfo,
 } from './agentMeta';
 
@@ -79,18 +80,24 @@ function PaneHeader({
         {/* Restart / Pop-out stubs removed: no backend command exists
             for either yet — fake controls on a real pane erode trust.
             Re-add alongside the real IPCs. */}
-        <button
-          className="icon-btn sm"
-          title="Close pane"
-          aria-label="Close pane"
-          disabled={kill.isPending}
-          onClick={(e) => {
-            e.stopPropagation();
-            kill.mutate(pane.id);
-          }}
-        >
-          <NIcon name="close" size={12} />
-        </button>
+        {isLiveSwarmPane(pane) ? (
+          <span className="pane-status" title="Bu pane Terminal Swarm’ın; oradan durdurulur">
+            swarm
+          </span>
+        ) : (
+          <button
+            className="icon-btn sm"
+            title="Close pane"
+            aria-label="Close pane"
+            disabled={kill.isPending}
+            onClick={(e) => {
+              e.stopPropagation();
+              kill.mutate(pane.id);
+            }}
+          >
+            <NIcon name="close" size={12} />
+          </button>
+        )}
       </div>
     </div>
   );

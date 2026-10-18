@@ -153,6 +153,21 @@ describe('TerminalRoute', () => {
     ).not.toBeDisabled();
   });
 
+  it('offers no close for a live Terminal Swarm pane', async () => {
+    const { commands } = await import('../lib/bindings');
+    vi.mocked(commands.terminalList).mockResolvedValue({
+      status: 'ok',
+      data: [{ ...RUNNING_PANE, workspace: 'swarm-term', role: 'scout' }, CLOSED_PANE],
+    });
+    renderRoute();
+    await waitFor(() => expect(screen.getAllByRole('tab')).toHaveLength(2));
+    // The swarm's pane is stopped from Terminal Swarm; the closed shell
+    // pane can still be removed here.
+    expect(screen.queryByRole('button', { name: /close claude pane/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /^close pane$/i })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /close shell pane/i })).toBeInTheDocument();
+  });
+
   it('renders the empty state with the New pane button when no panes exist', async () => {
     const { commands } = await import('../lib/bindings');
     vi.mocked(commands.terminalList).mockResolvedValue({ status: 'ok', data: [] });

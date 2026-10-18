@@ -34,6 +34,15 @@ export function useSwarmTermPersonas() {
   });
 }
 
+/** The session handle without the live refresh — for the shell; the
+ *  Terminal Swarm route keeps the shared cache fresh. */
+export function useSwarmTermSessionSnapshot() {
+  return useQuery({
+    queryKey: ['swarm-term', 'status'],
+    queryFn: () => unwrap(commands.swarmTermSessionStatus()),
+  });
+}
+
 export function useSwarmTermSessionStatus() {
   const qc = useQueryClient();
   // The handle carries every pane's readiness: refetch it when a pane's
@@ -64,9 +73,14 @@ export function useSwarmTermAlerts(): void {
   });
 }
 
+// The Terminal Swarm route reports every session action's failure in its
+// own error banner: `errorsShownInline` keeps the global toast off them.
+const INLINE = { errorsShownInline: true } as const;
+
 export function useStartSwarmTermSession() {
   const qc = useQueryClient();
   return useMutation({
+    meta: INLINE,
     mutationFn: (projectDir: string) =>
       unwrap(commands.swarmTermStartSession(projectDir)),
     onSuccess: () => {
@@ -79,6 +93,7 @@ export function useStartSwarmTermSession() {
 /** The user's yes to running the swarm in a folder (see `consent_required`). */
 export function useTrustSwarmTermProject() {
   return useMutation({
+    meta: INLINE,
     mutationFn: (projectDir: string) =>
       unwrap(commands.swarmTermTrustProject(projectDir)),
   });
@@ -87,6 +102,7 @@ export function useTrustSwarmTermProject() {
 export function useStopSwarmTermSession() {
   const qc = useQueryClient();
   return useMutation({
+    meta: INLINE,
     mutationFn: () => unwrap(commands.swarmTermStopSession()),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['swarm-term', 'status'] });
@@ -99,6 +115,7 @@ export function useStopSwarmTermSession() {
 export function useRestartSwarmTermAgent() {
   const qc = useQueryClient();
   return useMutation({
+    meta: INLINE,
     mutationFn: (agentId: string) => unwrap(commands.swarmTermRestartAgent(agentId)),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['swarm-term', 'status'] });
@@ -111,6 +128,7 @@ export function useRestartSwarmTermAgent() {
 export function useResumeSwarmTermDeliveries() {
   const qc = useQueryClient();
   return useMutation({
+    meta: INLINE,
     mutationFn: () => unwrap(commands.swarmTermResumeDeliveries()),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['swarm-term', 'status'] });
@@ -122,6 +140,7 @@ export function useResumeSwarmTermDeliveries() {
 export function useSetSwarmTermPaused() {
   const qc = useQueryClient();
   return useMutation({
+    meta: INLINE,
     mutationFn: (paused: boolean) => unwrap(commands.swarmTermSetPaused(paused)),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['swarm-term', 'status'] });
@@ -133,6 +152,7 @@ export function useSetSwarmTermPaused() {
 export function useExtendSwarmTermBudget() {
   const qc = useQueryClient();
   return useMutation({
+    meta: INLINE,
     mutationFn: () => unwrap(commands.swarmTermExtendBudget()),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['swarm-term', 'status'] });
@@ -151,6 +171,8 @@ export function useSwarmTermTeam() {
 export function useSaveSwarmTermTeam() {
   const qc = useQueryClient();
   return useMutation({
+    // Settings → Models shows the failure above its rows.
+    meta: INLINE,
     mutationFn: (team: SwarmTermTeam) => unwrap(commands.swarmTermSetTeam(team)),
     // Shown at once; a refused value comes back from the backend.
     onMutate: (team) => {
