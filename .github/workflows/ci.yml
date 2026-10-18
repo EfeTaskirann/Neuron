@@ -1,0 +1,87 @@
+# The gates every change keeps green, on the platform Neuron ships on
+# (Windows only). No secrets: the live / `#[ignore]` claude tests need a
+# logged-in claude CLI and spend its quota, so they stay manual.
+#
+# Third-party actions are pinned to a commit; the comment names the tag.
+
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  rust:
+    name: Rust (tests, clippy, bindings)
+    runs-on: windows-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: src-tauri
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The dev box's toolchain: bump the two together.
+      - uses: dtolnay/rust-toolchain@035fceb3c12fb0c6a9461b52775e16473133e591 # 1.95.0
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Unit tests
+        run: cargo test --lib --locked
+
+      # Only the Terminal Swarm is gated: the rest of the crate carries
+      # older warnings, which are counted but do not fail the build.
+      - name: Clippy (swarm_term stays clean)
+        shell: bash
+        run: |
+          cargo clippy --lib --tests --locked --message-format=short 2> clippy.txt \
+            || { cat clippy.txt; exit 1; }
+          grep -E '^src-tauri[\\/]src[\\/]' clippy.txt | sort -u > findings.txt || true
+          echo "clippy: $(wc -l < findings.txt) finding(s) in the crate; swarm_term is gated"
+          if grep -E '^src-tauri[\\/]src[\\/](swarm_term[\\/]|commands[\\/]swarm_term\.rs)' findings.txt; then
+            echo "::error::clippy findings in swarm_term (listed above)"
+            exit 1
+          fi
+
+      # `pnpm gen:bindings` without node: the checked-in TypeScript
+      # bindings must match the Rust command surface.
+      - name: Bindings are up to date
+        shell: bash
+        run: |
+          cargo run --locked --bin export-bindings
+          git diff --exit-code -- ../app/src/lib/bindings.ts
+
+  frontend:
+    name: Frontend (typecheck, lint, tests)
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # pnpm's version comes from `packageManager` in package.json.
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+      - run: pnpm lint
+      - name: Unit tests
+        working-directory: app
+        run: pnpm exec vitest run
