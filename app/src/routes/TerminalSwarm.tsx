@@ -16,11 +16,8 @@ import {
   useSwarmTermSessionStatus,
 } from '../hooks/useTerminalSwarmSession';
 import { useClaudeUpdateProgress } from '../hooks/useClaudeUpdateProgress';
-import {
-  useActiveEdge,
-  useAgentLifecycle,
-  useRoutingEvents,
-} from '../hooks/useRoutingEvents';
+import { useRoutingEvents } from '../hooks/useRoutingEvents';
+import { useActiveEdge, useAgentLifecycle } from '../hooks/useAgentLifecycle';
 
 /** Gap between the pasted chat message and its submitting CR. */
 const SUBMIT_DELAY_MS = 200;

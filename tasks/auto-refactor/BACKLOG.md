@@ -63,12 +63,12 @@
 - **Yapılacak:** route bazında denetle; eksik state'leri tutarlı bir desene (skeleton/empty card) bağla.
 - **Risk:** düşük-orta. **Mod:** apply.
 
-### T1-05 ☐ OKLCH + design-system parity denetimi
+### T1-05 ☑ OKLCH + design-system parity denetimi — WP-W6-02 (2026-10-18)
 - **Etki:** Charter #4 (OKLCH only). Yeni CSS'te hex/HSL kaçağı = ihlal.
 - **Yapılacak:** `app/src/styles/*.css` (`app.css`, `swarm-term.css`, `terminal.css`) içinde hex/HSL tara; `design-system-spec.md`'ye göre token sapmalarını düzelt.
 - **Risk:** düşük. **Mod:** apply (SVG içindeki legacy hex hariç — Charter izinli).
 
-### T1-06 ☐ Ölü CSS / kullanılmayan bileşen
+### T1-06 ☑ Ölü CSS / kullanılmayan bileşen — denetlendi, ölü sınıf yok (WP-W6-02)
 - **Kanıt:** `RoutingOverlay.tsx` silinmiş (git status) — ona ait CSS/import kaldı mı? Yeni `ToastHost`, `SwarmHierarchy` eklenmiş — stil eşleşmesi tam mı?
 - **Yapılacak:** kullanılmayan CSS sınıfı / export / import tara ve sil.
 - **Risk:** düşük. **Mod:** apply.
@@ -107,7 +107,7 @@
   `constants.ts` (SLOT_ORDER + LIFECYCLE_LABEL + `parseSwarmTermStartMs`/`formatMmSs` ULID/time yardımcıları), `SessionTimer.tsx`, `LifecyclePill.tsx`, `SwarmTermToolbar.tsx` (proje readout + Launch/Restart/Stop + timer), `OrchestratorChatBar.tsx` (chat + autonomous toggle — draft state kendinde, autonomous flag parent'ta lifted), `SwarmTermGrid.tsx` (grid + expand/focus/ESC/arrow-nav state kendinde), `ClaudeUpdateCorner.tsx`. Kök `TerminalSwarm.tsx` **565→174L** ince orkestrasyon (hooks + session lifecycle + kompozisyon). Public yüzey aynen: `export function TerminalSwarmRoute` korundu → `App.tsx:24` + `TerminalSwarm.test.tsx:48` import'ları **değişmedi**.
 - **Davranış:** JSX/DOM + className'ler + a11y etiketleri birebir taşındı; tek anlamlı karar `useAutonomousMode`'un parent'ta tutulması (localStorage/body-attr senkron route-ömrü boyunca canlı kalsın diye — orijinal mount semantiği). **Kanıt:** tsc ✓ / eslint --max-warnings=0 ✓ / `TerminalSwarm.test.tsx` 3/3 ✓ + `App.test.tsx` 18/18 ✓ (idle grid + aktif-session chrome + probe-failure).
 
-### T2-06 ☐ ⏸ `app/src/hooks/useRoutingEvents.ts` (357L) iki sorumluluğa ayrılabilir — W6 bekliyor
+### T2-06 ☑ `app/src/hooks/useRoutingEvents.ts` iki sorumluluğa ayrıldı — `useAgentLifecycle.ts` (WP-W6-02, 2026-10-18)
 - **Etki:** dosya iki ayrı endişe taşıyor: **(a)** `swarm-term:route` module-store + `useRoutingEvents` toplama (satır ~31-164), **(b)** türetilmiş display-lifecycle hook'ları `useActiveEdge`/`useLifecycleEvents`/`useAgentLifecycle` + `AgentLifecycle` tipi + `DONE_BODY_PREFIX_RE`/`REVIEWER_AGENTS` heuristiği (satır ~166-357). (b) saf sunum-türevi; (a) IO/store. Ayrım testedilebilirliği ve kohezyonu artırır (T2-03 Hook DRY ekseni).
 - **Neden ⏸ (bloklu):** 7 tüketiciden **4'ü hot-zone** — `routes/TerminalSwarm.tsx` + `components/swarm-term/{SwarmTermGrid,LifecyclePill,constants}` — `../hooks/useRoutingEvents`'ten import ediyor. Temiz split import yüzeyini değiştirir; hot-zone tüketicileri düzenlemek yasak. Yüzeyi korumak için barrel bırakmak split'i salt-içsel/düşük-değer yapar. **W6 (swarm_term) commit'lenip hot-zone kalkınca** apply edilebilir: (b) hook'ları `hooks/useAgentLifecycle.ts`'e taşı, tüm 7 import sitesini yeni yola çevir, barrel bırakma.
 - **Risk:** düşük (davranış-koruyan taşıma) ama W6-bağımlı. **Mod:** ⏸ audit (W6 aktifken) → apply (W6 stable olunca). **Kanıt:** tüketici taraması 2026-07-04_2140, hot-zone listesi `.run-context.md`.
