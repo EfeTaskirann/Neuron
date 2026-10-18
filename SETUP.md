@@ -209,6 +209,15 @@ Neuron/
    beklenen — sadece `git add app/src/lib/bindings.ts && git commit`
    yapıp tekrar dene.
 
+5. **Migration baseline (2026-10-18)**: 13 migration tek bir
+   `src-tauri/migrations/0001_baseline.sql` dosyasına indirildi (LF).
+   Eski zincirle oluşturulmuş bir `neuron.db`, ilk açılışta aynı
+   klasöre `neuron.pre-baseline-<id>.db` olarak kopyalanır ve yerine
+   boş bir veritabanı açılır. Bu tarihten önce derlenmiş bir Neuron
+   (ör. eski bir installer) yeni veritabanını açamaz; yeniden derle.
+   Yeni şema değişiklikleri için **yeni** numaralı bir migration ekle,
+   uygulanmış bir migration'ı asla düzenleme.
+
 ---
 
 ## 9. Mevcut durum (2026-05-07 itibarıyla)

@@ -112,10 +112,114 @@ async fn migrations_are_idempotent() {
         .expect("count applied migrations");
     // Migration count grows as the schema evolves. Update this
     // when adding a new file under `migrations/`.
-    assert_eq!(
-        count, 13,
-        "thirteen migrations recorded (0001 … 0013)"
-    );
+    assert_eq!(count, 1, "one migration recorded (0001_baseline)");
+}
+
+/// The sqlx ledger table, as sqlx creates it.
+const LEDGER_DDL: &str = "CREATE TABLE _sqlx_migrations ( \
+    version BIGINT PRIMARY KEY, description TEXT NOT NULL, \
+    installed_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, \
+    success BOOLEAN NOT NULL, checksum BLOB NOT NULL, execution_time BIGINT NOT NULL)";
+
+fn db_files(path: &std::path::Path) -> Vec<std::path::PathBuf> {
+    ["", "-wal", "-shm"]
+        .iter()
+        .map(|suffix| {
+            let mut f = path.as_os_str().to_owned();
+            f.push(suffix);
+            std::path::PathBuf::from(f)
+        })
+        .collect()
+}
+
+/// A database created before the baseline (its ledger starts with the
+/// old `0001_init`) is copied aside — with its data — and removed, and
+/// a fresh database then takes the baseline.
+#[tokio::test]
+async fn a_pre_baseline_database_is_copied_aside_and_replaced() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let path = dir.path().join("neuron.db");
+    let pool = open_pool_at(&path).await.expect("open old db");
+    sqlx::query(LEDGER_DDL).execute(&pool).await.unwrap();
+    sqlx::query(
+        "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time) \
+         VALUES (1, 'init', 1, x'00', 0), (13, 'servers drop mock stats', 1, x'00', 0)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO settings VALUES ('user.name', 'kept in the copy')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+
+    let copy = retire_pre_baseline_db(&path)
+        .await
+        .expect("retire")
+        .expect("an old-chain database is moved aside");
+    for f in db_files(&path) {
+        assert!(!f.exists(), "{} still there", f.display());
+    }
+    let name = copy.file_name().unwrap().to_string_lossy().into_owned();
+    assert!(name.starts_with("neuron.pre-baseline-") && name.ends_with(".db"), "{name}");
+
+    // The copy is a self-contained database holding the old data.
+    let old = open_pool_at(&copy).await.expect("open copy");
+    let kept: String = sqlx::query_scalar("SELECT value FROM settings WHERE key = 'user.name'")
+        .fetch_one(&old)
+        .await
+        .unwrap();
+    assert_eq!(kept, "kept in the copy");
+    old.close().await;
+
+    // A fresh database at the old path takes the baseline cleanly.
+    let fresh = open_pool_at(&path).await.expect("open fresh");
+    MIGRATOR.run(&fresh).await.expect("baseline applies");
+    let ledger: Vec<String> = sqlx::query_scalar("SELECT description FROM _sqlx_migrations")
+        .fetch_all(&fresh)
+        .await
+        .unwrap();
+    assert_eq!(ledger, vec!["baseline".to_string()]);
+}
+
+/// A baseline-lineage database, one with no ledger, and a missing file
+/// are all left exactly as they are.
+#[tokio::test]
+async fn other_databases_are_left_alone() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+
+    let missing = dir.path().join("missing.db");
+    assert!(retire_pre_baseline_db(&missing).await.unwrap().is_none());
+    assert!(!missing.exists());
+
+    let current = dir.path().join("current.db");
+    let pool = open_pool_at(&current).await.unwrap();
+    MIGRATOR.run(&pool).await.unwrap();
+    sqlx::query("UPDATE settings SET value = 'mine' WHERE key = 'user.name'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+    assert!(retire_pre_baseline_db(&current).await.unwrap().is_none());
+    let pool = open_pool_at(&current).await.unwrap();
+    let name: String = sqlx::query_scalar("SELECT value FROM settings WHERE key = 'user.name'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(name, "mine");
+    pool.close().await;
+
+    let no_ledger = dir.path().join("plain.db");
+    let pool = open_pool_at(&no_ledger).await.unwrap();
+    sqlx::query("CREATE TABLE t (x INTEGER)").execute(&pool).await.unwrap();
+    pool.close().await;
+    assert!(retire_pre_baseline_db(&no_ledger).await.unwrap().is_none());
+    assert!(no_ledger.exists());
 }
 
 /// Acceptance: WP-W2-05 — seed_mcp_servers writes every bundled

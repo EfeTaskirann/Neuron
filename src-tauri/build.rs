@@ -8,6 +8,11 @@ fn main() {
         .windows_attributes(tauri_build::WindowsAttributes::new_without_app_manifest());
     tauri_build::try_build(attrs).expect("tauri-build failed");
 
+    // `sqlx::migrate!` embeds each migration with `include_str!`, so an
+    // edited file triggers a rebuild but a NEW one does not. Watching the
+    // directory makes a newly added migration reach the binary.
+    println!("cargo:rerun-if-changed=migrations");
+
     // Why this exists
     // ---------------
     // `tauri-runtime-wry` imports `TaskDialogIndirect` from comctl32.
