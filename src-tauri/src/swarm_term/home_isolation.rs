@@ -448,7 +448,7 @@ fn write_atomic(path: &Path, content: &str) -> std::io::Result<()> {
 /// fallback chain that `swarm::binding::home_dir` uses (HOME first,
 /// USERPROFILE on Windows) since we don't want to take a new
 /// `dirs` crate dependency just for one call site.
-fn real_user_home() -> Result<PathBuf, AppError> {
+pub(crate) fn real_user_home() -> Result<PathBuf, AppError> {
     if let Ok(home) = std::env::var("HOME") {
         if !home.is_empty() {
             return Ok(PathBuf::from(home));

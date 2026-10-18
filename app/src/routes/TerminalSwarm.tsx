@@ -20,9 +20,23 @@ import {
   useAgentLifecycle,
   useRoutingEvents,
 } from '../hooks/useRoutingEvents';
+import { AppErrorClient } from '../lib/unwrap';
 
 /** Gap between the pasted chat message and its submitting CR. */
 const SUBMIT_DELAY_MS = 200;
+
+/**
+ * The line shown for a failed launch / stop / send: the error kind's copy
+ * plus the backend's detail. `AppErrorClient.message` is only the kind's
+ * generic copy, so without the detail a refused launch would never say
+ * why (e.g. which folder the project guard rejected).
+ */
+export function describeError(err: unknown): string {
+  if (err instanceof AppErrorClient && err.detail && err.detail !== err.message) {
+    return `${err.message} ${err.detail}`;
+  }
+  return err instanceof Error ? err.message : String(err);
+}
 
 /**
  * Make chat text safe inside a bracketed paste (mirrors the backend's
@@ -80,7 +94,7 @@ export function TerminalSwarmRoute(): JSX.Element {
     try {
       await startMut.mutateAsync(projectDir);
     } catch (err) {
-      setLaunchError(err instanceof Error ? err.message : String(err));
+      setLaunchError(describeError(err));
     }
   };
 
@@ -88,7 +102,7 @@ export function TerminalSwarmRoute(): JSX.Element {
     try {
       await stopMut.mutateAsync();
     } catch (err) {
-      setLaunchError(err instanceof Error ? err.message : String(err));
+      setLaunchError(describeError(err));
     }
   };
 
@@ -100,7 +114,7 @@ export function TerminalSwarmRoute(): JSX.Element {
       await stopMut.mutateAsync();
       await startMut.mutateAsync(dir);
     } catch (err) {
-      setLaunchError(err instanceof Error ? err.message : String(err));
+      setLaunchError(describeError(err));
     }
   };
 
@@ -138,7 +152,7 @@ export function TerminalSwarmRoute(): JSX.Element {
         await new Promise((resolve) => setTimeout(resolve, SUBMIT_DELAY_MS));
         await writeMut.mutateAsync({ paneId, data: '\r' });
       } catch (err) {
-        setLaunchError(err instanceof Error ? err.message : String(err));
+        setLaunchError(describeError(err));
       }
     });
   };
@@ -165,10 +179,7 @@ export function TerminalSwarmRoute(): JSX.Element {
       )}
       {sessionProbeFailed && (
         <div className="swarm-term-error" role="alert">
-          Session status unavailable:{' '}
-          {sessionProbeError instanceof Error
-            ? sessionProbeError.message
-            : String(sessionProbeError)}
+          Session status unavailable: {describeError(sessionProbeError)}
         </div>
       )}
 

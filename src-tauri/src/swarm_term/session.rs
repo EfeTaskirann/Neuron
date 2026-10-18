@@ -46,6 +46,7 @@ use crate::swarm_term::home_isolation::{
 };
 use crate::swarm_term::lifecycle::LifecycleStore;
 use crate::swarm_term::permissions::{self, SwarmTermPermissionMode};
+use crate::swarm_term::project_guard;
 use crate::swarm_term::persona::{
     build_kickoff_message, build_persona_prompt, is_ready_answer,
 };
@@ -239,6 +240,9 @@ impl TerminalSwarmRegistry {
                 project_dir.display()
             )));
         }
+        // The project folder is every agent's reach: refuse drive roots,
+        // the home folder, app-data, credential and OS folders.
+        project_guard::check(&app, &project_dir)?;
         let _reservation = {
             let guard = self.inner.lock().map_err(|_| {
                 AppError::Internal("swarm-term registry poisoned".into())

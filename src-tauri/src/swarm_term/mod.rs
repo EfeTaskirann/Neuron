@@ -36,6 +36,7 @@ pub mod home_isolation;
 pub mod lifecycle;
 pub(crate) mod permissions;
 pub mod persona;
+pub(crate) mod project_guard;
 pub mod session;
 
 pub use permissions::SwarmTermPermissionMode;

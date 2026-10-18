@@ -234,6 +234,34 @@ describe('TerminalSwarmRoute', () => {
     );
   });
 
+  it('says why a launch was refused, not just the generic error copy', async () => {
+    const { commands } = await import('../lib/bindings');
+    vi.mocked(commands.swarmTermStartSession).mockResolvedValue({
+      status: 'error',
+      error: { kind: 'invalid_input', message: '`C:\\` bir sürücü kökü.' },
+    });
+    renderRoute();
+    const launch = await screen.findByRole('button', { name: /launch swarm/i });
+    // Disabled until the session-status probe settles.
+    await waitFor(() => expect(launch).toBeEnabled());
+    fireEvent.click(launch);
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent('Girilen değer geçersiz. `C:\\` bir sürücü kökü.');
+  });
+
+  it('describeError keeps the backend detail and handles plain errors', async () => {
+    const { describeError } = await import('./TerminalSwarm');
+    const { AppErrorClient } = await import('../lib/unwrap');
+    expect(describeError(new AppErrorClient('internal', 'spawn agent `scout`: boom'))).toBe(
+      'Beklenmedik bir iç hata oluştu. spawn agent `scout`: boom',
+    );
+    expect(describeError(new AppErrorClient('conflict', ''))).toBe(
+      'İşlem mevcut bir kayıtla çakıştı.',
+    );
+    expect(describeError(new Error('IPC bridge down'))).toBe('IPC bridge down');
+    expect(describeError('plain')).toBe('plain');
+  });
+
   it('surfaces a session-status probe failure instead of silently showing the idle grid', async () => {
     const { commands } = await import('../lib/bindings');
     vi.mocked(commands.swarmTermSessionStatus).mockRejectedValue(
