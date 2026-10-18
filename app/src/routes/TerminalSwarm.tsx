@@ -175,7 +175,10 @@ export function TerminalSwarmRoute(): JSX.Element {
   const changesProject = session?.projectDir ?? projectDir;
   const changesQuery = useSwarmTermChanges(changesProject, {
     enabled: sessionActive || drawer === 'changes',
-    live: sessionActive,
+    // Snapshot only while the drawer is open: each poll walks the tree and
+    // writes git objects, so polling all session long for a toolbar count
+    // isn't worth it (the count refreshes when the drawer is opened).
+    live: drawer === 'changes',
   });
   // `!sessionLoading`: while the status probe is in flight we don't
   // yet know whether a session exists — launching then would only

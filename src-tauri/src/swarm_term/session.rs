@@ -1858,6 +1858,9 @@ async fn wait_for_ready_answers(
         let answered: Vec<(&str, bool)> = pending
             .iter()
             .copied()
+            // Only a pane whose kickoff is out can have answered it, so a
+            // pane still settling on a screen needs no transcript lookup.
+            .filter(|agent| kicked.contains_key(*agent))
             .filter_map(|agent| {
                 let claude_session = w.claude_sessions.get(agent)?;
                 kickoff_answer(&w.projects_dirs, claude_session, agent, awaited[agent].from_byte)

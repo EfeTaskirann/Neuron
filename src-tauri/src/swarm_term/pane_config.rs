@@ -140,15 +140,34 @@ pub(crate) fn claude_projects_dirs() -> Vec<PathBuf> {
 }
 
 /// The transcript of claude session `claude_session`, if it exists yet.
+/// Resolved `<session>.jsonl` paths, so the readiness waits and the
+/// session monitor don't walk every folder under `~/.claude/projects`
+/// on each poll (a heavy-claude user has hundreds). Keyed by the unique
+/// claude session id; pruned by [`remove_transcripts`] when a session
+/// stops.
+static TRANSCRIPT_PATHS: std::sync::Mutex<std::collections::BTreeMap<String, PathBuf>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
 pub(crate) fn find_transcript(projects_dirs: &[PathBuf], claude_session: &str) -> Option<PathBuf> {
+    if let Ok(cache) = TRANSCRIPT_PATHS.lock() {
+        if let Some(path) = cache.get(claude_session) {
+            if path.is_file() {
+                return Some(path.clone());
+            }
+        }
+    }
     let name = format!("{claude_session}.jsonl");
-    projects_dirs.iter().find_map(|projects| {
+    let found = projects_dirs.iter().find_map(|projects| {
         std::fs::read_dir(projects)
             .ok()?
             .flatten()
             .map(|project| project.path().join(&name))
             .find(|file| file.is_file())
-    })
+    });
+    if let (Some(path), Ok(mut cache)) = (&found, TRANSCRIPT_PATHS.lock()) {
+        cache.insert(claude_session.to_string(), path.clone());
+    }
+    found
 }
 
 /// Delete the transcripts (and their per-session sidecar directories) of
@@ -158,6 +177,11 @@ pub(crate) fn remove_transcripts<'a>(
     projects_dirs: &[PathBuf],
     claude_sessions: impl IntoIterator<Item = &'a str> + Clone,
 ) -> Vec<PathBuf> {
+    if let Ok(mut cache) = TRANSCRIPT_PATHS.lock() {
+        for id in claude_sessions.clone() {
+            cache.remove(id);
+        }
+    }
     let mut left = Vec::new();
     for projects in projects_dirs {
         let Ok(entries) = std::fs::read_dir(projects) else {
