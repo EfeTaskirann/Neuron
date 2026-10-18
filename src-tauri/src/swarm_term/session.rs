@@ -11,7 +11,7 @@
 //! drop outbound messages. Each pane's persona + bridge protocol is its
 //! appended system prompt (`--append-system-prompt-file`); a short
 //! kickoff turn is then pasted and the pane counts as ready once claude
-//! answers `@<id> hazır.` in its transcript (named by the pane's
+//! answers `@<id> READY` in its transcript (named by the pane's
 //! `--session-id`). The [`bridge::watcher::watcher_loop`] picks up the
 //! JSON envelopes those drops create and delivers their body into the
 //! appropriate target pane via bracketed paste.
@@ -50,11 +50,12 @@ use crate::swarm_term::persona::{
     build_kickoff_message, build_persona_prompt, is_ready_answer,
 };
 use crate::swarm_term::preflight;
+use crate::swarm_term::project_facts;
 use crate::swarm_term::trust;
 
 const READY_DELAY_MS: u64 = 1500;
 
-/// How long to wait for a pane's `@<id> hazır.` answer after its
+/// How long to wait for a pane's `@<id> READY` answer after its
 /// kickoff was SENT before giving up on it (logged; the pane stays
 /// not-ready so the bridge returns messages addressed to it to their
 /// senders).
@@ -400,6 +401,15 @@ impl TerminalSwarmRegistry {
         }
         heartbeat::beat(&session_dir);
 
+        // What the project is and how it is verified, read from its
+        // manifests: the footer tells every agent, and the shell roles
+        // may run exactly these commands (see `project_facts`).
+        let facts = project_facts::detect(&project_dir);
+        tracing::info!(
+            stacks = ?facts.stacks,
+            commands = ?facts.commands,
+            "swarm-term: project facts"
+        );
         // Personas are loaded BEFORE spawning: each pane gets its
         // persona + bridge protocol as an appended SYSTEM prompt
         // (`--append-system-prompt-file`), so it must exist on disk
@@ -441,6 +451,7 @@ impl TerminalSwarmRegistry {
                         agent_id,
                         &profile.body,
                         &bridgespace_root,
+                        &facts,
                     );
                     #[cfg(test)]
                     let prompt = tests::with_injection(agent_id, prompt);
@@ -462,7 +473,12 @@ impl TerminalSwarmRegistry {
                 )));
             }
             let mut args =
-                permissions::claude_permission_args(permission_mode, agent_id, &session_id);
+                permissions::claude_permission_args(
+                    permission_mode,
+                    agent_id,
+                    &session_id,
+                    &facts.commands,
+                );
             args.extend(pane_config::claude_args(&claude_sessions[agent_id], &persona_file));
             let agent_cmd = format!("{cmd} {}", permissions::join_quoted(&args));
             let mut extra_env = pane_config::pane_env();
@@ -570,7 +586,7 @@ impl TerminalSwarmRegistry {
         // Fire-and-forget kickoff: wait for the claude REPLs to settle,
         // paste the short kickoff turn into every pane, then mark each
         // pane ready only once claude has actually ANSWERED it with
-        // `@<id> hazır.` (read from the pane's own transcript — the
+        // `@<id> READY` (read from the pane's own transcript — the
         // terminal echo of the kickoff would be a false positive). A
         // pane stuck on a first-run screen therefore never becomes a
         // delivery target; messages to it are returned to their sender.
@@ -1205,8 +1221,8 @@ mod tests {
             })
     }
 
-    const READY_LINE: &str = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"@scout hazır."}]}}"#;
-    const KICKOFF_ECHO: &str = r#"{"type":"user","message":{"role":"user","content":"[Neuron] Oturum başladı. @scout hazır."}}"#;
+    const READY_LINE: &str = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"@scout READY"}]}}"#;
+    const KICKOFF_ECHO: &str = r#"{"type":"user","message":{"role":"user","content":"[Neuron] Oturum başladı. @scout READY"}}"#;
 
     #[test]
     fn a_dev_build_warns_when_the_swarm_edits_its_own_source() {
@@ -1655,6 +1671,7 @@ mod tests {
                     SwarmTermPermissionMode::Restricted,
                     agent,
                     "swarm-term-STRESS",
+                    &[],
                 );
                 args.extend(pane_config::claude_args(&id, &persona));
                 let mut cmd = format!("\"{}\"", spawn.program.display());

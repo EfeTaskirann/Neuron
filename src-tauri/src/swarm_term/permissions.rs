@@ -98,7 +98,10 @@ pub(crate) fn role_of(agent_id: &str) -> Role {
 }
 
 /// Verification commands available to the Verify and Build roles
-/// (prefix match). Covers the common toolchains a swarm may meet.
+/// (prefix match) in every project. Covers the common toolchains a
+/// swarm may meet; the commands the project's own manifests name (e.g.
+/// a monorepo package's `pnpm -C app test`) are added per session —
+/// see `project_facts`.
 const VERIFY_COMMANDS: &[&str] = &[
     "cargo check",
     "cargo test",
@@ -108,9 +111,6 @@ const VERIFY_COMMANDS: &[&str] = &[
     "pnpm test",
     "pnpm typecheck",
     "pnpm lint",
-    "pnpm -C app test",
-    "pnpm -C app typecheck",
-    "pnpm -C app lint",
     "pnpm exec vitest run",
     "pnpm exec tsc --noEmit",
     "npm test",
@@ -153,20 +153,34 @@ const GIT_ESCAPES: &[(&str, &str)] = &[
 
 /// The `claude` CLI arguments that set `agent_id`'s permissions under
 /// `mode`, for a session whose bridge root is `.bridgespace/<session_id>/`
-/// under the pane's working directory (the project).
+/// under the pane's working directory (the project). `project_commands`
+/// are the verification commands the project's manifests name.
 pub(crate) fn claude_permission_args(
     mode: SwarmTermPermissionMode,
     agent_id: &str,
     session_id: &str,
+    project_commands: &[String],
 ) -> Vec<String> {
     if mode == SwarmTermPermissionMode::Bypass {
         return vec!["--permission-mode".into(), "bypassPermissions".into()];
     }
     let mut args = vec!["--permission-mode".into(), "dontAsk".into(), "--allowedTools".into()];
-    args.extend(allowed_tools(agent_id, session_id));
+    args.extend(allowed_tools(agent_id, session_id, project_commands));
     args.push("--disallowedTools".into());
     args.extend(denied_tools(agent_id, session_id));
     args
+}
+
+/// The verification commands of a session: the generic ones, then the
+/// project's own (without repeats).
+fn verify_commands(project_commands: &[String]) -> Vec<&str> {
+    let mut all: Vec<&str> = VERIFY_COMMANDS.to_vec();
+    for c in project_commands {
+        if !all.contains(&c.as_str()) {
+            all.push(c);
+        }
+    }
+    all
 }
 
 /// Pure: the deny list for one agent. A deny rule beats every allow rule
@@ -203,7 +217,7 @@ pub(crate) fn denied_tools(agent_id: &str, session_id: &str) -> Vec<String> {
 }
 
 /// Pure: the allowlist for one agent.
-pub(crate) fn allowed_tools(agent_id: &str, session_id: &str) -> Vec<String> {
+pub(crate) fn allowed_tools(agent_id: &str, session_id: &str, project_commands: &[String]) -> Vec<String> {
     let mut rules = vec![
         "Read(./**)".to_string(),
         "TodoWrite".to_string(),
@@ -216,7 +230,7 @@ pub(crate) fn allowed_tools(agent_id: &str, session_id: &str) -> Vec<String> {
     if matches!(role, Role::Verify | Role::Build) {
         // claude has a separate PowerShell tool on Windows; the same
         // commands must be reachable through it, with the same limits.
-        for c in VERIFY_COMMANDS {
+        for c in verify_commands(project_commands) {
             rules.push(format!("Bash({c}:*)"));
             rules.push(format!("PowerShell({c})"));
             rules.push(format!("PowerShell({c} *)"));
@@ -236,7 +250,8 @@ const NO_CD: &str = "Shell zaten proje kökünde açılır: komutu doğrudan ça
 
 /// Human-readable summary for the persona footer, so an agent knows its
 /// limits up front instead of discovering them through denied calls.
-pub(crate) fn describe_for_persona(agent_id: &str) -> String {
+pub(crate) fn describe_for_persona(agent_id: &str, project_commands: &[String]) -> String {
+    let commands = verify_commands(project_commands).join(", ");
     let base = "Proje dosyalarını OKUYABİLİRSİN (yalnızca proje klasörü içinde; \
                 dışarısı reddedilir). Mesajlarını yalnızca KENDİ outbox'una yazabilirsin; \
                 başka bir ajanın outbox'u, `.git/`, `.claude/`, `.vscode/` ve `.idea/` \
@@ -251,14 +266,14 @@ pub(crate) fn describe_for_persona(agent_id: &str) -> String {
         Role::Verify => format!(
             "{base} Proje dosyalarını değiştiremezsin. `Bash` ile yalnızca doğrulama \
              komutlarını çalıştırabilirsin: {}. {git} {NO_CD}",
-            VERIFY_COMMANDS.join(", ")
+            commands
         ),
         Role::Build => format!(
             "{base} Proje klasörü içindeki dosyaları değiştirebilirsin (dışarısı \
              reddedilir). `Bash` ile yalnızca doğrulama komutlarını çalıştırabilirsin: \
              {}. {git} {NO_CD} Paket kurmak / başka bir komut gerekiyorsa coordinator'a \
              `hata —` ile bildir.",
-            VERIFY_COMMANDS.join(", ")
+            commands
         ),
     }
 }
@@ -283,7 +298,7 @@ mod tests {
     #[test]
     fn every_agent_has_a_role_and_nobody_gets_an_unrestricted_shell() {
         for &agent in AGENT_IDS {
-            let rules = allowed_tools(agent, "swarm-term-01X");
+            let rules = allowed_tools(agent, "swarm-term-01X", &[]);
             assert!(
                 !rules.iter().any(|r| r == "Bash" || r == "PowerShell"),
                 "{agent} has an unrestricted shell rule"
@@ -299,27 +314,27 @@ mod tests {
     #[test]
     fn only_builders_may_write_the_project() {
         for &agent in AGENT_IDS {
-            let writes_project = allowed_tools(agent, "s").contains(&"Edit(./**)".to_string());
+            let writes_project = allowed_tools(agent, "s", &[]).contains(&"Edit(./**)".to_string());
             assert_eq!(writes_project, role_of(agent) == Role::Build, "{agent}");
         }
     }
 
     #[test]
     fn coordinators_have_no_shell_verifiers_do() {
-        let has_bash = |a: &str| allowed_tools(a, "s").iter().any(|r| r.starts_with("Bash("));
+        let has_bash = |a: &str| allowed_tools(a, "s", &[]).iter().any(|r| r.starts_with("Bash("));
         for a in ["orchestrator", "coordinator", "scout", "planner"] {
             assert!(!has_bash(a), "{a}");
         }
         for a in ["backend-reviewer", "frontend-reviewer", "integration-tester", "backend-builder"] {
             assert!(has_bash(a), "{a}");
         }
-        assert!(allowed_tools("integration-tester", "s").contains(&"Bash(cargo test:*)".to_string()));
+        assert!(allowed_tools("integration-tester", "s", &[]).contains(&"Bash(cargo test:*)".to_string()));
     }
 
     #[test]
     fn args_use_dont_ask_and_quote_cleanly() {
         let args =
-            claude_permission_args(SwarmTermPermissionMode::Restricted, "scout", "swarm-term-01X");
+            claude_permission_args(SwarmTermPermissionMode::Restricted, "scout", "swarm-term-01X", &[]);
         assert_eq!(&args[..3], &["--permission-mode", "dontAsk", "--allowedTools"]);
         let joined = join_quoted(&args);
         assert!(joined.contains("\"Read(./**)\""));
@@ -342,10 +357,10 @@ mod tests {
     #[test]
     fn the_deny_list_follows_the_allow_list() {
         for &agent in AGENT_IDS {
-            let args = claude_permission_args(SwarmTermPermissionMode::Restricted, agent, "s");
+            let args = claude_permission_args(SwarmTermPermissionMode::Restricted, agent, "s", &[]);
             let deny_at = args.iter().position(|a| a == "--disallowedTools").expect(agent);
             assert_eq!(args.iter().filter(|a| *a == "--disallowedTools").count(), 1, "{agent}");
-            assert_eq!(&args[3..deny_at], allowed_tools(agent, "s").as_slice(), "{agent}");
+            assert_eq!(&args[3..deny_at], allowed_tools(agent, "s", &[]).as_slice(), "{agent}");
             assert_eq!(&args[deny_at + 1..], denied_tools(agent, "s").as_slice(), "{agent}");
         }
     }
@@ -421,7 +436,7 @@ mod tests {
     #[test]
     fn no_rule_needs_quoting_the_pane_tokenizer_cannot_do() {
         for &agent in AGENT_IDS {
-            for rule in allowed_tools(agent, "s").iter().chain(denied_tools(agent, "s").iter()) {
+            for rule in allowed_tools(agent, "s", &[]).iter().chain(denied_tools(agent, "s").iter()) {
                 assert!(!rule.contains('"') && !rule.contains('\\'), "{agent}: {rule}");
             }
         }
@@ -430,7 +445,7 @@ mod tests {
     #[test]
     fn bypass_mode_drops_the_allowlist() {
         assert_eq!(
-            claude_permission_args(SwarmTermPermissionMode::Bypass, "backend-builder", "s"),
+            claude_permission_args(SwarmTermPermissionMode::Bypass, "backend-builder", "s", &[]),
             ["--permission-mode", "bypassPermissions"]
         );
     }
@@ -460,17 +475,17 @@ mod tests {
 
     #[test]
     fn persona_summary_matches_the_role() {
-        assert!(describe_for_persona("scout").contains("shell (`Bash`) komutu"));
-        assert!(describe_for_persona("backend-reviewer").contains("cargo test"));
-        assert!(describe_for_persona("backend-builder").contains("değiştirebilirsin"));
-        let tester = describe_for_persona("integration-tester");
+        assert!(describe_for_persona("scout", &[]).contains("shell (`Bash`) komutu"));
+        assert!(describe_for_persona("backend-reviewer", &[]).contains("cargo test"));
+        assert!(describe_for_persona("backend-builder", &[]).contains("değiştirebilirsin"));
+        let tester = describe_for_persona("integration-tester", &[]);
         assert!(tester.contains("DIŞINA `cd` YAPMA"));
         // In-project subdirectories stay usable (review finding).
         assert!(tester.contains("`cd <alt-klasör> && <komut>`"));
-        assert!(!describe_for_persona("scout").contains("DIŞINA `cd`"));
+        assert!(!describe_for_persona("scout", &[]).contains("DIŞINA `cd`"));
         // The deny list is announced, so agents don't learn it by denial.
         for &agent in AGENT_IDS {
-            let text = describe_for_persona(agent);
+            let text = describe_for_persona(agent, &[]);
             assert!(text.contains("başka bir ajanın outbox'u"), "{agent}");
             assert!(text.contains("`.git/`"), "{agent}");
             assert_eq!(text.contains("`--output`"), role_of(agent) != Role::Coordinate, "{agent}");

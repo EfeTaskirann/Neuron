@@ -10,7 +10,7 @@ import { listen } from '@tauri-apps/api/event';
 //   malformed            — envelope failed JSON parse / validation
 //   denied               — hierarchy graph forbids the edge
 //   unknown_target       — target agent has no pane in the session
-//   target_not_ready     — target pane hasn't answered the kickoff with "@<id> hazır."
+//   target_not_ready     — target pane hasn't answered the kickoff with "@<id> READY"
 //   target_locked        — target pane is in error state (wedged / no stdin)
 //   target_write_timeout — write_to_pane exceeded the 2 s cap (delivery.rs)
 //   lifecycle_fanout     — bridge-synthesised autonomy follow-up (review /
