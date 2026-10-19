@@ -342,6 +342,7 @@ fn record(task: &RefTask, report: &LiveReport, checks: Vec<Check>, meta: &RunMet
         task_sent_s: tenths(report.task_sent_at),
         first_signal_s: report.signals.first().map(|s| since_task(s.at)),
         last_signal_s: report.signals.last().map(|s| since_task(s.at)),
+        last_activity_s: report.last_activity_at.map(since_task),
         total_s: tenths(report.ended_at),
         timed_out: report.timed_out,
         done_signals: done as u32,

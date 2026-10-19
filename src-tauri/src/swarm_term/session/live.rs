@@ -119,6 +119,9 @@ pub(crate) struct LiveReport {
     pub signals: Vec<TaskSignal>,
     /// When the watch ended, and whether the timeout ended it.
     pub ended_at: Duration,
+    /// The agents' last transcript write: when the swarm last did
+    /// anything, signal or not (a refusal ends without one).
+    pub last_activity_at: Option<Duration>,
     pub timed_out: bool,
     /// Envelopes delivered (`processed/`) and refused (`rejected/`).
     pub delivered: usize,
@@ -144,6 +147,8 @@ pub(crate) struct LiveReport {
 /// One live run of `spec`; prints the timeline as it goes.
 pub(crate) async fn run_live(spec: &LiveSpec) -> LiveReport {
     let started = Instant::now();
+    // The same moment on the wall clock, which file times are read on.
+    let started_wall = std::time::SystemTime::now();
     let stamp = |t: Instant| format!("{:>5.1}s", t.duration_since(started).as_secs_f32());
     let mut report = LiveReport::default();
 
@@ -489,6 +494,13 @@ pub(crate) async fn run_live(spec: &LiveSpec) -> LiveReport {
             continue;
         };
         let Ok(text) = std::fs::read_to_string(&file) else { continue };
+        // claude appends to the transcript as it works: its last write
+        // is the agent's last activity.
+        let written = std::fs::metadata(&file)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(started_wall).ok());
+        report.last_activity_at = report.last_activity_at.max(written);
         let copy = spec.out.join(format!("{agent}.jsonl"));
         if std::fs::write(&copy, &text).is_ok() {
             report.transcripts.insert(agent.clone(), copy);

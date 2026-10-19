@@ -115,6 +115,9 @@ pub(crate) struct RunRecord {
     /// Since the task was sent: the first and the last terminal signal.
     pub first_signal_s: Option<f64>,
     pub last_signal_s: Option<f64>,
+    /// Since the task was sent: the agents' last transcript write.
+    #[serde(default)]
+    pub last_activity_s: Option<f64>,
     /// The start to the end of the watch.
     pub total_s: f64,
     pub timed_out: bool,
@@ -135,9 +138,12 @@ pub(crate) struct RunRecord {
 
 impl RunRecord {
     /// How long the swarm worked on the task: until its last terminal
-    /// signal, else until the watch ended.
+    /// signal; without one (a refusal), until its last activity; else
+    /// until the watch ended (records from before `last_activity_s`).
     pub(crate) fn work_s(&self) -> f64 {
-        self.last_signal_s.unwrap_or(self.total_s - self.task_sent_s)
+        self.last_signal_s
+            .or(self.last_activity_s)
+            .unwrap_or(self.total_s - self.task_sent_s)
     }
 }
 
@@ -325,6 +331,7 @@ mod tests {
             task_sent_s: 13.0,
             first_signal_s: Some(work / 2.0),
             last_signal_s: Some(work),
+            last_activity_s: None,
             total_s: 13.0 + work + 90.0,
             timed_out: false,
             done_signals: 1,
@@ -400,12 +407,22 @@ mod tests {
     }
 
     #[test]
-    fn work_time_falls_back_to_the_watch_without_a_signal() {
+    fn work_time_falls_back_to_the_last_activity_then_the_watch() {
         let mut r = run("t", true, 100.0, 1);
+        r.last_activity_s = Some(130.0);
+        // A signal ends the work, whatever followed it.
         assert_eq!(r.work_s(), 100.0);
+        // A refusal sends none: the swarm's last activity ends it.
         r.last_signal_s = None;
+        assert_eq!(r.work_s(), 130.0);
+        // An early record has neither: the watch's end.
+        r.last_activity_s = None;
         r.total_s = 300.0;
         assert_eq!(r.work_s(), 287.0);
+        let mut line = serde_json::to_value(&r).expect("json");
+        line.as_object_mut().expect("object").remove("last_activity_s");
+        let read: RunRecord = serde_json::from_value(line).expect("a record without the field still reads");
+        assert_eq!(read, r);
         assert_eq!(secs(Some(59.6)), "1m00s");
         assert_eq!(secs(Some(42.0)), "42s");
         assert_eq!(tokens(Some(1_940_000.0)), "1.9M");
