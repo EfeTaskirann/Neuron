@@ -13,6 +13,11 @@ fn main() {
     // directory makes a newly added migration reach the binary.
     println!("cargo:rerun-if-changed=migrations");
 
+    // Stamp the build's commit and its date into the binary so a crash
+    // report names exactly which build crashed (a stale build was the
+    // whole reason the crash reporter exists).
+    emit_build_metadata();
+
     // Why this exists
     // ---------------
     // `tauri-runtime-wry` imports `TaskDialogIndirect` from comctl32.
@@ -32,6 +37,32 @@ fn main() {
     // above so there is exactly one MANIFEST resource per artifact.
     #[cfg(target_os = "windows")]
     embed_test_manifest();
+}
+
+/// Emit `NEURON_GIT_COMMIT` and `NEURON_BUILD_DATE` for `env!`/`option_env!`.
+/// Both fall back to "unknown" when git isn't available (a source tarball,
+/// a sandbox), so the build never fails on their account.
+fn emit_build_metadata() {
+    let git = |args: &[&str]| -> Option<String> {
+        let out = std::process::Command::new("git").args(args).output().ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let s = String::from_utf8(out.stdout).ok()?.trim().to_string();
+        (!s.is_empty()).then_some(s)
+    };
+    let commit = git(&["rev-parse", "--short", "HEAD"]).unwrap_or_else(|| "unknown".into());
+    let date = git(&["show", "-s", "--format=%cd", "--date=short", "HEAD"])
+        .unwrap_or_else(|| "unknown".into());
+    println!("cargo:rustc-env=NEURON_GIT_COMMIT={commit}");
+    println!("cargo:rustc-env=NEURON_BUILD_DATE={date}");
+    // Rebuild so the stamp follows HEAD. `.git` is one level up from
+    // `src-tauri/`; a missing path (worktree, tarball) is a harmless skip.
+    for p in ["../.git/HEAD", "../.git/logs/HEAD"] {
+        if std::path::Path::new(p).exists() {
+            println!("cargo:rerun-if-changed={p}");
+        }
+    }
 }
 
 #[cfg(target_os = "windows")]
