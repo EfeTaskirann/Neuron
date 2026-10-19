@@ -112,6 +112,12 @@ pub(crate) fn pane_env() -> HashMap<String, String> {
         ("DISABLE_AUTOUPDATER", "1"),
         ("CLAUDE_CODE_DISABLE_AUTOUPDATE", "1"),
         ("CLAUDE_CODE_DISABLE_AUTO_MEMORY", "1"),
+        // Every shell command starts in the project root again. claude
+        // resolves the `./` permission rules against the shell's current
+        // directory, so after a `cd storefront` the agent's own outbox
+        // rule (`Edit(./.bridgespace/…)`) pointed into `storefront/` and
+        // its messages were denied (live: claude 2.1.296, interactive).
+        ("CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR", "1"),
         // Present but empty: a token or key in the user's environment
         // would take precedence over their stored login.
         ("CLAUDE_CODE_OAUTH_TOKEN", ""),
@@ -341,6 +347,7 @@ mod tests {
         assert_eq!(pair("--append-system-prompt-file"), Some(Some("p.md".into())));
         let env = pane_env();
         assert_eq!(env.get("CLAUDE_CODE_DISABLE_AUTO_MEMORY").map(String::as_str), Some("1"));
+        assert_eq!(env.get("CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR").map(String::as_str), Some("1"));
         assert_eq!(env.get("CLAUDE_CODE_OAUTH_TOKEN").map(String::as_str), Some(""));
         assert_eq!(env.get("ANTHROPIC_API_KEY").map(String::as_str), Some(""));
         // The shared configuration: nothing points claude at another home.

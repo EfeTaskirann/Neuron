@@ -198,8 +198,9 @@ impl Drop for StartReservation<'_> {
 pub(crate) struct PaneSpawnSpec {
     /// The quoted claude program and its prefix args.
     pub program: String,
-    /// The project's verification commands (permission allowlist).
-    pub project_commands: Vec<String>,
+    /// The project's verification / install commands (permission
+    /// allowlist).
+    pub facts: project_facts::ProjectFacts,
     /// Agent id → its `--model` alias (see `team`).
     pub models: BTreeMap<String, String>,
 }
@@ -483,12 +484,13 @@ impl TerminalSwarmRegistry {
         tracing::info!(
             stacks = ?facts.stacks,
             commands = ?facts.commands,
+            installs = ?facts.install_commands,
             "swarm-term: project facts"
         );
         // Every pane's claude command is made of these (a restart, too).
         let spec = PaneSpawnSpec {
             program: cmd.clone(),
-            project_commands: facts.commands.clone(),
+            facts: facts.clone(),
             models: team_settings.models.clone(),
         };
         // Personas are loaded BEFORE spawning: each pane gets its
@@ -1136,7 +1138,7 @@ fn agent_command(
     session_args: Vec<String>,
 ) -> String {
     let mut args =
-        permissions::claude_permission_args(mode, agent_id, session_id, &spec.project_commands);
+        permissions::claude_permission_args(mode, agent_id, session_id, &spec.facts);
     if let Some(model) = spec.models.get(agent_id) {
         args.extend(["--model".to_string(), model.clone()]);
     }
@@ -2837,7 +2839,7 @@ mod tests {
                     SwarmTermPermissionMode::Restricted,
                     agent,
                     "swarm-term-STRESS",
-                    &[],
+                    &project_facts::ProjectFacts::default(),
                 );
                 args.extend(pane_config::claude_args(&id, &persona));
                 let mut cmd = format!("\"{}\"", spawn.program.display());

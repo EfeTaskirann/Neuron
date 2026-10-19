@@ -52,6 +52,7 @@ use serde::{Deserialize, Serialize};
 use specta::Type;
 
 use super::hierarchy::AGENT_IDS;
+use super::project_facts::ProjectFacts;
 
 #[cfg(test)]
 mod live_tests;
@@ -196,19 +197,19 @@ const SECRET_READS: &[&str] = &[
 
 /// The `claude` CLI arguments that set `agent_id`'s permissions under
 /// `mode`, for a session whose bridge root is `.bridgespace/<session_id>/`
-/// under the pane's working directory (the project). `project_commands`
-/// are the verification commands the project's manifests name.
+/// under the pane's working directory (the project). `facts` name the
+/// verification and install commands of the project's manifests.
 pub(crate) fn claude_permission_args(
     mode: SwarmTermPermissionMode,
     agent_id: &str,
     session_id: &str,
-    project_commands: &[String],
+    facts: &ProjectFacts,
 ) -> Vec<String> {
     if mode == SwarmTermPermissionMode::Bypass {
         return vec!["--permission-mode".into(), "bypassPermissions".into()];
     }
     let mut args = vec!["--permission-mode".into(), "dontAsk".into(), "--allowedTools".into()];
-    args.extend(allowed_tools(agent_id, session_id, project_commands));
+    args.extend(allowed_tools(agent_id, session_id, facts));
     args.push("--disallowedTools".into());
     args.extend(denied_tools(agent_id, session_id));
     args
@@ -269,7 +270,7 @@ pub(crate) fn denied_tools(agent_id: &str, session_id: &str) -> Vec<String> {
 }
 
 /// Pure: the allowlist for one agent.
-pub(crate) fn allowed_tools(agent_id: &str, session_id: &str, project_commands: &[String]) -> Vec<String> {
+pub(crate) fn allowed_tools(agent_id: &str, session_id: &str, facts: &ProjectFacts) -> Vec<String> {
     let mut rules = vec![
         "Read(./**)".to_string(),
         "TodoWrite".to_string(),
@@ -278,11 +279,19 @@ pub(crate) fn allowed_tools(agent_id: &str, session_id: &str, project_commands: 
     let role = role_of(agent_id);
     if role == Role::Build {
         rules.push("Edit(./**)".to_string());
+        // Installing what a lockfile pins (owner decision): exact rules,
+        // with no room for arguments — `npm ci --prefix ../x` would
+        // install outside the project. Residual risk, as for tests: the
+        // install runs the dependencies' own install scripts.
+        for c in &facts.install_commands {
+            rules.push(format!("Bash({c})"));
+            rules.push(format!("PowerShell({c})"));
+        }
     }
     if matches!(role, Role::Verify | Role::Build) {
         // claude has a separate PowerShell tool on Windows; the same
         // commands must be reachable through it, with the same limits.
-        for c in verify_commands(project_commands) {
+        for c in verify_commands(&facts.commands) {
             rules.push(format!("Bash({c}:*)"));
             rules.push(format!("PowerShell({c})"));
             rules.push(format!("PowerShell({c} *)"));
@@ -291,19 +300,37 @@ pub(crate) fn allowed_tools(agent_id: &str, session_id: &str, project_commands: 
     rules
 }
 
-/// Shell commands start in the project root already; a `cd` OUT of the
-/// project (live run: the tester `cd`-ed to the parent repository) gets
-/// the whole command denied. A `cd` into a project subdirectory is
-/// allowed and sometimes needed (a package without a `-C` variant).
-const NO_CD: &str = "Shell zaten proje kökünde açılır: komutu doğrudan çalıştır (ör. \
-                     `cargo test`). Proje kökünün DIŞINA `cd` YAPMA — o komut reddedilir. \
-                     Proje içindeki bir alt klasör gerekiyorsa `-C <klasör>` biçimini ya da \
-                     `cd <alt-klasör> && <komut>` kullan.";
+/// Shell commands start in the project root (every one of them — see
+/// `CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR` in `pane_config`); a `cd`
+/// OUT of the project (live run: the tester `cd`-ed to the parent
+/// repository) gets the whole command denied. A `cd` into a project
+/// subdirectory is allowed and sometimes needed (a package without a
+/// `-C` variant).
+const NO_CD: &str = "Her shell komutu proje kökünde başlar; bir önceki komuttaki `cd` \
+                     sonrakine taşınmaz. Komutu doğrudan çalıştır (ör. `cargo test`). Proje \
+                     kökünün DIŞINA `cd` YAPMA — o komut reddedilir. Proje içindeki bir alt \
+                     klasör gerekiyorsa `-C <klasör>` / `--prefix <klasör>` biçimini ya da \
+                     aynı komutta `cd <alt-klasör> && <komut>` kullan.";
 
 /// Human-readable summary for the persona footer, so an agent knows its
 /// limits up front instead of discovering them through denied calls.
-pub(crate) fn describe_for_persona(agent_id: &str, project_commands: &[String]) -> String {
-    let commands = verify_commands(project_commands).join(", ");
+pub(crate) fn describe_for_persona(agent_id: &str, facts: &ProjectFacts) -> String {
+    let commands = verify_commands(&facts.commands).join(", ");
+    let installs = facts.install_commands.iter().map(|c| format!("`{c}`")).collect::<Vec<_>>().join(", ");
+    // Who installs missing dependencies: a builder when a lockfile
+    // allows `npm ci`, the user otherwise.
+    let missing_deps = if installs.is_empty() {
+        "Bağımlılıklar kurulu değilse (`node_modules` yok, `tsc` / `vitest` bulunamıyor) \
+         kurmaya ÇALIŞMA: coordinator'a `hata — bağımlılıklar kurulu değil: <klasör>` yaz; \
+         lockfile olmadığı için kurulum kullanıcının işi."
+            .to_string()
+    } else {
+        format!(
+            "Bağımlılıklar kurulu değilse (`node_modules` yok, `tsc` / `vitest` bulunamıyor) \
+             kurmaya ÇALIŞMA: coordinator'a `hata — bağımlılıklar kurulu değil: <klasör>` yaz; \
+             builder {installs} ile kurar."
+        )
+    };
     let base = "Proje dosyalarını OKUYABİLİRSİN (yalnızca proje klasörü içinde; \
                 dışarısı reddedilir). Gizli dosyalar (`.env`, SSH/bulut anahtarları, \
                 `.npmrc`) okunamaz. Mesajlarını yalnızca KENDİ outbox'una yazabilirsin; \
@@ -313,22 +340,44 @@ pub(crate) fn describe_for_persona(agent_id: &str, project_commands: &[String]) 
                `--ext-diff` seçenekleri reddedilir; `git diff` ile proje dışı bir yolu \
                (`C:/…`, `~/…`, `../…`) okumak da reddedilir.";
     match role_of(agent_id) {
-        Role::Coordinate => format!(
-            "{base} Proje dosyalarını değiştiremez, shell (`Bash`) komutu ve web \
-             aracı kullanamazsın. Değişiklik gerekiyorsa bir builder'a dispatch et."
-        ),
+        Role::Coordinate => {
+            let mut text = format!(
+                "{base} Proje dosyalarını değiştiremez, shell (`Bash`) komutu ve web \
+                 aracı kullanamazsın. Değişiklik gerekiyorsa bir builder'a dispatch et."
+            );
+            if !installs.is_empty() {
+                text.push_str(&format!(
+                    " Bir ajan bağımlılıkların kurulu olmadığını bildirirse kurulumu \
+                     builder'a dispatch et ({installs})."
+                ));
+            }
+            text
+        }
         Role::Verify => format!(
             "{base} Proje dosyalarını değiştiremezsin. `Bash` ile yalnızca doğrulama \
-             komutlarını çalıştırabilirsin: {}. {git} {NO_CD}",
+             komutlarını çalıştırabilirsin: {}. {git} {NO_CD} {missing_deps}",
             commands
         ),
-        Role::Build => format!(
-            "{base} Proje klasörü içindeki dosyaları değiştirebilirsin (dışarısı \
-             reddedilir). `Bash` ile yalnızca doğrulama komutlarını çalıştırabilirsin: \
-             {}. {git} {NO_CD} Paket kurmak / başka bir komut gerekiyorsa coordinator'a \
-             `hata —` ile bildir.",
-            commands
-        ),
+        Role::Build => {
+            let install = if installs.is_empty() {
+                "Paket kurmak / başka bir komut gerekiyorsa coordinator'a `hata —` ile \
+                 bildir (lockfile olmadığı için kurulum kullanıcının işi)."
+                    .to_string()
+            } else {
+                format!(
+                    "Bağımlılıklar eksikse lockfile'daki sürümleri kuran şu komutları \
+                     AYNEN (ek argüman olmadan) çalıştırabilirsin: \
+                     {installs}. Başka bir paket kurmak / başka bir komut gerekiyorsa \
+                     coordinator'a `hata —` ile bildir."
+                )
+            };
+            format!(
+                "{base} Proje klasörü içindeki dosyaları değiştirebilirsin (dışarısı \
+                 reddedilir). `Bash` ile yalnızca doğrulama komutlarını çalıştırabilirsin: \
+                 {}. {git} {NO_CD} {install}",
+                commands
+            )
+        }
     }
 }
 
@@ -349,10 +398,14 @@ mod tests {
     use super::*;
     use crate::swarm_term::hierarchy::AGENT_IDS;
 
+    fn none() -> ProjectFacts {
+        ProjectFacts::default()
+    }
+
     #[test]
     fn every_agent_has_a_role_and_nobody_gets_an_unrestricted_shell() {
         for &agent in AGENT_IDS {
-            let rules = allowed_tools(agent, "swarm-term-01X", &[]);
+            let rules = allowed_tools(agent, "swarm-term-01X", &none());
             assert!(
                 !rules.iter().any(|r| r == "Bash" || r == "PowerShell"),
                 "{agent} has an unrestricted shell rule"
@@ -368,27 +421,57 @@ mod tests {
     #[test]
     fn only_builders_may_write_the_project() {
         for &agent in AGENT_IDS {
-            let writes_project = allowed_tools(agent, "s", &[]).contains(&"Edit(./**)".to_string());
+            let writes_project = allowed_tools(agent, "s", &none()).contains(&"Edit(./**)".to_string());
             assert_eq!(writes_project, role_of(agent) == Role::Build, "{agent}");
         }
     }
 
     #[test]
+    fn only_builders_may_install_and_only_the_exact_lockfile_install() {
+        let facts = ProjectFacts {
+            install_commands: vec!["npm ci".into(), "npm --prefix backend ci".into()],
+            ..ProjectFacts::default()
+        };
+        for &agent in AGENT_IDS {
+            let rules = allowed_tools(agent, "s", &facts);
+            let installs: Vec<&String> = rules.iter().filter(|r| r.contains(" ci")).collect();
+            if role_of(agent) == Role::Build {
+                // Exact rules: no `:*` / ` *` tail that would admit
+                // `npm ci --prefix ../elsewhere`.
+                assert_eq!(
+                    installs,
+                    ["Bash(npm ci)", "PowerShell(npm ci)", "Bash(npm --prefix backend ci)", "PowerShell(npm --prefix backend ci)"],
+                    "{agent}"
+                );
+                assert!(describe_for_persona(agent, &facts).contains("`npm --prefix backend ci`"));
+            } else {
+                assert!(installs.is_empty(), "{agent}: {installs:?}");
+            }
+        }
+        // The verifiers are told who installs: the builder, or with no
+        // lockfile the user.
+        assert!(describe_for_persona("integration-tester", &facts).contains("builder `npm ci`"));
+        assert!(describe_for_persona("integration-tester", &none()).contains("kullanıcının işi"));
+        assert!(describe_for_persona("coordinator", &facts).contains("kurulumu builder'a dispatch et"));
+        assert!(!describe_for_persona("coordinator", &none()).contains("kurulumu"));
+    }
+
+    #[test]
     fn coordinators_have_no_shell_verifiers_do() {
-        let has_bash = |a: &str| allowed_tools(a, "s", &[]).iter().any(|r| r.starts_with("Bash("));
+        let has_bash = |a: &str| allowed_tools(a, "s", &none()).iter().any(|r| r.starts_with("Bash("));
         for a in ["orchestrator", "coordinator", "scout", "planner"] {
             assert!(!has_bash(a), "{a}");
         }
         for a in ["backend-reviewer", "frontend-reviewer", "integration-tester", "backend-builder"] {
             assert!(has_bash(a), "{a}");
         }
-        assert!(allowed_tools("integration-tester", "s", &[]).contains(&"Bash(cargo test:*)".to_string()));
+        assert!(allowed_tools("integration-tester", "s", &none()).contains(&"Bash(cargo test:*)".to_string()));
     }
 
     #[test]
     fn args_use_dont_ask_and_quote_cleanly() {
         let args =
-            claude_permission_args(SwarmTermPermissionMode::Restricted, "scout", "swarm-term-01X", &[]);
+            claude_permission_args(SwarmTermPermissionMode::Restricted, "scout", "swarm-term-01X", &none());
         assert_eq!(&args[..3], &["--permission-mode", "dontAsk", "--allowedTools"]);
         let joined = join_quoted(&args);
         assert!(joined.contains("\"Read(./**)\""));
@@ -411,10 +494,10 @@ mod tests {
     #[test]
     fn the_deny_list_follows_the_allow_list() {
         for &agent in AGENT_IDS {
-            let args = claude_permission_args(SwarmTermPermissionMode::Restricted, agent, "s", &[]);
+            let args = claude_permission_args(SwarmTermPermissionMode::Restricted, agent, "s", &none());
             let deny_at = args.iter().position(|a| a == "--disallowedTools").expect(agent);
             assert_eq!(args.iter().filter(|a| *a == "--disallowedTools").count(), 1, "{agent}");
-            assert_eq!(&args[3..deny_at], allowed_tools(agent, "s", &[]).as_slice(), "{agent}");
+            assert_eq!(&args[3..deny_at], allowed_tools(agent, "s", &none()).as_slice(), "{agent}");
             assert_eq!(&args[deny_at + 1..], denied_tools(agent, "s").as_slice(), "{agent}");
         }
     }
@@ -513,7 +596,7 @@ mod tests {
     #[test]
     fn no_rule_needs_quoting_the_pane_tokenizer_cannot_do() {
         for &agent in AGENT_IDS {
-            for rule in allowed_tools(agent, "s", &[]).iter().chain(denied_tools(agent, "s").iter()) {
+            for rule in allowed_tools(agent, "s", &none()).iter().chain(denied_tools(agent, "s").iter()) {
                 assert!(!rule.contains('"') && !rule.contains('\\'), "{agent}: {rule}");
             }
         }
@@ -522,7 +605,7 @@ mod tests {
     #[test]
     fn bypass_mode_drops_the_allowlist() {
         assert_eq!(
-            claude_permission_args(SwarmTermPermissionMode::Bypass, "backend-builder", "s", &[]),
+            claude_permission_args(SwarmTermPermissionMode::Bypass, "backend-builder", "s", &none()),
             ["--permission-mode", "bypassPermissions"]
         );
     }
@@ -552,17 +635,17 @@ mod tests {
 
     #[test]
     fn persona_summary_matches_the_role() {
-        assert!(describe_for_persona("scout", &[]).contains("shell (`Bash`) komutu"));
-        assert!(describe_for_persona("backend-reviewer", &[]).contains("cargo test"));
-        assert!(describe_for_persona("backend-builder", &[]).contains("değiştirebilirsin"));
-        let tester = describe_for_persona("integration-tester", &[]);
+        assert!(describe_for_persona("scout", &none()).contains("shell (`Bash`) komutu"));
+        assert!(describe_for_persona("backend-reviewer", &none()).contains("cargo test"));
+        assert!(describe_for_persona("backend-builder", &none()).contains("değiştirebilirsin"));
+        let tester = describe_for_persona("integration-tester", &none());
         assert!(tester.contains("DIŞINA `cd` YAPMA"));
         // In-project subdirectories stay usable (review finding).
         assert!(tester.contains("`cd <alt-klasör> && <komut>`"));
-        assert!(!describe_for_persona("scout", &[]).contains("DIŞINA `cd`"));
+        assert!(!describe_for_persona("scout", &none()).contains("DIŞINA `cd`"));
         // The deny list is announced, so agents don't learn it by denial.
         for &agent in AGENT_IDS {
-            let text = describe_for_persona(agent, &[]);
+            let text = describe_for_persona(agent, &none());
             assert!(text.contains("başka bir ajanın outbox'u"), "{agent}");
             assert!(text.contains("`.git/`"), "{agent}");
             assert_eq!(text.contains("`--output`"), role_of(agent) != Role::Coordinate, "{agent}");

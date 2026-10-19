@@ -294,7 +294,7 @@ pub(crate) fn build_persona_prompt(
         ready = READY_TOKEN,
         project_block = project_block,
         team_block = team_block,
-        perms = crate::swarm_term::permissions::describe_for_persona(agent_id, &facts.commands),
+        perms = crate::swarm_term::permissions::describe_for_persona(agent_id, facts),
         max_rework = MAX_REWORK_ROUNDS,
         max_rework_plus = MAX_REWORK_ROUNDS + 1,
     );
@@ -370,6 +370,7 @@ mod tests {
         ProjectFacts {
             stacks: vec!["Rust (Cargo)".into(), "Node (pnpm)".into()],
             commands: vec!["cargo test".into(), "pnpm -C web test".into()],
+            install_commands: vec![],
         }
     }
 

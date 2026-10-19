@@ -19,6 +19,10 @@ pub(crate) struct ProjectFacts {
     pub stacks: Vec<String>,
     /// Commands that verify the project, as the agents should type them.
     pub commands: Vec<String>,
+    /// Commands that install a package's dependencies exactly as its
+    /// lockfile pins them (`npm ci`) — only for a package with its own
+    /// lockfile; the builders may run these.
+    pub install_commands: Vec<String>,
 }
 
 impl ProjectFacts {
@@ -31,6 +35,12 @@ impl ProjectFacts {
     fn add_command(&mut self, command: String) {
         if !self.commands.contains(&command) {
             self.commands.push(command);
+        }
+    }
+
+    fn add_install_command(&mut self, command: String) {
+        if !self.install_commands.contains(&command) {
+            self.install_commands.push(command);
         }
     }
 }
@@ -116,12 +126,47 @@ fn node_package(path: &Path, subdir: Option<&str>, pm: Option<&'static str>, fac
     };
     let pm = pm.unwrap_or("npm");
     facts.add_stack(&format!("Node ({pm})"));
+    // `npm ci` needs the lockfile in the package's own folder (a
+    // workspace root's lockfile does not let `npm --prefix <pkg> ci` run).
+    if pm == "npm" && ["package-lock.json", "npm-shrinkwrap.json"].iter().any(|f| path.join(f).is_file()) {
+        facts.add_install_command(match subdir {
+            None => "npm ci".to_string(),
+            Some(dir) => format!("npm --prefix {dir} ci"),
+        });
+    }
     let Some(scripts) = manifest.get("scripts").and_then(|s| s.as_object()) else {
         return;
     };
-    for script in NODE_SCRIPTS.iter().filter(|s| scripts.contains_key(**s)) {
-        facts.add_command(node_command(pm, subdir, script));
+    for base in NODE_SCRIPTS {
+        if scripts.contains_key(*base) {
+            facts.add_command(node_command(pm, subdir, base));
+        }
+        // Variants of a base script (`test:unit`, `lint:css`): a package
+        // may have only those (live: a Medusa backend with `test:unit`
+        // and no `test`, so its tests could not be run at all).
+        let mut variants: Vec<&str> = scripts
+            .keys()
+            .map(String::as_str)
+            .filter(|name| is_script_variant(base, name))
+            .collect();
+        variants.sort_unstable();
+        for name in variants {
+            facts.add_command(node_command(pm, subdir, name));
+        }
     }
+}
+
+/// `name` is `<base>:<variant>` with a variant that can sit inside a
+/// permission rule as-is, and is not a watch mode (it never exits, so a
+/// verifier running it would hang).
+fn is_script_variant(base: &str, name: &str) -> bool {
+    name.strip_prefix(base)
+        .and_then(|rest| rest.strip_prefix(':'))
+        .is_some_and(|variant| {
+            !variant.is_empty()
+                && !variant.contains("watch")
+                && variant.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'))
+        })
 }
 
 /// How `pm` runs `script` in `subdir` (`None` = the project root).
@@ -213,6 +258,47 @@ mod tests {
         write(d.path(), "ok-pkg/package.json", r#"{"scripts": {"test": "x"}}"#);
         assert_eq!(detect(d.path()).commands, ["npm --prefix ok-pkg test"]);
         assert!(!safe_dir_name("a b") && !safe_dir_name("a\"b") && safe_dir_name("my_pkg.v2"));
+    }
+
+    #[test]
+    fn script_variants_like_a_medusa_backend() {
+        let d = tempfile::tempdir().unwrap();
+        write(
+            d.path(),
+            "backend/package.json",
+            r#"{"scripts": {"build": "x", "test:unit": "jest", "test:integration:http": "jest",
+                "test:watch": "jest --watch", "lint:css": "x", "test:": "x", "test:a b": "x", "testx": "x"}}"#,
+        );
+        write(d.path(), "storefront/package.json", r#"{"scripts": {"test": "vitest run", "lint": "next lint"}}"#);
+        assert_eq!(
+            detect(d.path()).commands,
+            [
+                "npm --prefix backend run test:integration:http",
+                "npm --prefix backend run test:unit",
+                "npm --prefix backend run lint:css",
+                "npm --prefix storefront test",
+                "npm --prefix storefront run lint",
+            ]
+        );
+        assert_eq!(node_command("pnpm", None, "test:unit"), "pnpm test:unit");
+    }
+
+    #[test]
+    fn only_a_package_with_its_own_npm_lockfile_gets_npm_ci() {
+        let d = tempfile::tempdir().unwrap();
+        write(d.path(), "package.json", r#"{"scripts": {"test": "x"}}"#);
+        write(d.path(), "package-lock.json", "{}");
+        write(d.path(), "api/package.json", r#"{"scripts": {"test": "x"}}"#);
+        write(d.path(), "api/npm-shrinkwrap.json", "{}");
+        // Inherits npm from the root lockfile, but has none of its own.
+        write(d.path(), "web/package.json", r#"{"scripts": {"test": "x"}}"#);
+        write(d.path(), "pn/package.json", r#"{"scripts": {"test": "x"}}"#);
+        write(d.path(), "pn/pnpm-lock.yaml", "");
+        assert_eq!(detect(d.path()).install_commands, ["npm ci", "npm --prefix api ci"]);
+        // No lockfile at all (the live Medusa project): nothing to install.
+        let bare = tempfile::tempdir().unwrap();
+        write(bare.path(), "backend/package.json", r#"{"scripts": {"test:unit": "jest"}}"#);
+        assert!(detect(bare.path()).install_commands.is_empty());
     }
 
     #[test]
