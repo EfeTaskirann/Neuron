@@ -43,6 +43,17 @@ use super::synth::{
 /// will never see the poll cadence in practice.
 pub(super) const WATCH_POLL_MS: u64 = 250;
 
+/// A tick this much later than the last one is a gap nobody worked in:
+/// the machine slept (Windows' monotonic clock runs on through sleep) or
+/// the process was frozen — far beyond anything the loop itself waits on.
+const SUSPEND_GAP: Duration = Duration::from_secs(60);
+
+/// Pure: the time between two watcher ticks, when it is a suspend gap.
+fn suspend_gap(last_tick: Instant, now: Instant) -> Option<Duration> {
+    let gap = now.saturating_duration_since(last_tick);
+    (gap >= SUSPEND_GAP).then_some(gap)
+}
+
 /// Attempt cap for failures that waiting does not fix: an unparseable
 /// file (the cap only absorbs a sender still mid-write) and PTY write
 /// errors / timeouts.
@@ -172,7 +183,21 @@ pub(super) async fn watcher_loop<R: Runtime>(
     let mut stall_every_read = Instant::now();
     let mut stuck = StuckMoves::new();
     let mut was_paused = false;
+    let mut last_tick = Instant::now();
     loop {
+        // Slept through (see SUSPEND_GAP): the agents could not work, so
+        // the stall clocks and the waiting messages' grace move on by the
+        // gap — or every open task would be given up at once on wake.
+        let tick = Instant::now();
+        if let Some(gap) = suspend_gap(last_tick, tick) {
+            tracing::warn!(
+                gap_secs = gap.as_secs(),
+                "swarm-term bridge: resumed after a gap; stall clocks and message grace moved on"
+            );
+            lifecycle.credit_gap(gap);
+            reset_grace_clocks(&root);
+        }
+        last_tick = tick;
         // Paused (usage limit, budget, the user): every message waits in
         // its outbox, in order, until the bridge runs again.
         if control.is_paused() {
@@ -1042,6 +1067,19 @@ mod tests {
     fn unblock(dir: &Path) {
         fs::remove_file(dir).expect("rm blocker");
         fs::create_dir_all(dir).expect("mkdir");
+    }
+
+    #[test]
+    fn only_a_tick_far_past_the_last_one_is_a_suspend_gap() {
+        let t0 = Instant::now();
+        let s = Duration::from_secs;
+        assert_eq!(suspend_gap(t0, t0 + Duration::from_millis(250)), None);
+        // A slow tick (a delivery waiting out its write timeout) is work.
+        assert_eq!(suspend_gap(t0, t0 + s(59)), None);
+        assert_eq!(suspend_gap(t0, t0 + s(60)), Some(s(60)));
+        assert_eq!(suspend_gap(t0, t0 + s(2 * 3600)), Some(s(2 * 3600)));
+        // A clock read out of order is no gap.
+        assert_eq!(suspend_gap(t0 + s(5), t0), None);
     }
 
     #[test]

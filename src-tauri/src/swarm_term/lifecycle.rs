@@ -641,6 +641,19 @@ impl Inner {
         meta.rework = None;
     }
 
+    /// Move every stall clock — the entries and the pending reworks — on
+    /// by `d`: time that does not count.
+    fn credit(&mut self, d: Duration) {
+        for e in self.entries.values_mut() {
+            e.since += d;
+        }
+        for meta in self.tasks.values_mut() {
+            if let Some(w) = meta.rework.as_mut() {
+                w.since += d;
+            }
+        }
+    }
+
     /// VAL-01: bound memory over a long session. Pane entries that are
     /// settled go first; closed tasks keep their closure (the single-use
     /// guard) and only lose their notes, until the far larger
@@ -1061,13 +1074,17 @@ impl LifecycleStore {
             return;
         };
         let paused = now.saturating_duration_since(since);
-        for e in g.entries.values_mut() {
-            e.since += paused;
-        }
-        for meta in g.tasks.values_mut() {
-            if let Some(w) = meta.rework.as_mut() {
-                w.since += paused;
-            }
+        g.credit(paused);
+    }
+
+    /// Time nobody could work in — the machine slept, the process was
+    /// frozen (see `bridge::watcher`) — is not stall time either: every
+    /// clock is credited `gap`, as a pause would have been. While the
+    /// clocks stand still the resume credits it already.
+    pub fn credit_gap(&self, gap: Duration) {
+        let mut g = self.lock();
+        if g.paused_since.is_none() {
+            g.credit(gap);
         }
     }
 
@@ -1231,6 +1248,54 @@ mod tests {
         // ... the second one comes at 120 s.
         let stalls = s.take_stalls(t0 + Duration::from_secs(5058), build_after, build_after);
         assert_eq!(stalls.iter().map(|s| s.level).collect::<Vec<_>>(), [2]);
+    }
+
+    #[test]
+    fn a_gap_the_machine_slept_through_is_not_stall_time() {
+        let (rv, bd) = (10 * MIN, 20 * MIN);
+        let t0 = Instant::now();
+        let sleep = 120 * MIN;
+        let woke = t0 + 5 * MIN + sleep;
+        // Five minutes into the work: a dispatch (build clock), a review
+        // and a rework owed (review clocks).
+        let store = || {
+            let s = LifecycleStore::new();
+            s.assign_at("p-fb", "T1", t0);
+            rec_at(&s, "p-builder", &tr(TransitionKind::Done, "T2"), t0);
+            rec_at(&s, "p-builder", &tr(TransitionKind::Done, "T3"), t0);
+            rec_at(&s, "p-reviewer", &tr(TransitionKind::ChangesNeeded, "T3"), t0);
+            s
+        };
+        // Uncredited, waking two hours on gives every open task up at
+        // once, without a single reminder first.
+        let woken = store().take_stalls(woke, rv, bd);
+        assert!(woken.len() == 3 && woken.iter().all(|x| x.give_up), "{woken:?}");
+        // Credited, the work resumes where it stopped, five minutes in.
+        let s = store();
+        s.credit_gap(sleep);
+        assert!(s.take_stalls(woke, rv, bd).is_empty());
+        // The review and the rework are reminded five minutes later, the
+        // build fifteen — each at level 1, nothing given up.
+        let st = s.take_stalls(woke + 5 * MIN, rv, bd);
+        let seen: Vec<_> = st.iter().map(|x| (x.task_id.as_str(), x.level, x.give_up)).collect();
+        assert_eq!(seen, [("T2", 1, false), ("T3", 1, false)]);
+        let st = s.take_stalls(woke + 15 * MIN, rv, bd);
+        assert!(st.iter().any(|x| x.task_id == "T1" && x.level == 1 && !x.give_up), "{st:?}");
+    }
+
+    #[test]
+    fn a_gap_inside_a_hold_is_credited_once_by_the_resume() {
+        let (rv, bd) = (10 * MIN, 20 * MIN);
+        let t0 = Instant::now();
+        let s = LifecycleStore::new();
+        s.assign_at("p-fb", "T1", t0);
+        s.pause_clocks_at(t0 + MIN);
+        // The machine sleeps through the hold; the resume credits all of it.
+        s.credit_gap(60 * MIN);
+        s.resume_clocks_at(t0 + 61 * MIN);
+        // T1 had run a minute: it stalls 19 minutes on, not 79.
+        assert!(s.take_stalls(t0 + 79 * MIN, rv, bd).is_empty());
+        assert_eq!(s.take_stalls(t0 + 80 * MIN, rv, bd).len(), 1);
     }
 
     #[test]
