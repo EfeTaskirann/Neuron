@@ -488,11 +488,16 @@ pub(crate) async fn run_live(spec: &LiveSpec) -> LiveReport {
     // transcripts.
     let projects_dirs = pane_config::claude_projects_dirs();
     std::fs::create_dir_all(&spec.out).ok();
+    // The folders claude keeps this project's transcripts in.
+    let mut transcript_dirs: BTreeSet<PathBuf> = BTreeSet::new();
     for (agent, claude_session) in &claude_sessions {
         let Some(file) = pane_config::find_transcript(&projects_dirs, claude_session) else {
             println!("NO TRANSCRIPT [{agent}]");
             continue;
         };
+        if let Some(dir) = file.parent().filter(|d| !projects_dirs.iter().any(|root| root == d)) {
+            transcript_dirs.insert(dir.to_path_buf());
+        }
         let Ok(text) = std::fs::read_to_string(&file) else { continue };
         // claude appends to the transcript as it works: its last write
         // is the agent's last activity.
@@ -548,6 +553,14 @@ pub(crate) async fn run_live(spec: &LiveSpec) -> LiveReport {
         .collect();
     if !left.is_empty() {
         report.broken.push(format!("transcripts left behind: {left:?}"));
+    }
+    // A run on a fresh folder leaves claude's folder for it empty once its
+    // transcripts are gone: removed too. `remove_dir` takes only an empty
+    // folder — anything else claude or the user keeps there stays.
+    for dir in &transcript_dirs {
+        if std::fs::remove_dir(dir).is_err() && dir.exists() {
+            println!("KEPT claude's project folder (not empty): {}", dir.display());
+        }
     }
     INJECTIONS.lock().unwrap_or_else(|p| p.into_inner()).clear();
     report
