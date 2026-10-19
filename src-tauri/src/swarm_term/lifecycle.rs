@@ -78,6 +78,10 @@ pub const MAX_REWORK_ROUNDS: u8 = 2;
 /// The agent whose verdicts span every builder (smoke / retest runs).
 pub const TESTER: &str = "integration-tester";
 
+/// The agents the others ask — research and plans. They own no task, so
+/// what is watched is that they answer (see [`LifecycleStore::note_route`]).
+pub const ADVISORS: &[&str] = &["scout", "planner"];
+
 /// State a single `(source_pane, task_id)` tuple can be in within the
 /// autonomy cycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -524,6 +528,17 @@ struct Inner {
     /// Set while the stall clocks stand still (see
     /// [`LifecycleStore::pause_clocks`]).
     paused_since: Option<Instant>,
+    /// `(advisor, asker)` → the asker's first question the advisor has
+    /// not answered yet (see [`ADVISORS`]).
+    questions: HashMap<(String, String), Question>,
+}
+
+/// An unanswered question to an advisor.
+#[derive(Debug, Clone, Copy)]
+struct Question {
+    since: Instant,
+    /// Highest level already reported for it.
+    level: u8,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -607,6 +622,17 @@ pub struct Stall {
     pub give_up: bool,
 }
 
+/// A question to an advisor that crossed a threshold — output of
+/// [`LifecycleStore::take_unanswered`]: `level` 1 at the threshold (the
+/// advisor is reminded), 2 at twice it (the asker is told too).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unanswered {
+    pub advisor: String,
+    pub asker: String,
+    pub age: Duration,
+    pub level: u8,
+}
+
 fn stall_level(age: Duration, threshold: Duration) -> u8 {
     if age >= threshold * 3 {
         3
@@ -641,8 +667,8 @@ impl Inner {
         meta.rework = None;
     }
 
-    /// Move every stall clock — the entries and the pending reworks — on
-    /// by `d`: time that does not count.
+    /// Move every stall clock — the entries, the pending reworks and the
+    /// unanswered questions — on by `d`: time that does not count.
     fn credit(&mut self, d: Duration) {
         for e in self.entries.values_mut() {
             e.since += d;
@@ -651,6 +677,9 @@ impl Inner {
             if let Some(w) = meta.rework.as_mut() {
                 w.since += d;
             }
+        }
+        for q in self.questions.values_mut() {
+            q.since += d;
         }
     }
 
@@ -1088,6 +1117,50 @@ impl LifecycleStore {
         }
     }
 
+    /// A message `from` → `to` was delivered. An advisor (see
+    /// [`ADVISORS`]) that sends anything has spoken: none of its
+    /// questions wait any more. A message to an advisor is a question its
+    /// sender waits on, timed from the first one not yet answered.
+    pub fn note_route(&self, from: &str, to: &str) {
+        self.note_route_at(from, to, Instant::now());
+    }
+
+    fn note_route_at(&self, from: &str, to: &str, now: Instant) {
+        let mut g = self.lock();
+        if ADVISORS.contains(&from) {
+            g.questions.retain(|(advisor, _), _| advisor != from);
+        }
+        if ADVISORS.contains(&to) && from != to {
+            g.questions
+                .entry((to.to_string(), from.to_string()))
+                .or_insert(Question { since: now, level: 0 });
+        }
+    }
+
+    /// Questions to an advisor that crossed `after` since the last call:
+    /// level 1 at `after`, level 2 at twice it, each reported once.
+    /// Nothing is closed — an advisor owns no task; the asker decides.
+    pub fn take_unanswered(&self, now: Instant, after: Duration) -> Vec<Unanswered> {
+        let mut g = self.lock();
+        if g.paused_since.is_some() {
+            return Vec::new();
+        }
+        let mut out: Vec<Unanswered> = g
+            .questions
+            .iter_mut()
+            .filter_map(|((advisor, asker), q)| {
+                let age = now.saturating_duration_since(q.since);
+                let level = stall_level(age, after).min(2);
+                (level > q.level).then(|| {
+                    q.level = level;
+                    Unanswered { advisor: advisor.clone(), asker: asker.clone(), age, level }
+                })
+            })
+            .collect();
+        out.sort_by(|a, b| (&a.advisor, &a.asker).cmp(&(&b.advisor, &b.asker)));
+        out
+    }
+
     /// The agent behind `old` runs in a new pane now (restarted): its
     /// tasks move with it.
     pub fn rename_pane(&self, old: &str, new: &str) {
@@ -1296,6 +1369,65 @@ mod tests {
         // T1 had run a minute: it stalls 19 minutes on, not 79.
         assert!(s.take_stalls(t0 + 79 * MIN, rv, bd).is_empty());
         assert_eq!(s.take_stalls(t0 + 80 * MIN, rv, bd).len(), 1);
+    }
+
+    #[test]
+    fn an_unanswered_question_reminds_the_advisor_then_tells_the_asker() {
+        let s = LifecycleStore::new();
+        let t0 = Instant::now();
+        s.note_route_at("coordinator", "planner", t0);
+        let at = |minutes: u32| {
+            s.take_unanswered(t0 + minutes * MIN, 10 * MIN)
+                .into_iter()
+                .map(|q| (q.advisor, q.asker, q.level))
+                .collect::<Vec<_>>()
+        };
+        assert!(at(9).is_empty());
+        assert_eq!(at(10), [("planner".to_string(), "coordinator".to_string(), 1)]);
+        // Each level once ...
+        assert!(at(15).is_empty());
+        assert_eq!(at(20), [("planner".to_string(), "coordinator".to_string(), 2)]);
+        // ... and nothing after: an advisor owns no task to give up.
+        assert!(at(90).is_empty());
+    }
+
+    #[test]
+    fn an_advisor_that_speaks_answers_its_questions() {
+        let s = LifecycleStore::new();
+        let t0 = Instant::now();
+        let after = 10 * MIN;
+        // Two askers wait on the scout; it speaks, to anyone: both are
+        // answered.
+        s.note_route_at("backend-builder", "scout", t0);
+        s.note_route_at("coordinator", "scout", t0);
+        s.note_route_at("scout", "coordinator", t0 + 5 * MIN);
+        assert!(s.take_unanswered(t0 + 30 * MIN, after).is_empty());
+        // A new question starts a new wait, asking again does not restart
+        // it, and messages between the other agents are no questions.
+        s.note_route_at("backend-builder", "scout", t0 + 31 * MIN);
+        s.note_route_at("backend-builder", "scout", t0 + 39 * MIN);
+        s.note_route_at("coordinator", "backend-builder", t0 + 31 * MIN);
+        let st = s.take_unanswered(t0 + 41 * MIN, after);
+        let seen: Vec<_> = st.iter().map(|q| (q.advisor.as_str(), q.asker.as_str(), q.level)).collect();
+        assert_eq!(seen, [("scout", "backend-builder", 1)]);
+    }
+
+    #[test]
+    fn a_question_waits_out_a_hold_and_a_sleep() {
+        let s = LifecycleStore::new();
+        let t0 = Instant::now();
+        let after = 10 * MIN;
+        s.note_route_at("orchestrator", "planner", t0);
+        // Held from minute 1 to 61: nothing is reported meanwhile ...
+        s.pause_clocks_at(t0 + MIN);
+        assert!(s.take_unanswered(t0 + 30 * MIN, after).is_empty());
+        s.resume_clocks_at(t0 + 61 * MIN);
+        // ... and the question is a minute old again afterwards.
+        assert!(s.take_unanswered(t0 + 69 * MIN, after).is_empty());
+        // A two-hour sleep does not count either.
+        s.credit_gap(120 * MIN);
+        assert!(s.take_unanswered(t0 + 189 * MIN, after).is_empty());
+        assert_eq!(s.take_unanswered(t0 + 190 * MIN, after).len(), 1);
     }
 
     #[test]

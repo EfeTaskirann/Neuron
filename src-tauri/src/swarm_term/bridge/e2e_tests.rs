@@ -482,6 +482,25 @@ async fn lifecycle_failure_paths_with_fake_agents() {
     {
         failed.push("G4 nobody answered: ST1 given up as TASK_FAILED".into());
     }
+    // A question the planner never answers: the planner is reminded, then
+    // the asker is told to go on — nothing is given up.
+    send("coordinator", "planner", "plan the parser split", None);
+    if !wait_until(15, || {
+        let l = log("planner");
+        l.contains("@coordinator") && l.contains("cevabını bekliyor")
+    })
+    .await
+    {
+        failed.push("G5 silent planner reminded of the question".into());
+    }
+    if !wait_until(15, || {
+        let l = log("coordinator");
+        l.contains("@planner") && l.contains("cevap vermedi")
+    })
+    .await
+    {
+        failed.push("G6 coordinator told the planner did not answer".into());
+    }
     drop(_stall_override);
 
     uninstall(handle);
