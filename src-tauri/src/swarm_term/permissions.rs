@@ -279,10 +279,12 @@ pub(crate) fn allowed_tools(agent_id: &str, session_id: &str, facts: &ProjectFac
     let role = role_of(agent_id);
     if role == Role::Build {
         rules.push("Edit(./**)".to_string());
-        // Installing what a lockfile pins (owner decision): exact rules,
-        // with no room for arguments — `npm ci --prefix ../x` would
-        // install outside the project. Residual risk, as for tests: the
-        // install runs the dependencies' own install scripts.
+        // Dependency installs (owner decisions: `npm ci`, then a bare
+        // `npm install`): exact rules, with no room for arguments —
+        // `npm install <package>` would install a package an injected
+        // instruction picked, and `npm ci --prefix ../x` would install
+        // outside the project. Residual risk, as for tests: the install
+        // runs the dependencies' own install scripts.
         for c in &facts.install_commands {
             rules.push(format!("Bash({c})"));
             rules.push(format!("PowerShell({c})"));
@@ -295,6 +297,12 @@ pub(crate) fn allowed_tools(agent_id: &str, session_id: &str, facts: &ProjectFac
             rules.push(format!("Bash({c}:*)"));
             rules.push(format!("PowerShell({c})"));
             rules.push(format!("PowerShell({c} *)"));
+        }
+        // Exact, with no room for arguments (see
+        // `ProjectFacts::exact_commands`).
+        for c in &facts.exact_commands {
+            rules.push(format!("Bash({c})"));
+            rules.push(format!("PowerShell({c})"));
         }
     }
     rules
@@ -317,12 +325,13 @@ const NO_CD: &str = "Her shell komutu proje kökünde başlar; bir önceki komut
 pub(crate) fn describe_for_persona(agent_id: &str, facts: &ProjectFacts) -> String {
     let commands = verify_commands(&facts.commands).join(", ");
     let installs = facts.install_commands.iter().map(|c| format!("`{c}`")).collect::<Vec<_>>().join(", ");
-    // Who installs missing dependencies: a builder when a lockfile
-    // allows `npm ci`, the user otherwise.
+    // Who installs missing dependencies: a builder when the project has
+    // an install command it may run, the user otherwise.
     let missing_deps = if installs.is_empty() {
         "Bağımlılıklar kurulu değilse (`node_modules` yok, `tsc` / `vitest` bulunamıyor) \
          kurmaya ÇALIŞMA: coordinator'a `hata — bağımlılıklar kurulu değil: <klasör>` yaz; \
-         lockfile olmadığı için kurulum kullanıcının işi."
+         bu projede ajanların çalıştırabileceği bir kurulum komutu olmadığı için kurulum \
+         kullanıcının işi."
             .to_string()
     } else {
         format!(
@@ -330,6 +339,14 @@ pub(crate) fn describe_for_persona(agent_id: &str, facts: &ProjectFacts) -> Stri
              kurmaya ÇALIŞMA: coordinator'a `hata — bağımlılıklar kurulu değil: <klasör>` yaz; \
              builder {installs} ile kurar."
         )
+    };
+    // Commands that admit no argument are announced as such, so an agent
+    // doesn't learn it from a denial.
+    let exact = if facts.exact_commands.is_empty() {
+        String::new()
+    } else {
+        let list = facts.exact_commands.iter().map(|c| format!("`{c}`")).collect::<Vec<_>>().join(", ");
+        format!(" Şunlar da çalışır, ama yalnızca AYNEN (ek argüman olmadan): {list}.")
     };
     let base = "Proje dosyalarını OKUYABİLİRSİN (yalnızca proje klasörü içinde; \
                 dışarısı reddedilir). Gizli dosyalar (`.env`, SSH/bulut anahtarları, \
@@ -355,26 +372,28 @@ pub(crate) fn describe_for_persona(agent_id: &str, facts: &ProjectFacts) -> Stri
         }
         Role::Verify => format!(
             "{base} Proje dosyalarını değiştiremezsin. `Bash` ile yalnızca doğrulama \
-             komutlarını çalıştırabilirsin: {}. {git} {NO_CD} {missing_deps}",
+             komutlarını çalıştırabilirsin: {}.{exact} {git} {NO_CD} {missing_deps}",
             commands
         ),
         Role::Build => {
             let install = if installs.is_empty() {
                 "Paket kurmak / başka bir komut gerekiyorsa coordinator'a `hata —` ile \
-                 bildir (lockfile olmadığı için kurulum kullanıcının işi)."
+                 bildir (bu projede ajanların çalıştırabileceği bir kurulum komutu yok; \
+                 kurulum kullanıcının işi)."
                     .to_string()
             } else {
                 format!(
-                    "Bağımlılıklar eksikse lockfile'daki sürümleri kuran şu komutları \
-                     AYNEN (ek argüman olmadan) çalıştırabilirsin: \
-                     {installs}. Başka bir paket kurmak / başka bir komut gerekiyorsa \
-                     coordinator'a `hata —` ile bildir."
+                    "Bağımlılık kurmak için yalnızca şu komutları AYNEN (ek argüman \
+                     olmadan) çalıştırabilirsin: {installs}. Yeni bir paket gerekiyorsa \
+                     önce ilgili package.json'a ekle, sonra argümansız kurulum komutunu \
+                     çalıştır; komuta paket adı yazma (`npm install <paket>` reddedilir). \
+                     Başka bir komut gerekiyorsa coordinator'a `hata —` ile bildir."
                 )
             };
             format!(
                 "{base} Proje klasörü içindeki dosyaları değiştirebilirsin (dışarısı \
                  reddedilir). `Bash` ile yalnızca doğrulama komutlarını çalıştırabilirsin: \
-                 {}. {git} {NO_CD} {install}",
+                 {}.{exact} {git} {NO_CD} {install}",
                 commands
             )
         }
@@ -454,6 +473,48 @@ mod tests {
         assert!(describe_for_persona("integration-tester", &none()).contains("kullanıcının işi"));
         assert!(describe_for_persona("coordinator", &facts).contains("kurulumu builder'a dispatch et"));
         assert!(!describe_for_persona("coordinator", &none()).contains("kurulumu"));
+    }
+
+    #[test]
+    fn a_builder_may_run_a_bare_npm_install_but_never_name_a_package() {
+        // Exact rules: `npm install left-pad` (a package an injected
+        // instruction picked) stays denied; a new dependency goes through
+        // package.json, where the reviewers see it.
+        let facts =
+            ProjectFacts { install_commands: vec!["npm --prefix backend install".into()], ..ProjectFacts::default() };
+        for &agent in AGENT_IDS {
+            let rules: Vec<String> =
+                allowed_tools(agent, "s", &facts).into_iter().filter(|r| r.contains(" install")).collect();
+            if role_of(agent) == Role::Build {
+                assert_eq!(rules, ["Bash(npm --prefix backend install)", "PowerShell(npm --prefix backend install)"], "{agent}");
+                let text = describe_for_persona(agent, &facts);
+                assert!(text.contains("package.json") && text.contains("`npm install <paket>`"), "{agent}: {text}");
+            } else {
+                assert!(rules.is_empty(), "{agent}: {rules:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn exact_commands_are_exact_rules_for_the_shell_roles_only() {
+        // tsc takes `--outDir` and `--noEmit false`: a rule with room for
+        // arguments would let a verifier compile into any folder.
+        let tsc = "node backend/node_modules/typescript/bin/tsc -p backend --noEmit";
+        let facts = ProjectFacts { exact_commands: vec![tsc.into()], ..ProjectFacts::default() };
+        for &agent in AGENT_IDS {
+            let rules: Vec<String> =
+                allowed_tools(agent, "s", &facts).into_iter().filter(|r| r.contains("typescript/bin/tsc")).collect();
+            if role_of(agent) == Role::Coordinate {
+                assert!(rules.is_empty(), "{agent}: {rules:?}");
+            } else {
+                assert_eq!(rules, [format!("Bash({tsc})"), format!("PowerShell({tsc})")], "{agent}");
+                let text = describe_for_persona(agent, &facts);
+                assert!(text.contains(&format!("`{tsc}`")) && text.contains("AYNEN"), "{agent}: {text}");
+            }
+            for rule in &rules {
+                assert!(!rule.contains('"') && !rule.contains('\\'), "{agent}: {rule}");
+            }
+        }
     }
 
     #[test]

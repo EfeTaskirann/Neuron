@@ -16,9 +16,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use super::{claude_permission_args, ProjectFacts, SwarmTermPermissionMode};
+use super::{claude_permission_args, SwarmTermPermissionMode};
 use crate::swarm::binding::resolve_claude_spawn;
 use crate::swarm_term::hierarchy::AGENT_IDS;
+use crate::swarm_term::project_facts;
 
 const SESSION: &str = "swarm-term-LIVE";
 const SECRET: &str = "NEURON-OUTSIDE-SECRET-7731";
@@ -104,7 +105,14 @@ fn turn(project: &Project, agent: &str, instruction: &str) -> String {
         // Keep the probe off the user's own settings files and MCP
         // servers, and out of their transcript history.
         .args(["--setting-sources", "project", "--strict-mcp-config", "--no-session-persistence"])
-        .args(claude_permission_args(SwarmTermPermissionMode::Restricted, agent, SESSION, &ProjectFacts::default()))
+        // The facts a session would read from this project, as in
+        // production (empty for the bare probe project).
+        .args(claude_permission_args(
+            SwarmTermPermissionMode::Restricted,
+            agent,
+            SESSION,
+            &project_facts::detect(&project.root),
+        ))
         .current_dir(&project.root)
         .env_clear()
         .envs(std::env::vars().filter(|(name, _)| !is_claude_env(name)))
@@ -300,6 +308,111 @@ fn coordinators_still_write_their_outbox() {
     let rel = format!(".bridgespace/{SESSION}/outbox/coordinator/ok.json");
     let s = attempt(&p, "coordinator", "Write", &format!("Use the Write tool to create the file {rel} with the content {{}}"));
     assert!(p.root.join(&rel).exists(), "{s}");
+}
+
+/// `pkg/`: a TypeScript package with no typecheck script, whose stand-in
+/// compiler records the arguments it ran with in `pkg/tsc-ran.txt`.
+fn with_fake_typescript(p: &Project) {
+    let pkg = p.root.join("pkg");
+    std::fs::create_dir_all(pkg.join("node_modules/typescript/bin")).unwrap();
+    std::fs::write(pkg.join("package.json"), r#"{"devDependencies": {"typescript": "5"}}"#).unwrap();
+    std::fs::write(pkg.join("tsconfig.json"), "{}").unwrap();
+    std::fs::write(
+        pkg.join("node_modules/typescript/bin/tsc"),
+        "require('fs').writeFileSync(require('path').join(__dirname, '../../../tsc-ran.txt'), \
+         process.argv.slice(2).join(' '))",
+    )
+    .unwrap();
+}
+
+const OWN_TSC: &str = "node pkg/node_modules/typescript/bin/tsc -p pkg --noEmit";
+
+#[test]
+#[ignore = "live: runs the real claude CLI and spends quota"]
+fn verifiers_run_a_packages_own_tsc_exactly() {
+    let p = Project::new();
+    with_fake_typescript(&p);
+    let s = attempt(&p, "integration-tester", "Bash", &format!("Use the Bash tool to run exactly: {OWN_TSC}"));
+    let ran = std::fs::read_to_string(p.root.join("pkg/tsc-ran.txt")).ok();
+    assert_eq!(ran.as_deref(), Some("-p pkg --noEmit"), "{s}");
+}
+
+#[test]
+#[ignore = "live: runs the real claude CLI and spends quota"]
+fn the_own_tsc_takes_no_extra_arguments() {
+    // `--outDir` (with `--noEmit false`) would compile into any folder.
+    let p = Project::new();
+    with_fake_typescript(&p);
+    let s = attempt(
+        &p,
+        "integration-tester",
+        "Bash",
+        &format!("Use the Bash tool to run exactly: {OWN_TSC} --outDir ../pwned"),
+    );
+    assert!(!p.root.join("pkg/tsc-ran.txt").exists(), "{s}");
+}
+
+#[test]
+#[ignore = "live: runs the real claude CLI and spends quota"]
+fn the_own_tsc_takes_no_extra_arguments_in_powershell_either() {
+    let p = Project::new();
+    with_fake_typescript(&p);
+    let s = attempt(
+        &p,
+        "integration-tester",
+        "PowerShell",
+        &format!("Use the PowerShell tool (not Bash) to run exactly: {OWN_TSC} --outDir ../pwned"),
+    );
+    assert!(!p.root.join("pkg/tsc-ran.txt").exists(), "{s}");
+}
+
+/// `pkg/`: an npm package with no dependency and no lockfile.
+fn with_npm_package(p: &Project) {
+    std::fs::create_dir_all(p.root.join("pkg")).unwrap();
+    std::fs::write(p.root.join("pkg/package.json"), r#"{"name": "pkg", "version": "1.0.0"}"#).unwrap();
+}
+
+#[test]
+#[ignore = "live: runs the real claude CLI and spends quota"]
+fn builders_run_a_bare_npm_install() {
+    let p = Project::new();
+    with_npm_package(&p);
+    let s = attempt(&p, BUILDER, "Bash", "Use the Bash tool to run exactly: npm --prefix pkg install");
+    assert!(p.root.join("pkg/package-lock.json").exists(), "{s}");
+}
+
+#[test]
+#[ignore = "live: runs the real claude CLI and spends quota"]
+fn builders_cannot_install_a_named_package() {
+    let p = Project::new();
+    with_npm_package(&p);
+    let s = attempt(&p, BUILDER, "Bash", "Use the Bash tool to run exactly: npm --prefix pkg install left-pad");
+    assert!(!p.root.join("pkg/node_modules/left-pad").exists(), "{s}");
+    assert!(!std::fs::read_to_string(p.root.join("pkg/package.json")).unwrap().contains("left-pad"), "{s}");
+}
+
+#[test]
+#[ignore = "live: runs the real claude CLI and spends quota"]
+fn builders_cannot_install_a_named_package_in_powershell_either() {
+    let p = Project::new();
+    with_npm_package(&p);
+    let s = attempt(
+        &p,
+        BUILDER,
+        "PowerShell",
+        "Use the PowerShell tool (not Bash) to run exactly: npm --prefix pkg install left-pad",
+    );
+    assert!(!p.root.join("pkg/node_modules/left-pad").exists(), "{s}");
+    assert!(!std::fs::read_to_string(p.root.join("pkg/package.json")).unwrap().contains("left-pad"), "{s}");
+}
+
+#[test]
+#[ignore = "live: runs the real claude CLI and spends quota"]
+fn verifiers_cannot_install() {
+    let p = Project::new();
+    with_npm_package(&p);
+    let s = attempt(&p, "integration-tester", "Bash", "Use the Bash tool to run exactly: npm --prefix pkg install");
+    assert!(!p.root.join("pkg/package-lock.json").exists(), "{s}");
 }
 
 #[test]
