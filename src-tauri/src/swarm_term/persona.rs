@@ -130,10 +130,13 @@ pub(crate) fn build_persona_prompt(
         } else {
             facts.stacks.join(", ")
         };
-        let commands = if facts.commands.is_empty() {
+        // The exact-only ones too: the agents type their verification
+        // commands from this line.
+        let all: Vec<String> = facts.commands.iter().chain(&facts.exact_commands).cloned().collect();
+        let commands = if all.is_empty() {
             "algılanamadı — scout'a sor".to_string()
         } else {
-            quoted(&facts.commands)
+            quoted(&all)
         };
         format!(
             "- Yığın: {stacks}\n\
@@ -371,7 +374,19 @@ mod tests {
             stacks: vec!["Rust (Cargo)".into(), "Node (pnpm)".into()],
             commands: vec!["cargo test".into(), "pnpm -C web test".into()],
             install_commands: vec![],
+            exact_commands: vec![],
         }
+    }
+
+    #[test]
+    fn the_project_block_lists_the_exact_commands_too() {
+        // The agents type their verification commands from this line; a
+        // package's own tsc must be on it or nobody knows it exists.
+        let mut f = facts();
+        f.exact_commands = vec!["node web/node_modules/typescript/bin/tsc -p web --noEmit".into()];
+        let p = build_persona_prompt("integration-tester", "x", &dummy_bridge_root(), &f, AGENT_IDS);
+        let line = p.lines().find(|l| l.starts_with("- Doğrulama komutları:")).expect("commands line");
+        assert!(line.contains("`node web/node_modules/typescript/bin/tsc -p web --noEmit`"), "{line}");
     }
 
     #[test]

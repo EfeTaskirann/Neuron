@@ -8,7 +8,7 @@
 use std::path::Path;
 
 /// Node scripts worth a verifier's time (run, not built).
-const NODE_SCRIPTS: &[&str] = &["test", "typecheck", "lint", "check"];
+const NODE_SCRIPTS: &[&str] = &["test", "typecheck", "type-check", "lint", "check"];
 
 /// Folders one level down that are never a package of the project.
 const SKIP_DIRS: &[&str] = &["node_modules", "target", "dist", "build", "out", "vendor", "coverage"];
@@ -23,6 +23,11 @@ pub(crate) struct ProjectFacts {
     /// lockfile pins them (`npm ci`) — only for a package with its own
     /// lockfile; the builders may run these.
     pub install_commands: Vec<String>,
+    /// Verification commands that run only exactly as written: a
+    /// TypeScript package's own compiler, for a package with no
+    /// typecheck script. `tsc` takes `--outDir` and `--noEmit false`, so
+    /// a rule with room for arguments would let it write anywhere.
+    pub exact_commands: Vec<String>,
 }
 
 impl ProjectFacts {
@@ -41,6 +46,12 @@ impl ProjectFacts {
     fn add_install_command(&mut self, command: String) {
         if !self.install_commands.contains(&command) {
             self.install_commands.push(command);
+        }
+    }
+
+    fn add_exact_command(&mut self, command: String) {
+        if !self.exact_commands.contains(&command) {
+            self.exact_commands.push(command);
         }
     }
 }
@@ -134,26 +145,49 @@ fn node_package(path: &Path, subdir: Option<&str>, pm: Option<&'static str>, fac
             Some(dir) => format!("npm --prefix {dir} ci"),
         });
     }
-    let Some(scripts) = manifest.get("scripts").and_then(|s| s.as_object()) else {
-        return;
-    };
-    for base in NODE_SCRIPTS {
-        if scripts.contains_key(*base) {
-            facts.add_command(node_command(pm, subdir, base));
-        }
-        // Variants of a base script (`test:unit`, `lint:css`): a package
-        // may have only those (live: a Medusa backend with `test:unit`
-        // and no `test`, so its tests could not be run at all).
-        let mut variants: Vec<&str> = scripts
-            .keys()
-            .map(String::as_str)
-            .filter(|name| is_script_variant(base, name))
-            .collect();
-        variants.sort_unstable();
-        for name in variants {
-            facts.add_command(node_command(pm, subdir, name));
+    let scripts = manifest.get("scripts").and_then(|s| s.as_object());
+    if let Some(scripts) = scripts {
+        for base in NODE_SCRIPTS {
+            if scripts.contains_key(*base) {
+                facts.add_command(node_command(pm, subdir, base));
+            }
+            // Variants of a base script (`test:unit`, `lint:css`): a package
+            // may have only those (live: a Medusa backend with `test:unit`
+            // and no `test`, so its tests could not be run at all).
+            let mut variants: Vec<&str> = scripts
+                .keys()
+                .map(String::as_str)
+                .filter(|name| is_script_variant(base, name))
+                .collect();
+            variants.sort_unstable();
+            for name in variants {
+                facts.add_command(node_command(pm, subdir, name));
+            }
         }
     }
+    // A TypeScript package no script typechecks (live: the same Medusa
+    // backend): its own compiler, run exactly — never through `npx`,
+    // which fetches a package named `tsc` from the registry when the
+    // local one is missing.
+    let typechecked = scripts.is_some_and(|s| s.keys().any(|name| is_typecheck_script(name)));
+    if !typechecked && path.join("tsconfig.json").is_file() && declares(&manifest, "typescript") {
+        facts.add_exact_command(match subdir {
+            None => "node node_modules/typescript/bin/tsc --noEmit".to_string(),
+            Some(dir) => format!("node {dir}/node_modules/typescript/bin/tsc -p {dir} --noEmit"),
+        });
+    }
+}
+
+/// A script that already typechecks its package.
+fn is_typecheck_script(name: &str) -> bool {
+    ["typecheck", "type-check"].iter().any(|base| name == *base || is_script_variant(base, name))
+}
+
+/// `manifest` lists `dependency` in its dependencies or devDependencies.
+fn declares(manifest: &serde_json::Value, dependency: &str) -> bool {
+    ["dependencies", "devDependencies"].iter().any(|field| {
+        manifest.get(field).and_then(|d| d.as_object()).is_some_and(|d| d.contains_key(dependency))
+    })
 }
 
 /// `name` is `<base>:<variant>` with a variant that can sit inside a
@@ -299,6 +333,47 @@ mod tests {
         let bare = tempfile::tempdir().unwrap();
         write(bare.path(), "backend/package.json", r#"{"scripts": {"test:unit": "jest"}}"#);
         assert!(detect(bare.path()).install_commands.is_empty());
+    }
+
+    #[test]
+    fn a_typescript_package_without_a_typecheck_script_gets_its_own_tsc() {
+        // The live Medusa backend: TypeScript and a tsconfig, but only
+        // `test:unit` — so nothing in the swarm could typecheck it.
+        let d = tempfile::tempdir().unwrap();
+        write(d.path(), "backend/package.json", r#"{"scripts": {"test:unit": "jest"}, "devDependencies": {"typescript": "^5"}}"#);
+        write(d.path(), "backend/tsconfig.json", "{}");
+        // Its own typecheck script already covers it: no second, raw tsc.
+        write(d.path(), "storefront/package.json", r#"{"scripts": {"typecheck": "tsc --noEmit"}, "devDependencies": {"typescript": "^5"}}"#);
+        write(d.path(), "storefront/tsconfig.json", "{}");
+        // Without a tsconfig, or without TypeScript, tsc has nothing to run.
+        write(d.path(), "tools/package.json", r#"{"devDependencies": {"typescript": "^5"}}"#);
+        write(d.path(), "plain/package.json", r#"{"dependencies": {"left-pad": "1"}}"#);
+        write(d.path(), "plain/tsconfig.json", "{}");
+        assert_eq!(
+            detect(d.path()).exact_commands,
+            ["node backend/node_modules/typescript/bin/tsc -p backend --noEmit"]
+        );
+    }
+
+    #[test]
+    fn a_root_typescript_package_with_no_scripts_runs_tsc_from_the_root() {
+        let d = tempfile::tempdir().unwrap();
+        write(d.path(), "package.json", r#"{"dependencies": {"typescript": "5"}}"#);
+        write(d.path(), "tsconfig.json", "{}");
+        assert_eq!(detect(d.path()).exact_commands, ["node node_modules/typescript/bin/tsc --noEmit"]);
+    }
+
+    #[test]
+    fn the_hyphenated_spelling_and_variants_are_typecheck_scripts_too() {
+        let d = tempfile::tempdir().unwrap();
+        write(d.path(), "web/package.json", r#"{"scripts": {"type-check": "tsc"}, "devDependencies": {"typescript": "5"}}"#);
+        write(d.path(), "web/tsconfig.json", "{}");
+        write(d.path(), "api/package.json", r#"{"scripts": {"typecheck:app": "tsc -p app"}, "devDependencies": {"typescript": "5"}}"#);
+        write(d.path(), "api/tsconfig.json", "{}");
+        let facts = detect(d.path());
+        assert_eq!(facts.commands, ["npm --prefix api run typecheck:app", "npm --prefix web run type-check"]);
+        // Each is typechecked by its own script: no raw tsc on top.
+        assert!(facts.exact_commands.is_empty(), "{:?}", facts.exact_commands);
     }
 
     #[test]

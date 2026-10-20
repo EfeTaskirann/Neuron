@@ -296,6 +296,12 @@ pub(crate) fn allowed_tools(agent_id: &str, session_id: &str, facts: &ProjectFac
             rules.push(format!("PowerShell({c})"));
             rules.push(format!("PowerShell({c} *)"));
         }
+        // Exact, with no room for arguments (see
+        // `ProjectFacts::exact_commands`).
+        for c in &facts.exact_commands {
+            rules.push(format!("Bash({c})"));
+            rules.push(format!("PowerShell({c})"));
+        }
     }
     rules
 }
@@ -331,6 +337,14 @@ pub(crate) fn describe_for_persona(agent_id: &str, facts: &ProjectFacts) -> Stri
              builder {installs} ile kurar."
         )
     };
+    // Commands that admit no argument are announced as such, so an agent
+    // doesn't learn it from a denial.
+    let exact = if facts.exact_commands.is_empty() {
+        String::new()
+    } else {
+        let list = facts.exact_commands.iter().map(|c| format!("`{c}`")).collect::<Vec<_>>().join(", ");
+        format!(" Şunlar da çalışır, ama yalnızca AYNEN (ek argüman olmadan): {list}.")
+    };
     let base = "Proje dosyalarını OKUYABİLİRSİN (yalnızca proje klasörü içinde; \
                 dışarısı reddedilir). Gizli dosyalar (`.env`, SSH/bulut anahtarları, \
                 `.npmrc`) okunamaz. Mesajlarını yalnızca KENDİ outbox'una yazabilirsin; \
@@ -355,7 +369,7 @@ pub(crate) fn describe_for_persona(agent_id: &str, facts: &ProjectFacts) -> Stri
         }
         Role::Verify => format!(
             "{base} Proje dosyalarını değiştiremezsin. `Bash` ile yalnızca doğrulama \
-             komutlarını çalıştırabilirsin: {}. {git} {NO_CD} {missing_deps}",
+             komutlarını çalıştırabilirsin: {}.{exact} {git} {NO_CD} {missing_deps}",
             commands
         ),
         Role::Build => {
@@ -374,7 +388,7 @@ pub(crate) fn describe_for_persona(agent_id: &str, facts: &ProjectFacts) -> Stri
             format!(
                 "{base} Proje klasörü içindeki dosyaları değiştirebilirsin (dışarısı \
                  reddedilir). `Bash` ile yalnızca doğrulama komutlarını çalıştırabilirsin: \
-                 {}. {git} {NO_CD} {install}",
+                 {}.{exact} {git} {NO_CD} {install}",
                 commands
             )
         }
@@ -454,6 +468,28 @@ mod tests {
         assert!(describe_for_persona("integration-tester", &none()).contains("kullanıcının işi"));
         assert!(describe_for_persona("coordinator", &facts).contains("kurulumu builder'a dispatch et"));
         assert!(!describe_for_persona("coordinator", &none()).contains("kurulumu"));
+    }
+
+    #[test]
+    fn exact_commands_are_exact_rules_for_the_shell_roles_only() {
+        // tsc takes `--outDir` and `--noEmit false`: a rule with room for
+        // arguments would let a verifier compile into any folder.
+        let tsc = "node backend/node_modules/typescript/bin/tsc -p backend --noEmit";
+        let facts = ProjectFacts { exact_commands: vec![tsc.into()], ..ProjectFacts::default() };
+        for &agent in AGENT_IDS {
+            let rules: Vec<String> =
+                allowed_tools(agent, "s", &facts).into_iter().filter(|r| r.contains("typescript/bin/tsc")).collect();
+            if role_of(agent) == Role::Coordinate {
+                assert!(rules.is_empty(), "{agent}: {rules:?}");
+            } else {
+                assert_eq!(rules, [format!("Bash({tsc})"), format!("PowerShell({tsc})")], "{agent}");
+                let text = describe_for_persona(agent, &facts);
+                assert!(text.contains(&format!("`{tsc}`")) && text.contains("AYNEN"), "{agent}: {text}");
+            }
+            for rule in &rules {
+                assert!(!rule.contains('"') && !rule.contains('\\'), "{agent}: {rule}");
+            }
+        }
     }
 
     #[test]
