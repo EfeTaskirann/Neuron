@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use super::{claude_permission_args, SwarmTermPermissionMode};
+use super::{claude_permission_args, ProjectFacts, SwarmTermPermissionMode};
 use crate::swarm::binding::resolve_claude_spawn;
 use crate::swarm_term::hierarchy::AGENT_IDS;
 
@@ -104,7 +104,7 @@ fn turn(project: &Project, agent: &str, instruction: &str) -> String {
         // Keep the probe off the user's own settings files and MCP
         // servers, and out of their transcript history.
         .args(["--setting-sources", "project", "--strict-mcp-config", "--no-session-persistence"])
-        .args(claude_permission_args(SwarmTermPermissionMode::Restricted, agent, SESSION, &[]))
+        .args(claude_permission_args(SwarmTermPermissionMode::Restricted, agent, SESSION, &ProjectFacts::default()))
         .current_dir(&project.root)
         .env_clear()
         .envs(std::env::vars().filter(|(name, _)| !is_claude_env(name)))
