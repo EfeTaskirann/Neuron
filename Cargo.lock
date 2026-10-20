@@ -2352,6 +2352,7 @@ dependencies = [
 name = "neuron"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "include_dir",
  "keyring",
  "mockito",
@@ -2359,6 +2360,7 @@ dependencies = [
  "rand 0.8.6",
  "regex",
  "reqwest 0.12.23",
+ "rfd",
  "serde",
  "serde_json",
  "sha2",
