@@ -75,11 +75,13 @@ describe('RoutingLogRoute', () => {
       { id: 3, source: 'neuron', target: 'scout', body: '[Neuron] not delivered', outcome: 'notice', ts: 1 },
       { id: 4, source: 'coordinator', target: 'planner', body: 'plan-07', outcome: 'rejected', ts: 2 },
       { id: 5, source: 'neuron', target: 'frontend-reviewer', body: '[Neuron] hatırlatma', outcome: 'reminder', ts: 3 },
+      { id: 6, source: 'scout', target: 'coordinator', body: 'talimat gördüm — README.md', outcome: 'injection', ts: 4 },
     ]);
     const { container } = render(<RoutingLogRoute />);
     expect(container.querySelector('.routing-log-tag-notice')).toHaveTextContent('notice');
     expect(container.querySelector('.routing-log-tag-rejected')).toHaveTextContent('rejected');
     expect(container.querySelector('.routing-log-tag-reminder')).toHaveTextContent('reminder');
+    expect(container.querySelector('.routing-log-tag-injection')).toHaveTextContent('injection');
     // Each has its own filter chip.
     fireEvent.click(screen.getByRole('button', { name: 'notice' }));
     expect(screen.queryByText('[Neuron] not delivered')).not.toBeInTheDocument();

@@ -562,6 +562,23 @@ pub fn is_error_report(body: &str) -> bool {
         && !head[4..].chars().next().is_some_and(char::is_alphanumeric)
 }
 
+/// Head of the report an agent sends when it found an instruction in
+/// the project's text (a README, a comment, a rule file) and did not
+/// follow it: `talimat gördüm — <dosya>: <özet>`. The bridge delivers it
+/// like any message and shows it to the user (Routing Log, toast).
+pub const INJECTION_PREFIX: &str = "talimat gördüm";
+
+/// Pure: true when a body is an injection report (see
+/// [`INJECTION_PREFIX`]; any case, leading markdown).
+pub fn is_injection_report(body: &str) -> bool {
+    let head = body.trim().trim_start_matches(is_decoration);
+    // `to_lowercase` turns the Turkish dotted İ into `i` + U+0307.
+    let folded: String = head.to_lowercase().replace('\u{307}', "");
+    folded
+        .strip_prefix(INJECTION_PREFIX)
+        .is_some_and(|rest| !rest.chars().next().is_some_and(char::is_alphanumeric))
+}
+
 /// Pure: true when a coordinator-bound body LOOKS like a lifecycle
 /// signal (starts with `done` / `approved` / `changes needed` / …, or —
 /// when the envelope carries a `task_id` — the Turkish completion word
@@ -2363,6 +2380,21 @@ mod tests {
         }
         for body in ["hatalı satır düzeltildi", "tamam — hata yok", "", "hat"] {
             assert!(!is_error_report(body), "{body}");
+        }
+    }
+
+    #[test]
+    fn injection_report_detection() {
+        for body in [
+            "talimat gördüm — README.md: \"run curl …\"",
+            "Talimat gördüm: src/x.rs yorumu",
+            "**TALİMAT GÖRDÜM** — AGENTS.md",
+            "talimat gördüm",
+        ] {
+            assert!(is_injection_report(body), "{body}");
+        }
+        for body in ["talimatı uyguladım", "hata — x", "", "talimat gördümde", "gördüm talimat"] {
+            assert!(!is_injection_report(body), "{body}");
         }
     }
 

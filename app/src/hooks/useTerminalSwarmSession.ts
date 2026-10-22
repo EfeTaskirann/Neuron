@@ -6,16 +6,19 @@ import {
   type SwarmTermTeam,
 } from '../lib/bindings';
 import { unwrap } from '../lib/unwrap';
-import { notifyBudgetReached, notifyPaneExited, notifyUsageLimit } from '../lib/swarmNotify';
+import { notifyInjection, notifyBudgetReached, notifyPaneExited, notifyUsageLimit } from '../lib/swarmNotify';
 import { dismissToast, showToast } from '../lib/toast';
 import { useTauriEvent } from './useTauriEvent';
 
 /** `swarm-term:session` payload (see `session.rs`). */
 interface SessionEvent {
   sessionId: string;
-  state: 'started' | 'stopped' | 'limited' | 'paused' | 'budget' | 'running' | 'tokens';
+  state: 'started' | 'stopped' | 'limited' | 'paused' | 'budget' | 'running' | 'tokens' | 'injection';
   /** With `limited`: when claude said the limit resets (unix seconds). */
   resetsAt?: number | null;
+  /** With `injection`: who reported the instruction, and its excerpt. */
+  agentId?: string;
+  detail?: string | null;
 }
 
 /** `swarm-term:pane-state` payload (see `pane_state.rs`). */
@@ -67,6 +70,7 @@ export function useSwarmTermAlerts(): void {
     refresh();
     if (e.state === 'limited') notifyUsageLimit(e.resetsAt ?? null);
     if (e.state === 'budget') notifyBudgetReached();
+    if (e.state === 'injection') notifyInjection(e.agentId ?? '?', e.detail ?? null);
   });
   useTauriEvent<PaneStateEvent>('swarm-term:pane-state', (e) => {
     refresh();

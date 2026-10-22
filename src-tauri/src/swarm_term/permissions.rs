@@ -172,6 +172,68 @@ const GIT_ESCAPES: &[(&str, &str)] = &[
     ("git diff", "../"),
 ];
 
+/// Options that turn an allowed verification command into a write
+/// outside the project, a read of another project, or a run of an
+/// arbitrary program — the same names recur across cargo, tsc, vitest,
+/// eslint, pytest and go, so they are denied in EVERY shell command of
+/// the Verify and Build roles (a leading `*`). A project command's own
+/// `-C app` / `--prefix backend` is not in the list; the exact install
+/// rules carry none of these either (see the tests). Entries with a
+/// trailing space or `=` are the forms that take a value.
+const OUTPUT_ESCAPES: &[&str] = &[
+    // cargo / rustc / libtest: build elsewhere, build another project,
+    // write the test log anywhere.
+    "--target-dir",
+    "--out-dir",
+    "--artifact-dir",
+    "--manifest-path",
+    "--logfile",
+    // tsc: emit elsewhere, or re-enable emitting under `--noEmit`.
+    "--outDir",
+    "--outFile",
+    "--declarationDir",
+    "--tsBuildInfoFile",
+    "--noEmit false",
+    "--noEmit=false",
+    "--project ",
+    "--project=",
+    // vitest / eslint / reporters: report files, another root.
+    "--outputFile",
+    "--output-file",
+    "--coverage.reportsDirectory",
+    "--root ",
+    "--root=",
+    "--dir ",
+    "--dir=",
+    " -o ",
+    "-o=",
+    // pytest: report, temp and log files anywhere, another root.
+    "--junitxml",
+    "--junit-xml",
+    "--basetemp",
+    "--rootdir",
+    "--cov-report",
+    "--log-file",
+    // go test / go vet: profiles and binaries anywhere, a program of
+    // the agent's choice run as the test / tool, files replaced from a
+    // JSON map.
+    "-outputdir",
+    "-coverprofile",
+    "-cpuprofile",
+    "-memprofile",
+    "-blockprofile",
+    "-mutexprofile",
+    "-trace=",
+    "-exec ",
+    "-exec=",
+    "-toolexec",
+    "-vettool",
+    "-overlay",
+    // Any tool's config file: cargo's `build.target-dir` override, a
+    // vitest / eslint config outside the project that runs its code.
+    "--config",
+];
+
 /// Secret files no pane may READ, whatever its role. The panes run on the
 /// shared Claude config with `--setting-sources project`, so the user's
 /// own `permissions.deny` rules no longer constrain them; this baseline
@@ -265,6 +327,10 @@ pub(crate) fn denied_tools(agent_id: &str, session_id: &str) -> Vec<String> {
             rules.push(format!("Bash({cmd} *{opt}*)"));
             rules.push(format!("PowerShell({cmd} *{opt}*)"));
         }
+        for opt in OUTPUT_ESCAPES {
+            rules.push(format!("Bash(*{opt}*)"));
+            rules.push(format!("PowerShell(*{opt}*)"));
+        }
     }
     rules
 }
@@ -355,7 +421,11 @@ pub(crate) fn describe_for_persona(agent_id: &str, facts: &ProjectFacts) -> Stri
                 reddedilir. Web araçları kapalı.";
     let git = "`git diff` / `git log` / `git show` içinde `--output`, `--no-index` ve \
                `--ext-diff` seçenekleri reddedilir; `git diff` ile proje dışı bir yolu \
-               (`C:/…`, `~/…`, `../…`) okumak da reddedilir.";
+               (`C:/…`, `~/…`, `../…`) okumak da reddedilir. Doğrulama komutlarında çıktı \
+               yolu, profil, dış proje ve program seçenekleri de reddedilir (`--target-dir`, \
+               `--manifest-path`, `--outDir`, `--outputFile`, `--junitxml`, `-o`, \
+               `-coverprofile`, `-exec`, `--config`, `--dir`, `--root` …): komutu çıktısını \
+               proje dışına yazacak ya da başka bir projeyi okuyacak biçimde çağırma.";
     match role_of(agent_id) {
         Role::Coordinate => {
             let mut text = format!(
@@ -651,6 +721,55 @@ mod tests {
                     assert!(!rule.contains('\\'), "{agent}: backslash in {rule}");
                 }
             }
+        }
+    }
+
+    #[test]
+    fn shell_roles_lose_the_output_path_options_but_keep_their_commands() {
+        let facts = ProjectFacts {
+            commands: vec![
+                "pnpm -C app test".into(),
+                "pnpm -C app exec vitest run".into(),
+                "npm --prefix backend run test:unit".into(),
+            ],
+            install_commands: vec![
+                "npm ci".into(),
+                "npm --prefix backend install".into(),
+                "pnpm install --frozen-lockfile".into(),
+            ],
+            exact_commands: vec!["node app/node_modules/typescript/bin/tsc -p app --noEmit".into()],
+            ..ProjectFacts::default()
+        };
+        for &agent in AGENT_IDS {
+            let deny = denied_tools(agent, "s");
+            let has = |r: &str| deny.iter().any(|d| d == r);
+            if role_of(agent) == Role::Coordinate {
+                assert!(!has("Bash(*--target-dir*)"), "{agent}");
+                continue;
+            }
+            for rule in [
+                "Bash(*--target-dir*)",
+                "Bash(*--outDir*)",
+                "Bash(*--outputFile*)",
+                "Bash(*--junitxml*)",
+                "Bash(* -o *)",
+                "Bash(*-exec *)",
+                "Bash(*--manifest-path*)",
+                "PowerShell(*--target-dir*)",
+                "PowerShell(*-coverprofile*)",
+            ] {
+                assert!(has(rule), "{agent} lacks {rule}");
+            }
+            // No option in the list hits a command the role may run: a deny
+            // beats an allow, so one collision would silently kill a
+            // project's own test or install command.
+            for allowed in allowed_tools(agent, "s", &facts) {
+                for opt in OUTPUT_ESCAPES {
+                    assert!(!allowed.contains(opt), "{agent}: `{opt}` would deny {allowed}");
+                }
+            }
+            let text = describe_for_persona(agent, &facts);
+            assert!(text.contains("--target-dir") && text.contains("`-o`"), "{agent}: {text}");
         }
     }
 
