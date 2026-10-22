@@ -476,7 +476,7 @@ fn emit_lifecycle<R: Runtime>(
 }
 
 /// Drop a coordinator-signed follow-up envelope for `target`.
-pub(super) fn enqueue_fanout<R: Runtime>(
+pub(crate) fn enqueue_fanout<R: Runtime>(
     app: &AppHandle<R>,
     root: &Path,
     panes_by_agent: &HashMap<String, String>,

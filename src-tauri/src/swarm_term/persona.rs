@@ -309,6 +309,10 @@ pub(crate) fn build_persona_prompt(
          `CHANGES_NEEDED`'de backend görevi kapatır ve orchestrator'a `TASK_FAILED <task_id>`\n\
          bildirir. `[izin]` / `[ortam]` / `[belirsiz]` retleri bu sayıya girmez.\n\
          Kapanmış (`TASK_DONE` / `TASK_FAILED`) bir task_id tekrar kullanılamaz.\n\n\
+         Neuron her görevin token harcamasını transkriptlerden sayar: görev token bütçesini\n\
+         aşınca coordinator'a `PAHALILAŞIYOR` notu gider (kapsamı daralt ya da böl); bütçenin\n\
+         iki katında Neuron görevi kapatır, orchestrator'a `TASK_FAILED <task_id>` iletir ve\n\
+         görevi tutan ajana bırakmasını söyler.\n\n\
          ### İlk yanıt\n\n\
          Oturumun ilk mesajı `{kickoff}` ile başlar. O mesaja **yalnızca** şunu yaz\n\
          ve dur: `@{agent_id} {ready}` (bu iki kelime, hangi dilde çalışırsan çalış\n\
@@ -463,6 +467,16 @@ mod tests {
         let p = build_persona_prompt("backend-builder", "x", &dummy_bridge_root(), &facts(), AGENT_IDS);
         assert!(p.contains(&format!("`[Neuron] {REPIN_PREFIX}`")), "{p}");
         assert!(p.contains("Ona cevap yazma, mesaj gönderme"), "{p}");
+    }
+
+    #[test]
+    fn the_footer_tells_the_coordinator_what_the_token_budget_does() {
+        // Neuron counts each task's tokens from the transcripts: the
+        // coordinator must know the warning and the stop are Neuron's,
+        // not a peer's opinion.
+        let p = build_persona_prompt("coordinator", "x", &dummy_bridge_root(), &facts(), AGENT_IDS);
+        assert!(p.contains("token bütçesi"), "{p}");
+        assert!(p.contains("PAHALILAŞIYOR") && p.contains("iki katında"), "{p}");
     }
 
     #[test]

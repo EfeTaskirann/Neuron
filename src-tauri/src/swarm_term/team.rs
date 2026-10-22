@@ -34,22 +34,55 @@ pub const DEFAULT_MESSAGE_BUDGET: u32 = 300;
 /// A budget above this is no budget at all; refused as a typo.
 const MAX_MESSAGE_BUDGET: u32 = 100_000;
 
+/// The model a role runs when the user chose none: the roles that only
+/// read and judge (scout, planner, the reviewers) on the cheaper
+/// family; the ones that write and run (builders, tester) and the two
+/// that own the protocol (orchestrator, coordinator) on claude's own
+/// default. RouteLLM's lesson at role granularity.
+pub const DEFAULT_MODELS: &[(&str, &str)] = &[
+    ("scout", "sonnet"),
+    ("planner", "sonnet"),
+    ("backend-reviewer", "sonnet"),
+    ("frontend-reviewer", "sonnet"),
+];
+
+/// Tokens (input + cache + output, all agents) one task may spend before
+/// the coordinator is told it is getting expensive; at twice this the
+/// task is closed. Unless the user set another budget.
+pub const DEFAULT_TASK_TOKEN_BUDGET: u64 = 3_000_000;
+
+/// A task budget above this is no budget at all; refused as a typo.
+const MAX_TASK_TOKEN_BUDGET: u64 = 1_000_000_000;
+
+fn default_task_token_budget() -> u64 {
+    DEFAULT_TASK_TOKEN_BUDGET
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct SwarmTermTeam {
     /// Run the Lite team ([`LITE_TEAM`]) instead of all nine agents.
     pub lite: bool,
     /// Agent id → model alias ([`MODEL_ALIASES`]). An agent not named
-    /// runs claude's default model.
+    /// runs its role's default ([`DEFAULT_MODELS`]), else claude's own.
     pub models: BTreeMap<String, String>,
     /// Agent-to-agent messages a session may deliver before it holds;
     /// `0`: no limit.
     pub message_budget: u32,
+    /// Tokens one task may spend before the coordinator is warned; the
+    /// task is closed at twice it. `0`: no limit. See `tokens`.
+    #[serde(default = "default_task_token_budget")]
+    pub task_token_budget: u64,
 }
 
 impl Default for SwarmTermTeam {
     fn default() -> Self {
-        Self { lite: false, models: BTreeMap::new(), message_budget: DEFAULT_MESSAGE_BUDGET }
+        Self {
+            lite: false,
+            models: BTreeMap::new(),
+            message_budget: DEFAULT_MESSAGE_BUDGET,
+            task_token_budget: DEFAULT_TASK_TOKEN_BUDGET,
+        }
     }
 }
 
@@ -63,9 +96,18 @@ impl SwarmTermTeam {
             .collect()
     }
 
-    /// The model alias `agent` runs, if one is set.
+    /// The model alias `agent` runs: the user's choice, else its role's
+    /// default, else `None` (claude's own).
     pub fn model_of(&self, agent: &str) -> Option<&str> {
-        self.models.get(agent).map(String::as_str)
+        self.models.get(agent).map(String::as_str).or_else(|| default_model_of(agent))
+    }
+
+    /// Agent → the alias its pane is spawned with (`--model`).
+    pub fn effective_models(&self) -> BTreeMap<String, String> {
+        AGENT_IDS
+            .iter()
+            .filter_map(|agent| self.model_of(agent).map(|m| (agent.to_string(), m.to_string())))
+            .collect()
     }
 
     fn check(&self) -> Result<(), AppError> {
@@ -86,8 +128,19 @@ impl SwarmTermTeam {
                 self.message_budget
             )));
         }
+        if self.task_token_budget > MAX_TASK_TOKEN_BUDGET {
+            return Err(AppError::InvalidInput(format!(
+                "task token budget {} is above {MAX_TASK_TOKEN_BUDGET}",
+                self.task_token_budget
+            )));
+        }
         Ok(())
     }
+}
+
+/// The alias a role runs by default (see [`DEFAULT_MODELS`]).
+pub fn default_model_of(agent: &str) -> Option<&'static str> {
+    DEFAULT_MODELS.iter().find(|(a, _)| *a == agent).map(|(_, m)| *m)
 }
 
 /// The saved settings; unset or unreadable ones read as the defaults.
@@ -137,6 +190,7 @@ mod tests {
                 ("backend-builder".to_string(), "sonnet".to_string()),
             ]),
             message_budget: 50,
+            task_token_budget: 2_000_000,
         };
         save(&pool, &team).await.unwrap();
         let back = load(&pool).await.unwrap();
@@ -158,5 +212,49 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(load(&pool).await.unwrap(), SwarmTermTeam::default());
+    }
+
+    #[test]
+    fn reading_roles_default_to_the_cheaper_model_unless_chosen() {
+        let team = SwarmTermTeam::default();
+        for agent in ["scout", "planner", "backend-reviewer", "frontend-reviewer"] {
+            assert_eq!(team.model_of(agent), Some("sonnet"), "{agent}");
+        }
+        for agent in ["orchestrator", "coordinator", "backend-builder", "frontend-builder", "integration-tester"] {
+            assert_eq!(team.model_of(agent), None, "{agent}");
+        }
+        let chosen = SwarmTermTeam {
+            models: BTreeMap::from([
+                ("scout".to_string(), "opus".to_string()),
+                ("backend-builder".to_string(), "haiku".to_string()),
+            ]),
+            ..SwarmTermTeam::default()
+        };
+        assert_eq!(chosen.model_of("scout"), Some("opus"));
+        assert_eq!(chosen.model_of("backend-builder"), Some("haiku"));
+        assert_eq!(chosen.model_of("planner"), Some("sonnet"));
+        // What the panes are spawned with.
+        let effective = chosen.effective_models();
+        assert_eq!(effective.len(), 5, "{effective:?}");
+        assert_eq!(effective.get("scout").map(String::as_str), Some("opus"));
+        assert_eq!(effective.get("frontend-reviewer").map(String::as_str), Some("sonnet"));
+        assert!(!effective.contains_key("coordinator"));
+        // Every default is a real agent on a real alias.
+        for (agent, model) in DEFAULT_MODELS {
+            assert!(AGENT_IDS.contains(agent) && MODEL_ALIASES.contains(model), "{agent} {model}");
+        }
+    }
+
+    #[test]
+    fn the_task_token_budget_has_a_default_and_a_ceiling() {
+        assert_eq!(SwarmTermTeam::default().task_token_budget, DEFAULT_TASK_TOKEN_BUDGET);
+        // Settings saved before the field existed read with the default.
+        let old: SwarmTermTeam =
+            serde_json::from_str(r#"{"lite":false,"models":{},"messageBudget":300}"#).unwrap();
+        assert_eq!(old.task_token_budget, DEFAULT_TASK_TOKEN_BUDGET);
+        let too_big = SwarmTermTeam { task_token_budget: MAX_TASK_TOKEN_BUDGET + 1, ..SwarmTermTeam::default() };
+        assert!(too_big.check().is_err());
+        let off = SwarmTermTeam { task_token_budget: 0, ..SwarmTermTeam::default() };
+        assert!(off.check().is_ok());
     }
 }

@@ -111,6 +111,8 @@ const SESSION: TerminalSwarmSessionHandle = {
   messagesDelivered: 12,
   messageBudget: 300,
   budgetReached: false,
+  tokensUsed: 1234567,
+  taskTokenBudget: 3000000,
 };
 
 beforeEach(async () => {
@@ -542,6 +544,13 @@ describe('TerminalSwarmRoute', () => {
     expect(banner).toHaveTextContent('300/300');
     fireEvent.click(screen.getByRole('button', { name: 'Bütçeyi artır, sürdür' }));
     await waitFor(() => expect(commands.swarmTermExtendBudget).toHaveBeenCalled());
+  });
+
+  it('shows the session token usage in the toolbar', async () => {
+    const { commands } = await import('../lib/bindings');
+    vi.mocked(commands.swarmTermSessionStatus).mockResolvedValue({ status: 'ok', data: SESSION });
+    renderRoute();
+    expect(await screen.findByLabelText(/Harcanan token/)).toHaveTextContent('1,2M token');
   });
 
   it('marks the agents a Lite session leaves out', async () => {

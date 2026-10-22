@@ -180,6 +180,8 @@ describe('TerminalRoute', () => {
         messagesDelivered: 0,
         messageBudget: 0,
         budgetReached: false,
+        tokensUsed: 0,
+        taskTokenBudget: 3000000,
       },
     });
     renderRoute();

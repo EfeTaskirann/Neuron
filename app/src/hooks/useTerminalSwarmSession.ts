@@ -13,7 +13,7 @@ import { useTauriEvent } from './useTauriEvent';
 /** `swarm-term:session` payload (see `session.rs`). */
 interface SessionEvent {
   sessionId: string;
-  state: 'started' | 'stopped' | 'limited' | 'paused' | 'budget' | 'running';
+  state: 'started' | 'stopped' | 'limited' | 'paused' | 'budget' | 'running' | 'tokens';
   /** With `limited`: when claude said the limit resets (unix seconds). */
   resetsAt?: number | null;
 }

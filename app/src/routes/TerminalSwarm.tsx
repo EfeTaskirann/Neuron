@@ -363,6 +363,8 @@ export function TerminalSwarmRoute(): JSX.Element {
           paused={session?.paused ?? false}
           pausePending={pauseMut.isPending}
           paneStates={paneStates}
+          tokensUsed={session?.tokensUsed ?? 0}
+          taskTokenBudget={session?.taskTokenBudget ?? 0}
           onLaunch={launch}
           onRestart={restart}
           onStop={stop}

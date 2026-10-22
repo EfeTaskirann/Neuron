@@ -57,6 +57,7 @@ use crate::swarm_term::preflight;
 use crate::swarm_term::project_facts;
 use crate::swarm_term::repin::{self, Compaction};
 use crate::swarm_term::team;
+use crate::swarm_term::tokens::{self, Crossing, Overrun, TokenLedger};
 use crate::swarm_term::trust;
 
 const READY_DELAY_MS: u64 = 1500;
@@ -158,6 +159,11 @@ pub struct TerminalSwarmSessionHandle {
     pub messages_delivered: u32,
     pub message_budget: u32,
     pub budget_reached: bool,
+    /// Tokens every agent's answers cost so far (input + cache + output)
+    /// and the per-task budget the session runs with (`0`: none). See
+    /// `tokens`.
+    pub tokens_used: u64,
+    pub task_token_budget: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
@@ -255,6 +261,9 @@ pub(crate) struct ActiveSession {
     pub budget: Arc<AtomicU32>,
     pub delivered: Arc<AtomicU32>,
     pub budget_step: u32,
+    /// Tokens spent, per task and in all (see `tokens`), counted by
+    /// [`monitor_session`].
+    pub tokens: Arc<Mutex<TokenLedger>>,
     /// Every pane's readiness, published by the kickoff task.
     pub pane_states: Arc<PaneStates>,
     /// Pane ids that have answered their kickoff and are safe targets for
@@ -501,7 +510,7 @@ impl TerminalSwarmRegistry {
         let spec = PaneSpawnSpec {
             program: cmd.clone(),
             facts: facts.clone(),
-            models: team_settings.models.clone(),
+            models: team_settings.effective_models(),
         };
         // Personas are loaded BEFORE spawning: each pane gets its
         // persona + bridge protocol as an appended SYSTEM prompt
@@ -634,6 +643,7 @@ impl TerminalSwarmRegistry {
         let delivered = Arc::new(AtomicU32::new(0));
         let limit = Arc::new(Mutex::new(UsageLimit::default()));
         let restarting = Arc::new(Mutex::new(HashSet::new()));
+        let tokens = Arc::new(Mutex::new(TokenLedger::new(team_settings.task_token_budget)));
         let session = ActiveSession {
             session_id: session_id.clone(),
             project_dir: project_dir.clone(),
@@ -656,6 +666,7 @@ impl TerminalSwarmRegistry {
             budget: Arc::clone(&budget),
             delivered: Arc::clone(&delivered),
             budget_step: team_settings.message_budget,
+            tokens: Arc::clone(&tokens),
             pane_states: Arc::clone(&pane_states),
             ready_panes: Arc::clone(&ready_panes),
             alive: Arc::clone(&alive),
@@ -774,6 +785,7 @@ impl TerminalSwarmRegistry {
             bridgespace_root: bridgespace_root.clone(),
             budget,
             delivered,
+            tokens,
         }));
 
         // Session upkeep, ends with the session: heartbeat both on-disk
@@ -1199,7 +1211,7 @@ fn hold_deliveries(control: &BridgeControl, lifecycle: &LifecycleStore, reason: 
 }
 
 /// `swarm-term:session` with a hold's state change (`paused`, `budget`,
-/// `running`), for the UI.
+/// `running`) or a grown token count (`tokens`), for the UI.
 fn emit_session_state<R: Runtime>(app: &AppHandle<R>, session_id: &str, state: &str) {
     let _ = tauri::Emitter::emit(
         app,
@@ -1262,6 +1274,8 @@ struct SessionMonitor<R: Runtime> {
     /// The message budget (`0`: no limit) and the deliveries counted.
     budget: Arc<AtomicU32>,
     delivered: Arc<AtomicU32>,
+    /// Tokens per task, charged from the transcripts (see `tokens`).
+    tokens: Arc<Mutex<TokenLedger>>,
 }
 
 /// Watch the session until it stops:
@@ -1281,12 +1295,18 @@ struct SessionMonitor<R: Runtime> {
 /// * A context compaction, read from the same transcripts
 ///   ([`repin::compaction_signal`]): the agent gets its open tasks and
 ///   rules pasted back ([`repin_after_compaction`]).
+/// * Every answer's token usage, read from the same transcripts
+///   ([`tokens::usage_signal`]) and charged to the tasks open on that
+///   pane: a task past its budget is reported to the coordinator, one at
+///   twice the budget is closed ([`act_on_overrun`]).
 async fn monitor_session<R: Runtime>(m: SessionMonitor<R>) {
     let mut tails: HashMap<String, TranscriptTail> = HashMap::new();
     let mut gone: HashSet<String> = HashSet::new();
     // Compactions whose re-pin is still owed (held during the usage limit);
     // one per agent — the newest is the state that counts.
     let mut compactions: BTreeMap<String, Compaction> = BTreeMap::new();
+    // Token budget crossings whose notices are still owed (held likewise).
+    let mut overruns: Vec<Overrun> = Vec::new();
     loop {
         tokio::time::sleep(MONITOR_EVERY).await;
         if !m.alive.load(Ordering::SeqCst) {
@@ -1326,6 +1346,7 @@ async fn monitor_session<R: Runtime>(m: SessionMonitor<R>) {
         }
 
         let mut signals: Vec<(String, LimitSignal)> = Vec::new();
+        let tokens_before = m.tokens.lock().unwrap_or_else(|p| p.into_inner()).total();
         for (agent, claude_session) in &m.claude_sessions {
             let Some(file) = pane_config::find_transcript(&m.projects_dirs, claude_session) else {
                 continue;
@@ -1335,6 +1356,19 @@ async fn monitor_session<R: Runtime>(m: SessionMonitor<R>) {
             compactions.extend(
                 lines.iter().filter_map(|l| repin::compaction_signal(l)).map(|c| (agent.clone(), c)),
             );
+            for usage in lines.iter().filter_map(|l| tokens::usage_signal(l)) {
+                let open: Vec<String> = current
+                    .get(agent)
+                    .map(|pane| m.lifecycle.open_tasks_of(pane).into_iter().map(|t| t.id).collect())
+                    .unwrap_or_default();
+                let crossed =
+                    m.tokens.lock().unwrap_or_else(|p| p.into_inner()).observe(agent, &usage, &open);
+                overruns.extend(crossed);
+            }
+        }
+        if m.tokens.lock().unwrap_or_else(|p| p.into_inner()).total() != tokens_before {
+            // The UI's token readout re-reads the session on this.
+            emit_session_state(&m.app, &m.session_id, "tokens");
         }
         if !signals.is_empty() {
             let mut limit = m.limit.lock().unwrap_or_else(|p| p.into_inner());
@@ -1357,12 +1391,16 @@ async fn monitor_session<R: Runtime>(m: SessionMonitor<R>) {
                 emit_limit(&m.app, &m.session_id, &limit);
             }
         }
-        // A re-pin pasted during the usage limit would be spent on a failed
+        // A notice pasted during the usage limit would be spent on a failed
         // turn (or answer claude's limit menu): it waits for the limit to lift.
-        if !compactions.is_empty() && !m.control.paused_by(PauseReason::UsageLimit) {
-            for (agent, compaction) in std::mem::take(&mut compactions) {
-                repin_after_compaction(&m, &current, &agent, &compaction).await;
-            }
+        if m.control.paused_by(PauseReason::UsageLimit) {
+            continue;
+        }
+        for (agent, compaction) in std::mem::take(&mut compactions) {
+            repin_after_compaction(&m, &current, &agent, &compaction).await;
+        }
+        for overrun in std::mem::take(&mut overruns) {
+            act_on_overrun(&m, &current, &overrun).await;
         }
     }
 }
@@ -1402,6 +1440,51 @@ async fn repin_after_compaction<R: Runtime>(
     );
     bridge::notify_agent(&m.registry, panes, agent, &text).await;
     bridge::emit_notice(&m.app, agent, &text, "context compacted");
+}
+
+/// A task crossed its token budget (see [`tokens`]): tell the
+/// coordinator; at twice the budget close it — `TASK_FAILED` to the
+/// orchestrator through the bridge (which records the closure when it
+/// delivers it, as for a stalled task given up), and a word to the
+/// agents still holding it.
+async fn act_on_overrun<R: Runtime>(
+    m: &SessionMonitor<R>,
+    panes: &HashMap<String, String>,
+    overrun: &Overrun,
+) {
+    let budget = m.tokens.lock().unwrap_or_else(|p| p.into_inner()).budget();
+    let id = overrun.task_id.as_str();
+    match overrun.crossing {
+        Crossing::Warn => {
+            let text = tokens::warn_notice(id, overrun.spent, budget);
+            tracing::warn!(
+                task_id = %id,
+                spent = overrun.spent,
+                budget,
+                "swarm-term: task past its token budget — coordinator told"
+            );
+            bridge::notify_agent(&m.registry, panes, "coordinator", &text).await;
+            bridge::emit_notice(&m.app, "coordinator", &text, "task past its token budget");
+        }
+        Crossing::Stop => {
+            let (failed, coordinator, holder) = tokens::stop_texts(id, overrun.spent, budget);
+            tracing::warn!(
+                task_id = %id,
+                spent = overrun.spent,
+                budget,
+                "swarm-term: task at twice its token budget — closed, TASK_FAILED"
+            );
+            bridge::enqueue_fanout(&m.app, &m.bridgespace_root, panes, "orchestrator", failed, id);
+            bridge::notify_agent(&m.registry, panes, "coordinator", &coordinator).await;
+            bridge::emit_notice(&m.app, "coordinator", &coordinator, "task at twice its token budget");
+            for (agent, pane) in panes {
+                if m.lifecycle.open_tasks_of(pane).iter().any(|t| t.id == id) {
+                    bridge::notify_agent(&m.registry, panes, agent, &holder).await;
+                    bridge::emit_notice(&m.app, agent, &holder, "task at twice its token budget");
+                }
+            }
+        }
+    }
 }
 
 /// What one transcript line says about the account's usage limit.
@@ -2201,6 +2284,7 @@ fn handle_from(s: &ActiveSession) -> TerminalSwarmSessionHandle {
         .collect();
     panes.sort_by(|a, b| a.agent_id.cmp(&b.agent_id));
     let limit = s.limit.lock().unwrap_or_else(|p| p.into_inner());
+    let tokens = s.tokens.lock().unwrap_or_else(|p| p.into_inner());
     TerminalSwarmSessionHandle {
         session_id: s.session_id.clone(),
         project_dir: s.project_dir.display().to_string(),
@@ -2217,6 +2301,8 @@ fn handle_from(s: &ActiveSession) -> TerminalSwarmSessionHandle {
         messages_delivered: s.delivered.load(Ordering::SeqCst),
         message_budget: s.budget.load(Ordering::SeqCst),
         budget_reached: s.control.paused_by(PauseReason::Budget),
+        tokens_used: tokens.total(),
+        task_token_budget: tokens.budget(),
     }
 }
 
