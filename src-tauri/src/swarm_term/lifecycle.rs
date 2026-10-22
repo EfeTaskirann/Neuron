@@ -70,6 +70,18 @@ pub const TASK_FAILED_PREFIX: &str = "TASK_FAILED ";
 /// test passes now, and the tester alone never reads the fix's code.
 pub const RETEST_PREFIX: &str = "retest ";
 
+/// Body-prefix of the synthesised first test request sent to the
+/// integration-tester once a domain reviewer approved a task: a review
+/// reads the code, only a run proves it (the live EvE run approved eight
+/// tasks with no test ever run). `TASK_DONE` follows the tester's
+/// `APPROVED`, never the reviewer's.
+pub const TEST_PREFIX: &str = "test ";
+
+/// Body-prefix of the synthesised clarification request sent to the
+/// planner when a reviewer rejects a task as `belirsiz`: the task is
+/// not wrong code to rework but an unclear spec to fix.
+pub const CLARIFY_PREFIX: &str = "netleştir ";
+
 /// Rework rounds a task gets after `CHANGES_NEEDED`. The rejection
 /// after the last round closes the task as failed. The single source of
 /// the retry limit — personas quote it, the backend enforces it.
@@ -157,6 +169,13 @@ pub struct Recorded {
     pub limit_exceeded: bool,
     /// The task was already closed before this signal; nothing fans out.
     pub already_closed: Option<Closure>,
+    /// With `retest`: the tester never saw this task, so the request is
+    /// the first `test <id>`, not a `retest <id>`.
+    pub first_test: bool,
+    /// This `CHANGES_NEEDED` named a cause that is not the builder's
+    /// code: the task is held (`Izin` / `Ortam`, for the user) or sent
+    /// back to the planner (`Belirsiz`), and no rework round was spent.
+    pub blocked: Option<Cause>,
 }
 
 impl Recorded {
@@ -169,8 +188,155 @@ impl Recorded {
             rejections: 0,
             limit_exceeded: false,
             already_closed: None,
+            first_test: false,
+            blocked: None,
         }
     }
+}
+
+/// Why a reviewer rejected a task, or an agent gave it up — read off the
+/// leading tag of its note (`[izin] …`, `ortam: …`). Only `Kod` (and an
+/// untagged note) is the builder's to fix and counts toward
+/// [`MAX_REWORK_ROUNDS`]: an environment or permission problem is the
+/// USER's to fix, and an unclear spec the planner's (live run: two tasks
+/// burnt their rounds on a missing install permission).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Cause {
+    /// A tool or command the agent needs is denied by its permissions.
+    Izin,
+    /// The environment is not set up: missing dependencies, tools, services.
+    Ortam,
+    /// The task's spec or acceptance criterion is unclear.
+    Belirsiz,
+    /// The builder's code is wrong.
+    Kod,
+}
+
+impl Cause {
+    /// The tag as the personas spell it.
+    pub fn tag(self) -> &'static str {
+        match self {
+            Self::Izin => "izin",
+            Self::Ortam => "ortam",
+            Self::Belirsiz => "belirsiz",
+            Self::Kod => "kod",
+        }
+    }
+
+    /// The user must act before the task can go on.
+    pub fn needs_user(self) -> bool {
+        matches!(self, Self::Izin | Self::Ortam)
+    }
+}
+
+/// Pure: the cause tag a note LEADS with (`[izin] npm install reddedildi`,
+/// `(ortam) node_modules yok`, `belirsiz: kabul ölçütü yok`, `KOD — …`),
+/// in Turkish or English. A tag anywhere else is prose.
+pub fn cause_of(note: &str) -> Option<Cause> {
+    let head = note
+        .trim()
+        .trim_start_matches(|c: char| c.is_whitespace() || matches!(c, '[' | '(' | '*' | '`' | '_' | '#'));
+    let word: String = head.chars().take_while(|c| c.is_alphabetic()).collect();
+    let after = head[word.len()..].trim_start();
+    // The tag ends the way a tag does, not the way a sentence goes on.
+    if !after.is_empty() && !after.starts_with([']', ')', ':', '—', '–', '-', '*', '`']) {
+        return None;
+    }
+    match word.to_lowercase().as_str() {
+        "izin" | "permission" | "yetki" => Some(Cause::Izin),
+        "ortam" | "env" | "environment" | "kurulum" => Some(Cause::Ortam),
+        "belirsiz" | "unclear" | "spec" => Some(Cause::Belirsiz),
+        "kod" | "code" | "bug" => Some(Cause::Kod),
+        _ => None,
+    }
+}
+
+/// What a builder's `DONE` note says about running the verification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DoneEvidence {
+    /// Names a verification command and its result.
+    Ran,
+    /// Says, with a reason, that nothing could be run (`doğrulama yok: …`).
+    Declined,
+    /// Neither: the DONE is not accepted.
+    Missing,
+}
+
+/// Command spellings a verification run starts with.
+const RUN_VERBS: &[&str] = &[
+    "cargo ", "pnpm ", "npm ", "npx ", "yarn ", "bun ", "pytest", "python -m pytest", "go test",
+    "go vet", "tsc", "vitest", "jest", "eslint", "node ", "mvn ", "gradle", "dotnet ", "make ",
+];
+
+/// Words that report a run's outcome (either way: a reported failure is
+/// evidence too, just not a passing one).
+const RESULT_WORDS: &[&str] = &[
+    "exit 0", "exit code 0", "çıkış 0", "çıkış kodu 0", "geçti", "passed", " pass", "0 failed",
+    "başarılı", "hatasız", "temiz", "clean", "yeşil", "green", " ok", "✅", "failed", "fail:",
+    "exit 1", "çıkış 1", "hata verdi",
+];
+
+/// How a builder says it could not run anything; a reason must follow.
+const DECLINE_WORDS: &[&str] = &[
+    "doğrulama yok", "dogrulama yok", "test yok", "doğrulanamadı", "koşulamadı", "no verification",
+    "not verified",
+];
+
+/// Pure: did the builder's `DONE` note carry run evidence? `Ran` needs a
+/// command AND an outcome ("cargo test → 12 geçti, exit 0"); naming a
+/// command without a result ("cargo test çalıştırmadım") is not a run.
+/// `Declined` needs a reason after the declaration.
+pub fn done_evidence(note: Option<&str>) -> DoneEvidence {
+    let Some(note) = note else {
+        return DoneEvidence::Missing;
+    };
+    let lower = note.to_lowercase();
+    for word in DECLINE_WORDS {
+        if let Some(at) = lower.find(word) {
+            let rest = lower[at + word.len()..]
+                .trim_start_matches(|c: char| c.is_whitespace() || matches!(c, ':' | '—' | '–' | '-' | ','));
+            if rest.chars().filter(|c| c.is_alphanumeric()).count() >= 3 {
+                return DoneEvidence::Declined;
+            }
+        }
+    }
+    let ran = RUN_VERBS.iter().any(|v| lower.contains(v));
+    let reported = RESULT_WORDS.iter().any(|w| lower.contains(w));
+    if ran && reported {
+        DoneEvidence::Ran
+    } else {
+        DoneEvidence::Missing
+    }
+}
+
+/// Pure: does a `CHANGES_NEEDED` note point at something concrete — a
+/// failing test, an error line, a file and line? "kod kötü, baştan yaz"
+/// gives the builder nothing to act on and spends a round for nothing.
+pub fn rework_evidence(note: &str) -> bool {
+    let lower = note.to_lowercase();
+    const HINTS: &[&str] = &[
+        "test", "fail", "error", "hata", "panic", "expected", "assert", "exception", "satır", "line ",
+        " ts", "warning", "uyarı", "çıktı", "output",
+    ];
+    if HINTS.iter().any(|h| lower.contains(h)) {
+        return true;
+    }
+    // A `file.ext` or `file.ext:42` reference.
+    let bytes = lower.as_bytes();
+    (1..bytes.len().saturating_sub(1)).any(|i| {
+        bytes[i] == b'.'
+            && bytes[i - 1].is_ascii_alphanumeric()
+            && lower[i + 1..]
+                .chars()
+                .take_while(|c| c.is_ascii_alphabetic())
+                .count()
+                .clamp(0, 5)
+                >= 1
+            && lower[i + 1..]
+                .chars()
+                .find(|c| !c.is_ascii_alphabetic())
+                .map_or(true, |c| c.is_whitespace() || matches!(c, ':' | '(' | ',' | ';' | ')'))
+    })
 }
 
 /// The four lifecycle transitions recognised on routed envelope bodies.
@@ -554,6 +720,10 @@ struct TaskMeta {
     /// A rejection the coordinator has not re-dispatched yet.
     rework: Option<Entry>,
     closed: Option<Closure>,
+    /// Held for the user (`Izin` / `Ortam`) or the planner (`Belirsiz`):
+    /// no stall clock runs and no round is counted until the next
+    /// dispatch of the id lifts it.
+    blocked: Option<Cause>,
 }
 
 impl TaskMeta {
@@ -690,6 +860,27 @@ impl LifecycleStore {
         self.record_at(source_agent, source_pane, transition, verdict_panes, note, Instant::now())
     }
 
+    /// [`record`](Self::record) with the cause a `CHANGES_NEEDED` named
+    /// (see [`Cause`]); `None` counts as the builder's code.
+    pub fn record_with_cause(
+        &self,
+        source_agent: &str,
+        source_pane: &str,
+        transition: &Transition,
+        verdict_panes: &[&str],
+        note: Option<&str>,
+        cause: Option<Cause>,
+    ) -> Recorded {
+        self.record_with_cause_at(
+            (source_agent, source_pane),
+            transition,
+            verdict_panes,
+            note,
+            cause,
+            Instant::now(),
+        )
+    }
+
     fn record_at(
         &self,
         source_agent: &str,
@@ -699,6 +890,20 @@ impl LifecycleStore {
         note: Option<&str>,
         now: Instant,
     ) -> Recorded {
+        self.record_with_cause_at((source_agent, source_pane), transition, verdict_panes, note, None, now)
+    }
+
+    /// `source` = the signal's `(agent, pane)`.
+    fn record_with_cause_at(
+        &self,
+        source: (&str, &str),
+        transition: &Transition,
+        verdict_panes: &[&str],
+        note: Option<&str>,
+        cause: Option<Cause>,
+        now: Instant,
+    ) -> Recorded {
+        let (source_agent, source_pane) = source;
         let id = transition.task_id.as_str();
         let key = (source_pane.to_string(), id.to_string());
         let mut g = self.lock();
@@ -723,11 +928,16 @@ impl LifecycleStore {
             TransitionKind::Building | TransitionKind::Done => None,
         }
         .filter(|_| is_reviewer(source_agent));
+        // A hold (environment / permission / unclear spec) stops the
+        // builder wherever it is, not only after its DONE: nothing it
+        // does can go on until the user or the planner acted.
+        let held = transition.kind == TransitionKind::ChangesNeeded
+            && matches!(cause, Some(Cause::Izin | Cause::Ortam | Cause::Belirsiz));
         if let Some(builder_next) = verdict {
             for ((pane, eid), e) in g.entries.iter_mut() {
                 if eid == id
                     && verdict_panes.contains(&pane.as_str())
-                    && e.state == LifecycleState::AwaitingReview
+                    && (e.state == LifecycleState::AwaitingReview || (held && e.state.in_flight()))
                 {
                     *e = Entry::new(builder_next, now);
                 }
@@ -741,23 +951,21 @@ impl LifecycleStore {
                     meta.done_notes.push((source_agent.to_string(), note.to_string()));
                 }
             }
-            // A domain reviewer approved the fix of a task the TESTER
-            // rejected: the task stays open until the tester re-runs it.
-            TransitionKind::Approved
-                if verdict.is_some()
-                    && source_agent != TESTER
-                    && g.tasks.get(id).is_some_and(|m| m.needs_retest) =>
-            {
+            // A domain reviewer approved: the task stays open until the
+            // tester runs it — the first time (`test`) or again after a
+            // tester rejection (`retest`). A review alone closes nothing.
+            TransitionKind::Approved if verdict.is_some() && source_agent != TESTER => {
                 rec.retest = true;
+                rec.first_test = !g.tasks.get(id).is_some_and(|m| m.needs_retest);
                 rec.builder_note = g.tasks.get(id).and_then(TaskMeta::builder_note);
                 rec.others_in_flight = g
                     .entries
                     .iter()
                     .any(|(k, e)| k != &key && k.1 == id && e.state.in_flight());
             }
+            // The tester's pass closes the task. The orchestrator must
+            // hear what the fix changed, not only "tests pass".
             TransitionKind::Approved if verdict.is_some() => {
-                // A task closed after a tester rejection: the orchestrator
-                // must hear what the fix changed, not only "tests pass".
                 rec.builder_note = g
                     .tasks
                     .get(id)
@@ -767,19 +975,38 @@ impl LifecycleStore {
             }
             TransitionKind::ChangesNeeded if verdict.is_some() => {
                 let meta = g.tasks.entry(id.to_string()).or_default();
-                meta.rejections = meta.rejections.saturating_add(1);
-                if source_agent == TESTER {
-                    // A new fix round starts: its notes are what the
-                    // next retest is about.
-                    meta.needs_retest = true;
-                    meta.done_notes.clear();
-                }
                 rec.rejections = meta.rejections;
-                if meta.rejections > MAX_REWORK_ROUNDS {
-                    rec.limit_exceeded = true;
-                    g.close(id, Closure::Failed, now);
-                } else {
-                    meta.rework = Some(Entry::new(LifecycleState::Failed, now));
+                match cause {
+                    // Not the builder's to fix: hold the task for the user,
+                    // no round spent, no rework nag.
+                    Some(c @ (Cause::Izin | Cause::Ortam)) => {
+                        meta.blocked = Some(c);
+                        meta.rework = None;
+                        rec.blocked = Some(c);
+                    }
+                    // An unclear spec goes back to the planner; the
+                    // coordinator still owes the re-dispatch afterwards.
+                    Some(Cause::Belirsiz) => {
+                        meta.blocked = Some(Cause::Belirsiz);
+                        meta.rework = Some(Entry::new(LifecycleState::Failed, now));
+                        rec.blocked = Some(Cause::Belirsiz);
+                    }
+                    Some(Cause::Kod) | None => {
+                        meta.rejections = meta.rejections.saturating_add(1);
+                        if source_agent == TESTER {
+                            // A new fix round starts: its notes are what the
+                            // next retest is about.
+                            meta.needs_retest = true;
+                            meta.done_notes.clear();
+                        }
+                        rec.rejections = meta.rejections;
+                        if meta.rejections > MAX_REWORK_ROUNDS {
+                            rec.limit_exceeded = true;
+                            g.close(id, Closure::Failed, now);
+                        } else {
+                            meta.rework = Some(Entry::new(LifecycleState::Failed, now));
+                        }
+                    }
                 }
             }
             _ => {}
@@ -803,6 +1030,9 @@ impl LifecycleStore {
             return false;
         }
         meta.rework = None;
+        // A re-dispatch is how a held task goes on: the user (or the
+        // planner) acted, the coordinator sent it again.
+        meta.blocked = None;
         let key = (pane.to_string(), task_id.to_string());
         if g.entries.get(&key).is_some_and(|e| {
             matches!(e.state, LifecycleState::Building | LifecycleState::AwaitingReview)
@@ -894,6 +1124,48 @@ impl LifecycleStore {
         };
         g.close(task_id, Closure::Failed, now);
         outcome
+    }
+
+    /// An agent reported `hata — [izin|ortam] …` for `task_id`: the task
+    /// is not given up but HELD — its in-flight work on `closable_panes`
+    /// is settled, no stall clock runs, and the next dispatch of the id
+    /// (after the user fixed the cause) reopens it. The same ownership
+    /// rules as [`abandon`](Self::abandon): someone else's open task is
+    /// left alone ([`Abandon::Elsewhere`]).
+    pub fn block(&self, closable_panes: &[&str], task_id: &str, cause: Cause) -> Abandon {
+        let mut g = self.lock();
+        if let Some(closure) = g.tasks.get(task_id).and_then(|m| m.closed) {
+            return Abandon::AlreadyClosed(closure);
+        }
+        let in_flight = |own: bool| {
+            g.entries.iter().any(|((pane, id), e)| {
+                id == task_id
+                    && e.state.in_flight()
+                    && closable_panes.contains(&pane.as_str()) == own
+            })
+        };
+        let outcome = if in_flight(true) {
+            Abandon::Closed
+        } else if in_flight(false) {
+            return Abandon::Elsewhere;
+        } else {
+            Abandon::Untracked
+        };
+        let now = Instant::now();
+        for ((pane, id), e) in g.entries.iter_mut() {
+            if id == task_id && e.state.in_flight() && closable_panes.contains(&pane.as_str()) {
+                *e = Entry::new(LifecycleState::Failed, now);
+            }
+        }
+        let meta = g.tasks.entry(task_id.to_string()).or_default();
+        meta.blocked = Some(cause);
+        meta.rework = None;
+        outcome
+    }
+
+    /// Held for the user or the planner (see [`Cause`]).
+    pub fn is_blocked(&self, task_id: &str) -> bool {
+        self.lock().tasks.get(task_id).is_some_and(|m| m.blocked.is_some())
     }
 
     /// The coordinator reported `TASK_FAILED <id>` to the orchestrator:
@@ -1158,11 +1430,21 @@ pub fn followup_for_coordinator_inbound(
             if rec.others_in_flight {
                 return None;
             }
-            (TESTER, format!("{RETEST_PREFIX}{id}"))
+            let prefix = if rec.first_test { TEST_PREFIX } else { RETEST_PREFIX };
+            (TESTER, format!("{prefix}{id}"))
         }
         TransitionKind::Approved if is_reviewer(src_agent) => {
             ("orchestrator", format!("{TASK_DONE_PREFIX}{id}"))
         }
+        // An unclear spec is the planner's to fix; a held task (user's
+        // environment / permissions) fans out nowhere — the bridge's
+        // notice carries it.
+        TransitionKind::ChangesNeeded
+            if is_reviewer(src_agent) && rec.blocked == Some(Cause::Belirsiz) =>
+        {
+            ("planner", format!("{CLARIFY_PREFIX}{id}"))
+        }
+        TransitionKind::ChangesNeeded if rec.blocked.is_some() => return None,
         TransitionKind::ChangesNeeded if is_reviewer(src_agent) && rec.limit_exceeded => (
             "orchestrator",
             format!(
@@ -1202,6 +1484,201 @@ mod tests {
 
     fn fresh() -> Recorded {
         Recorded::plain(LifecycleState::Assigned)
+    }
+
+    // -- run evidence on DONE ---------------------------------------- //
+
+    #[test]
+    fn done_evidence_accepts_a_run_command_with_its_result() {
+        for note in [
+            "auth.rs: refresh eklendi; doğrulama: cargo test -p neuron auth → 12 geçti, exit 0",
+            "routes.ts değişti. doğrulama: npm --prefix storefront test: 116 passed",
+            "doğrulama: node backend/node_modules/typescript/bin/tsc -p backend --noEmit — hatasız (çıkış 0)",
+            "pnpm -C app lint ran clean, exit code 0",
+        ] {
+            assert_eq!(done_evidence(Some(note)), DoneEvidence::Ran, "{note}");
+        }
+    }
+
+    #[test]
+    fn done_evidence_accepts_an_explicit_decline_with_a_reason() {
+        assert_eq!(
+            done_evidence(Some("README güncellendi; doğrulama yok: projede test komutu yok")),
+            DoneEvidence::Declined
+        );
+        // A bare declaration with no reason is not a declaration.
+        assert_eq!(done_evidence(Some("doğrulama yok")), DoneEvidence::Missing);
+    }
+
+    #[test]
+    fn done_evidence_rejects_a_note_without_a_run() {
+        assert_eq!(done_evidence(None), DoneEvidence::Missing);
+        assert_eq!(done_evidence(Some("auth.rs: refresh eklendi")), DoneEvidence::Missing);
+        // Naming a command is not running it: no result follows.
+        assert_eq!(
+            done_evidence(Some("cargo test çalıştırmadım, zaman kalmadı")),
+            DoneEvidence::Missing
+        );
+    }
+
+    // -- cause tags ---------------------------------------------------- //
+
+    #[test]
+    fn cause_of_reads_a_leading_tag_in_any_spelling() {
+        assert_eq!(cause_of("[izin] npm install reddedildi"), Some(Cause::Izin));
+        assert_eq!(cause_of("(ortam) node_modules yok"), Some(Cause::Ortam));
+        assert_eq!(cause_of("belirsiz: kabul ölçütü verilmedi"), Some(Cause::Belirsiz));
+        assert_eq!(cause_of("KOD — test_refresh fails"), Some(Cause::Kod));
+        assert_eq!(cause_of("[permission] denied"), Some(Cause::Izin));
+        assert_eq!(cause_of("[env] missing node"), Some(Cause::Ortam));
+    }
+
+    #[test]
+    fn cause_of_ignores_a_tag_that_does_not_lead() {
+        assert_eq!(cause_of("auth.rs [izin] eksik"), None);
+        assert_eq!(cause_of("izinli kullanıcı testi fail"), None);
+        assert_eq!(cause_of(""), None);
+    }
+
+    #[test]
+    fn rework_evidence_needs_a_test_name_or_an_error_line() {
+        for note in [
+            "src/auth.rs:42 null deref on refresh",
+            "test_refresh fails: expected 200 got 401",
+            "account.ts(247,22): error TS7006",
+            "cargo test → 1 failed: tests::parses_done_token",
+        ] {
+            assert!(rework_evidence(note), "{note}");
+        }
+        for note in ["kod kötü, baştan yaz", "beğenmedim", ""] {
+            assert!(!rework_evidence(note), "{note:?}");
+        }
+    }
+
+    // -- the tester closes every task -------------------------------- //
+
+    #[test]
+    fn a_reviewers_approval_sends_the_task_to_the_tester_before_task_done() {
+        let s = LifecycleStore::new();
+        let t0 = Instant::now();
+        s.assign_at("p-builder", "T1", t0);
+        let done = Transition { kind: TransitionKind::Done, task_id: "T1".into() };
+        s.record_at("backend-builder", "p-builder", &done, &[], Some("auth.rs; doğrulama: cargo test ok"), t0);
+        let ok = Transition { kind: TransitionKind::Approved, task_id: "T1".into() };
+        let rec = rec_at(&s, "p-reviewer", &ok, t0);
+        assert!(rec.retest && rec.first_test, "{rec:?}");
+        assert_eq!(rec.builder_note.as_deref(), Some("auth.rs; doğrulama: cargo test ok"));
+        assert_eq!(
+            followup_for_coordinator_inbound("backend-reviewer", &ok, &rec),
+            Some(("integration-tester".into(), "test T1".into()))
+        );
+        assert_eq!(s.closure("T1"), None, "a review alone must not close the task");
+    }
+
+    #[test]
+    fn the_testers_approval_closes_the_task() {
+        let s = LifecycleStore::new();
+        let t0 = Instant::now();
+        s.assign_at("p-builder", "T1", t0);
+        let done = Transition { kind: TransitionKind::Done, task_id: "T1".into() };
+        s.record_at("backend-builder", "p-builder", &done, &[], None, t0);
+        let ok = Transition { kind: TransitionKind::Approved, task_id: "T1".into() };
+        rec_at(&s, "p-reviewer", &ok, t0);
+        let rec = rec_at(&s, "p-tester", &ok, t0);
+        assert!(!rec.retest, "{rec:?}");
+        assert_eq!(
+            followup_for_coordinator_inbound(TESTER, &ok, &rec),
+            Some(("orchestrator".into(), "TASK_DONE T1".into()))
+        );
+        assert_eq!(s.closure("T1"), Some(Closure::Done));
+    }
+
+    #[test]
+    fn a_fix_of_a_tester_rejection_is_retested_not_tested() {
+        let s = LifecycleStore::new();
+        let t0 = Instant::now();
+        s.assign_at("p-builder", "T1", t0);
+        let done = Transition { kind: TransitionKind::Done, task_id: "T1".into() };
+        let no = Transition { kind: TransitionKind::ChangesNeeded, task_id: "T1".into() };
+        let ok = Transition { kind: TransitionKind::Approved, task_id: "T1".into() };
+        s.record_at("backend-builder", "p-builder", &done, &[], None, t0);
+        rec_at(&s, "p-reviewer", &ok, t0);
+        s.record_with_cause("integration-tester", "p-tester", &no, &["p-builder", "p-bb"], Some("tests::x fails"), Some(Cause::Kod));
+        s.assign_at("p-builder", "T1", t0);
+        s.record_at("backend-builder", "p-builder", &done, &[], Some("fixed x"), t0);
+        let rec = rec_at(&s, "p-reviewer", &ok, t0);
+        assert!(rec.retest && !rec.first_test, "{rec:?}");
+        assert_eq!(
+            followup_for_coordinator_inbound("backend-reviewer", &ok, &rec),
+            Some(("integration-tester".into(), "retest T1".into()))
+        );
+    }
+
+    // -- rejections by cause ------------------------------------------- //
+
+    #[test]
+    fn an_environment_rejection_does_not_consume_a_rework_round() {
+        let s = LifecycleStore::new();
+        let t0 = Instant::now();
+        s.assign_at("p-builder", "T1", t0);
+        let no = Transition { kind: TransitionKind::ChangesNeeded, task_id: "T1".into() };
+        for _ in 0..3 {
+            let rec = s.record_with_cause("backend-reviewer", "p-reviewer", &no, &["p-builder"], Some("[ortam] node_modules yok"), Some(Cause::Ortam));
+            assert_eq!(rec.rejections, 0, "{rec:?}");
+            assert!(!rec.limit_exceeded);
+            assert_eq!(rec.blocked, Some(Cause::Ortam));
+            assert_eq!(followup_for_coordinator_inbound("backend-reviewer", &no, &rec), None);
+            s.assign_at("p-builder", "T1", t0);
+        }
+        assert_eq!(s.closure("T1"), None);
+        // The first real code rejection is round 1, not round 4.
+        let rec = s.record_with_cause("backend-reviewer", "p-reviewer", &no, &["p-builder"], Some("auth.rs:42 wrong"), Some(Cause::Kod));
+        assert_eq!(rec.rejections, 1);
+        assert_eq!(rec.blocked, None);
+    }
+
+    #[test]
+    fn a_blocked_task_is_reopened_by_the_next_dispatch() {
+        let s = LifecycleStore::new();
+        let t0 = Instant::now();
+        s.assign_at("p-builder", "T1", t0);
+        let no = Transition { kind: TransitionKind::ChangesNeeded, task_id: "T1".into() };
+        s.record_with_cause("backend-reviewer", "p-reviewer", &no, &["p-builder"], None, Some(Cause::Izin));
+        assert!(s.is_blocked("T1"));
+        // No rework nag while the user fixes it: the coordinator owes nothing yet.
+        assert!(s.take_stalls(t0 + Duration::from_secs(3600), Duration::from_secs(60), Duration::from_secs(60)).is_empty());
+        assert!(s.assign_at("p-builder", "T1", t0));
+        assert!(!s.is_blocked("T1"));
+        assert_eq!(s.state_of("p-builder", "T1"), Some(LifecycleState::Assigned));
+    }
+
+    #[test]
+    fn an_unclear_rejection_goes_back_to_the_planner_without_a_round() {
+        let s = LifecycleStore::new();
+        let t0 = Instant::now();
+        s.assign_at("p-builder", "T1", t0);
+        let no = Transition { kind: TransitionKind::ChangesNeeded, task_id: "T1".into() };
+        let rec = s.record_with_cause("backend-reviewer", "p-reviewer", &no, &["p-builder"], Some("belirsiz: kabul ölçütü yok"), Some(Cause::Belirsiz));
+        assert_eq!(rec.rejections, 0);
+        assert_eq!(
+            followup_for_coordinator_inbound("backend-reviewer", &no, &rec),
+            Some(("planner".into(), "netleştir T1".into()))
+        );
+        assert_eq!(s.closure("T1"), None);
+    }
+
+    #[test]
+    fn an_error_report_with_an_environment_cause_blocks_instead_of_closing() {
+        let s = LifecycleStore::new();
+        let t0 = Instant::now();
+        s.assign_at("p-builder", "T1", t0);
+        assert_eq!(s.block(&["p-builder"], "T1", Cause::Izin), Abandon::Closed);
+        assert_eq!(s.closure("T1"), None);
+        assert!(s.is_blocked("T1"));
+        // Someone else's open task is not this reporter's to block.
+        s.assign_at("p-fb", "T2", t0);
+        assert_eq!(s.block(&["p-builder"], "T2", Cause::Ortam), Abandon::Elsewhere);
+        assert!(!s.is_blocked("T2"));
     }
 
     #[test]
@@ -2026,6 +2503,8 @@ mod tests {
         s.assign_at("p-builder", "old-1", t0);
         rec_at(&s, "p-builder", &tr(TransitionKind::Done, "old-1"), t0);
         rec_at(&s, "p-reviewer", &tr(TransitionKind::Approved, "old-1"), t0);
+        // The tester's pass is what closes a task.
+        rec_at(&s, "p-tester", &tr(TransitionKind::Approved, "old-1"), t0);
         for n in 0..MAX_LIFECYCLE_ENTRIES + 10 {
             s.assign_at("p-x", &format!("t{n}"), t0);
         }
@@ -2097,9 +2576,12 @@ mod tests {
         // tester is not a builder.
         assert_eq!(s.dispatch_conflict("p-builder", "T3", &builders), None);
         assert_eq!(s.dispatch_conflict("p-tester", "T3", &builders), None);
-        // Closed ids are refused for everyone.
+        // Closed ids are refused for everyone — and only the tester's
+        // pass closes; after the review alone the id is still open.
         rec_at(&s, "p-builder", &tr(TransitionKind::Done, "T3"), t0);
         rec_at(&s, "p-reviewer", &tr(TransitionKind::Approved, "T3"), t0);
+        assert_eq!(s.dispatch_conflict("p-tester", "T3", &builders), None);
+        rec_at(&s, "p-tester", &tr(TransitionKind::Approved, "T3"), t0);
         assert!(s.dispatch_conflict("p-tester", "T3", &builders).unwrap().contains("TASK_DONE"));
     }
 

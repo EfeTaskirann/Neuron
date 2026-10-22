@@ -95,6 +95,8 @@ describe('backend lifecycle events', () => {
     expect(lifecyclePhase('AwaitingReview', 'Done')).toBe('review');
     expect(lifecyclePhase('Approved', 'Approved')).toBe('done');
     expect(lifecyclePhase('Failed', 'ChangesNeeded')).toBe('rework');
+    // Held for the user (a missing permission / install): not lost.
+    expect(lifecyclePhase('Failed', 'Blocked')).toBe('rework');
     expect(lifecyclePhase('Failed', 'TaskFailed')).toBe('failed');
     expect(lifecyclePhase('Failed', 'Abandoned')).toBe('failed');
     expect(lifecyclePhase('Nonsense', 'x')).toBeNull();

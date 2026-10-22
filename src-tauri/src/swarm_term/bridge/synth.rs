@@ -18,10 +18,11 @@ use crate::swarm_term::hierarchy::{
     builders_judged_by, is_allowed, is_builder, is_dispatcher, is_reviewer,
 };
 use crate::swarm_term::lifecycle::{
-    body_task_id, error_reason, followup_for_coordinator_inbound, is_error_report,
-    lifecycle_note, looks_like_unparsed_signal, parse_lifecycle_token_with_fallback,
-    task_failed_id, Abandon, Closure, LifecycleState, LifecycleStore, TransitionKind,
-    MAX_REWORK_ROUNDS, TASK_FAILED_PREFIX, TESTER,
+    body_task_id, cause_of, done_evidence, error_reason, followup_for_coordinator_inbound,
+    is_error_report, lifecycle_note, looks_like_unparsed_signal,
+    parse_lifecycle_token_with_fallback, rework_evidence, task_failed_id, Abandon, Cause, Closure,
+    DoneEvidence, LifecycleState, LifecycleStore, TransitionKind, MAX_REWORK_ROUNDS,
+    TASK_FAILED_PREFIX, TESTER,
 };
 
 use super::envelope::Envelope;
@@ -76,6 +77,37 @@ pub(super) fn lifecycle_synthesise<R: Runtime>(
     if let Some(id) = task_id.filter(|_| is_error_report(body)) {
         let mut closable = vec![source_pane.as_str()];
         closable.extend(&judged);
+        let why = error_reason(body);
+        // `hata — [izin] …` / `[ortam] …`: not the agent's failure but the
+        // user's environment. Hold the task for the user instead of
+        // failing it (live run: two tasks died on a missing install
+        // permission and the fix needed a new id each time).
+        if let Some(cause) = why.as_deref().and_then(cause_of).filter(|c| c.needs_user()) {
+            return match lifecycle.block(&closable, id, cause) {
+                Abandon::Closed | Abandon::Untracked => {
+                    tracing::info!(
+                        source = %from_agent,
+                        task_id = %id,
+                        cause = cause.tag(),
+                        "swarm-term bridge: task held for the user (hata with a cause)"
+                    );
+                    let owners = task_owners(lifecycle, panes_by_agent, id);
+                    emit_lifecycle(app, from_agent, &source_pane, id, "Blocked", LifecycleState::Failed, &owners);
+                    vec![held_notice(from_agent, id, cause, why.as_deref())]
+                }
+                Abandon::Elsewhere => vec![Notice::new(
+                    "coordinator",
+                    format!(
+                        "@{from_agent} `{id}` için `hata — [{}]` bildirdi ama görev başka bir \
+                         ajanda hâlâ açık; beklemeye alınmadı. Engel gerçekse kullanıcıya \
+                         söyle ve o ajanın da bildirmesini bekle.",
+                        cause.tag()
+                    ),
+                    "hata with a cause about a task open elsewhere",
+                )],
+                Abandon::AlreadyClosed(closure) => vec![closed_notice(from_agent, id, closure)],
+            };
+        }
         return match lifecycle.abandon(&closable, id) {
             Abandon::Closed | Abandon::Untracked => {
                 tracing::info!(
@@ -85,7 +117,7 @@ pub(super) fn lifecycle_synthesise<R: Runtime>(
                 );
                 let owners = task_owners(lifecycle, panes_by_agent, id);
                 emit_lifecycle(app, from_agent, &source_pane, id, "Abandoned", LifecycleState::Failed, &owners);
-                let why = error_reason(body).unwrap_or_else(|| "sebep belirtilmedi".into());
+                let why = why.unwrap_or_else(|| "sebep belirtilmedi".into());
                 enqueue_fanout(
                     app,
                     root,
@@ -132,7 +164,47 @@ pub(super) fn lifecycle_synthesise<R: Runtime>(
     // was rejected) — carried into the follow-up so it is not
     // context-free.
     let note = lifecycle_note(body, &id);
-    let rec = lifecycle.record(from_agent, &source_pane, &transition, &judged, note.as_deref());
+    // A builder's DONE must say what it ran: a review reads the code, a
+    // run proves it (live: eight tasks approved with no test ever run).
+    if transition.kind == TransitionKind::Done
+        && is_builder(from_agent)
+        && done_evidence(note.as_deref()) == DoneEvidence::Missing
+    {
+        tracing::info!(source = %from_agent, task_id = %id, "swarm-term bridge: DONE refused — no run evidence");
+        return vec![Notice::new(
+            from_agent,
+            format!(
+                "`DONE {id}` KABUL EDİLMEDİ: çalıştırma kanıtı yok, review başlamadı. Hangi \
+                 doğrulama komutunu koştun ve sonucu ne? Şöyle yeniden gönder: \
+                 `DONE {id} — <ne değişti>; doğrulama: <komut> → <sonuç, ör. 12 geçti, exit 0>`. \
+                 Hiçbir komut koşulamıyorsa `doğrulama yok: <neden>` yaz."
+            ),
+            "DONE without run evidence",
+        )];
+    }
+    // A rejection names its cause; a code rejection must point at
+    // something to fix (a failing test, an error line, file:line) or the
+    // builder spends a round guessing.
+    let cause = note.as_deref().and_then(cause_of);
+    if transition.kind == TransitionKind::ChangesNeeded
+        && is_reviewer(from_agent)
+        && matches!(cause, None | Some(Cause::Kod))
+        && !note.as_deref().is_some_and(rework_evidence)
+    {
+        tracing::info!(source = %from_agent, task_id = %id, "swarm-term bridge: CHANGES_NEEDED refused — no evidence");
+        return vec![Notice::new(
+            from_agent,
+            format!(
+                "`CHANGES_NEEDED {id}` KABUL EDİLMEDİ: kanıt yok, düzeltme başlamadı. Başarısız \
+                 testin adını, hata satırını ya da dosya:satır'ı yaz ve yeniden gönder: \
+                 `CHANGES_NEEDED {id} — <test/hata> — <ne değişmeli>`. Sorun kod değilse başa \
+                 etiket koy: `[izin]`, `[ortam]` (kullanıcıya gider, tur sayılmaz) ya da \
+                 `[belirsiz]` (planner'a gider)."
+            ),
+            "CHANGES_NEEDED without evidence",
+        )];
+    }
+    let rec = lifecycle.record_with_cause(from_agent, &source_pane, &transition, &judged, note.as_deref(), cause);
     tracing::info!(
         source = %from_agent,
         source_pane = %source_pane,
@@ -153,6 +225,8 @@ pub(super) fn lifecycle_synthesise<R: Runtime>(
     // instead of "failed".
     let transition_label = if rec.limit_exceeded {
         "Failed".to_string()
+    } else if rec.blocked.is_some() {
+        "Blocked".to_string()
     } else {
         format!("{:?}", transition.kind)
     };
@@ -166,6 +240,11 @@ pub(super) fn lifecycle_synthesise<R: Runtime>(
         &task_owners(lifecycle, panes_by_agent, &id),
     );
 
+    // Held for the user: nothing fans out; the coordinator learns what
+    // the user must fix and that no round was spent.
+    if let Some(cause) = rec.blocked.filter(|c| c.needs_user()) {
+        return vec![held_notice(from_agent, &id, cause, note.as_deref())];
+    }
     let Some((target, base)) = followup_for_coordinator_inbound(from_agent, &transition, &rec)
     else {
         return Vec::new();
@@ -201,8 +280,38 @@ pub(super) fn lifecycle_synthesise<R: Runtime>(
             ),
             "rework limit exceeded",
         )],
+        TransitionKind::ChangesNeeded if rec.blocked == Some(Cause::Belirsiz) => vec![Notice::new(
+            "coordinator",
+            format!(
+                "`{id}` @{from_agent} tarafından `belirsiz` diye geri çevrildi; düzeltme turu \
+                 SAYILMADI. Planner'a `netleştir {id}` iletildi: cevabıyla görevi netleşmiş \
+                 kabul ölçütüyle builder'a yeniden dispatch et (aynı task_id)."
+            ),
+            "unclear task sent to the planner",
+        )],
         _ => Vec::new(),
     }
+}
+
+/// The coordinator's notice for a task held for the user (`[izin]` /
+/// `[ortam]`): what blocks it, that no round was spent, and how it goes
+/// on (a re-dispatch of the same id once the user acted).
+fn held_notice(from_agent: &str, id: &str, cause: Cause, why: Option<&str>) -> Notice {
+    let what = match cause {
+        Cause::Izin => "bir izin",
+        _ => "ortam",
+    };
+    let why = why.unwrap_or("sebep belirtilmedi");
+    Notice::new(
+        "coordinator",
+        format!(
+            "`{id}` BEKLEMEDE: @{from_agent} {what} engeli bildirdi — {why}. Bu ajanın değil \
+             KULLANICININ çözeceği bir sorun; düzeltme turu sayılmadı, görev kapanmadı. \
+             Kullanıcıya ne gerektiğini tek cümleyle söyle; çözüldüğünü öğrenince AYNI \
+             task_id ile builder'a yeniden dispatch et."
+        ),
+        "task held for the user",
+    )
 }
 
 /// A dispatcher (orchestrator / coordinator) delivered a `task_id`-

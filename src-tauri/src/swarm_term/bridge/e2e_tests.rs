@@ -219,7 +219,7 @@ async fn bridge_end_to_end_with_fake_agents() {
         r#"{"from":"scout","to":"coordinator"}"#, None);
     // H3 + H7: decorated DONE with a note → review fanout carrying it.
     drop_raw(&root, "backend-builder", "04",
-        r#"{"from":"backend-builder","to":"coordinator","body":"**DONE** T4 — auth.rs: refresh eklendi","task_id":"T4"}"#, None);
+        r#"{"from":"backend-builder","to":"coordinator","body":"**DONE** T4 — auth.rs: refresh eklendi; cargo test ok","task_id":"T4"}"#, None);
     // H3: "tamam —" completion with a task_id → sender told it was ignored.
     drop_raw(&root, "frontend-builder", "05",
         r#"{"from":"frontend-builder","to":"coordinator","body":"tamam — login sayfasi bitti","task_id":"T5"}"#, None);
@@ -386,17 +386,22 @@ async fn lifecycle_failure_paths_with_fake_agents() {
     // ---- A: reviewer rejects → coordinator re-dispatches → re-review -- //
     send("orchestrator", "backend-builder", "build R1", Some("R1"));
     step!("A1 builder got the dispatch", log("backend-builder").contains("build R1"));
-    send("backend-builder", "coordinator", "DONE R1 - v1 auth.rs", Some("R1"));
+    send("backend-builder", "coordinator", "DONE R1 - v1 auth.rs; cargo test ok", Some("R1"));
     step!("A2 reviewer got review R1", count("backend-reviewer", "review R1") == 1);
-    send("backend-reviewer", "coordinator", "CHANGES_NEEDED R1 - add a test", Some("R1"));
+    send("backend-reviewer", "coordinator", "CHANGES_NEEDED R1 - no test covers parse(): add one", Some("R1"));
     step!("A3 coordinator got the rejection", log("coordinator").contains("CHANGES_NEEDED R1"));
     send("coordinator", "backend-builder", "R1 fix-round-1 add a test", Some("R1"));
     step!("A4 builder got the fix dispatch", log("backend-builder").contains("fix-round-1"));
-    send("backend-builder", "coordinator", "DONE R1 - v2 test added", Some("R1"));
+    send("backend-builder", "coordinator", "DONE R1 - v2 test added; cargo test passed", Some("R1"));
     step!("A5 reviewer re-reviews the fix", count("backend-reviewer", "review R1") == 2
         && log("backend-reviewer").contains("v2 test added"));
     send("backend-reviewer", "coordinator", "APPROVED R1", Some("R1"));
-    step!("A6 orchestrator got TASK_DONE R1", log("orchestrator").contains("TASK_DONE R1"));
+    // A review alone closes nothing: the tester runs it first.
+    step!("A6 tester got test R1 with the builder's note",
+        log("integration-tester").contains("test R1") && log("integration-tester").contains("v2 test added"));
+    step!("A7 no TASK_DONE before the tester passes", !log("orchestrator").contains("TASK_DONE R1"));
+    send("integration-tester", "coordinator", "APPROVED R1 - cargo test: 40 passed", Some("R1"));
+    step!("A8 orchestrator got TASK_DONE R1", log("orchestrator").contains("TASK_DONE R1"));
 
     // ---- B: tester FAIL → fix → review → RETEST by the tester -------- //
     send("orchestrator", "integration-tester", "smoke S1 run cargo test", Some("S1"));
@@ -406,7 +411,7 @@ async fn lifecycle_failure_paths_with_fake_agents() {
     step!("B2 coordinator got the test failure", log("coordinator").contains("CHANGES_NEEDED S1"));
     send("coordinator", "backend-builder", "S1 fix test_parse", Some("S1"));
     step!("B3 builder got the fix dispatch", log("backend-builder").contains("S1 fix test_parse"));
-    send("backend-builder", "coordinator", "DONE S1 - parse.rs fixed", Some("S1"));
+    send("backend-builder", "coordinator", "DONE S1 - parse.rs fixed; cargo test passed", Some("S1"));
     step!("B4 the fix is reviewed first", log("backend-reviewer").contains("review S1"));
     step!("B5 no retest before the review", !log("integration-tester").contains("retest S1"));
     send("backend-reviewer", "coordinator", "APPROVED S1 - looks right", Some("S1"));
@@ -434,9 +439,9 @@ async fn lifecycle_failure_paths_with_fake_agents() {
     send("orchestrator", "backend-builder", "build L1", Some("L1"));
     step!("D0 builder got L1", log("backend-builder").contains("build L1"));
     for round in 1..=3usize {
-        send("backend-builder", "coordinator", &format!("DONE L1 - attempt {round}"), Some("L1"));
+        send("backend-builder", "coordinator", &format!("DONE L1 - attempt {round}; npm test passed"), Some("L1"));
         step!(format!("D{round} review L1 #{round}"), count("backend-reviewer", "review L1") == round);
-        send("backend-reviewer", "coordinator", &format!("CHANGES_NEEDED L1 - still wrong {round}"), Some("L1"));
+        send("backend-reviewer", "coordinator", &format!("CHANGES_NEEDED L1 - test_x fails, attempt {round} still wrong"), Some("L1"));
         step!(format!("D{round} rejection #{round} delivered"), count("coordinator", "CHANGES_NEEDED L1") == round);
         if round < 3 {
             send("coordinator", "backend-builder", &format!("L1 rework {round}"), Some("L1"));
@@ -457,9 +462,35 @@ async fn lifecycle_failure_paths_with_fake_agents() {
     // ---- F: misaddressed DONE still starts the review ----------------- //
     send("orchestrator", "frontend-builder", "build F1", Some("F1"));
     step!("F1 builder got F1", log("frontend-builder").contains("build F1"));
-    send("frontend-builder", "orchestrator", "DONE F1 - Login.tsx", Some("F1"));
+    send("frontend-builder", "orchestrator", "DONE F1 - Login.tsx; pnpm test passed", Some("F1"));
     step!("F2 DONE sent to the orchestrator still reached the reviewer",
         log("frontend-reviewer").contains("review F1"));
+
+    // ---- I: a DONE without run evidence is refused, not reviewed ----- //
+    send("orchestrator", "backend-builder", "build V1", Some("V1"));
+    step!("I0 builder got V1", log("backend-builder").contains("build V1"));
+    send("backend-builder", "coordinator", "DONE V1 - auth.rs changed", Some("V1"));
+    step!("I1 the builder is told its DONE was refused",
+        log("backend-builder").contains("KABUL EDİLMEDİ") && !log("backend-reviewer").contains("review V1"));
+    send("backend-builder", "coordinator", "DONE V1 - auth.rs changed; doğrulama: cargo test → 3 geçti, exit 0", Some("V1"));
+    step!("I2 the review starts once the evidence is there", log("backend-reviewer").contains("review V1"));
+
+    // ---- J: a hata with a cause holds the task for the user ----------- //
+    send("orchestrator", "frontend-builder", "build P1", Some("P1"));
+    step!("J0 builder got P1", log("frontend-builder").contains("build P1"));
+    send("frontend-builder", "coordinator", "hata - [izin] npm install denied", Some("P1"));
+    step!("J1 coordinator told the task is held for the user", log("coordinator").contains("BEKLEMEDE"));
+    step!("J2 no TASK_FAILED for a held task", !log("orchestrator").contains("TASK_FAILED P1"));
+    send("coordinator", "frontend-builder", "P1 again, install is fixed", Some("P1"));
+    step!("J3 a held id can be dispatched again", log("frontend-builder").contains("P1 again"));
+
+    // ---- K: a code rejection without evidence is refused -------------- //
+    send("orchestrator", "backend-builder", "build K1", Some("K1"));
+    step!("K0 builder got K1", log("backend-builder").contains("build K1"));
+    send("backend-builder", "coordinator", "DONE K1 - k.rs; cargo test passed", Some("K1"));
+    step!("K1 reviewer got review K1", log("backend-reviewer").contains("review K1"));
+    send("backend-reviewer", "coordinator", "CHANGES_NEEDED K1 - rewrite it, I dislike it", Some("K1"));
+    step!("K2 the reviewer is told its rejection was refused", log("backend-reviewer").contains("KABUL EDİLMEDİ"));
 
     // ---- H: a task_id only in the body is still tracked; its hata fails it //
     send("orchestrator", "backend-builder", "build H2 now. task_id=H2. Report DONE H2", None);

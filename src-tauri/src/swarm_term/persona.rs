@@ -248,7 +248,11 @@ pub(crate) fn build_persona_prompt(
             `task_id`'li bir görevse envelope'un `task_id` alanını doldurup\n\
             coordinator'a yolla — backend görevi kapatır ve orchestrator'a\n\
             `TASK_FAILED <task_id>` bildirir. Netleştirilebilecek bir sorunsa `hata`\n\
-            değil `belirsiz` yaz; `hata` \"bu görevden vazgeçtim\" demektir.\n\n\
+            değil `belirsiz` yaz; `hata` \"bu görevden vazgeçtim\" demektir.\n\
+            **İstisna — sorun senin değil ortamın / izinlerinse** başa etiket koy:\n\
+            `hata — [izin] <reddedilen komut>` ya da `hata — [ortam] <eksik olan>`.\n\
+            Böyle bir `hata` görevi KAPATMAZ: backend görevi kullanıcı için beklemeye\n\
+            alır, kullanıcı çözünce coordinator aynı task_id ile yeniden dispatch eder.\n\n\
          **Gönderen tarafsan, ALDIĞIN state'e göre:**\n\
          - `alındı —` → SUS. Specialist çalışıyor; ikinci dispatch atma, polling yapma.\n\
          - `tamam —` → completion'ı kabul et, bir sonraki faza geç.\n\
@@ -265,18 +269,31 @@ pub(crate) fn build_persona_prompt(
          otomatik `review <id>` dispatch).\n\n\
          Token body'nin EN BAŞINDA, BÜYÜK harfle, markdown süsü (`**`, `:`) olmadan\n\
          yazılır; ardından bir boşluk ve task_id gelir.\n\n\
-         - **Builder ise** iş bitince: `body: \"DONE <task_id> — <ne değişti, hangi dosyalar>\"`.\n\
-           `—` sonrasındaki not reviewer'a (ya da yeniden test için tester'a) otomatik\n\
-           iletilir; neye bakılacağı oradan öğrenilir, o yüzden dosya yollarını yaz.\n\
+         - **Builder ise** iş bitince: `body: \"DONE <task_id> — <ne değişti, hangi dosyalar>;\n\
+           doğrulama: <koştuğun komut> → <sonucu>\"` (ör. `doğrulama: cargo test → 12 geçti,\n\
+           exit 0`). ÇALIŞTIRMA KANITI ŞART: komut ve sonucu yazılmamış bir `DONE` kabul\n\
+           edilmez, review başlamaz; sana `[Neuron]` notu gelir. Hiçbir komut\n\
+           koşamıyorsan `doğrulama yok: <neden>` yaz. `—` sonrasındaki not reviewer'a ve\n\
+           tester'a otomatik iletilir; neye bakılacağı oradan öğrenilir, o yüzden dosya\n\
+           yollarını yaz.\n\
          - **Builder ise** çalışmaya başladığını duyurmak istiyorsan (opsiyonel):\n\
            `body: \"BUILDING <task_id>\"`.\n\
-         - **Reviewer / integration-tester ise** onay (test PASS) verince:\n\
-           `body: \"APPROVED <task_id>\"`.\n\
-         - **Reviewer / integration-tester ise** değişiklik gerekiyorsa (test FAIL):\n\
-           `body: \"CHANGES_NEEDED <task_id> — <ne değişmeli: dosya, sebep, hangi builder>\"`.\n\
-           Düzeltmeyi coordinator dispatch eder; builder'a ayrıca yazma.\n\n\
-         Bir görev en fazla {max_rework} düzeltme turu alır: {max_rework_plus}. `CHANGES_NEEDED`'de\n\
-         backend görevi kapatır ve orchestrator'a `TASK_FAILED <task_id>` bildirir.\n\
+         - **Reviewer ise** onay verince: `body: \"APPROVED <task_id>\"`. Bu görevi\n\
+           KAPATMAZ: backend tester'a `test <task_id> — <builder notu>` düşürür; bir görev\n\
+           ancak tester'ın koşan testiyle kapanır.\n\
+         - **integration-tester ise** PASS verince: `body: \"APPROVED <task_id> — <komut>:\n\
+           <sonuç>\"`. Görevi bu kapatır (orchestrator'a `TASK_DONE <task_id>` gider).\n\
+         - **Reviewer / integration-tester ise** değişiklik gerekiyorsa:\n\
+           `body: \"CHANGES_NEEDED <task_id> — [neden] <kanıt> — <ne değişmeli, hangi builder>\"`.\n\
+           Neden etiketi: `[kod]` (varsayılan: builder'ın hatası; KANIT ŞART — başarısız\n\
+           testin adı, hata satırı ya da dosya:satır; kanıtsız ret kabul edilmez),\n\
+           `[izin]` ya da `[ortam]` (kullanıcının çözeceği sorun: görev beklemeye alınır,\n\
+           düzeltme turu SAYILMAZ), `[belirsiz]` (kabul ölçütü belli değil: planner'a\n\
+           gider, tur sayılmaz). Düzeltmeyi coordinator dispatch eder; builder'a ayrıca\n\
+           yazma.\n\n\
+         Bir görev en fazla {max_rework} düzeltme turu alır (`[kod]` nedenli): {max_rework_plus}.\n\
+         `CHANGES_NEEDED`'de backend görevi kapatır ve orchestrator'a `TASK_FAILED <task_id>`\n\
+         bildirir. `[izin]` / `[ortam]` / `[belirsiz]` retleri bu sayıya girmez.\n\
          Kapanmış (`TASK_DONE` / `TASK_FAILED`) bir task_id tekrar kullanılamaz.\n\n\
          ### İlk yanıt\n\n\
          Oturumun ilk mesajı `{kickoff}` ile başlar. O mesaja **yalnızca** şunu yaz\n\
@@ -387,6 +404,21 @@ mod tests {
         let p = build_persona_prompt("integration-tester", "x", &dummy_bridge_root(), &f, AGENT_IDS);
         let line = p.lines().find(|l| l.starts_with("- Doğrulama komutları:")).expect("commands line");
         assert!(line.contains("`node web/node_modules/typescript/bin/tsc -p web --noEmit`"), "{line}");
+    }
+
+    #[test]
+    fn the_footer_teaches_run_evidence_and_cause_tags() {
+        // The bridge refuses a DONE without run evidence and a code
+        // rejection without a test / error line, and holds a task on
+        // `[izin]` / `[ortam]`: the agents must learn it here, not from
+        // the refusal.
+        let p = build_persona_prompt("backend-builder", "x", &dummy_bridge_root(), &facts(), AGENT_IDS);
+        assert!(p.contains("doğrulama: <koştuğun komut> → <sonucu>"), "{p}");
+        assert!(p.contains("`doğrulama yok: <neden>`"));
+        assert!(p.contains("`test <task_id> — <builder notu>`"));
+        assert!(p.contains("`[izin]`") && p.contains("`[ortam]`") && p.contains("`[belirsiz]`"));
+        assert!(p.contains("`hata — [izin] <reddedilen komut>`"));
+        assert!(p.contains("KANIT ŞART"));
     }
 
     #[test]

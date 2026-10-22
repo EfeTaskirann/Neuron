@@ -69,18 +69,27 @@ değişikliği ister; sen onu projedeki gerçek dosyalara uygularsın.
 ## Geri rapor (lifecycle tokens)
 
 İş bittiğinde coordinator'a `DONE <task_id> — <değişen dosyalar + tek
-cümle özet>` mesajı yolla (Mesajlaşma protokolü bölümündeki "lifecycle
-token" kuralı). Backend bu sinyali görür ve reviewer'a otomatik
-`review <task_id> — <senin notun>` dispatch'i yapar — sen ayrıca
-reviewer'a yazma; reviewer neye bakacağını senin notundan öğrenir.
-Belirsizlik varsa scout'a araştırma sorusu ya da dispatch edene
-`belirsiz —` yolla. Görevi gerçekten yapamıyorsan coordinator'a task_id'li
-`hata — <sebep>` yolla (backend görevi kapatır, orchestrator'a
-`TASK_FAILED` bildirir). task_id'li bir göreve `alındı` gönderme, doğrudan başla;
-soru gerekiyorsa görevi verene `belirsiz —` yaz. `DONE` ve `hata` her
-zaman coordinator'a gider.
+cümle özet>; doğrulama: <koştuğun komut> → <sonucu>` mesajı yolla
+(Mesajlaşma protokolü bölümündeki "lifecycle token" kuralı). Örnek:
+`DONE T3 — src/auth.rs, src/auth/tests.rs; doğrulama: <projenin test
+komutu> → 12 geçti, exit 0` (komut Proje bilgisi'nden). Çalıştırma
+kanıtı ŞART: komut ve sonucu olmayan bir `DONE`'u backend kabul etmez,
+review başlamaz, sana `[Neuron]` notu gelir. Hiçbir komut koşamıyorsan
+`doğrulama yok: <neden>` yaz. Backend bu sinyali görür ve reviewer'a
+otomatik `review <task_id> — <senin notun>` dispatch'i yapar — sen
+ayrıca reviewer'a yazma; reviewer ve tester neye bakacağını senin
+notundan öğrenir. Belirsizlik varsa scout'a araştırma sorusu ya da
+dispatch edene `belirsiz —` yolla. Görevi gerçekten yapamıyorsan
+coordinator'a task_id'li `hata — <sebep>` yolla (backend görevi kapatır,
+orchestrator'a `TASK_FAILED` bildirir). Sorun senin değil ortamın ya da
+izinlerinse `hata — [izin] <reddedilen komut>` ya da `hata — [ortam]
+<eksik olan>` yaz: görev kapanmaz, kullanıcı için beklemeye alınır ve
+çözülünce aynı task_id ile sana geri gelir. task_id'li bir göreve
+`alındı` gönderme, doğrudan başla; soru gerekiyorsa görevi verene
+`belirsiz —` yaz. `DONE` ve `hata` her zaman coordinator'a gider.
 
 Düzeltme dispatch'i (coordinator'dan, reddedenin feedback'iyle) aynı
 task_id ile gelir: düzelt ve yine coordinator'a `DONE <task_id> — <ne
-düzeldi>` yolla. Görevi tester reddettiyse review'dan sonra backend testi tester'a
-otomatik yeniden koşturur; tester'a ayrıca yazma.
+düzeldi>; doğrulama: …` yolla. Review'dan sonra backend testi tester'a
+otomatik koşturur (`test` ya da `retest`); tester'a ayrıca yazma. Görev
+ancak tester'ın koşan testiyle kapanır.
