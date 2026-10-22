@@ -1521,6 +1521,11 @@ impl LifecycleStore {
         open
     }
 
+    /// The dispatch excerpt kept for `task_id` (see [`OpenTask`]).
+    pub fn dispatch_of(&self, task_id: &str) -> Option<String> {
+        self.lock().tasks.get(task_id).and_then(|m| m.dispatch.clone())
+    }
+
     /// What the coordinator still owes on open tasks, `(id, what)`
     /// sorted by id: a rework dispatch after a `[kod]` rejection, a
     /// re-dispatch of a task held for the user, or the planner's
@@ -1802,6 +1807,8 @@ mod tests {
         // (awaiting review); the tester's pass ends it.
         s.assign_at("p-builder", "T1", t0);
         assert!(s.open_tasks_of("p-builder")[0].dispatch.is_some());
+        assert!(s.dispatch_of("T1").is_some_and(|d| d.starts_with("build T1 — auth.rs")));
+        assert_eq!(s.dispatch_of("nope"), None);
         s.record_at("backend-builder", "p-builder", &tr(TransitionKind::Done, "T1"), &[], None, t0);
         assert_eq!(s.open_tasks_of("p-builder")[0].state, LifecycleState::AwaitingReview);
         rec_at(&s, "p-reviewer", &tr(TransitionKind::Approved, "T1"), t0);

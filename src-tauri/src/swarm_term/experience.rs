@@ -60,7 +60,7 @@ impl Kind {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Card {
-    /// `YYYY-MM-DD` (UTC) of the newest time it was recorded.
+    /// `YYYY-MM-DD` (local) of the newest time it was recorded.
     pub date: String,
     pub kind: Kind,
     /// One line, at most [`MAX_CARD_CHARS`] characters.
@@ -157,13 +157,12 @@ fn render(cards: &[Card]) -> String {
 
 /// One line of at most [`MAX_CARD_CHARS`] characters.
 fn one_line(text: &str) -> String {
-    let joined = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if joined.chars().count() <= MAX_CARD_CHARS {
-        return joined;
-    }
-    let mut cut: String = joined.chars().take(MAX_CARD_CHARS).collect();
-    cut.push('…');
-    cut
+    cut(&collapse(text), MAX_CARD_CHARS)
+}
+
+/// One line: every run of whitespace (newlines included) becomes a space.
+fn collapse(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// The cards as the persona lists them: `✓ 2026-10-22 T4 — cargo test → ok`.
@@ -171,26 +170,97 @@ pub fn lines_for_persona(cards: &[Card]) -> Vec<String> {
     cards.iter().map(|c| format!("{} {} {}", c.kind.mark(), c.date, c.text)).collect()
 }
 
-/// `YYYY-MM-DD` of a unix time, UTC (Hinnant's days-to-civil).
-pub(crate) fn civil_date(secs: u64) -> String {
-    let z = (secs / 86_400) as i64 + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = yoe + era * 400 + i64::from(month <= 2);
-    format!("{year:04}-{month:02}-{day:02}")
+/// The card for a task the tester passed: what the task was (the
+/// dispatch's first sentence) and the commands that proved it, so the
+/// next session reads "this kind of work, proved by this command" —
+/// not a task id and a paragraph of test counts.
+pub fn passed_card(id: &str, dispatch: Option<&str>, note: Option<&str>) -> String {
+    const HEAD_CHARS: usize = 90;
+    let head = dispatch
+        .map(|d| task_head(id, d, HEAD_CHARS))
+        .filter(|h| !h.is_empty())
+        .or_else(|| note.map(|n| cut(&collapse(n), HEAD_CHARS)))
+        .filter(|h| !h.is_empty());
+    let commands = note.map(commands_in).unwrap_or_default();
+    match (head, commands.is_empty(), note) {
+        (None, true, _) => format!("{id}: tester geçirdi"),
+        (None, false, _) => format!("{id}: doğrulama: {}", commands.join("; ")),
+        // The dispatch names the task and the note has no command: the
+        // note itself is what proved it ("5/5 PASS").
+        (Some(h), true, Some(n)) if dispatch.is_some() => {
+            format!("{id}: {h} · doğrulama: {}", cut(&collapse(n), HEAD_CHARS))
+        }
+        (Some(h), true, _) => format!("{id}: {h}"),
+        (Some(h), false, _) => format!("{id}: {h} · doğrulama: {}", commands.join("; ")),
+    }
 }
 
+/// The dispatch's first sentence, without the leading `<kind> <id> —`.
+fn task_head(id: &str, dispatch: &str, max: usize) -> String {
+    let line = collapse(dispatch);
+    let mut rest = line.as_str();
+    if let Some(pos) = rest.find(id) {
+        let after = &rest[pos + id.len()..];
+        let whole_word = after.chars().next().map_or(true, |c| !c.is_alphanumeric());
+        if pos <= 24 && whole_word {
+            rest = after;
+        }
+    }
+    let rest = rest.trim_start_matches(|c: char| c.is_whitespace() || matches!(c, '—' | '–' | '-' | ':'));
+    let head = match rest.find(". ") {
+        Some(i) if rest[..=i].chars().count() <= max => &rest[..=i],
+        _ => rest,
+    };
+    cut(head, max)
+}
+
+/// Words that start a command in a tester's note.
+const RUNNERS: &[&str] =
+    &["npm", "pnpm", "yarn", "npx", "node", "cargo", "pytest", "python", "go", "make", "dotnet", "mvn", "gradle"];
+
+/// Where a command ends and its result begins, in a tester's note.
+const RESULT_STARTS: &[&str] = &[": ", " →", " (", " geçti", " passed", ", ", " = ", " exit", " ok"];
+
+/// The commands a tester's note names (up to two, without their results).
+fn commands_in(note: &str) -> Vec<String> {
+    let line = collapse(note);
+    let mut out: Vec<String> = Vec::new();
+    for segment in line.split(';') {
+        let seg = segment.trim();
+        let words: Vec<&str> = seg.split(' ').collect();
+        let Some(start) = words.iter().position(|w| {
+            RUNNERS.contains(&w.trim_matches(|c: char| !c.is_alphanumeric()))
+        }) else {
+            continue;
+        };
+        let offset: usize = words[..start].iter().map(|w| w.len() + 1).sum();
+        let from = &seg[offset..];
+        let end = RESULT_STARTS.iter().filter_map(|m| from.find(m)).min().unwrap_or(from.len());
+        let cmd = from[..end].trim().trim_end_matches([':', '.']).to_string();
+        if !cmd.is_empty() && !out.contains(&cmd) {
+            out.push(cmd);
+        }
+        if out.len() == 2 {
+            break;
+        }
+    }
+    out
+}
+
+/// At most `max` characters, `…` when cut.
+fn cut(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut c: String = s.chars().take(max).collect();
+    c.push('…');
+    c
+}
+
+/// Today's date where the user is (`YYYY-MM-DD`), the date they see in
+/// the file next to the swarm's own notes.
 fn today() -> String {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    civil_date(secs)
+    chrono::Local::now().format("%Y-%m-%d").to_string()
 }
 
 #[cfg(test)]
@@ -257,10 +327,30 @@ mod tests {
     }
 
     #[test]
+    fn a_passed_card_says_what_the_task_was_and_what_proved_it() {
+        let dispatch = "p4-1 — İadede sadakat puanını geri al.\n\nDosyalar: backend/src/subscribers/loyalty.ts (1-85), backend/src/modules/loyalty/points.ts";
+        let note = "npm --prefix backend run test:unit: 48 suite / 389 test geçti, 0 fail (loyalty-return.unit.spec.ts PASS), exit 0; node backend/node_modules/typescript/bin/tsc -p backend --noEmit → 0 hata";
+        assert_eq!(
+            passed_card("p4-1", Some(dispatch), Some(note)),
+            "p4-1: İadede sadakat puanını geri al. · doğrulama: npm --prefix backend run test:unit; node backend/node_modules/typescript/bin/tsc -p backend --noEmit"
+        );
+        // No dispatch on record: the note's head stands in for the task.
+        assert_eq!(passed_card("S1", None, Some("cargo test: 40 passed")), "S1: cargo test: 40 passed · doğrulama: cargo test");
+        // A dispatch that names the kind before the id, and a note without a command.
+        assert_eq!(passed_card("R1", Some("build R1 — parse.rs fixed"), Some("5/5 PASS")), "R1: parse.rs fixed · doğrulama: 5/5 PASS");
+        // Nothing at all.
+        assert_eq!(passed_card("S2", None, None), "S2: tester geçirdi");
+        // A long dispatch is cut.
+        let long = format!("T9 — {}", "a".repeat(200));
+        let c = passed_card("T9", Some(&long), None);
+        assert!(c.starts_with("T9: aaaa") && c.ends_with('…') && c.chars().count() <= 100, "{c}");
+    }
+
+    #[test]
     fn persona_lines_and_dates() {
-        assert_eq!(civil_date(0), "1970-01-01");
-        assert_eq!(civil_date(951_782_400), "2000-02-29");
-        assert_eq!(civil_date(1_792_627_200), "2026-10-22");
+        let t = today();
+        assert_eq!(t.len(), 10, "{t}");
+        assert!(t.chars().all(|c| c.is_ascii_digit() || c == '-'), "{t}");
         let cards = [
             Card { date: "2026-10-22".into(), kind: Kind::Passed, text: "T4 — cargo test → ok".into() },
             Card { date: "2026-10-23".into(), kind: Kind::Broken, text: "başlangıçta kırık: cargo check (exit 101)".into() },

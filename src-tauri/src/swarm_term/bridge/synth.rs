@@ -273,7 +273,7 @@ pub(super) fn lifecycle_synthesise<R: Runtime>(
         experience::record_for_session(
             root,
             experience::Kind::Passed,
-            &format!("{id} — {}", note.as_deref().unwrap_or("tester geçirdi")),
+            &experience::passed_card(&id, lifecycle.dispatch_of(&id).as_deref(), note.as_deref()),
         );
     }
     // Held for the user: nothing fans out; the coordinator learns what

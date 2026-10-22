@@ -361,6 +361,11 @@ pub(crate) fn allowed_tools(agent_id: &str, session_id: &str, facts: &ProjectFac
         }
     }
     if matches!(role, Role::Verify | Role::Build) {
+        // `echo`: the agents chain `; echo EXIT=$?` onto a verification
+        // command to quote its exit code, and claude checks every command
+        // of a chain — six denials in one live run. Writes go through
+        // claude's own redirect check, which the project boundary covers.
+        rules.push("Bash(echo:*)".to_string());
         // claude has a separate PowerShell tool on Windows; the same
         // commands must be reachable through it, with the same limits.
         for c in verify_commands(&facts.commands) {
@@ -429,7 +434,11 @@ pub(crate) fn describe_for_persona(agent_id: &str, facts: &ProjectFacts) -> Stri
                yolu, profil, dış proje ve program seçenekleri de reddedilir (`--target-dir`, \
                `--manifest-path`, `--outDir`, `--outputFile`, `--junitxml`, `-o`, \
                `-coverprofile`, `-exec`, `--config`, `--dir`, `--root` …): komutu çıktısını \
-               proje dışına yazacak ya da başka bir projeyi okuyacak biçimde çağırma.";
+               proje dışına yazacak ya da başka bir projeyi okuyacak biçimde çağırma. İçinde \
+               `$?`, `${PIPESTATUS[0]}` gibi bir kabuk değişkeni geçen komut, izinli olsa da \
+               reddedilir: çıkış kodunu yazdırmaya çalışma — araç sıfır dışı çıkış kodunu zaten \
+               gösterir, çıktı geldiyse komut geçmiştir. Sade `echo` serbest; zincirlediğin \
+               (`;`, `&&`, `|`) her komut tek tek izinli olmalı, yoksa satırın tamamı reddedilir.";
     match role_of(agent_id) {
         Role::Coordinate => {
             let mut text = format!(
@@ -774,6 +783,24 @@ mod tests {
             }
             let text = describe_for_persona(agent, &facts);
             assert!(text.contains("--target-dir") && text.contains("`-o`"), "{agent}: {text}");
+        }
+    }
+
+    #[test]
+    fn shell_roles_may_echo_but_are_told_not_to_expand_variables() {
+        // Live run 2026-10-23: six verification commands were denied whole
+        // because the agent chained `; echo EXIT=$?` onto them. claude
+        // checks every command of a chain (`echo` was not allowed) and
+        // refuses any command with a shell variable whatever the rules say
+        // (live probe) — so `echo` is allowed and the persona says no `$?`.
+        for &agent in AGENT_IDS {
+            let allowed = allowed_tools(agent, "s", &none());
+            let echoes = allowed.contains(&"Bash(echo:*)".to_string());
+            assert_eq!(echoes, role_of(agent) != Role::Coordinate, "{agent}");
+            if echoes {
+                let text = describe_for_persona(agent, &none());
+                assert!(text.contains("`echo`") && text.contains("`$?`"), "{agent}: {text}");
+            }
         }
     }
 

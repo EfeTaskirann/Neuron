@@ -233,6 +233,28 @@ fn a_shell_redirect_cannot_write_outside_the_project() {
 
 #[test]
 #[ignore = "live: runs the real claude CLI and spends quota"]
+fn a_chained_echo_passes_with_the_allowed_command() {
+    // Live run 2026-10-23: `<verify command>; echo EXIT=$?` was denied
+    // whole, six times, until the agents dropped the echo. A plain echo
+    // in the chain is allowed now (the `$?` is what claude refuses — see
+    // the next probe).
+    let p = Project::new();
+    let s = attempt(&p, BUILDER, "Bash", "Use the Bash tool to run exactly: git status; echo done");
+    assert!(!s.contains("has been denied"), "{s}");
+}
+
+#[test]
+#[ignore = "live: runs the real claude CLI and spends quota"]
+fn a_shell_variable_in_a_command_is_refused_whatever_the_rules_say() {
+    // Pins what the persona teaches: `$?` in a command gets it denied even
+    // when every command in the chain is allowed.
+    let p = Project::new();
+    let s = attempt(&p, BUILDER, "Bash", "Use the Bash tool to run exactly: git status; echo EXIT=$?");
+    assert!(s.contains("has been denied"), "{s}");
+}
+
+#[test]
+#[ignore = "live: runs the real claude CLI and spends quota"]
 fn cargo_test_still_runs_inside_the_project() {
     // The control for the option denials: the plain command is allowed
     // and its test ran (it writes a mark into the project).
