@@ -134,6 +134,20 @@ impl LifecycleState {
     }
 }
 
+/// A task open on a pane, as the re-pin after a compaction names it
+/// (see `repin`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenTask {
+    pub id: String,
+    pub state: LifecycleState,
+    /// The dispatch that gave it, shortened to [`DISPATCH_EXCERPT_CHARS`]
+    /// — what a compaction's summary most often loses.
+    pub dispatch: Option<String>,
+}
+
+/// How much of a dispatch the store keeps for the re-pin.
+pub const DISPATCH_EXCERPT_CHARS: usize = 240;
+
 /// How a task ended. Once set, no further fanout happens for the id and
 /// new dispatches carrying it are refused (ids are single-use).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -584,6 +598,17 @@ pub fn error_reason(body: &str) -> Option<String> {
     (!reason.is_empty()).then(|| cap_note(reason))
 }
 
+/// One line of a dispatch, at most [`DISPATCH_EXCERPT_CHARS`] chars.
+fn dispatch_excerpt(body: &str) -> String {
+    let one_line = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    if one_line.chars().count() <= DISPATCH_EXCERPT_CHARS {
+        return one_line;
+    }
+    let mut cut: String = one_line.chars().take(DISPATCH_EXCERPT_CHARS).collect();
+    cut.push('…');
+    cut
+}
+
 fn cap_note(note: &str) -> String {
     let capped = crate::text::truncate_chars(note, MAX_FOLLOWUP_NOTE_CHARS);
     if capped.len() < note.len() {
@@ -724,6 +749,8 @@ struct TaskMeta {
     /// no stall clock runs and no round is counted until the next
     /// dispatch of the id lifts it.
     blocked: Option<Cause>,
+    /// The latest dispatch's wording, shortened (see [`OpenTask`]).
+    dispatch: Option<String>,
 }
 
 impl TaskMeta {
@@ -1022,12 +1049,31 @@ impl LifecycleStore {
         self.assign_at(pane, task_id, Instant::now())
     }
 
+    /// [`assign`](Self::assign) that also keeps an excerpt of the
+    /// dispatch's `body` for the re-pin after a compaction.
+    pub fn assign_with_dispatch(&self, pane: &str, task_id: &str, body: Option<&str>) -> bool {
+        self.assign_with_dispatch_at(pane, task_id, body, Instant::now())
+    }
+
     fn assign_at(&self, pane: &str, task_id: &str, now: Instant) -> bool {
+        self.assign_with_dispatch_at(pane, task_id, None, now)
+    }
+
+    fn assign_with_dispatch_at(
+        &self,
+        pane: &str,
+        task_id: &str,
+        body: Option<&str>,
+        now: Instant,
+    ) -> bool {
         let mut g = self.lock();
         g.evict_if_full();
         let meta = g.tasks.entry(task_id.to_string()).or_default();
         if meta.closed.is_some() {
             return false;
+        }
+        if let Some(body) = body {
+            meta.dispatch = Some(dispatch_excerpt(body));
         }
         meta.rework = None;
         // A re-dispatch is how a held task goes on: the user (or the
@@ -1375,6 +1421,49 @@ impl LifecycleStore {
         panes
     }
 
+    /// The in-flight tasks on `pane`, sorted by id, each with the
+    /// dispatch excerpt kept for it — what the re-pin after a compaction
+    /// reminds the agent of.
+    pub fn open_tasks_of(&self, pane: &str) -> Vec<OpenTask> {
+        let g = self.lock();
+        let mut open: Vec<OpenTask> = g
+            .entries
+            .iter()
+            .filter(|((p, _), e)| p == pane && e.state.in_flight())
+            .map(|((_, id), e)| OpenTask {
+                id: id.clone(),
+                state: e.state,
+                dispatch: g.tasks.get(id).and_then(|m| m.dispatch.clone()),
+            })
+            .collect();
+        open.sort_by(|a, b| a.id.cmp(&b.id));
+        open
+    }
+
+    /// What the coordinator still owes on open tasks, `(id, what)`
+    /// sorted by id: a rework dispatch after a `[kod]` rejection, a
+    /// re-dispatch of a task held for the user, or the planner's
+    /// clarification it waits for.
+    pub fn owed_by_coordinator(&self) -> Vec<(String, String)> {
+        let g = self.lock();
+        let mut owed: Vec<(String, String)> = g
+            .tasks
+            .iter()
+            .filter(|(_, m)| m.closed.is_none())
+            .filter_map(|(id, m)| {
+                let what = match m.blocked {
+                    Some(Cause::Belirsiz) => "planner'ın netleştirmesini bekliyor".to_string(),
+                    Some(cause) => format!("beklemede ({})", cause.tag()),
+                    None if m.rework.is_some() => "düzeltme dispatch'i bekliyor".to_string(),
+                    None => return None,
+                };
+                Some((id.clone(), what))
+            })
+            .collect();
+        owed.sort();
+        owed
+    }
+
     /// Mark `(source_pane, task_id)` as `Done` regardless of prior
     /// state. Used by the bridge after the synthesised `TASK_DONE`
     /// fanout to the orchestrator has been emitted.
@@ -1612,6 +1701,53 @@ mod tests {
             followup_for_coordinator_inbound("backend-reviewer", &ok, &rec),
             Some(("integration-tester".into(), "retest T1".into()))
         );
+    }
+
+    // -- what a pane holds, for the re-pin after a compaction ----------- //
+
+    #[test]
+    fn a_dispatch_excerpt_is_kept_for_the_repin() {
+        let s = LifecycleStore::new();
+        let t0 = Instant::now();
+        let long = format!("build T1 — auth.rs'e token refresh ekle; kabul: cargo test geçer. {}", "x".repeat(600));
+        assert!(s.assign_with_dispatch("p-builder", "T1", Some(&long)));
+        let open = s.open_tasks_of("p-builder");
+        assert_eq!(open.len(), 1);
+        assert_eq!((open[0].id.as_str(), open[0].state), ("T1", LifecycleState::Assigned));
+        let d = open[0].dispatch.as_deref().unwrap();
+        assert!(d.starts_with("build T1 — auth.rs'e token refresh ekle"), "{d}");
+        assert!(d.chars().count() <= 241, "{}", d.chars().count());
+        // A plain `assign` (no body) keeps the excerpt; DONE keeps the task open
+        // (awaiting review); the tester's pass ends it.
+        s.assign_at("p-builder", "T1", t0);
+        assert!(s.open_tasks_of("p-builder")[0].dispatch.is_some());
+        s.record_at("backend-builder", "p-builder", &tr(TransitionKind::Done, "T1"), &[], None, t0);
+        assert_eq!(s.open_tasks_of("p-builder")[0].state, LifecycleState::AwaitingReview);
+        rec_at(&s, "p-reviewer", &tr(TransitionKind::Approved, "T1"), t0);
+        rec_at(&s, "p-tester", &tr(TransitionKind::Approved, "T1"), t0);
+        assert!(s.open_tasks_of("p-builder").is_empty());
+        assert!(s.open_tasks_of("p-nobody").is_empty());
+    }
+
+    #[test]
+    fn the_coordinator_owes_rework_and_held_tasks() {
+        let s = LifecycleStore::new();
+        let t0 = Instant::now();
+        s.assign_at("p-builder", "T1", t0);
+        s.assign_at("p-fb", "T2", t0);
+        assert!(s.owed_by_coordinator().is_empty());
+        let no1 = Transition { kind: TransitionKind::ChangesNeeded, task_id: "T1".into() };
+        s.record_with_cause("backend-reviewer", "p-reviewer", &no1, &["p-builder"], Some("auth.rs:42 wrong"), Some(Cause::Kod));
+        let no2 = Transition { kind: TransitionKind::ChangesNeeded, task_id: "T2".into() };
+        s.record_with_cause("frontend-reviewer", "p-fr", &no2, &["p-fb"], Some("[izin] npm denied"), Some(Cause::Izin));
+        let owed = s.owed_by_coordinator();
+        assert_eq!(
+            owed,
+            [("T1".to_string(), "düzeltme dispatch'i bekliyor".to_string()), ("T2".to_string(), "beklemede (izin)".to_string())]
+        );
+        // The re-dispatch settles the debt.
+        s.assign_at("p-builder", "T1", t0);
+        assert_eq!(s.owed_by_coordinator().len(), 1);
     }
 
     // -- rejections by cause ------------------------------------------- //

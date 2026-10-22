@@ -55,6 +55,7 @@ use crate::swarm_term::persona::{
 };
 use crate::swarm_term::preflight;
 use crate::swarm_term::project_facts;
+use crate::swarm_term::repin::{self, Compaction};
 use crate::swarm_term::team;
 use crate::swarm_term::trust;
 
@@ -1277,9 +1278,15 @@ struct SessionMonitor<R: Runtime> {
 ///   whose options include paid ones. claude itself continues when the
 ///   limit resets; the first answer of an agent the limit stopped (or the
 ///   user's resume) lets the swarm run again.
+/// * A context compaction, read from the same transcripts
+///   ([`repin::compaction_signal`]): the agent gets its open tasks and
+///   rules pasted back ([`repin_after_compaction`]).
 async fn monitor_session<R: Runtime>(m: SessionMonitor<R>) {
     let mut tails: HashMap<String, TranscriptTail> = HashMap::new();
     let mut gone: HashSet<String> = HashSet::new();
+    // Compactions whose re-pin is still owed (held during the usage limit);
+    // one per agent — the newest is the state that counts.
+    let mut compactions: BTreeMap<String, Compaction> = BTreeMap::new();
     loop {
         tokio::time::sleep(MONITOR_EVERY).await;
         if !m.alive.load(Ordering::SeqCst) {
@@ -1325,31 +1332,76 @@ async fn monitor_session<R: Runtime>(m: SessionMonitor<R>) {
             };
             let lines = tails.entry(agent.clone()).or_default().read_new(&file);
             signals.extend(lines.iter().filter_map(|l| limit_signal(l)).map(|s| (agent.clone(), s)));
+            compactions.extend(
+                lines.iter().filter_map(|l| repin::compaction_signal(l)).map(|c| (agent.clone(), c)),
+            );
         }
-        if signals.is_empty() {
-            continue;
-        }
-        let mut limit = m.limit.lock().unwrap_or_else(|p| p.into_inner());
-        let before = (limit.limited, limit.resets_at);
-        for (agent, signal) in signals {
-            limit.observe(&agent, signal);
-        }
-        if (limit.limited, limit.resets_at) == before {
-            continue;
-        }
-        if limit.limited != before.0 {
-            hold_deliveries(&m.control, &m.lifecycle, PauseReason::UsageLimit, limit.limited);
-            if limit.limited {
-                tracing::warn!(
-                    resets_at = ?limit.resets_at,
-                    "swarm-term: usage limit hit — deliveries and stall clocks held"
-                );
-            } else {
-                tracing::info!("swarm-term: an agent got through — usage limit over, deliveries resume");
+        if !signals.is_empty() {
+            let mut limit = m.limit.lock().unwrap_or_else(|p| p.into_inner());
+            let before = (limit.limited, limit.resets_at);
+            for (agent, signal) in signals {
+                limit.observe(&agent, signal);
+            }
+            if (limit.limited, limit.resets_at) != before {
+                if limit.limited != before.0 {
+                    hold_deliveries(&m.control, &m.lifecycle, PauseReason::UsageLimit, limit.limited);
+                    if limit.limited {
+                        tracing::warn!(
+                            resets_at = ?limit.resets_at,
+                            "swarm-term: usage limit hit — deliveries and stall clocks held"
+                        );
+                    } else {
+                        tracing::info!("swarm-term: an agent got through — usage limit over, deliveries resume");
+                    }
+                }
+                emit_limit(&m.app, &m.session_id, &limit);
             }
         }
-        emit_limit(&m.app, &m.session_id, &limit);
+        // A re-pin pasted during the usage limit would be spent on a failed
+        // turn (or answer claude's limit menu): it waits for the limit to lift.
+        if !compactions.is_empty() && !m.control.paused_by(PauseReason::UsageLimit) {
+            for (agent, compaction) in std::mem::take(&mut compactions) {
+                repin_after_compaction(&m, &current, &agent, &compaction).await;
+            }
+        }
     }
+}
+
+/// Paste `agent` the re-pin note after a `compaction` of its context
+/// (see [`repin`]): its open tasks with their dispatches, what the
+/// coordinator owes, its own rules and limits. Best-effort, like every
+/// `[Neuron]` notice; an agent being restarted is skipped (its restart
+/// kickoff tells it to go on with its work).
+async fn repin_after_compaction<R: Runtime>(
+    m: &SessionMonitor<R>,
+    panes: &HashMap<String, String>,
+    agent: &str,
+    compaction: &Compaction,
+) {
+    let Some(pane) = panes.get(agent) else {
+        return;
+    };
+    if m.restarting.lock().unwrap_or_else(|p| p.into_inner()).contains(agent) {
+        return;
+    }
+    let open = m.lifecycle.open_tasks_of(pane);
+    let owed = if agent == "coordinator" {
+        m.lifecycle.owed_by_coordinator()
+    } else {
+        Vec::new()
+    };
+    let outbox = m.bridgespace_root.join("outbox").join(agent);
+    let text = repin::repin_message(agent, compaction, &open, &owed, &outbox);
+    tracing::info!(
+        agent_id = %agent,
+        trigger = %compaction.trigger,
+        pre_tokens = compaction.pre_tokens,
+        post_tokens = compaction.post_tokens,
+        open_tasks = open.len(),
+        "swarm-term: context compacted — rules and task state re-pinned"
+    );
+    bridge::notify_agent(&m.registry, panes, agent, &text).await;
+    bridge::emit_notice(&m.app, agent, &text, "context compacted");
 }
 
 /// What one transcript line says about the account's usage limit.

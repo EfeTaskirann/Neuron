@@ -42,6 +42,7 @@ pub mod persona;
 pub(crate) mod preflight;
 pub(crate) mod project_facts;
 pub(crate) mod project_guard;
+pub(crate) mod repin;
 pub mod session;
 pub mod team;
 pub(crate) mod trust;

@@ -511,7 +511,7 @@ fn reject_unread<R: Runtime>(
 }
 
 /// Routing Log row for a `[Neuron]` notice pasted into `recipient`'s pane.
-fn emit_notice<R: Runtime>(app: &AppHandle<R>, recipient: &str, text: &str, reason: &str) {
+pub(crate) fn emit_notice<R: Runtime>(app: &AppHandle<R>, recipient: &str, text: &str, reason: &str) {
     let _ = app.emit(
         crate::events::SWARM_TERM_ROUTE,
         json!({
@@ -937,7 +937,7 @@ async fn process_one<R: Runtime>(
                 );
             }
             let task_id = envelope_task_id.as_deref();
-            note_dispatch(app, &from_agent, &to_agent, &target_pane, task_id, lifecycle);
+            note_dispatch(app, &from_agent, &to_agent, &target_pane, &body, task_id, lifecycle);
             note_coordinator_report(
                 app,
                 &from_agent,

@@ -316,19 +316,23 @@ fn held_notice(from_agent: &str, id: &str, cause: Cause, why: Option<&str>) -> N
 
 /// A dispatcher (orchestrator / coordinator) delivered a `task_id`-
 /// bearing message to a builder or the tester: track it as `Assigned`,
-/// so a dispatch nobody acts on stalls instead of waiting forever.
+/// so a dispatch nobody acts on stalls instead of waiting forever, and
+/// keep the `body`'s excerpt for the re-pin after a compaction.
 pub(super) fn note_dispatch<R: Runtime>(
     app: &AppHandle<R>,
     from_agent: &str,
     to_agent: &str,
     target_pane: &str,
+    body: &str,
     task_id: Option<&str>,
     lifecycle: &LifecycleStore,
 ) {
     let Some(id) = task_id.filter(|_| tracks_dispatch(from_agent, to_agent)) else {
         return;
     };
-    if lifecycle.assign(target_pane, id) {
+    // The body's excerpt is what the re-pin after a compaction gives the
+    // agent back (see `repin`).
+    if lifecycle.assign_with_dispatch(target_pane, id, Some(body)) {
         emit_lifecycle(
             app,
             to_agent,

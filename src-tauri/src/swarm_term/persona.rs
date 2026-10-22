@@ -25,6 +25,7 @@ use std::path::Path;
 use crate::swarm_term::hierarchy::{allowed_for, AGENT_IDS};
 use crate::swarm_term::lifecycle::MAX_REWORK_ROUNDS;
 use crate::swarm_term::project_facts::ProjectFacts;
+use crate::swarm_term::repin::REPIN_PREFIX;
 
 /// First line of the kickoff turn; the footer tells the agent to answer
 /// a message starting with it with exactly `@<id> READY`.
@@ -317,8 +318,13 @@ pub(crate) fn build_persona_prompt(
          Pane'in yeniden başlatılırsa konuşman kaldığı yerden sürer ve bir mesaj\n\
          `{restart}` ile başlar: ona da önce aynı iki kelimeyi tek başına yaz;\n\
          sonra yarım kalan bir işin varsa kaldığın yerden sürdür, yoksa bir sonraki\n\
-         mesajı bekle.",
+         mesajı bekle.\n\n\
+         Bağlamın sıkıştırılınca (claude konuşmanı özetleyince) bir mesaj\n\
+         `[Neuron] {repin}` ile başlar: açık görevlerini, dispatch'lerini ve\n\
+         kurallarını yineler. Ona cevap yazma, mesaj gönderme; yarım kalan işini\n\
+         kaldığın yerden sürdür.",
         agent_id = agent_id,
+        repin = REPIN_PREFIX,
         bridge_root_str = bridge_root_str,
         dest_block = dest_block,
         example_dst = example_dst,
@@ -448,6 +454,15 @@ mod tests {
         assert!(p.contains("`[izin]`") && p.contains("`[ortam]`") && p.contains("`[belirsiz]`"));
         assert!(p.contains("`hata — [izin] <reddedilen komut>`"));
         assert!(p.contains("KANIT ŞART"));
+    }
+
+    #[test]
+    fn the_footer_names_the_repin_note_after_a_compaction() {
+        // The note is pasted as a turn; without this the agent answers
+        // it (or treats it as a peer's message) instead of going on.
+        let p = build_persona_prompt("backend-builder", "x", &dummy_bridge_root(), &facts(), AGENT_IDS);
+        assert!(p.contains(&format!("`[Neuron] {REPIN_PREFIX}`")), "{p}");
+        assert!(p.contains("Ona cevap yazma, mesaj gönderme"), "{p}");
     }
 
     #[test]

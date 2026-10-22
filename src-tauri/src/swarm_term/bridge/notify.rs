@@ -20,7 +20,7 @@ use super::delivery::{
 /// Best-effort paste of a `[Neuron] …` notice into `agent`'s pane.
 /// Failures are logged and swallowed — a notice must never block or
 /// fail the delivery pipeline that produced it.
-pub(super) async fn notify_agent(
+pub(crate) async fn notify_agent(
     registry: &TerminalRegistry,
     panes_by_agent: &HashMap<String, String>,
     agent: &str,
