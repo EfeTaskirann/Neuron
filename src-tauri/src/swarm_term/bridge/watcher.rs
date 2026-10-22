@@ -973,7 +973,7 @@ async fn process_one<R: Runtime>(
             if is_injection_report(&body) {
                 emit_injection(app, root, &from_agent, &to_agent, &body);
             }
-            note_coordinator_report(
+            if let Some(id) = note_coordinator_report(
                 app,
                 &from_agent,
                 &to_agent,
@@ -981,7 +981,13 @@ async fn process_one<R: Runtime>(
                 task_id,
                 panes_by_agent,
                 lifecycle,
-            );
+            ) {
+                crate::swarm_term::experience::record_for_session(
+                    root,
+                    crate::swarm_term::experience::Kind::Failed,
+                    &format!("{id} — coordinator vazgeçti: {}", truncate(&body, 120)),
+                );
+            }
             if let Some(original) = &redirected_from {
                 let text = format!(
                     "`{}` mesajın @{original} yerine @coordinator'a iletildi: lifecycle \

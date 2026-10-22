@@ -14,6 +14,7 @@ use std::sync::Arc;
 use serde_json::json;
 use tauri::{AppHandle, Emitter, Runtime};
 
+use crate::swarm_term::experience;
 use crate::swarm_term::hierarchy::{
     builders_judged_by, is_allowed, is_builder, is_dispatcher, is_reviewer,
 };
@@ -93,6 +94,11 @@ pub(super) fn lifecycle_synthesise<R: Runtime>(
                     );
                     let owners = task_owners(lifecycle, panes_by_agent, id);
                     emit_lifecycle(app, from_agent, &source_pane, id, "Blocked", LifecycleState::Failed, &owners);
+                    experience::record_for_session(
+                        root,
+                        experience::Kind::Blocked,
+                        &format!("{id} — [{}] {}", cause.tag(), why.as_deref().unwrap_or("sebep belirtilmedi")),
+                    );
                     vec![held_notice(from_agent, id, cause, why.as_deref())]
                 }
                 Abandon::Elsewhere => vec![Notice::new(
@@ -118,6 +124,11 @@ pub(super) fn lifecycle_synthesise<R: Runtime>(
                 let owners = task_owners(lifecycle, panes_by_agent, id);
                 emit_lifecycle(app, from_agent, &source_pane, id, "Abandoned", LifecycleState::Failed, &owners);
                 let why = why.unwrap_or_else(|| "sebep belirtilmedi".into());
+                experience::record_for_session(
+                    root,
+                    experience::Kind::Failed,
+                    &format!("{id} — @{from_agent} hata: {why}"),
+                );
                 enqueue_fanout(
                     app,
                     root,
@@ -240,6 +251,31 @@ pub(super) fn lifecycle_synthesise<R: Runtime>(
         &task_owners(lifecycle, panes_by_agent, &id),
     );
 
+    // What the project remembers of this step (see `experience`): a task
+    // the tester's run closed, one the rework limit closed, one held for
+    // the user.
+    if rec.limit_exceeded {
+        experience::record_for_session(
+            root,
+            experience::Kind::Failed,
+            &format!("{id} — düzeltme limiti aşıldı; son ret: {}", note.as_deref().unwrap_or("-")),
+        );
+    } else if let Some(cause) = rec.blocked.filter(|c| c.needs_user()) {
+        experience::record_for_session(
+            root,
+            experience::Kind::Blocked,
+            &format!("{id} — [{}] {}", cause.tag(), note.as_deref().unwrap_or("-")),
+        );
+    } else if transition.kind == TransitionKind::Approved
+        && from_agent == TESTER
+        && lifecycle.closure(&id) == Some(Closure::Done)
+    {
+        experience::record_for_session(
+            root,
+            experience::Kind::Passed,
+            &format!("{id} — {}", note.as_deref().unwrap_or("tester geçirdi")),
+        );
+    }
     // Held for the user: nothing fans out; the coordinator learns what
     // the user must fix and that no round was spent.
     if let Some(cause) = rec.blocked.filter(|c| c.needs_user()) {
@@ -402,6 +438,7 @@ fn closed_notice(to: &str, id: &str, closure: Closure) -> Notice {
 
 /// The coordinator told the orchestrator `TASK_FAILED <id>` (it gave up
 /// on a task): close it so it stops stalling and cannot be re-dispatched.
+/// Returns the id it closed, if it closed one.
 pub(super) fn note_coordinator_report<R: Runtime>(
     app: &AppHandle<R>,
     from_agent: &str,
@@ -410,19 +447,19 @@ pub(super) fn note_coordinator_report<R: Runtime>(
     task_id: Option<&str>,
     panes_by_agent: &HashMap<String, String>,
     lifecycle: &LifecycleStore,
-) {
+) -> Option<String> {
     if from_agent != "coordinator" || to_agent != "orchestrator" {
-        return;
+        return None;
     }
-    let Some(id) = task_failed_id(body, task_id) else {
-        return;
-    };
-    if lifecycle.fail_task(id) {
-        tracing::info!(task_id = %id, "swarm-term bridge: coordinator gave up a task — closed");
-        let pane = panes_by_agent.get("coordinator").map(String::as_str).unwrap_or("");
-        let owners = task_owners(lifecycle, panes_by_agent, id);
-        emit_lifecycle(app, "coordinator", pane, id, "TaskFailed", LifecycleState::Failed, &owners);
+    let id = task_failed_id(body, task_id)?;
+    if !lifecycle.fail_task(id) {
+        return None;
     }
+    tracing::info!(task_id = %id, "swarm-term bridge: coordinator gave up a task — closed");
+    let pane = panes_by_agent.get("coordinator").map(String::as_str).unwrap_or("");
+    let owners = task_owners(lifecycle, panes_by_agent, id);
+    emit_lifecycle(app, "coordinator", pane, id, "TaskFailed", LifecycleState::Failed, &owners);
+    Some(id.to_string())
 }
 
 /// The agents whose work `task_id` is: the panes holding it, minus the

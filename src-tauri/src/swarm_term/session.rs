@@ -43,6 +43,7 @@ use crate::swarm_term::bridge::{
     self, BridgeControl, BridgeHandle, PauseReason, SharedPanes, BRIDGE_DIRNAME,
 };
 use crate::swarm_term::checkpoint;
+use crate::swarm_term::experience;
 use crate::swarm_term::heartbeat;
 use crate::swarm_term::hierarchy::{builders_judged_by, AGENT_IDS};
 use crate::swarm_term::lifecycle::{LifecycleStore, TESTER};
@@ -427,6 +428,12 @@ impl TerminalSwarmRegistry {
         // keeps per-session message files out of `git status`.
         let session_id = format!("swarm-term-{}", Ulid::new());
         let bridge_parent = project_dir.join(BRIDGE_DIRNAME);
+        // What earlier sessions learned here goes into every persona (see
+        // `experience`); what the probe found broken now is remembered.
+        facts.experience = experience::lines_for_persona(&experience::load(&bridge_parent));
+        for broken in &facts.broken {
+            experience::record(&bridge_parent, experience::Kind::Broken, &format!("başlangıçta kırık: {broken}"));
+        }
         std::fs::create_dir_all(&bridge_parent).map_err(|e| {
             AppError::Internal(format!(
                 "mkdir {}: {e}",
@@ -1441,6 +1448,10 @@ async fn repin_after_compaction<R: Runtime>(
     if m.restarting.lock().unwrap_or_else(|p| p.into_inner()).contains(agent) {
         return;
     }
+    // A compaction is the agent at work (it filled its context doing
+    // something) and stops it for a while: neither a stall nor a wait.
+    m.lifecycle.note_activity(agent);
+    m.lifecycle.note_progress(pane);
     let open = m.lifecycle.open_tasks_of(pane);
     let owed = if agent == "coordinator" {
         m.lifecycle.owed_by_coordinator()
@@ -1494,6 +1505,11 @@ async fn act_on_overrun<R: Runtime>(
                 "swarm-term: task at twice its token budget — closed, TASK_FAILED"
             );
             bridge::enqueue_fanout(&m.app, &m.bridgespace_root, panes, "orchestrator", failed, id);
+            experience::record_for_session(
+                &m.bridgespace_root,
+                experience::Kind::Failed,
+                &format!("{id} — token bütçesinin iki katı harcandı ({})", tokens::fmt_tokens(overrun.spent)),
+            );
             bridge::notify_agent(&m.registry, panes, "coordinator", &coordinator).await;
             bridge::emit_notice(&m.app, "coordinator", &coordinator, "task at twice its token budget");
             for (agent, pane) in panes {

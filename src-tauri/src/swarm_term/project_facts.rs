@@ -35,6 +35,10 @@ pub(crate) struct ProjectFacts {
     /// (exit <code>)`. Told to the agents so they don't take a
     /// pre-existing failure for their own.
     pub broken: Vec<String>,
+    /// What earlier sessions in this project learned, one line per card
+    /// (see `experience::lines_for_persona`); information, never an
+    /// instruction.
+    pub experience: Vec<String>,
 }
 
 impl ProjectFacts {

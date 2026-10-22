@@ -302,6 +302,10 @@ pub(crate) fn denied_tools(agent_id: &str, session_id: &str) -> Vec<String> {
     // directory), so writing one forges a message.
     rules.push("Edit(./.bridgespace/.gitignore)".into());
     rules.push("Edit(./.bridgespace/_archive/**)".into());
+    // Neuron's memory of the project (see `experience`): it feeds the
+    // next session's personas, so an agent that could edit it would
+    // write tomorrow's instructions.
+    rules.push("Edit(./.bridgespace/experience.md)".into());
     rules.push(format!("Edit(./.bridgespace/{session_id}/processed/**)"));
     rules.push(format!("Edit(./.bridgespace/{session_id}/rejected/**)"));
     // The legacy `inbox/` drop path: the watcher still scans it and pastes
@@ -679,7 +683,7 @@ mod tests {
                 .filter(|r| r.contains(".bridgespace"))
                 .collect();
             let mut expected: BTreeSet<String> =
-                [".gitignore", "_archive/**", "s/processed/**", "s/rejected/**", "s/inbox/**"]
+                [".gitignore", "_archive/**", "experience.md", "s/processed/**", "s/rejected/**", "s/inbox/**"]
                     .iter()
                     .map(|p| format!("Edit(./.bridgespace/{p})"))
                     .collect();
@@ -770,6 +774,17 @@ mod tests {
             }
             let text = describe_for_persona(agent, &facts);
             assert!(text.contains("--target-dir") && text.contains("`-o`"), "{agent}: {text}");
+        }
+    }
+
+    #[test]
+    fn nobody_writes_the_experience_file() {
+        // Neuron's memory of the project feeds the next session's
+        // personas: an agent that could edit it would write tomorrow's
+        // instructions.
+        for &agent in AGENT_IDS {
+            let deny = denied_tools(agent, "s");
+            assert!(deny.contains(&"Edit(./.bridgespace/experience.md)".to_string()), "{agent}: {deny:?}");
         }
     }
 

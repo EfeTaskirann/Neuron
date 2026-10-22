@@ -32,6 +32,7 @@
 
 pub mod bridge;
 pub mod checkpoint;
+pub(crate) mod experience;
 pub(crate) mod heartbeat;
 pub mod hierarchy;
 pub mod lifecycle;

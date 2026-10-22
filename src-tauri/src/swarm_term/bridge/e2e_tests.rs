@@ -402,6 +402,11 @@ async fn lifecycle_failure_paths_with_fake_agents() {
     step!("A7 no TASK_DONE before the tester passes", !log("orchestrator").contains("TASK_DONE R1"));
     send("integration-tester", "coordinator", "APPROVED R1 - cargo test: 40 passed", Some("R1"));
     step!("A8 orchestrator got TASK_DONE R1", log("orchestrator").contains("TASK_DONE R1"));
+    // The bridge root is `<parent>/bridge`, so the experience file lands
+    // in the parent, as `<project>/.bridgespace/experience.md` would.
+    step!("A9 the passed task left an experience card",
+        std::fs::read_to_string(work.path().join("experience.md"))
+            .is_ok_and(|t| t.contains("✓") && t.contains("R1") && t.contains("cargo test: 40 passed")));
 
     // ---- B: tester FAIL → fix → review → RETEST by the tester -------- //
     send("orchestrator", "integration-tester", "smoke S1 run cargo test", Some("S1"));
