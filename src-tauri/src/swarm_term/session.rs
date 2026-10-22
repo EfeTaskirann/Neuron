@@ -350,6 +350,16 @@ impl TerminalSwarmRegistry {
         if let Some(note) = &preflight.note {
             tracing::warn!("swarm-term pre-flight: {note}");
         }
+        // What the project is and how it is verified, read from its
+        // manifests (see `project_facts`) — and a probe of its cheap
+        // checks before nine panes open: a missing toolchain is one clear
+        // error here, not nine failed tasks later.
+        let mut facts = project_facts::detect(&project_dir);
+        let env = preflight::probe_environment(&project_dir, &facts).await?;
+        if !env.broken.is_empty() {
+            tracing::warn!(broken = ?env.broken, "swarm-term pre-flight: checks failing before the start");
+        }
+        facts.broken = env.broken;
         // The user's cost controls: the team, its models, the message budget.
         let team_settings = team::load(&pool).await?;
         let agents = team_settings.agents();
@@ -477,10 +487,9 @@ impl TerminalSwarmRegistry {
         }
         heartbeat::beat(&session_dir);
 
-        // What the project is and how it is verified, read from its
-        // manifests: the footer tells every agent, and the shell roles
-        // may run exactly these commands (see `project_facts`).
-        let facts = project_facts::detect(&project_dir);
+        // The facts (detected and probed before the preparation above):
+        // the footer tells every agent, and the shell roles may run
+        // exactly these commands.
         tracing::info!(
             stacks = ?facts.stacks,
             commands = ?facts.commands,

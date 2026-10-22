@@ -30,6 +30,11 @@ pub(crate) struct ProjectFacts {
     /// typecheck script. `tsc` takes `--outDir` and `--noEmit false`, so
     /// a rule with room for arguments would let it write anywhere.
     pub exact_commands: Vec<String>,
+    /// Verification commands the start-up probe (`preflight`) found
+    /// failing before any agent touched the project, as `<command>
+    /// (exit <code>)`. Told to the agents so they don't take a
+    /// pre-existing failure for their own.
+    pub broken: Vec<String>,
 }
 
 impl ProjectFacts {

@@ -138,9 +138,22 @@ pub(crate) fn build_persona_prompt(
         } else {
             quoted(&all)
         };
+        // Checks the start-up probe found failing before any agent began:
+        // not a builder's doing, and not a task unless dispatched as one.
+        let broken = if facts.broken.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "- Başlangıçta kırık: {} — swarm başlamadan önce de başarısızdı. Bu hatayı \
+                 kendi değişikliğin sanma; görevin değilse düzeltmeye kalkma, raporunda \
+                 not düş.\n",
+                quoted(&facts.broken)
+            )
+        };
         format!(
             "- Yığın: {stacks}\n\
              - Doğrulama komutları: {commands}\n\
+             {broken}\
              Bunlar Neuron'un projenin manifest dosyalarından (Cargo.toml, \
              package.json, …) çıkardığı bilgiler; modüller, dizinler ve kurallar \
              için projenin kendisine (ve CLAUDE.md'sine) bak, gerekirse scout'a sor."
@@ -392,7 +405,23 @@ mod tests {
             commands: vec!["cargo test".into(), "pnpm -C web test".into()],
             install_commands: vec![],
             exact_commands: vec![],
+            broken: vec![],
         }
+    }
+
+    #[test]
+    fn the_project_block_names_the_commands_broken_at_start() {
+        // The start-up probe found `cargo check` failing before any agent
+        // touched the project: builders must not take that failure for
+        // their own, and nobody should spend a round "fixing" it unasked.
+        let mut f = facts();
+        f.broken = vec!["cargo check (exit 101)".into()];
+        let p = build_persona_prompt("backend-builder", "x", &dummy_bridge_root(), &f, AGENT_IDS);
+        let line = p.lines().find(|l| l.starts_with("- Başlangıçta kırık:")).expect("broken line");
+        assert!(line.contains("`cargo check (exit 101)`"), "{line}");
+        // Nothing broken: no such line.
+        let p = build_persona_prompt("backend-builder", "x", &dummy_bridge_root(), &facts(), AGENT_IDS);
+        assert!(!p.contains("Başlangıçta kırık"));
     }
 
     #[test]

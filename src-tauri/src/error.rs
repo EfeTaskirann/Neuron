@@ -45,6 +45,7 @@ use thiserror::Error;
 /// | `ConsentRequired` | `consent_required` | the user has not agreed yet (e.g. to run the swarm in a folder) |
 /// | `ClaudeVersionUnsupported` | `claude_version_unsupported` | installed `claude` CLI is too old for the terminal swarm |
 /// | `ClaudeLoginRequired` | `claude_login_required` | `claude` CLI is not logged in |
+/// | `EnvironmentNotReady` | `environment_not_ready` | the project's toolchain is missing (install first) |
 #[derive(Debug, Clone, Error, Deserialize)]
 #[serde(tag = "kind", content = "message", rename_all = "snake_case")]
 pub enum AppError {
@@ -172,6 +173,14 @@ pub enum AppError {
     #[error("claude login required: {0}")]
     ClaudeLoginRequired(String),
 
+    /// The project's own toolchain is not there (its typecheck says
+    /// `'tsc' is not recognized`): the start-up probe in
+    /// `crate::swarm_term::preflight` refuses to open nine panes that
+    /// would all fail the same way. The message names the command, what
+    /// it said, and the install command to run first.
+    #[error("environment not ready: {0}")]
+    EnvironmentNotReady(String),
+
     /// Catch-all for unclassified failures (panics-in-tasks, missing
     /// env, etc.). Frontend treats `internal` as a developer bug.
     #[error("internal error: {0}")]
@@ -202,6 +211,7 @@ impl AppError {
             Self::ConsentRequired(_) => "consent_required",
             Self::ClaudeVersionUnsupported(_) => "claude_version_unsupported",
             Self::ClaudeLoginRequired(_) => "claude_login_required",
+            Self::EnvironmentNotReady(_) => "environment_not_ready",
             Self::Internal(_) => "internal",
         }
     }
@@ -231,6 +241,7 @@ impl AppError {
             | Self::ConsentRequired(m)
             | Self::ClaudeVersionUnsupported(m)
             | Self::ClaudeLoginRequired(m)
+            | Self::EnvironmentNotReady(m)
             | Self::Internal(m) => Cow::Borrowed(m.as_str()),
             Self::WorkspaceBusy {
                 workspace_id,
@@ -347,6 +358,7 @@ mod tests {
             "claude_version_unsupported"
         );
         assert_eq!(AppError::ClaudeLoginRequired("x".into()).kind(), "claude_login_required");
+        assert_eq!(AppError::EnvironmentNotReady("x".into()).kind(), "environment_not_ready");
         assert_eq!(AppError::Internal("x".into()).kind(), "internal");
     }
 
