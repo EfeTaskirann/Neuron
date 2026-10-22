@@ -20,7 +20,7 @@ use tokio::sync::Notify;
 
 use crate::sidecar::terminal::TerminalRegistry;
 use crate::swarm_term::hierarchy::{allowed_for, is_allowed, AGENT_IDS};
-use crate::swarm_term::lifecycle::{is_injection_report, misaddressed_signal, LifecycleStore};
+use crate::swarm_term::lifecycle::{is_injection_report, is_request, misaddressed_signal, LifecycleStore};
 
 use super::delivery::{
     format_routed_message, is_delivery_blocked, submit_pasted,
@@ -969,7 +969,7 @@ async fn process_one<R: Runtime>(
             }
             let task_id = envelope_task_id.as_deref();
             note_dispatch(app, &from_agent, &to_agent, &target_pane, &body, task_id, lifecycle);
-            lifecycle.note_message(&from_agent, &to_agent, task_id);
+            lifecycle.note_message(&from_agent, &to_agent, task_id, is_request(&body, task_id));
             if is_injection_report(&body) {
                 emit_injection(app, root, &from_agent, &to_agent, &body);
             }

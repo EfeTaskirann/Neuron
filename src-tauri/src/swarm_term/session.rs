@@ -46,7 +46,7 @@ use crate::swarm_term::checkpoint;
 use crate::swarm_term::experience;
 use crate::swarm_term::heartbeat;
 use crate::swarm_term::hierarchy::{builders_judged_by, AGENT_IDS};
-use crate::swarm_term::lifecycle::{LifecycleStore, TESTER};
+use crate::swarm_term::lifecycle::{LifecycleState, LifecycleStore, TESTER};
 use crate::swarm_term::pane_config::{self, PaneManifest};
 use crate::swarm_term::pane_state::{PaneReadiness, PaneStates, TerminalSwarmPaneState};
 use crate::swarm_term::permissions::{self, SwarmTermPermissionMode};
@@ -1504,6 +1504,21 @@ async fn act_on_overrun<R: Runtime>(
                 budget,
                 "swarm-term: task at twice its token budget — closed, TASK_FAILED"
             );
+            // Who holds it, before the closure settles their entries.
+            let holders: Vec<String> = panes
+                .iter()
+                .filter(|(_, pane)| m.lifecycle.open_tasks_of(pane).iter().any(|t| t.id == id))
+                .map(|(agent, _)| agent.clone())
+                .collect();
+            // Closed here and now: the UI hears it at once, and the
+            // TASK_FAILED below finds the task closed when the bridge
+            // delivers it (live run 2: the delivery had recorded a second
+            // "coordinator gave up" card for the same stop).
+            if m.lifecycle.fail_task(id) {
+                let pane = panes.get("coordinator").map(String::as_str).unwrap_or("");
+                let owners = bridge::task_owners(&m.lifecycle, panes, id);
+                bridge::emit_lifecycle(&m.app, "coordinator", pane, id, "TaskFailed", LifecycleState::Failed, &owners);
+            }
             bridge::enqueue_fanout(&m.app, &m.bridgespace_root, panes, "orchestrator", failed, id);
             experience::record_for_session(
                 &m.bridgespace_root,
@@ -1512,11 +1527,9 @@ async fn act_on_overrun<R: Runtime>(
             );
             bridge::notify_agent(&m.registry, panes, "coordinator", &coordinator).await;
             bridge::emit_notice(&m.app, "coordinator", &coordinator, "task at twice its token budget");
-            for (agent, pane) in panes {
-                if m.lifecycle.open_tasks_of(pane).iter().any(|t| t.id == id) {
-                    bridge::notify_agent(&m.registry, panes, agent, &holder).await;
-                    bridge::emit_notice(&m.app, agent, &holder, "task at twice its token budget");
-                }
+            for agent in &holders {
+                bridge::notify_agent(&m.registry, panes, agent, &holder).await;
+                bridge::emit_notice(&m.app, agent, &holder, "task at twice its token budget");
             }
         }
     }
@@ -2604,6 +2617,18 @@ mod tests {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(2);
+        // `NEURON_LIVE_QUIET_SECS`: how long the bridge must be silent after
+        // the expected signals before the run winds down (default 60).
+        let quiet = Duration::from_secs(
+            std::env::var("NEURON_LIVE_QUIET_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(60u64),
+        );
+        // `NEURON_LIVE_COMPACT_AT=<secs>:<agent>`: type `/compact` into that
+        // agent's pane at that time — the compaction re-pin, forced.
+        let mut compact_at: Option<(Duration, String)> =
+            std::env::var("NEURON_LIVE_COMPACT_AT").ok().and_then(|v| {
+                let (secs, agent) = v.split_once(':')?;
+                Some((Duration::from_secs(secs.parse().ok()?), agent.to_string()))
+            });
 
         // `NEURON_LIVE_INJECT` = JSON `{"<agent>": "<extra persona text>"}`.
         if let Ok(raw) = std::env::var("NEURON_LIVE_INJECT") {
@@ -2630,7 +2655,7 @@ mod tests {
                 let v: serde_json::Value =
                     serde_json::from_str(e.payload()).unwrap_or_default();
                 let outcome = v["outcome"].as_str().unwrap_or("");
-                if matches!(outcome, "notice" | "reminder") {
+                if matches!(outcome, "notice" | "reminder" | "injection") {
                     let body: String = v["body"].as_str().unwrap_or("").chars().take(220).collect();
                     println!(
                         "[{:>5.1}s] {} → {}: {}",
@@ -2810,6 +2835,17 @@ mod tests {
         let mut budget_holds = 0usize;
         let mut held_since: Option<Instant> = None;
         while started.elapsed() < timeout {
+            if compact_at.as_ref().is_some_and(|(at, _)| started.elapsed() >= *at) {
+                let (_, agent) = compact_at.take().expect("compact_at");
+                if let Some(pane) = panes.get(agent.as_str()) {
+                    let typed = bridge::paste_then_submit(&registry, pane, b"/compact").await;
+                    println!(
+                        "[{}] /compact typed into {agent}: {:?}",
+                        stamp(Instant::now()),
+                        typed.map(|_| "ok")
+                    );
+                }
+            }
             for kind in ["processed", "rejected"] {
                 for target in AGENT_IDS {
                     let dir = root.join(kind).join(target);
@@ -2881,7 +2917,7 @@ mod tests {
                 }
                 _ => {}
             }
-            if task_done >= expect && last_message.elapsed() > Duration::from_secs(60) {
+            if task_done >= expect && last_message.elapsed() > quiet {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(500)).await;

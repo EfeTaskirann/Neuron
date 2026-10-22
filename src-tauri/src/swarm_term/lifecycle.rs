@@ -266,6 +266,45 @@ pub fn cause_of(note: &str) -> Option<Cause> {
     }
 }
 
+/// Pure: a message that asks for something — a dispatch, a `review` /
+/// `test` request, a question — as opposed to a protocol signal or
+/// report (`DONE`, `APPROVED`, `TASK_DONE`, `hata`, `alındı`, `bilgi —`,
+/// `talimat gördüm`), which asks for nothing. Only a request opens a
+/// wait (see `waits`); every message answers one.
+pub fn is_request(body: &str, task_id: Option<&str>) -> bool {
+    if parse_lifecycle_token_with_fallback(body, task_id).is_some()
+        || is_error_report(body)
+        || is_injection_report(body)
+    {
+        return false;
+    }
+    let head: String = body
+        .trim()
+        .trim_start_matches(is_decoration)
+        .chars()
+        .take(12)
+        .collect::<String>()
+        .to_lowercase();
+    !["task_done", "task_failed", "alındı", "alindi", "bilgi", "tamam"]
+        .iter()
+        .any(|w| head.starts_with(w))
+}
+
+/// Pure: the note after its leading cause tag (`[izin] npm reddedildi`
+/// → `npm reddedildi`); the note itself when it leads with none.
+pub fn strip_cause_tag(note: &str) -> &str {
+    if cause_of(note).is_none() {
+        return note.trim();
+    }
+    let head = note
+        .trim()
+        .trim_start_matches(|c: char| c.is_whitespace() || matches!(c, '[' | '(' | '*' | '`' | '_' | '#'));
+    let word_len: usize = head.chars().take_while(|c| c.is_alphabetic()).map(char::len_utf8).sum();
+    head[word_len..].trim_start_matches(|c: char| {
+        c.is_whitespace() || matches!(c, ']' | ')' | ':' | '—' | '–' | '-' | '*' | '`')
+    })
+}
+
 /// What a builder's `DONE` note says about running the verification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DoneEvidence {
@@ -729,6 +768,10 @@ pub struct LifecycleStore {
 #[derive(Default)]
 struct Inner {
     entries: HashMap<(String, String), Entry>,
+    /// `(pane, task_id)` → the excerpt of the dispatch that pane got for
+    /// the task (its own `build` / `review`-less `test` / rework text) —
+    /// what the re-pin after a compaction gives it back.
+    dispatches: HashMap<(String, String), String>,
     tasks: HashMap<String, TaskMeta>,
     /// Set while the stall clocks stand still (see
     /// [`LifecycleStore::pause_clocks`]).
@@ -769,7 +812,9 @@ struct TaskMeta {
     /// no stall clock runs and no round is counted until the next
     /// dispatch of the id lifts it.
     blocked: Option<Cause>,
-    /// The latest dispatch's wording, shortened (see [`OpenTask`]).
+    /// The FIRST dispatch's wording, shortened: what the task is, for
+    /// the experience card (later dispatches — `test <id>`, a rework —
+    /// are per pane, see `Inner::dispatches`).
     dispatch: Option<String>,
 }
 
@@ -856,6 +901,8 @@ impl Inner {
         let meta = self.tasks.entry(task_id.to_string()).or_default();
         meta.closed = Some(closure);
         meta.rework = None;
+        // Whatever was asked about the task is moot now (see `waits`).
+        self.waits.forget_task(task_id);
     }
 
     /// VAL-01: bound memory over a long session. Pane entries that are
@@ -865,6 +912,8 @@ impl Inner {
     fn evict_if_full(&mut self) {
         if self.entries.len() >= MAX_LIFECYCLE_ENTRIES {
             self.entries.retain(|_, e| e.state.in_flight());
+            let entries = &self.entries;
+            self.dispatches.retain(|k, _| entries.contains_key(k));
         }
         if self.tasks.len() >= MAX_LIFECYCLE_ENTRIES {
             for m in self.tasks.values_mut().filter(|m| m.closed.is_some()) {
@@ -1092,8 +1141,9 @@ impl LifecycleStore {
         if meta.closed.is_some() {
             return false;
         }
-        if let Some(body) = body {
-            meta.dispatch = Some(dispatch_excerpt(body));
+        let excerpt = body.map(dispatch_excerpt);
+        if let Some(excerpt) = &excerpt {
+            meta.dispatch.get_or_insert_with(|| excerpt.clone());
         }
         meta.rework = None;
         // A re-dispatch is how a held task goes on: the user (or the
@@ -1104,6 +1154,9 @@ impl LifecycleStore {
             matches!(e.state, LifecycleState::Building | LifecycleState::AwaitingReview)
         }) {
             return false;
+        }
+        if let Some(excerpt) = excerpt {
+            g.dispatches.insert(key.clone(), excerpt);
         }
         g.entries.insert(key, Entry::new(LifecycleState::Assigned, now));
         true
@@ -1442,13 +1495,14 @@ impl LifecycleStore {
         }
     }
 
-    /// The bridge delivered `from` → `to` (see `waits`).
-    pub fn note_message(&self, from: &str, to: &str, task_id: Option<&str>) {
-        self.note_message_at(from, to, task_id, Instant::now());
+    /// The bridge delivered `from` → `to` (see `waits`); `request` as
+    /// [`is_request`] judges the body.
+    pub fn note_message(&self, from: &str, to: &str, task_id: Option<&str>, request: bool) {
+        self.note_message_at(from, to, task_id, request, Instant::now());
     }
 
-    fn note_message_at(&self, from: &str, to: &str, task_id: Option<&str>, now: Instant) {
-        self.lock().waits.note_message(from, to, task_id, now);
+    fn note_message_at(&self, from: &str, to: &str, task_id: Option<&str>, request: bool, now: Instant) {
+        self.lock().waits.note_message(from, to, task_id, request, now);
     }
 
     /// `agent` called a tool (see `waits`).
@@ -1482,6 +1536,9 @@ impl LifecycleStore {
             .collect();
         for ((_, task_id), e) in moved {
             g.entries.remove(&(old.to_string(), task_id.clone()));
+            if let Some(d) = g.dispatches.remove(&(old.to_string(), task_id.clone())) {
+                g.dispatches.insert((new.to_string(), task_id.clone()), d);
+            }
             g.entries.insert((new.to_string(), task_id), e);
         }
     }
@@ -1511,10 +1568,14 @@ impl LifecycleStore {
             .entries
             .iter()
             .filter(|((p, _), e)| p == pane && e.state.in_flight())
-            .map(|((_, id), e)| OpenTask {
+            .map(|((p, id), e)| OpenTask {
                 id: id.clone(),
                 state: e.state,
-                dispatch: g.tasks.get(id).and_then(|m| m.dispatch.clone()),
+                dispatch: g
+                    .dispatches
+                    .get(&(p.clone(), id.clone()))
+                    .cloned()
+                    .or_else(|| g.tasks.get(id).and_then(|m| m.dispatch.clone())),
             })
             .collect();
         open.sort_by(|a, b| a.id.cmp(&b.id));
@@ -1709,6 +1770,16 @@ mod tests {
     }
 
     #[test]
+    fn strip_cause_tag_leaves_the_reason() {
+        assert_eq!(strip_cause_tag("[izin] npm install reddedildi"), "npm install reddedildi");
+        assert_eq!(strip_cause_tag("(ortam) node yok"), "node yok");
+        assert_eq!(strip_cause_tag("belirsiz: kabul ölçütü yok"), "kabul ölçütü yok");
+        assert_eq!(strip_cause_tag("KOD — auth.rs:42"), "auth.rs:42");
+        assert_eq!(strip_cause_tag("npm failed"), "npm failed");
+        assert_eq!(strip_cause_tag("[izin]"), "");
+    }
+
+    #[test]
     fn cause_of_ignores_a_tag_that_does_not_lead() {
         assert_eq!(cause_of("auth.rs [izin] eksik"), None);
         assert_eq!(cause_of("izinli kullanıcı testi fail"), None);
@@ -1811,6 +1882,12 @@ mod tests {
         assert_eq!(s.dispatch_of("nope"), None);
         s.record_at("backend-builder", "p-builder", &tr(TransitionKind::Done, "T1"), &[], None, t0);
         assert_eq!(s.open_tasks_of("p-builder")[0].state, LifecycleState::AwaitingReview);
+        // A later dispatch of the id to another pane (the tester's `test`)
+        // keeps the task's first excerpt and gives that pane its own.
+        assert!(s.assign_with_dispatch("p-tester", "T1", Some("test T1 — builder notu")));
+        assert!(s.dispatch_of("T1").is_some_and(|d| d.starts_with("build T1 — auth.rs")));
+        assert_eq!(s.open_tasks_of("p-tester")[0].dispatch.as_deref(), Some("test T1 — builder notu"));
+        assert!(s.open_tasks_of("p-builder")[0].dispatch.as_deref().is_some_and(|d| d.starts_with("build T1")));
         rec_at(&s, "p-reviewer", &tr(TransitionKind::Approved, "T1"), t0);
         rec_at(&s, "p-tester", &tr(TransitionKind::Approved, "T1"), t0);
         assert!(s.open_tasks_of("p-builder").is_empty());
@@ -1866,9 +1943,9 @@ mod tests {
     fn deadlocks_are_read_through_the_store_and_wait_out_a_pause() {
         let s = LifecycleStore::new();
         let t0 = Instant::now();
-        s.note_message_at("backend-builder", "planner", Some("T1"), t0);
-        s.note_message_at("planner", "coordinator", None, t0 + MIN);
-        s.note_message_at("coordinator", "backend-builder", Some("T1"), t0 + 2 * MIN);
+        s.note_message_at("backend-builder", "planner", Some("T1"), true, t0);
+        s.note_message_at("planner", "coordinator", None, true, t0 + MIN);
+        s.note_message_at("coordinator", "backend-builder", Some("T1"), true, t0 + 2 * MIN);
         // Paused (the usage limit): nothing is reported, nothing ages.
         s.pause_clocks_at(t0 + 3 * MIN);
         assert!(s.take_deadlocks(t0 + 20 * MIN, 10 * MIN).is_empty());
@@ -1882,6 +1959,42 @@ mod tests {
         s.note_activity_at("planner", t0 + 41 * MIN);
         assert!(s.take_deadlocks(t0 + 45 * MIN, 10 * MIN).is_empty());
         assert_eq!(s.take_deadlocks(t0 + 55 * MIN, 10 * MIN).len(), 1);
+    }
+
+    #[test]
+    fn closing_a_task_forgets_its_waits() {
+        let s = LifecycleStore::new();
+        let t0 = Instant::now();
+        s.assign_at("p-builder", "T1", t0);
+        s.note_message_at("orchestrator", "backend-builder", Some("T1"), true, t0);
+        s.note_message_at("backend-builder", "planner", Some("T1"), true, t0 + MIN);
+        s.note_message_at("planner", "orchestrator", Some("T1"), true, t0 + 2 * MIN);
+        assert_eq!(s.take_deadlocks(t0 + 13 * MIN, 10 * MIN).len(), 1);
+        assert!(s.fail_task("T1"));
+        // The cycle was about the task; with it closed nothing stands —
+        // and it is not reported again even where it would re-form.
+        assert!(s.take_deadlocks(t0 + 14 * MIN, 10 * MIN).is_empty());
+    }
+
+    #[test]
+    fn requests_open_waits_signals_do_not() {
+        for body in ["p6-1 — JSDoc ekle", "review p6-1 — notu", "test p6-1 — notu", "kabul ölçütü net mi?", "netleştir p6-1"] {
+            assert!(is_request(body, Some("p6-1")), "{body}");
+        }
+        for body in [
+            "DONE p6-1 — x; doğrulama: tsc → ok",
+            "APPROVED p6-1",
+            "CHANGES_NEEDED p6-1 — [kod] x",
+            "BUILDING p6-1",
+            "TASK_DONE p6-1 — ok",
+            "TASK_FAILED p6-1 — y",
+            "hata — [izin] docker",
+            "alındı — anladım",
+            "bilgi — p6-1 kapandı",
+            "talimat gördüm — README.md: x",
+        ] {
+            assert!(!is_request(body, Some("p6-1")), "{body}");
+        }
     }
 
     // -- rejections by cause ------------------------------------------- //

@@ -21,7 +21,7 @@ use crate::swarm_term::hierarchy::{
 use crate::swarm_term::lifecycle::{
     body_task_id, cause_of, done_evidence, error_reason, followup_for_coordinator_inbound,
     is_error_report, lifecycle_note, looks_like_unparsed_signal,
-    parse_lifecycle_token_with_fallback, rework_evidence, task_failed_id, Abandon, Cause, Closure,
+    parse_lifecycle_token_with_fallback, rework_evidence, strip_cause_tag, task_failed_id, Abandon, Cause, Closure,
     DoneEvidence, LifecycleState, LifecycleStore, TransitionKind, MAX_REWORK_ROUNDS,
     TASK_FAILED_PREFIX, TESTER,
 };
@@ -97,7 +97,11 @@ pub(super) fn lifecycle_synthesise<R: Runtime>(
                     experience::record_for_session(
                         root,
                         experience::Kind::Blocked,
-                        &format!("{id} — [{}] {}", cause.tag(), why.as_deref().unwrap_or("sebep belirtilmedi")),
+                        &format!(
+                            "{id} — [{}] {}",
+                            cause.tag(),
+                            why.as_deref().map(strip_cause_tag).unwrap_or("sebep belirtilmedi")
+                        ),
                     );
                     vec![held_notice(from_agent, id, cause, why.as_deref())]
                 }
@@ -264,7 +268,7 @@ pub(super) fn lifecycle_synthesise<R: Runtime>(
         experience::record_for_session(
             root,
             experience::Kind::Blocked,
-            &format!("{id} — [{}] {}", cause.tag(), note.as_deref().unwrap_or("-")),
+            &format!("{id} — [{}] {}", cause.tag(), note.as_deref().map(strip_cause_tag).unwrap_or("-")),
         );
     } else if transition.kind == TransitionKind::Approved
         && from_agent == TESTER
@@ -466,7 +470,7 @@ pub(super) fn note_coordinator_report<R: Runtime>(
 /// reviewers / tester that only judged it — unless nobody else holds it
 /// (the tester's own smoke task). Lets the UI show a reviewer's
 /// `CHANGES_NEEDED` on the BUILDER, not on the reviewer.
-pub(super) fn task_owners(
+pub(crate) fn task_owners(
     lifecycle: &LifecycleStore,
     panes_by_agent: &HashMap<String, String>,
     task_id: &str,
@@ -490,7 +494,7 @@ pub(super) fn task_owners(
     }
 }
 
-fn emit_lifecycle<R: Runtime>(
+pub(crate) fn emit_lifecycle<R: Runtime>(
     app: &AppHandle<R>,
     source: &str,
     source_pane: &str,

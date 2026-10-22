@@ -4,14 +4,16 @@
 //! The bridge sees every message; the session monitor sees every tool
 //! call in the transcripts. From those two the graph knows, for each
 //! agent, its newest message to each peer and its newest activity. An
-//! agent WAITS on a peer when its last message to that peer is
-//! unanswered and old, and the agent has been idle as long (it is not
-//! working on something else). A cycle of such waits — A on B, B on C,
-//! C on A — means nobody will ever move: the coordinator is told
-//! ([`crate::swarm_term::bridge`]'s stall scan), once per cycle while
-//! it stands. The lifecycle's task states cannot form such a cycle on
-//! their own; the questions and reports agents send each other outside
-//! the protocol can, and did in live runs.
+//! agent WAITS on a peer when its last REQUEST to that peer (a dispatch,
+//! a review / test request, a question — not a `DONE`, `APPROVED`,
+//! `TASK_DONE` or report, which asks for nothing) is unanswered and old,
+//! and the agent has been idle as long (it is not working on something
+//! else). A cycle of such waits — A on B, B on C, C on A — means nobody
+//! will ever move: the coordinator is told ([`crate::swarm_term::bridge`]'s
+//! stall scan), once per cycle while it stands. A closed task takes its
+//! waits with it. Live run 2026-10-23: counting signals as waits made
+//! dispatch → DONE → TASK_DONE look like a deadlock after the task had
+//! closed — hence the request / signal distinction.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
@@ -53,8 +55,10 @@ pub fn activity_signal(line: &str) -> bool {
     })
 }
 
-/// A message on record: when it went and the task it named.
-type Sent = (Instant, Option<String>);
+/// A message on record: when it went, the task it named, and whether it
+/// asked for something (only a request opens a wait; every message
+/// answers one).
+type Sent = (Instant, Option<String>, bool);
 
 #[derive(Debug, Default)]
 pub struct WaitGraph {
@@ -69,11 +73,17 @@ pub struct WaitGraph {
 }
 
 impl WaitGraph {
-    /// The bridge delivered a message `from` → `to`.
-    pub fn note_message(&mut self, from: &str, to: &str, task_id: Option<&str>, now: Instant) {
+    /// The bridge delivered a message `from` → `to`; `request` says whether
+    /// it asks for something (see `lifecycle::is_request`).
+    pub fn note_message(&mut self, from: &str, to: &str, task_id: Option<&str>, request: bool, now: Instant) {
         self.last_sent
-            .insert((from.to_string(), to.to_string()), (now, task_id.map(str::to_string)));
+            .insert((from.to_string(), to.to_string()), (now, task_id.map(str::to_string), request));
         self.note_activity(from, now);
+    }
+
+    /// `task_id` closed: whatever was asked about it is moot.
+    pub fn forget_task(&mut self, task_id: &str) {
+        self.last_sent.retain(|_, (_, task, _)| task.as_deref() != Some(task_id));
     }
 
     /// `agent` did something (a tool call in its transcript).
@@ -86,7 +96,7 @@ impl WaitGraph {
 
     /// The clocks stood still for `by` (a pause): nothing aged meanwhile.
     pub fn shift(&mut self, by: Duration) {
-        for (t, _) in self.last_sent.values_mut() {
+        for (t, _, _) in self.last_sent.values_mut() {
             *t += by;
         }
         for t in self.last_activity.values_mut() {
@@ -98,17 +108,17 @@ impl WaitGraph {
     /// each reported once while it stands.
     pub fn take_deadlocks(&mut self, now: Instant, wait_after: Duration) -> Vec<Deadlock> {
         let cycles = {
-            // An edge: an old, unanswered message from an agent idle as long.
+            // An edge: an old, unanswered request from an agent idle as long.
             let mut edges: BTreeMap<&str, Vec<(&str, &Sent)>> = BTreeMap::new();
             for ((from, to), sent) in &self.last_sent {
-                let (t, _) = sent;
-                if now.saturating_duration_since(*t) < wait_after {
+                let (t, _, request) = sent;
+                if !*request || now.saturating_duration_since(*t) < wait_after {
                     continue;
                 }
                 let answered = self
                     .last_sent
                     .get(&(to.clone(), from.clone()))
-                    .is_some_and(|(reply, _)| *reply > *t);
+                    .is_some_and(|(reply, _, _)| *reply > *t);
                 let idle = self
                     .last_activity
                     .get(from)
@@ -162,7 +172,7 @@ fn find_cycles<'a>(
                 .enumerate()
                 .filter_map(|(i, from)| {
                     let to = members[(i + 1) % members.len()];
-                    let (t, task_id) = edges.get(from)?.iter().find(|(peer, _)| *peer == to)?.1;
+                    let (t, task_id, _) = edges.get(from)?.iter().find(|(peer, _)| *peer == to)?.1;
                     Some(WaitEdge {
                         from: from.to_string(),
                         to: to.to_string(),
@@ -193,10 +203,36 @@ mod tests {
     /// builder → planner → coordinator → builder, one minute apart.
     fn triangle(t0: Instant) -> WaitGraph {
         let mut g = WaitGraph::default();
-        g.note_message("backend-builder", "planner", Some("T1"), t0);
-        g.note_message("planner", "coordinator", None, t0 + MIN);
-        g.note_message("coordinator", "backend-builder", Some("T1"), t0 + 2 * MIN);
+        g.note_message("backend-builder", "planner", Some("T1"), true, t0);
+        g.note_message("planner", "coordinator", None, true, t0 + MIN);
+        g.note_message("coordinator", "backend-builder", Some("T1"), true, t0 + 2 * MIN);
         g
+    }
+
+    #[test]
+    fn signals_answer_a_wait_but_never_open_one() {
+        let t0 = Instant::now();
+        let mut g = WaitGraph::default();
+        // dispatch (a request) → DONE → TASK_DONE (signals): the swarm is
+        // quiet and every message is "unanswered", yet nobody waits.
+        g.note_message("orchestrator", "backend-builder", Some("T1"), true, t0);
+        g.note_message("backend-builder", "coordinator", Some("T1"), false, t0 + MIN);
+        g.note_message("coordinator", "orchestrator", Some("T1"), false, t0 + 2 * MIN);
+        assert!(g.take_deadlocks(t0 + 20 * MIN, 10 * MIN).is_empty());
+        // A signal still answers a request: `review` out, `APPROVED` back.
+        g.note_message("coordinator", "backend-reviewer", Some("T1"), true, t0 + 3 * MIN);
+        g.note_message("backend-reviewer", "coordinator", Some("T1"), false, t0 + 4 * MIN);
+        g.note_message("backend-reviewer", "coordinator", None, true, t0 + 5 * MIN);
+        g.note_message("coordinator", "backend-reviewer", None, false, t0 + 6 * MIN);
+        assert!(g.take_deadlocks(t0 + 30 * MIN, 10 * MIN).is_empty());
+    }
+
+    #[test]
+    fn a_closed_task_takes_its_waits_with_it() {
+        let t0 = Instant::now();
+        let mut g = triangle(t0);
+        g.forget_task("T1");
+        assert!(g.take_deadlocks(t0 + 13 * MIN, 10 * MIN).is_empty());
     }
 
     #[test]
@@ -222,7 +258,7 @@ mod tests {
         // when it forms again.
         g.note_activity("planner", t0 + 15 * MIN);
         assert!(g.take_deadlocks(t0 + 16 * MIN, 10 * MIN).is_empty());
-        g.note_message("planner", "coordinator", None, t0 + 16 * MIN);
+        g.note_message("planner", "coordinator", None, true, t0 + 16 * MIN);
         assert_eq!(g.take_deadlocks(t0 + 27 * MIN, 10 * MIN).len(), 1);
     }
 
@@ -231,8 +267,8 @@ mod tests {
         let t0 = Instant::now();
         // Two agents: one of them always spoke last, so no cycle.
         let mut g = WaitGraph::default();
-        g.note_message("coordinator", "backend-builder", Some("T1"), t0);
-        g.note_message("backend-builder", "coordinator", Some("T1"), t0 + MIN);
+        g.note_message("coordinator", "backend-builder", Some("T1"), true, t0);
+        g.note_message("backend-builder", "coordinator", Some("T1"), true, t0 + MIN);
         assert!(g.take_deadlocks(t0 + 15 * MIN, 10 * MIN).is_empty());
         // A sender still working (tool calls after its message) waits on
         // nobody; once it has been idle long enough, it does.
