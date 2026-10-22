@@ -1,7 +1,11 @@
 //! Stalled-task reminders. A task that sits in `Assigned`, `Building`
-//! or `AwaitingReview` for too long gets a `[Neuron]` reminder pasted
+//! or `AwaitingReview` for too long WITHOUT evidence of progress (a tool
+//! call in the responsible agent's transcript resets its clock — see
+//! `LifecycleStore::note_progress`) gets a `[Neuron]` reminder pasted
 //! into the responsible agent's pane; at twice the threshold the
 //! coordinator is told too, so it can re-dispatch or give the task up.
+//! The same scan reports a cycle of agents waiting on each other (see
+//! `waits`) to the coordinator.
 //! A rejection the coordinator never re-dispatched reminds the
 //! coordinator, and escalates to the orchestrator. If nobody answers the
 //! escalation either, the task is given up and reported `TASK_FAILED`.
@@ -17,6 +21,7 @@ use tauri::{AppHandle, Emitter, Runtime};
 
 use crate::sidecar::terminal::TerminalRegistry;
 use crate::swarm_term::hierarchy::{reviewer_for_builder, AGENT_IDS};
+use crate::swarm_term::waits::Deadlock;
 use crate::swarm_term::lifecycle::{
     LifecycleState, LifecycleStore, Stall, MAX_REWORK_ROUNDS, TASK_FAILED_PREFIX, TESTER,
 };
@@ -96,7 +101,7 @@ pub(super) async fn check_stalls<R: Runtime>(
             );
             enqueue_fanout(app, root, panes_by_agent, "orchestrator", failed, &stall.task_id);
             notify_agent(registry, panes_by_agent, "coordinator", &notice).await;
-            emit_reminder(app, "coordinator", &notice);
+            emit_reminder(app, "coordinator", &notice, "stalled task reminder");
             continue;
         }
         tracing::warn!(
@@ -108,16 +113,26 @@ pub(super) async fn check_stalls<R: Runtime>(
             "swarm-term bridge: stalled task — reminder sent"
         );
         notify_agent(registry, panes_by_agent, responsible, &text).await;
-        emit_reminder(app, responsible, &text);
+        emit_reminder(app, responsible, &text, "stalled task reminder");
         if stall.level >= 2 {
             let (to, text) = escalation_for(responsible, &stall);
             notify_agent(registry, panes_by_agent, to, &text).await;
-            emit_reminder(app, to, &text);
+            emit_reminder(app, to, &text, "stalled task reminder");
         }
+    }
+    for deadlock in lifecycle.take_deadlocks(Instant::now(), review_after) {
+        let text = deadlock_text(&deadlock);
+        let cycle: Vec<&str> = deadlock.edges.iter().map(|e| e.from.as_str()).collect();
+        tracing::warn!(
+            cycle = %cycle.join(" -> "),
+            "swarm-term bridge: agents waiting on each other — coordinator told"
+        );
+        notify_agent(registry, panes_by_agent, "coordinator", &text).await;
+        emit_reminder(app, "coordinator", &text, "deadlock");
     }
 }
 
-fn emit_reminder<R: Runtime>(app: &AppHandle<R>, target: &str, text: &str) {
+fn emit_reminder<R: Runtime>(app: &AppHandle<R>, target: &str, text: &str, reason: &str) {
     let _ = app.emit(
         crate::events::SWARM_TERM_ROUTE,
         json!({
@@ -125,7 +140,7 @@ fn emit_reminder<R: Runtime>(app: &AppHandle<R>, target: &str, text: &str) {
             "target": target,
             "body": format!("[Neuron] {text}"),
             "outcome": "reminder",
-            "reason": "stalled task reminder",
+            "reason": reason,
         }),
     );
 }
@@ -155,7 +170,7 @@ pub(super) fn reminder_for(
             Some((
                 reviewer,
                 format!(
-                    "hatırlatma: `review {id}` {since} cevapsız. İncelemeyi \
+                    "hatırlatma: `review {id}` {since} ilerlemiyor (araç çağrısı, mesaj yok). İncelemeyi \
                      bitirip coordinator'a `APPROVED {id}` ya da `CHANGES_NEEDED {id} — \
                      <ne değişmeli>` yolla; takıldıysan coordinator'a `hata — <sebep>` yaz \
                      (task_id alanı `{id}`)."
@@ -166,14 +181,14 @@ pub(super) fn reminder_for(
             let agent = AGENT_IDS.iter().copied().find(|a| Some(*a) == source_agent)?;
             let text = if agent == TESTER {
                 format!(
-                    "hatırlatma: `{id}` test görevi {since} sonuçsuz. Testi \
+                    "hatırlatma: `{id}` test görevi {since} ilerlemiyor (araç çağrısı, mesaj yok). Testi \
                      koşturup coordinator'a `APPROVED {id}` (PASS) ya da `CHANGES_NEEDED \
                      {id} — <hangi test, hangi dosya, hangi builder>` (FAIL) yolla; \
                      koşturamıyorsan coordinator'a `hata — <sebep>` yaz (task_id alanı `{id}`)."
                 )
             } else {
                 format!(
-                    "hatırlatma: `{id}` görevi {since} bitmedi. Bittiyse \
+                    "hatırlatma: `{id}` görevi {since} ilerleme göstermedi (dosya değişikliği, komut, mesaj yok). Bittiyse \
                      coordinator'a `DONE {id} — <değişen dosyalar>` yolla; takıldıysan \
                      coordinator'a `hata — <sebep>` yaz (task_id alanı `{id}`)."
                 )
@@ -207,6 +222,25 @@ pub(super) fn give_up_texts(responsible: &str, stall: &Stall) -> (String, String
             "`{id}` @{responsible}'dan yanıt alınamadığı için kapatıldı; orchestrator'a \
              `TASK_FAILED {id}` iletildi. Bu task_id ile yeniden dispatch ETME."
         ),
+    )
+}
+
+/// Pure: the coordinator's notice for a cycle of waits (see `waits`).
+pub(super) fn deadlock_text(deadlock: &Deadlock) -> String {
+    let chain: Vec<String> = deadlock
+        .edges
+        .iter()
+        .map(|e| {
+            let task = e.task_id.as_deref().map(|t| format!("`{t}`, ")).unwrap_or_default();
+            format!("@{} → @{} ({}{})", e.from, e.to, task, since(e.since))
+        })
+        .collect();
+    format!(
+        "KİLİTLENME: {}. Her biri son mesajından beri cevap bekliyor ve hiçbiri çalışmıyor. \
+         Zinciri kır: cevapsız kalan soruyu sen yanıtla, bekleyen görevi aynı task_id ile \
+         yeniden dispatch et ya da çözülmüyorsa orchestrator'a `TASK_FAILED <task_id> — \
+         kilitlenme` yolla.",
+        chain.join(", ")
     )
 }
 

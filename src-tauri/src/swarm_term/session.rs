@@ -44,8 +44,8 @@ use crate::swarm_term::bridge::{
 };
 use crate::swarm_term::checkpoint;
 use crate::swarm_term::heartbeat;
-use crate::swarm_term::hierarchy::AGENT_IDS;
-use crate::swarm_term::lifecycle::LifecycleStore;
+use crate::swarm_term::hierarchy::{builders_judged_by, AGENT_IDS};
+use crate::swarm_term::lifecycle::{LifecycleStore, TESTER};
 use crate::swarm_term::pane_config::{self, PaneManifest};
 use crate::swarm_term::pane_state::{PaneReadiness, PaneStates, TerminalSwarmPaneState};
 use crate::swarm_term::permissions::{self, SwarmTermPermissionMode};
@@ -59,6 +59,7 @@ use crate::swarm_term::repin::{self, Compaction};
 use crate::swarm_term::team;
 use crate::swarm_term::tokens::{self, Crossing, Overrun, TokenLedger};
 use crate::swarm_term::trust;
+use crate::swarm_term::waits;
 
 const READY_DELAY_MS: u64 = 1500;
 
@@ -1299,6 +1300,9 @@ struct SessionMonitor<R: Runtime> {
 ///   ([`tokens::usage_signal`]) and charged to the tasks open on that
 ///   pane: a task past its budget is reported to the coordinator, one at
 ///   twice the budget is closed ([`act_on_overrun`]).
+/// * Every tool call ([`waits::activity_signal`]): evidence the agent is
+///   working, which restarts its tasks' stall clocks (and, for a
+///   reviewer, its builder's review clock) and feeds the wait graph.
 async fn monitor_session<R: Runtime>(m: SessionMonitor<R>) {
     let mut tails: HashMap<String, TranscriptTail> = HashMap::new();
     let mut gone: HashSet<String> = HashSet::new();
@@ -1364,6 +1368,21 @@ async fn monitor_session<R: Runtime>(m: SessionMonitor<R>) {
                 let crossed =
                     m.tokens.lock().unwrap_or_else(|p| p.into_inner()).observe(agent, &usage, &open);
                 overruns.extend(crossed);
+            }
+            if lines.iter().any(|l| waits::activity_signal(l)) {
+                m.lifecycle.note_activity(agent);
+                if let Some(pane) = current.get(agent) {
+                    m.lifecycle.note_progress(pane);
+                }
+                // A domain reviewer's work keeps its builder's `review`
+                // wait fresh; the tester's own test task is on its own pane.
+                if agent != TESTER {
+                    for builder in builders_judged_by(agent) {
+                        if let Some(pane) = current.get(*builder) {
+                            m.lifecycle.note_review_progress(pane);
+                        }
+                    }
+                }
             }
         }
         if m.tokens.lock().unwrap_or_else(|p| p.into_inner()).total() != tokens_before {

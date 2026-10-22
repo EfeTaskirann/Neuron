@@ -47,6 +47,7 @@ pub mod session;
 pub mod team;
 pub(crate) mod tokens;
 pub(crate) mod trust;
+pub(crate) mod waits;
 
 pub use permissions::SwarmTermPermissionMode;
 pub use session::{TerminalSwarmRegistry, TerminalSwarmSessionHandle};

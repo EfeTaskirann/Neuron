@@ -25,6 +25,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use crate::swarm_term::waits::{Deadlock, WaitGraph};
 use crate::swarm_term::hierarchy::{
     is_allowed, is_builder, is_reviewer, reviewer_for_builder,
 };
@@ -715,6 +716,8 @@ struct Inner {
     /// Set while the stall clocks stand still (see
     /// [`LifecycleStore::pause_clocks`]).
     paused_since: Option<Instant>,
+    /// Who waits for whom (see `waits`).
+    waits: WaitGraph,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1387,6 +1390,67 @@ impl LifecycleStore {
                 w.since += paused;
             }
         }
+        g.waits.shift(paused);
+    }
+
+    /// Evidence that the agent on `pane` is working on its task (a tool
+    /// call in its transcript): its in-progress entries' stall clocks
+    /// start over. A stall is time WITHOUT evidence, not wall-clock
+    /// time since the dispatch — a long build keeps producing evidence.
+    pub fn note_progress(&self, pane: &str) {
+        self.note_progress_at(pane, Instant::now());
+    }
+
+    fn note_progress_at(&self, pane: &str, now: Instant) {
+        let mut g = self.lock();
+        for ((p, _), e) in g.entries.iter_mut() {
+            if p == pane && e.state.in_progress() {
+                *e = Entry::new(e.state, now);
+            }
+        }
+    }
+
+    /// The paired reviewer is working: the `AwaitingReview` entries on
+    /// `builder_pane` start over likewise.
+    pub fn note_review_progress(&self, builder_pane: &str) {
+        self.note_review_progress_at(builder_pane, Instant::now());
+    }
+
+    fn note_review_progress_at(&self, builder_pane: &str, now: Instant) {
+        let mut g = self.lock();
+        for ((p, _), e) in g.entries.iter_mut() {
+            if p == builder_pane && e.state == LifecycleState::AwaitingReview {
+                *e = Entry::new(e.state, now);
+            }
+        }
+    }
+
+    /// The bridge delivered `from` → `to` (see `waits`).
+    pub fn note_message(&self, from: &str, to: &str, task_id: Option<&str>) {
+        self.note_message_at(from, to, task_id, Instant::now());
+    }
+
+    fn note_message_at(&self, from: &str, to: &str, task_id: Option<&str>, now: Instant) {
+        self.lock().waits.note_message(from, to, task_id, now);
+    }
+
+    /// `agent` called a tool (see `waits`).
+    pub fn note_activity(&self, agent: &str) {
+        self.note_activity_at(agent, Instant::now());
+    }
+
+    fn note_activity_at(&self, agent: &str, now: Instant) {
+        self.lock().waits.note_activity(agent, now);
+    }
+
+    /// The deadlocks standing now (see `waits`); none while the clocks
+    /// are paused.
+    pub fn take_deadlocks(&self, now: Instant, wait_after: Duration) -> Vec<Deadlock> {
+        let mut g = self.lock();
+        if g.paused_since.is_some() {
+            return Vec::new();
+        }
+        g.waits.take_deadlocks(now, wait_after)
     }
 
     /// The agent behind `old` runs in a new pane now (restarted): its
@@ -1748,6 +1812,52 @@ mod tests {
         // The re-dispatch settles the debt.
         s.assign_at("p-builder", "T1", t0);
         assert_eq!(s.owed_by_coordinator().len(), 1);
+    }
+
+    // -- progress-based stalls and deadlocks --------------------------- //
+
+    #[test]
+    fn progress_evidence_resets_the_stall_clock() {
+        let s = LifecycleStore::new();
+        let t0 = Instant::now();
+        s.assign_at("p-builder", "T1", t0);
+        // Tool calls keep coming: no reminder at the wall-clock threshold.
+        s.note_progress_at("p-builder", t0 + 15 * MIN);
+        assert!(s.take_stalls(t0 + 25 * MIN, 10 * MIN, 20 * MIN).is_empty());
+        let st = s.take_stalls(t0 + 36 * MIN, 10 * MIN, 20 * MIN);
+        assert_eq!((st.len(), st[0].level, st[0].age), (1, 1, 21 * MIN));
+        // Progress on another pane changes nothing here.
+        s.note_progress_at("p-fb", t0 + 50 * MIN);
+        assert_eq!(s.take_stalls(t0 + 57 * MIN, 10 * MIN, 20 * MIN).len(), 1);
+        // A review in progress (the reviewer's tool calls) keeps the
+        // builder's AwaitingReview entry fresh.
+        s.record_at("backend-builder", "p-builder", &tr(TransitionKind::Done, "T1"), &[], None, t0 + 60 * MIN);
+        s.note_review_progress_at("p-builder", t0 + 68 * MIN);
+        assert!(s.take_stalls(t0 + 72 * MIN, 10 * MIN, 20 * MIN).is_empty());
+        let st = s.take_stalls(t0 + 79 * MIN, 10 * MIN, 20 * MIN);
+        assert_eq!((st.len(), st[0].state), (1, LifecycleState::AwaitingReview));
+    }
+
+    #[test]
+    fn deadlocks_are_read_through_the_store_and_wait_out_a_pause() {
+        let s = LifecycleStore::new();
+        let t0 = Instant::now();
+        s.note_message_at("backend-builder", "planner", Some("T1"), t0);
+        s.note_message_at("planner", "coordinator", None, t0 + MIN);
+        s.note_message_at("coordinator", "backend-builder", Some("T1"), t0 + 2 * MIN);
+        // Paused (the usage limit): nothing is reported, nothing ages.
+        s.pause_clocks_at(t0 + 3 * MIN);
+        assert!(s.take_deadlocks(t0 + 20 * MIN, 10 * MIN).is_empty());
+        s.resume_clocks_at(t0 + 30 * MIN);
+        assert!(s.take_deadlocks(t0 + 35 * MIN, 10 * MIN).is_empty());
+        let found = s.take_deadlocks(t0 + 40 * MIN, 10 * MIN);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].edges.len(), 3);
+        assert_eq!(found[0].edges[0].since, 13 * MIN);
+        // Activity breaks it; idling again re-forms (and re-reports) it.
+        s.note_activity_at("planner", t0 + 41 * MIN);
+        assert!(s.take_deadlocks(t0 + 45 * MIN, 10 * MIN).is_empty());
+        assert_eq!(s.take_deadlocks(t0 + 55 * MIN, 10 * MIN).len(), 1);
     }
 
     // -- rejections by cause ------------------------------------------- //

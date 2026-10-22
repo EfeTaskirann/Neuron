@@ -938,6 +938,7 @@ async fn process_one<R: Runtime>(
             }
             let task_id = envelope_task_id.as_deref();
             note_dispatch(app, &from_agent, &to_agent, &target_pane, &body, task_id, lifecycle);
+            lifecycle.note_message(&from_agent, &to_agent, task_id);
             note_coordinator_report(
                 app,
                 &from_agent,
