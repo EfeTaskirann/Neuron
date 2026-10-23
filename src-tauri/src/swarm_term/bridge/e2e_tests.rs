@@ -421,8 +421,11 @@ async fn lifecycle_failure_paths_with_fake_agents() {
     step!("B4 the fix is reviewed first", log("backend-reviewer").contains("review S1"));
     step!("B5 no retest before the review", !log("integration-tester").contains("retest S1"));
     send("backend-reviewer", "coordinator", "APPROVED S1 - looks right", Some("S1"));
-    step!("B6 tester got retest S1 with the builder's note",
-        log("integration-tester").contains("retest S1") && log("integration-tester").contains("parse.rs fixed"));
+    step!("B6 tester got retest S1 with the builder's note and the declared files",
+        log("integration-tester").contains("retest S1") && log("integration-tester").contains("parse.rs fixed")
+            && log("integration-tester").contains("retest S1 — ")
+            && log("integration-tester").contains("| dosyalar: ")
+            && log("integration-tester").contains("src/parse.rs"));
     step!("B7 no TASK_DONE before the retest passes", !log("orchestrator").contains("TASK_DONE S1"));
     send("integration-tester", "coordinator", "APPROVED S1", Some("S1"));
     step!("B7b a tester APPROVED without its run is refused",

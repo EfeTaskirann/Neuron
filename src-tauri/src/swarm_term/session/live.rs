@@ -135,10 +135,15 @@ fn failed_signal(at: Duration, body: &str, envelope_id: Option<String>) -> TaskS
     }
 }
 
-/// Pure: the text after a signal's dash (`TASK_FAILED T1 — <this>`).
+/// Pure: a signal's reason — what follows the id token (`TASK_FAILED T1 —
+/// <this>`), whichever separator the coordinator used (`—`, `–`, `-`, `:`).
 fn signal_reason(body: &str) -> Option<String> {
-    let (_, reason) = body.split_once(" — ").or_else(|| body.split_once(" - "))?;
-    let reason = reason.trim();
+    let is_separator = |c: char| c.is_whitespace() || matches!(c, '—' | '–' | '-' | ':');
+    // Past `TASK_FAILED`, then past the id token (a bare separator where
+    // the id is only in the envelope).
+    let after_keyword = body.trim_start().split_once(char::is_whitespace)?.1.trim_start();
+    let after_id = after_keyword.split_once(char::is_whitespace).map(|(_, r)| r).unwrap_or("");
+    let reason = after_id.trim_start_matches(is_separator).trim();
     (!reason.is_empty()).then(|| reason.chars().take(240).collect())
 }
 
@@ -643,6 +648,13 @@ mod tests {
         assert_eq!((bare.label, bare.reason.as_deref()), (None, Some("gave up")));
         let none = failed_signal(std::time::Duration::ZERO, "TASK_FAILED T3", None);
         assert_eq!((none.task_id.as_deref(), none.reason), (Some("T3"), None));
+        // The coordinator's own wording varies: a colon, an en dash.
+        for body in ["TASK_FAILED T3: [FM-2.2] builder never asked", "TASK_FAILED T3 – [FM-2.2] builder never asked"] {
+            let s = failed_signal(std::time::Duration::ZERO, body, None);
+            assert_eq!(s.task_id.as_deref(), Some("T3"), "{body}");
+            assert_eq!(s.label.as_deref(), Some("FM-2.2"), "{body}");
+            assert_eq!(s.reason.as_deref(), Some("[FM-2.2] builder never asked"), "{body}");
+        }
         // A reason is cut, a done signal carries none.
         let long = format!("TASK_FAILED T4 — {}", "x".repeat(400));
         assert!(failed_signal(std::time::Duration::ZERO, &long, None).reason.unwrap().chars().count() <= 240);

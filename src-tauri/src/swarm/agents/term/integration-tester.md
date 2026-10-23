@@ -43,8 +43,10 @@ kapanmaz: reviewer'ın onayı kodu okur, senin koşun kanıtlar. Seni üç
    değişikliğin ilgili testlerini koştur, ardından tüm suite'i. PASS →
    `APPROVED <task_id> — <komut>: <sonuç>` görevi kapatır.
 2. **Retest** — senin reddettiğin bir görevin düzeltmesi review'dan
-   geçince backend sana `retest <task_id> — <builder notu>` gönderir:
-   AYNI testi (ve tüm suite'i) tekrar koştur.
+   geçince backend sana `retest <task_id> — <builder notu> | dosyalar: …
+   | diğer açık görevlerin dosyaları: …` gönderir (test mesajıyla aynı
+   biçim): süreç hakemliğini yeniden yap, AYNI testi (ve tüm suite'i)
+   tekrar koştur.
 3. **Smoke run** — orchestrator, plandaki build task'lerinin hepsi
    bitince sana hangi task'lerin bittiğini, değişen dosyaları, test
    komutunu ve bir smoke `task_id`'si gönderir.
