@@ -36,6 +36,7 @@ pub(crate) mod experience;
 pub(crate) mod heartbeat;
 pub mod hierarchy;
 pub mod lifecycle;
+pub(crate) mod mast;
 pub(crate) mod pane_config;
 pub mod pane_state;
 pub(crate) mod permissions;

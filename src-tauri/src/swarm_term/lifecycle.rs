@@ -1895,6 +1895,21 @@ impl LifecycleStore {
             .unwrap_or_default()
     }
 
+    /// The files every OTHER open task declared, `(task, files)` sorted by
+    /// task — what the tester may see in the diff besides `task_id`'s own
+    /// files. Tasks that declared none are left out.
+    pub fn open_claims(&self, task_id: &str) -> Vec<(String, Vec<String>)> {
+        let g = self.lock();
+        let mut out: Vec<(String, Vec<String>)> = g
+            .tasks
+            .iter()
+            .filter(|(id, m)| id.as_str() != task_id && m.closed.is_none() && !m.files.is_empty())
+            .map(|(id, m)| (id.clone(), m.files.iter().cloned().collect()))
+            .collect();
+        out.sort();
+        out
+    }
+
     /// Where `deps` stand: open (known, not closed), failed, or never
     /// seen. Ids closed as done need no waiting and are left out.
     pub fn dependency_hold(&self, deps: &[String]) -> DependencyHold {
@@ -2014,8 +2029,9 @@ pub fn followup_for_coordinator_inbound(
         TransitionKind::ChangesNeeded if is_reviewer(src_agent) && rec.limit_exceeded => (
             "orchestrator",
             format!(
-                "{TASK_FAILED_PREFIX}{id} — {}. ret: düzeltme limiti ({MAX_REWORK_ROUNDS} tur) \
+                "{TASK_FAILED_PREFIX}{id} — {} {}. ret: düzeltme limiti ({MAX_REWORK_ROUNDS} tur) \
                  aşıldı (@{src_agent})",
+                crate::swarm_term::mast::REWORK_LIMIT.tag(),
                 rec.rejections
             ),
         ),
@@ -2934,6 +2950,46 @@ mod tests {
         assert_eq!(s.dependency_hold(&[]), DependencyHold::default());
     }
 
+    #[test]
+    fn open_claims_lists_the_other_open_tasks_files() {
+        let s = LifecycleStore::new();
+        let t0 = Instant::now();
+        s.assign_at("p-builder", "T1", t0);
+        s.claim_files("T1", &["src/a.rs".to_string()]);
+        s.assign_at("p-fb", "T2", t0);
+        s.claim_files("T2", &["app/b.tsx".to_string(), "app/c.tsx".to_string()]);
+        s.assign_at("p-fb", "T3", t0);
+        s.claim_files("T3", &[]); // declared none: not listed
+        s.assign_at("p-builder", "T4", t0);
+        s.claim_files("T4", &["src/d.rs".to_string()]);
+        assert!(s.fail_task("T4")); // closed: not listed
+        assert_eq!(
+            s.open_claims("T1"),
+            vec![("T2".to_string(), vec!["app/b.tsx".to_string(), "app/c.tsx".to_string()])]
+        );
+        assert_eq!(
+            s.open_claims("T2"),
+            vec![("T1".to_string(), vec!["src/a.rs".to_string()])]
+        );
+        assert!(s.open_claims("nope").len() == 2);
+    }
+
+    #[test]
+    fn the_rework_limit_failure_is_labelled_step_repetition() {
+        let mut rec = Recorded::plain(LifecycleState::Failed);
+        rec.limit_exceeded = true;
+        rec.rejections = 3;
+        let (to, body) = followup_for_coordinator_inbound(
+            "backend-reviewer",
+            &tr(TransitionKind::ChangesNeeded, "L1"),
+            &rec,
+        )
+        .expect("the limit fans out");
+        assert_eq!(to, "orchestrator");
+        assert!(body.starts_with("TASK_FAILED L1 — [FM-1.3] 3. ret: düzeltme limiti"), "{body}");
+        assert_eq!(crate::swarm_term::mast::failure_mode_of(&body), Some(crate::swarm_term::mast::REWORK_LIMIT));
+    }
+
     // -- take_stalls ------------------------------------------------- //
 
     const MIN: Duration = Duration::from_secs(60);
@@ -3460,7 +3516,7 @@ mod tests {
         assert!(r.limit_exceeded);
         let (to, body) = ok_followup("backend-reviewer", &ch, &r).expect("TASK_FAILED");
         assert_eq!(to, "orchestrator");
-        assert!(body.starts_with("TASK_FAILED T1 — 3. ret"), "{body}");
+        assert!(body.starts_with("TASK_FAILED T1 — [FM-1.3] 3. ret"), "{body}");
         assert_eq!(s.closure("T1"), Some(Closure::Failed));
 
         // Nothing fans out for a closed task, and it cannot be re-dispatched.

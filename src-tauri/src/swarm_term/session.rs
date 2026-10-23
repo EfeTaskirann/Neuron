@@ -1523,7 +1523,11 @@ async fn act_on_overrun<R: Runtime>(
             experience::record_for_session(
                 &m.bridgespace_root,
                 experience::Kind::Failed,
-                &format!("{id} — token bütçesinin iki katı harcandı ({})", tokens::fmt_tokens(overrun.spent)),
+                &format!(
+                    "{id} — {} token bütçesinin iki katı harcandı ({})",
+                    crate::swarm_term::mast::TOKEN_OVERRUN.tag(),
+                    tokens::fmt_tokens(overrun.spent)
+                ),
             );
             bridge::notify_agent(&m.registry, panes, "coordinator", &coordinator).await;
             bridge::emit_notice(&m.app, "coordinator", &coordinator, "task at twice its token budget");

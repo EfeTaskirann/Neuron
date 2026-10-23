@@ -108,7 +108,12 @@ pub(super) async fn check_stalls<R: Runtime>(
             crate::swarm_term::experience::record_for_session(
                 root,
                 crate::swarm_term::experience::Kind::Failed,
-                &format!("{} — @{responsible} {} yanıt vermedi (takılma)", stall.task_id, since(stall.age)),
+                &format!(
+                    "{} — {} @{responsible} {} yanıt vermedi (takılma)",
+                    stall.task_id,
+                    crate::swarm_term::mast::STALL.tag(),
+                    since(stall.age)
+                ),
             );
             notify_agent(registry, panes_by_agent, "coordinator", &notice).await;
             emit_reminder(app, "coordinator", &notice, "stalled task reminder");
@@ -263,8 +268,9 @@ pub(super) fn give_up_texts(responsible: &str, stall: &Stall) -> (String, String
     let since = since(stall.age);
     (
         format!(
-            "{TASK_FAILED_PREFIX}{id} — @{responsible} {since} yanıt vermedi \
-             (hatırlatma ve eskalasyondan sonra da)"
+            "{TASK_FAILED_PREFIX}{id} — {} @{responsible} {since} yanıt vermedi \
+             (hatırlatma ve eskalasyondan sonra da)",
+            crate::swarm_term::mast::STALL.tag()
         ),
         format!(
             "`{id}` @{responsible}'dan yanıt alınamadığı için kapatıldı; orchestrator'a \

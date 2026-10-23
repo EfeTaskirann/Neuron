@@ -136,7 +136,8 @@ yollar. Backend OTOMATİK olarak paired-reviewer'a `review <task_id> —
 <builder notu>` düşürür. Reviewer onaylayınca backend SENİN pane'ine
 `TASK_DONE <task_id>` düşürür. Görev başarısız kapanırsa (builder
 `hata` bildirdi ya da düzeltme limiti aşıldı) backend sana
-`TASK_FAILED <task_id> — <sebep>` düşürür. **Bunlar senin manuel
+`TASK_FAILED <task_id> — <sebep>` düşürür (sebebin başındaki `[FM-x.y]`
+arızanın MAST türüdür; raporunda aynen aktar). **Bunlar senin manuel
 dispatch'in DEĞİL — otonom sinyallerdir.** Geldiğinde:
 
 - Her task_id için ya `TASK_DONE` ya `TASK_FAILED` gelir. Plan'da N

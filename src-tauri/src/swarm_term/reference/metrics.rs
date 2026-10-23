@@ -4,6 +4,8 @@
 //! - [`RunRecord`]: one task's run — a line of the history file.
 //! - [`trend_table`]: the history per task and team — pass rate, medians,
 //!   and the newest run against the ones before it.
+//! - [`pass_k`]: one suite invocation run k times — which tasks passed
+//!   every run; [`failure_distribution`]: its TASK_FAILEDs by MAST label.
 //!
 //! Pure apart from the history file, so CI tests it.
 
@@ -91,12 +93,28 @@ impl Check {
     }
 }
 
+/// A failed task of a run: its id, the MAST code its `TASK_FAILED`
+/// carried (`FM-3.1`; none when the coordinator wrote no label) and the
+/// reason text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct FailureNote {
+    pub task: String,
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub reason: String,
+}
+
 /// One reference task's run: a line of the history file. Times are
 /// seconds; `_at` is unix seconds.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct RunRecord {
     /// Bumped when a field changes meaning.
     pub schema: u32,
+    /// Which repetition of the suite (1-based; 0 in lines written before
+    /// `NEURON_REF_REPEAT` existed).
+    #[serde(default)]
+    pub rep: u32,
     /// The suite run it was part of.
     pub suite: String,
     pub task: String,
@@ -125,6 +143,9 @@ pub(crate) struct RunRecord {
     pub failed_signals: u32,
     /// The signals in order, `TASK_DONE <id>` / `TASK_FAILED <id>`.
     pub signals: Vec<String>,
+    /// The failed tasks with their MAST labels and reasons.
+    #[serde(default)]
+    pub failures: Vec<FailureNote>,
     pub delivered: u32,
     pub rejected: u32,
     pub notices: u32,
@@ -175,6 +196,88 @@ pub(crate) fn read_history(file: &Path) -> (Vec<RunRecord>, usize) {
 
 /// Half again as much is worth a flag.
 const JUMP: f64 = 0.5;
+
+/// One task's runs in a suite invocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TaskPassK {
+    pub task: String,
+    pub team: String,
+    pub runs: usize,
+    pub passed: usize,
+}
+
+/// pass^k of one suite invocation: a task passes only if every one of its
+/// runs passed (Bjarnason et al. 2026 — one run is a coin toss).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct PassK {
+    /// The most runs any task has.
+    pub k: usize,
+    pub tasks: usize,
+    pub all_passed: usize,
+    pub per_task: Vec<TaskPassK>,
+}
+
+impl PassK {
+    pub(crate) fn render(&self) -> String {
+        if self.tasks == 0 {
+            return "pass^k: kayıt yok\n".into();
+        }
+        let fallen: Vec<String> = self
+            .per_task
+            .iter()
+            .filter(|t| t.passed < t.runs)
+            .map(|t| format!("{} {}/{}", t.task, t.passed, t.runs))
+            .collect();
+        let mut out = format!("pass^{}: {}/{} görev her koşuyu geçti", self.k, self.all_passed, self.tasks);
+        if !fallen.is_empty() {
+            out.push_str(&format!("; düşenler: {}", fallen.join(", ")));
+        }
+        out.push('\n');
+        out
+    }
+}
+
+/// Pure: pass^k over the records of ONE suite invocation (filter the
+/// history by `suite` first), per task and team.
+pub(crate) fn pass_k(records: &[RunRecord]) -> PassK {
+    let mut rows: BTreeMap<(&str, &str), (usize, usize)> = BTreeMap::new();
+    for r in records {
+        let e = rows.entry((r.task.as_str(), r.team.as_str())).or_default();
+        e.0 += 1;
+        e.1 += usize::from(r.pass);
+    }
+    let per_task: Vec<TaskPassK> = rows
+        .into_iter()
+        .map(|((task, team), (runs, passed))| TaskPassK { task: task.into(), team: team.into(), runs, passed })
+        .collect();
+    PassK {
+        k: per_task.iter().map(|t| t.runs).max().unwrap_or(0),
+        tasks: per_task.len(),
+        all_passed: per_task.iter().filter(|t| t.runs > 0 && t.passed == t.runs).count(),
+        per_task,
+    }
+}
+
+/// Pure: how often each MAST label closed a task in `records`, most
+/// frequent first (`etiketsiz` for a label-less TASK_FAILED).
+pub(crate) fn failure_distribution(records: &[RunRecord]) -> Vec<(String, usize)> {
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for f in records.iter().flat_map(|r| &r.failures) {
+        *counts.entry(f.label.clone().unwrap_or_else(|| "etiketsiz".into())).or_default() += 1;
+    }
+    let mut out: Vec<(String, usize)> = counts.into_iter().collect();
+    out.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    out
+}
+
+/// One line of [`failure_distribution`].
+pub(crate) fn render_distribution(distribution: &[(String, usize)]) -> String {
+    if distribution.is_empty() {
+        return "arıza dağılımı: TASK_FAILED yok\n".into();
+    }
+    let parts: Vec<String> = distribution.iter().map(|(label, n)| format!("{label} ×{n}")).collect();
+    format!("arıza dağılımı: {}\n", parts.join(", "))
+}
 
 /// The trend table over `history` (oldest first), one row per task and
 /// team: the last `window` runs as ✔/✘, the pass rate over them, the
@@ -318,6 +421,8 @@ mod tests {
     fn run(task: &str, pass: bool, work: f64, output: u64) -> RunRecord {
         RunRecord {
             schema: 1,
+            rep: 1,
+            failures: Vec::new(),
             suite: "ref-1".into(),
             task: task.into(),
             tier: "smoke".into(),
@@ -404,6 +509,59 @@ mod tests {
         assert_eq!(records.iter().map(|r| r.task.as_str()).collect::<Vec<_>>(), ["a", "b"]);
         assert_eq!(records[1], run("b", false, 20.0, 2));
         assert_eq!(skipped, 1);
+    }
+
+    #[test]
+    fn pass_k_counts_the_tasks_that_passed_every_run() {
+        let mut history = Vec::new();
+        for rep in 1..=3u32 {
+            for (task, pass) in [("a", true), ("b", rep != 2), ("c", true)] {
+                let mut r = run(task, pass, 60.0, 1000);
+                r.rep = rep;
+                history.push(r);
+            }
+        }
+        // A record of another suite is not this invocation's.
+        let mut other = run("a", false, 60.0, 1000);
+        other.suite = "ref-0".into();
+        history.push(other);
+        let mine: Vec<RunRecord> = history.iter().filter(|r| r.suite == "ref-1").cloned().collect();
+        let pk = pass_k(&mine);
+        assert_eq!((pk.k, pk.tasks, pk.all_passed), (3, 3, 2));
+        let b = pk.per_task.iter().find(|t| t.task == "b").expect("b");
+        assert_eq!((b.runs, b.passed), (3, 2));
+        let text = pk.render();
+        assert!(text.contains("pass^3") && text.contains("2/3 görev") && text.contains("b 2/3"), "{text}");
+        // One run each: pass^1 is the plain pass count.
+        let single = pass_k(&mine[..3]);
+        assert_eq!((single.k, single.all_passed), (1, 3));
+        assert_eq!(pass_k(&[]).render(), "pass^k: kayıt yok\n");
+    }
+
+    #[test]
+    fn the_failure_distribution_counts_labels_and_the_unlabelled() {
+        let mut a = run("a", false, 60.0, 1000);
+        a.failures = vec![
+            FailureNote { task: "T1".into(), label: Some("FM-3.1".into()), reason: "hata".into() },
+            FailureNote { task: "T2".into(), label: Some("FM-1.3".into()), reason: "limit".into() },
+        ];
+        let mut b = run("b", false, 60.0, 1000);
+        b.failures = vec![
+            FailureNote { task: "T3".into(), label: Some("FM-3.1".into()), reason: "stall".into() },
+            FailureNote { task: "T4".into(), label: None, reason: "gave up".into() },
+        ];
+        assert_eq!(
+            failure_distribution(&[a.clone(), b.clone()]),
+            vec![("FM-3.1".to_string(), 2), ("FM-1.3".to_string(), 1), ("etiketsiz".to_string(), 1)]
+        );
+        assert!(failure_distribution(&[run("c", true, 1.0, 1)]).is_empty());
+        // Old history lines carry neither field.
+        let mut line = serde_json::to_value(&a).expect("json");
+        let obj = line.as_object_mut().expect("object");
+        obj.remove("rep");
+        obj.remove("failures");
+        let read: RunRecord = serde_json::from_value(line).expect("a record without the fields still reads");
+        assert_eq!((read.rep, read.failures.len()), (0, 0));
     }
 
     #[test]

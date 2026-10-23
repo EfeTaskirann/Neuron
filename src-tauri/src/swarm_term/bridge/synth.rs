@@ -128,17 +128,18 @@ pub(super) fn lifecycle_synthesise<R: Runtime>(
                 let owners = task_owners(lifecycle, panes_by_agent, id);
                 emit_lifecycle(app, from_agent, &source_pane, id, "Abandoned", LifecycleState::Failed, &owners);
                 let why = why.unwrap_or_else(|| "sebep belirtilmedi".into());
+                let label = crate::swarm_term::mast::HATA.tag();
                 experience::record_for_session(
                     root,
                     experience::Kind::Failed,
-                    &format!("{id} — @{from_agent} hata: {why}"),
+                    &format!("{id} — {label} @{from_agent} hata: {why}"),
                 );
                 enqueue_fanout(
                     app,
                     root,
                     panes_by_agent,
                     "orchestrator",
-                    format!("{TASK_FAILED_PREFIX}{id} — @{from_agent} hata bildirdi: {why}"),
+                    format!("{TASK_FAILED_PREFIX}{id} — {label} @{from_agent} hata bildirdi: {why}"),
                     id,
                 );
                 vec![Notice::new(
@@ -216,6 +217,23 @@ pub(super) fn lifecycle_synthesise<R: Runtime>(
             "DONE without file declaration",
         )];
     }
+    // The tester's APPROVED closes the task: it must say what it ran, as
+    // a builder's DONE must — a bare pass is a claim, not a run.
+    if transition.kind == TransitionKind::Approved
+        && from_agent == TESTER
+        && done_evidence(note.as_deref()) == DoneEvidence::Missing
+    {
+        tracing::info!(source = %from_agent, task_id = %id, "swarm-term bridge: tester APPROVED refused — no run evidence");
+        return vec![Notice::new(
+            from_agent,
+            format!(
+                "`APPROVED {id}` KABUL EDİLMEDİ: koştuğun komut ve sonucu yok, görev kapanmadı. \
+                 `APPROVED {id} — <komut>: <sonuç, ör. cargo test: 40 passed>` diye yeniden \
+                 gönder; builder'ın `doğrulama:` komutunu aynen koştuğunu da yaz."
+            ),
+            "APPROVED without run evidence",
+        )];
+    }
     // A rejection names its cause; a code rejection must point at
     // something to fix (a failing test, an error line, file:line) or the
     // builder spends a round guessing.
@@ -291,7 +309,11 @@ pub(super) fn lifecycle_synthesise<R: Runtime>(
         experience::record_for_session(
             root,
             experience::Kind::Failed,
-            &format!("{id} — düzeltme limiti aşıldı; son ret: {}", note.as_deref().unwrap_or("-")),
+            &format!(
+                "{id} — {} düzeltme limiti aşıldı; son ret: {}",
+                crate::swarm_term::mast::REWORK_LIMIT.tag(),
+                note.as_deref().unwrap_or("-")
+            ),
         );
     } else if let Some(cause) = rec.blocked.filter(|c| c.needs_user()) {
         experience::record_for_session(
@@ -332,6 +354,21 @@ pub(super) fn lifecycle_synthesise<R: Runtime>(
     };
     if let Some(fix) = fix {
         synth_body.push_str(&format!(" (düzeltme: {fix})"));
+    }
+    // The tester judges the process too: it gets the files the builder
+    // declared (to hold against `git diff`) and what the other open tasks
+    // declared (what else the diff may show).
+    if target == TESTER {
+        let files = lifecycle.claimed_files(&id);
+        if !files.is_empty() {
+            synth_body.push_str(&format!(" | dosyalar: {}", files.join(", ")));
+        }
+        let others = lifecycle.open_claims(&id);
+        if !others.is_empty() {
+            let list: Vec<String> =
+                others.iter().map(|(t, fs)| format!("{t} → {}", fs.join(", "))).collect();
+            synth_body.push_str(&format!(" | diğer açık görevlerin dosyaları: {}", list.join("; ")));
+        }
     }
     enqueue_fanout(app, root, panes_by_agent, &target, synth_body, &id);
     match transition.kind {
@@ -546,7 +583,8 @@ fn closed_notice(to: &str, id: &str, closure: Closure) -> Notice {
 
 /// The coordinator told the orchestrator `TASK_FAILED <id>` (it gave up
 /// on a task): close it so it stops stalling and cannot be re-dispatched.
-/// Returns the id it closed, if it closed one.
+/// Returns the id it closed and the MAST mode the body names (none when
+/// the coordinator wrote no `[FM-x.y]`), if it closed one.
 pub(super) fn note_coordinator_report<R: Runtime>(
     app: &AppHandle<R>,
     from_agent: &str,
@@ -555,7 +593,7 @@ pub(super) fn note_coordinator_report<R: Runtime>(
     task_id: Option<&str>,
     panes_by_agent: &HashMap<String, String>,
     lifecycle: &LifecycleStore,
-) -> Option<String> {
+) -> Option<(String, Option<crate::swarm_term::mast::FailureMode>)> {
     if from_agent != "coordinator" || to_agent != "orchestrator" {
         return None;
     }
@@ -567,7 +605,7 @@ pub(super) fn note_coordinator_report<R: Runtime>(
     let pane = panes_by_agent.get("coordinator").map(String::as_str).unwrap_or("");
     let owners = task_owners(lifecycle, panes_by_agent, id);
     emit_lifecycle(app, "coordinator", pane, id, "TaskFailed", LifecycleState::Failed, &owners);
-    Some(id.to_string())
+    Some((id.to_string(), crate::swarm_term::mast::failure_mode_of(body)))
 }
 
 /// The agents whose work `task_id` is: the panes holding it, minus the

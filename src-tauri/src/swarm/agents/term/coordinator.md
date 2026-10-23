@@ -140,8 +140,19 @@ aynı noktada dönüp duruyor) orchestrator'a şunu yolla — envelope
 `task_id` alanını doldurarak:
 
 ```
-TASK_FAILED <task_id> — <neden düzeltilemedi, bir cümle>
+TASK_FAILED <task_id> — [FM-x.y] <neden düzeltilemedi, bir cümle>
 ```
+
+`[FM-x.y]` arızanın MAST türüdür (Cemri vd. 2025); birini seç: FM-1.1
+görev tanımına aykırı, FM-1.2 rol tanımına aykırı, FM-1.3 adım tekrarı,
+FM-1.4 bağlam kaybı, FM-1.5 bitiş koşulunu bilmeme, FM-2.1 konuşma
+sıfırlanması, FM-2.2 netleştirme istememe, FM-2.3 görevden sapma, FM-2.4
+bilgi saklama, FM-2.5 diğer ajanın girdisini yok sayma, FM-2.6 akıl
+yürütme–eylem uyumsuzluğu, FM-3.1 erken bitirme, FM-3.2 doğrulama
+yok/eksik, FM-3.3 yanlış doğrulama. Etiketsiz bir `TASK_FAILED` da kabul
+edilir ama sana `[Neuron]` notu düşer. Backend'in kendi kapattığı görevlere
+(hata ve takılma → FM-3.1; düzeltme limiti ve token aşımı → FM-1.3) etiketi
+backend koyar.
 
 Backend görevi kapatır; o id bir daha dispatch edilemez.
 

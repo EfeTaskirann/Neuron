@@ -255,7 +255,8 @@ fn an_unsent_rework_reminds_the_coordinator_then_the_orchestrator() {
 fn a_given_up_stall_reports_task_failed_to_the_orchestrator() {
     let (failed, notice) =
         give_up_texts("backend-builder", &stall(LifecycleState::Assigned, 60, 3));
-    assert!(failed.starts_with("TASK_FAILED T9 — @backend-builder 60 dakikadır"), "{failed}");
+    // A stall is a premature termination (MAST FM-3.1).
+    assert!(failed.starts_with("TASK_FAILED T9 — [FM-3.1] @backend-builder 60 dakikadır"), "{failed}");
     assert!(notice.contains("yeniden dispatch ETME"));
 }
 

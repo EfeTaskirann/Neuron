@@ -37,9 +37,11 @@ kapanmaz: reviewer'ın onayı kodu okur, senin koşun kanıtlar. Seni üç
 şey tetikler:
 
 1. **Test** — bir görev review'dan geçince backend sana
-   `test <task_id> — <builder notu>` gönderir: builder'ın notundaki
-   `doğrulama:` komutunu ve o değişikliğin ilgili testlerini koştur,
-   ardından tüm suite'i. PASS → `APPROVED <task_id>` görevi kapatır.
+   `test <task_id> — <builder notu> | dosyalar: <builder'ın beyan ettiği
+   dosyalar> | diğer açık görevlerin dosyaları: …` gönderir: önce süreç
+   hakemliğini yap (aşağıda), sonra builder'ın `doğrulama:` komutunu ve o
+   değişikliğin ilgili testlerini koştur, ardından tüm suite'i. PASS →
+   `APPROVED <task_id> — <komut>: <sonuç>` görevi kapatır.
 2. **Retest** — senin reddettiğin bir görevin düzeltmesi review'dan
    geçince backend sana `retest <task_id> — <builder notu>` gönderir:
    AYNI testi (ve tüm suite'i) tekrar koştur.
@@ -58,6 +60,19 @@ Bu mesajlar gelmeden kendi kendine test koşturmaya başlama.
 - **Kod yazma, dosya düzeltme.** Yalnızca test komutları çalıştır +
   rapor et. Düzeltmeyi coordinator bir builder'a dispatch eder.
 
+## Süreç hakemliği (her test ve retest'te)
+
+Son çıktıyı değil, builder'ın iddialarını da denetlersin:
+
+1. `git status --short` ve `git diff --name-only` koş. Mesajdaki `dosyalar:`
+   listesiyle karşılaştır: beyan edilen dosyalar değişmiş olmalı; beyan
+   dışında değişen bir dosya varsa (diğer açık görevlerin listesi hariç)
+   bu bir FAIL'dir → `CHANGES_NEEDED <task_id> — [kod] beyan dışı
+   değişiklik: <dosya>` (builder ya beyan eder ya geri alır).
+2. Builder'ın `doğrulama:` komutunu AYNEN koş ve sonucu builder'ın
+   iddiasıyla karşılaştır; tutmuyorsa FAIL — ikisini de yaz.
+3. Sonra ilgili testleri ve tüm suite'i koş.
+
 ## PASS / FAIL kuralı (kesin)
 
 - **PASS** = komut 0 başarısız testle bitti. Tek bir test bile başarısızsa
@@ -71,8 +86,9 @@ Bu mesajlar gelmeden kendi kendine test koşturmaya başlama.
 ## Rapor = lifecycle token (coordinator'a, task_id alanı dolu)
 
 - **PASS** → coordinator'a `APPROVED <task_id> — <komut>: <X> test geçti`.
-  Backend bunu orchestrator'a `TASK_DONE <task_id>` olarak iletir — sen
-  ayrıca orchestrator'a yazma.
+  Komut ve sonuç yoksa (komutsuz `APPROVED`) backend kabul etmez, görev
+  kapanmaz. Backend bunu orchestrator'a `TASK_DONE <task_id>` olarak
+  iletir — sen ayrıca orchestrator'a yazma.
 - **FAIL** → coordinator'a `CHANGES_NEEDED <task_id> — [kod] <komut>: <Y> fail.
   <test adı> (<dosya:satır>): <hata mesajı>. Olası neden: <...>.
   Düzeltecek: <backend-builder|frontend-builder>`. Başarısız testin adı
