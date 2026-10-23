@@ -9,8 +9,9 @@ use super::delivery::{
 };
 use super::envelope::{sniff_from, Envelope};
 use super::notify::rejection_notice;
-use super::stall::{escalation_for, give_up_texts, question_notice, question_reminder, reminder_for};
+use super::stall::{deadlock_text, escalation_for, give_up_texts, question_notice, question_reminder, reminder_for};
 use crate::swarm_term::lifecycle::{LifecycleState, Stall, Unanswered};
+use crate::swarm_term::waits::{Deadlock, WaitEdge};
 use super::fsops::{
     archive_rejected, attempts_sidecar, bump_attempts, drop_envelope,
     ensure_gitignore, move_to_processed, move_to_rejected, prepare_layout,
@@ -158,6 +159,28 @@ fn stall(state: LifecycleState, mins: u64, level: u8) -> Stall {
         level,
         give_up: false,
     }
+}
+
+#[test]
+fn deadlock_text_names_every_waiter_and_the_task() {
+    let edge = |from: &str, to: &str, task: Option<&str>, mins: u64| WaitEdge {
+        from: from.into(),
+        to: to.into(),
+        task_id: task.map(str::to_string),
+        since: std::time::Duration::from_secs(mins * 60),
+    };
+    let d = Deadlock {
+        edges: vec![
+            edge("backend-builder", "planner", Some("T1"), 13),
+            edge("planner", "coordinator", None, 12),
+            edge("coordinator", "backend-builder", Some("T1"), 11),
+        ],
+    };
+    let t = deadlock_text(&d);
+    assert!(t.contains("KİLİTLENME"), "{t}");
+    assert!(t.contains("@backend-builder → @planner") && t.contains("`T1`") && t.contains("13 dakikadır"), "{t}");
+    assert!(t.contains("@coordinator → @backend-builder") && t.contains("TASK_FAILED"), "{t}");
+    assert!(!t.contains('\n'));
 }
 
 #[test]

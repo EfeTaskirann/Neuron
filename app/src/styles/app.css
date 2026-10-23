@@ -1482,6 +1482,7 @@ html[data-motion="off"] *::after {
 .routing-log-tag-unknown_target,
 .routing-log-tag-target_locked,
 .routing-log-tag-target_write_timeout,
+.routing-log-tag-injection,
 .routing-log-tag-rejected {
   background: color-mix(in oklch, var(--syn-error) 18%, transparent);
   border-color: var(--syn-error);

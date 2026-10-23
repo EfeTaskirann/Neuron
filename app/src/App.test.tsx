@@ -237,7 +237,7 @@ beforeEach(async () => {
   vi.mocked(commands.swarmTermListPersonas).mockResolvedValue({ status: 'ok', data: [] });
   vi.mocked(commands.swarmTermGetTeam).mockResolvedValue({
     status: 'ok',
-    data: { lite: false, models: {}, messageBudget: 300 },
+    data: { lite: false, models: {}, messageBudget: 300, taskTokenBudget: 3000000 },
   });
   vi.mocked(commands.swarmTermSessionStatus).mockResolvedValue({ status: 'ok', data: null });
   vi.mocked(commands.meGet).mockResolvedValue(ME_OK);

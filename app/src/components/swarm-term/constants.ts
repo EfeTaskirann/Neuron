@@ -62,3 +62,13 @@ export function formatMmSs(ms: number): string {
   const s = total % 60;
   return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
 }
+
+/** `1,2M`, `850k`, `12` — mirrors the backend's `tokens::fmt_tokens`. */
+export function formatTokens(tokens: number): string {
+  if (tokens >= 1_000_000) {
+    const tenths = Math.round(tokens / 100_000);
+    return tenths % 10 === 0 ? `${tenths / 10}M` : `${Math.floor(tenths / 10)},${tenths % 10}M`;
+  }
+  if (tokens >= 1000) return `${Math.round(tokens / 1000)}k`;
+  return String(tokens);
+}

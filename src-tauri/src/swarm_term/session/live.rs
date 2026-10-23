@@ -44,6 +44,9 @@ pub(crate) struct LiveSpec {
     /// open in the lifecycle — to end the run: the orchestrator writes its
     /// summary meanwhile.
     pub settle: Duration,
+    /// Type `/compact` into this agent's pane this long after the start —
+    /// the compaction re-pin, forced.
+    pub compact_at: Option<(Duration, String)>,
     pub inject: Vec<(String, String)>,
     /// Saved as Settings → Models does before the start.
     pub team: Option<team::SwarmTermTeam>,
@@ -64,7 +67,9 @@ impl LiveSpec {
     /// smoke run), `NEURON_LIVE_INJECT` (JSON `{"<agent>": "<extra persona
     /// text>"}`), `NEURON_LIVE_TEAM` (a `SwarmTermTeam` JSON),
     /// `NEURON_LIVE_RAW_DUMP=<file>`, `NEURON_LIVE_SCREEN_AT=<s>`,
-    /// `NEURON_LIVE_RESTART=<agent>`, `NEURON_LIVE_REVERT=1`.
+    /// `NEURON_LIVE_RESTART=<agent>`, `NEURON_LIVE_REVERT=1`,
+    /// `NEURON_LIVE_QUIET_SECS` (the settle window, default 60),
+    /// `NEURON_LIVE_COMPACT_AT=<secs>:<agent>`.
     pub(crate) fn from_env() -> Self {
         let required = |k: &str| std::env::var(k).unwrap_or_else(|_| panic!("set {k}"));
         let var = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
@@ -76,7 +81,13 @@ impl LiveSpec {
                 60 * var("NEURON_LIVE_TIMEOUT_MIN").and_then(|v| v.parse().ok()).unwrap_or(20u64),
             ),
             expect: var("NEURON_LIVE_EXPECT").and_then(|v| v.parse().ok()).unwrap_or(2),
-            settle: Duration::from_secs(60),
+            settle: Duration::from_secs(
+                var("NEURON_LIVE_QUIET_SECS").and_then(|v| v.parse().ok()).unwrap_or(60u64),
+            ),
+            compact_at: var("NEURON_LIVE_COMPACT_AT").and_then(|v| {
+                let (secs, agent) = v.split_once(':')?;
+                Some((Duration::from_secs(secs.parse().ok()?), agent.to_string()))
+            }),
             inject: var("NEURON_LIVE_INJECT")
                 .map(|raw| {
                     serde_json::from_str::<HashMap<String, String>>(&raw)
@@ -175,7 +186,7 @@ pub(crate) async fn run_live(spec: &LiveSpec) -> LiveReport {
             let v: serde_json::Value = serde_json::from_str(e.payload()).unwrap_or_default();
             let outcome = v["outcome"].as_str().unwrap_or("");
             let counter = match outcome {
-                "notice" => &notices,
+                "notice" | "injection" => &notices,
                 "reminder" => &reminders,
                 _ => return,
             };
@@ -355,8 +366,17 @@ pub(crate) async fn run_live(spec: &LiveSpec) -> LiveReport {
     let mut last_message = task_sent;
     // The message budget holding the swarm, and the user raising it.
     let mut held_since: Option<Instant> = None;
+    let mut compact_at = spec.compact_at.clone();
     report.timed_out = true;
     while started.elapsed() < spec.timeout {
+        if compact_at.as_ref().is_some_and(|(at, _)| started.elapsed() >= *at) {
+            let (_, agent) = compact_at.take().expect("compact_at");
+            if let Some(pane) = panes.get(agent.as_str()) {
+                let typed =
+                    crate::swarm_term::bridge::paste_then_submit(&registry, pane, b"/compact").await;
+                println!("[{:>5.1}s] /compact typed into {agent}: {:?}", started.elapsed().as_secs_f32(), typed.map(|_| "ok"));
+            }
+        }
         for kind in ["processed", "rejected"] {
             for target in AGENT_IDS {
                 let dir = root.join(kind).join(target);

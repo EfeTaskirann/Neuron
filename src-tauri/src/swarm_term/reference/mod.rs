@@ -547,6 +547,7 @@ mod tests {
                 timeout,
                 expect: task.signals,
                 settle: settle_for(task),
+                compact_at: None,
                 inject: Vec::new(),
                 team: team.clone(),
                 raw_dump: None,

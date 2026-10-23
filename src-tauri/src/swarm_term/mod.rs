@@ -32,6 +32,7 @@
 
 pub mod bridge;
 pub mod checkpoint;
+pub(crate) mod experience;
 pub(crate) mod heartbeat;
 pub mod hierarchy;
 pub mod lifecycle;
@@ -42,11 +43,14 @@ pub mod persona;
 pub(crate) mod preflight;
 pub(crate) mod project_facts;
 pub(crate) mod project_guard;
+pub(crate) mod repin;
 #[cfg(test)]
 mod reference;
 pub mod session;
 pub mod team;
+pub(crate) mod tokens;
 pub(crate) mod trust;
+pub(crate) mod waits;
 
 pub use permissions::SwarmTermPermissionMode;
 pub use session::{TerminalSwarmRegistry, TerminalSwarmSessionHandle};

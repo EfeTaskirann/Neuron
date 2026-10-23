@@ -83,6 +83,9 @@ mod e2e_tests;
 mod tests;
 
 pub(crate) use delivery::{paste_then_submit, sanitize_for_paste};
+pub(crate) use notify::notify_agent;
+pub(crate) use synth::{emit_lifecycle, enqueue_fanout, task_owners};
+pub(crate) use watcher::emit_notice;
 pub use envelope::Envelope;
 pub use fsops::{
     archive_rejected, drop_envelope, ensure_gitignore, prepare_layout,

@@ -23,6 +23,9 @@ import { notifyTaskSignal } from '../lib/swarmNotify';
 //                          or its lifecycle signal (e.g. "tamam —" instead of
 //                          "DONE") was not recognised
 //   reminder             — `[Neuron]` stalled-task reminder (source "neuron")
+//   injection            — an agent reported an instruction it found in the
+//                          project's text (`talimat gördüm — …`); delivered
+//                          as usual, shown so the user sees the attempt
 //
 // Collection is a MODULE-LEVEL store (mirrors lib/toast.ts): one
 // app-lifetime listener starts on the first consumer mount and the
@@ -44,7 +47,8 @@ export type RouteOutcome =
   | 'lifecycle_fanout'
   | 'rejected'
   | 'notice'
-  | 'reminder';
+  | 'reminder'
+  | 'injection';
 
 export interface RouteEvent {
   /** Client-minted monotonic id — a stable React list key (rows
@@ -84,6 +88,7 @@ export const ALL_OUTCOMES: readonly RouteOutcome[] = [
   'rejected',
   'notice',
   'reminder',
+  'injection',
 ];
 
 function coerceOutcome(raw: string): RouteOutcome {

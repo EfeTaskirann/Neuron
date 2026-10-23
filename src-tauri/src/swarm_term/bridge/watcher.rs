@@ -20,7 +20,7 @@ use tokio::sync::Notify;
 
 use crate::sidecar::terminal::TerminalRegistry;
 use crate::swarm_term::hierarchy::{allowed_for, is_allowed, AGENT_IDS};
-use crate::swarm_term::lifecycle::{misaddressed_signal, LifecycleStore};
+use crate::swarm_term::lifecycle::{is_injection_report, is_request, misaddressed_signal, LifecycleStore};
 
 use super::delivery::{
     format_routed_message, is_delivery_blocked, submit_pasted,
@@ -535,8 +535,39 @@ fn reject_unread<R: Runtime>(
     );
 }
 
+/// An agent reported an instruction it found in the project's text and
+/// did not follow (see the persona's authority rules): a Routing Log row
+/// and a toast show it to the user. The message itself was delivered.
+fn emit_injection<R: Runtime>(app: &AppHandle<R>, root: &Path, from: &str, to: &str, body: &str) {
+    tracing::warn!(
+        source = %from,
+        body = %truncate(body, 200),
+        "swarm-term bridge: an agent reported an instruction in the project's text"
+    );
+    let _ = app.emit(
+        crate::events::SWARM_TERM_ROUTE,
+        json!({
+            "source": from,
+            "target": to,
+            "body": body,
+            "outcome": "injection",
+            "reason": "instruction found in project text",
+        }),
+    );
+    let session_id = root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let _ = app.emit(
+        crate::events::SWARM_TERM_SESSION,
+        json!({
+            "sessionId": session_id,
+            "state": "injection",
+            "agentId": from,
+            "detail": truncate(body, 200),
+        }),
+    );
+}
+
 /// Routing Log row for a `[Neuron]` notice pasted into `recipient`'s pane.
-fn emit_notice<R: Runtime>(app: &AppHandle<R>, recipient: &str, text: &str, reason: &str) {
+pub(crate) fn emit_notice<R: Runtime>(app: &AppHandle<R>, recipient: &str, text: &str, reason: &str) {
     let _ = app.emit(
         crate::events::SWARM_TERM_ROUTE,
         json!({
@@ -962,10 +993,14 @@ async fn process_one<R: Runtime>(
                 );
             }
             let task_id = envelope_task_id.as_deref();
-            note_dispatch(app, &from_agent, &to_agent, &target_pane, task_id, lifecycle);
+            note_dispatch(app, &from_agent, &to_agent, &target_pane, &body, task_id, lifecycle);
+            lifecycle.note_message(&from_agent, &to_agent, task_id, is_request(&body, task_id));
             // A question to an advisor, or an advisor speaking (see `stall`).
             lifecycle.note_route(&from_agent, &to_agent);
-            note_coordinator_report(
+            if is_injection_report(&body) {
+                emit_injection(app, root, &from_agent, &to_agent, &body);
+            }
+            if let Some(id) = note_coordinator_report(
                 app,
                 &from_agent,
                 &to_agent,
@@ -973,7 +1008,13 @@ async fn process_one<R: Runtime>(
                 task_id,
                 panes_by_agent,
                 lifecycle,
-            );
+            ) {
+                crate::swarm_term::experience::record_for_session(
+                    root,
+                    crate::swarm_term::experience::Kind::Failed,
+                    &format!("{id} — coordinator vazgeçti: {}", truncate(&body, 120)),
+                );
+            }
             if let Some(original) = &redirected_from {
                 let text = format!(
                     "`{}` mesajın @{original} yerine @coordinator'a iletildi: lifecycle \

@@ -91,7 +91,12 @@ describe('SettingsRoute', () => {
 
   it('saves the team, an agent model and the message budget', async () => {
     const { commands } = await import('../lib/bindings');
-    const team = { lite: false, models: {}, messageBudget: 300 };
+    const team: import('../lib/bindings').SwarmTermTeam = {
+      lite: false,
+      models: {},
+      messageBudget: 300,
+      taskTokenBudget: 3000000,
+    };
     // The backend hands back what was saved last.
     let saved = team;
     vi.mocked(commands.swarmTermGetTeam).mockImplementation(async () => ({
@@ -110,6 +115,11 @@ describe('SettingsRoute', () => {
       expect(commands.swarmTermSetTeam).toHaveBeenLastCalledWith({ ...team, lite: true }),
     );
     const scout = screen.getByRole('radiogroup', { name: 'scout modeli' });
+    // Reading roles default to Sonnet and the label says so; a builder's
+    // default is claude's own.
+    expect(within(scout).getByRole('radio', { name: 'Varsayılan (Sonnet)' })).toBeChecked();
+    const builder = screen.getByRole('radiogroup', { name: 'backend-builder modeli' });
+    expect(within(builder).getByRole('radio', { name: 'Varsayılan' })).toBeChecked();
     fireEvent.click(within(scout).getByRole('radio', { name: 'Haiku' }));
     await waitFor(() =>
       expect(commands.swarmTermSetTeam).toHaveBeenLastCalledWith({
@@ -128,6 +138,18 @@ describe('SettingsRoute', () => {
         lite: true,
         models: { scout: 'haiku' },
         messageBudget: 50,
+        taskTokenBudget: 3000000,
+      }),
+    );
+    const tokens = screen.getByLabelText('Görev token bütçesi');
+    fireEvent.change(tokens, { target: { value: '2000000' } });
+    fireEvent.blur(tokens);
+    await waitFor(() =>
+      expect(commands.swarmTermSetTeam).toHaveBeenLastCalledWith({
+        lite: true,
+        models: { scout: 'haiku' },
+        messageBudget: 50,
+        taskTokenBudget: 2000000,
       }),
     );
   });

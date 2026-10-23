@@ -460,6 +460,13 @@ export const commands = {
 	messagesDelivered: number,
 	messageBudget: number,
 	budgetReached: boolean,
+	/**
+	 *  Tokens every agent's answers cost so far (input + cache + output)
+	 *  and the per-task budget the session runs with (`0`: none). See
+	 *  `tokens`.
+	 */
+	tokensUsed: number,
+	taskTokenBudget: number,
 } | null, AppErrorWire>(__TAURI_INVOKE("swarm_term_session_status")),
 	swarmTermStartSession: (projectDir: string) => typedError<TerminalSwarmSessionHandle, AppErrorWire>(__TAURI_INVOKE("swarm_term_start_session", { projectDir })),
 	/**
@@ -1756,7 +1763,7 @@ export type SwarmTermTeam = {
 	lite: boolean,
 	/**
 	 *  Agent id → model alias ([`MODEL_ALIASES`]). An agent not named
-	 *  runs claude's default model.
+	 *  runs its role's default ([`DEFAULT_MODELS`]), else claude's own.
 	 */
 	models: { [key in string]: string },
 	/**
@@ -1764,6 +1771,11 @@ export type SwarmTermTeam = {
 	 *  `0`: no limit.
 	 */
 	messageBudget: number,
+	/**
+	 *  Tokens one task may spend before the coordinator is warned; the
+	 *  task is closed at twice it. `0`: no limit. See `tokens`.
+	 */
+	taskTokenBudget?: number,
 };
 
 export type TerminalSwarmPane = {
@@ -1823,6 +1835,13 @@ export type TerminalSwarmSessionHandle = {
 	messagesDelivered: number,
 	messageBudget: number,
 	budgetReached: boolean,
+	/**
+	 *  Tokens every agent's answers cost so far (input + cache + output)
+	 *  and the per-task budget the session runs with (`0`: none). See
+	 *  `tokens`.
+	 */
+	tokensUsed: number,
+	taskTokenBudget: number,
 };
 
 /**

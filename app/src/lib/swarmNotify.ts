@@ -98,6 +98,20 @@ export function notifyPaneExited(agentId: string): void {
   requestAttention();
 }
 
+/** Toast (and taskbar flash) when an agent found an instruction in the
+ *  project's text (a README, a comment, a rule file) and reported it
+ *  instead of following it. */
+export function notifyInjection(agentId: string, detail: string | null): void {
+  showToast({
+    variant: 'error',
+    body:
+      `@${agentId} proje metninde kendisine yönelik bir talimat gördü ve uygulamadı` +
+      (detail ? `: ${detail}` : '.'),
+    durationMs: 15000,
+  });
+  requestAttention();
+}
+
 /** Flash the taskbar while the window is in the background. */
 function requestAttention(): void {
   if (typeof document !== 'undefined' && !document.hasFocus()) {

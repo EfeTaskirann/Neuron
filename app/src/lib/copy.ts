@@ -44,6 +44,7 @@ const APP_ERROR_COPY: Record<string, string> = {
   consent_required: 'Bu işlem için önce onayın gerekiyor.',
   claude_version_unsupported: 'Kurulu Claude Code sürümü desteklenmiyor.',
   claude_login_required: 'Claude Code’a giriş yapılmamış.',
+  environment_not_ready: 'Proje ortamı hazır değil — önce bağımlılıkları kur.',
   internal: 'Beklenmedik bir iç hata oluştu.',
 };
 

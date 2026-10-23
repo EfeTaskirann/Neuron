@@ -118,7 +118,9 @@ export function lifecyclePhase(state: string, transition: string): AgentLifecycl
     case 'Done':
       return 'done';
     case 'Failed':
-      return transition === 'ChangesNeeded' ? 'rework' : 'failed';
+      // A rejection, or a task held for the user (`Blocked`): a fix is
+      // coming, the task is not lost.
+      return transition === 'ChangesNeeded' || transition === 'Blocked' ? 'rework' : 'failed';
     default:
       return null;
   }

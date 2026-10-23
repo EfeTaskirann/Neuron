@@ -172,6 +172,68 @@ const GIT_ESCAPES: &[(&str, &str)] = &[
     ("git diff", "../"),
 ];
 
+/// Options that turn an allowed verification command into a write
+/// outside the project, a read of another project, or a run of an
+/// arbitrary program — the same names recur across cargo, tsc, vitest,
+/// eslint, pytest and go, so they are denied in EVERY shell command of
+/// the Verify and Build roles (a leading `*`). A project command's own
+/// `-C app` / `--prefix backend` is not in the list; the exact install
+/// rules carry none of these either (see the tests). Entries with a
+/// trailing space or `=` are the forms that take a value.
+const OUTPUT_ESCAPES: &[&str] = &[
+    // cargo / rustc / libtest: build elsewhere, build another project,
+    // write the test log anywhere.
+    "--target-dir",
+    "--out-dir",
+    "--artifact-dir",
+    "--manifest-path",
+    "--logfile",
+    // tsc: emit elsewhere, or re-enable emitting under `--noEmit`.
+    "--outDir",
+    "--outFile",
+    "--declarationDir",
+    "--tsBuildInfoFile",
+    "--noEmit false",
+    "--noEmit=false",
+    "--project ",
+    "--project=",
+    // vitest / eslint / reporters: report files, another root.
+    "--outputFile",
+    "--output-file",
+    "--coverage.reportsDirectory",
+    "--root ",
+    "--root=",
+    "--dir ",
+    "--dir=",
+    " -o ",
+    "-o=",
+    // pytest: report, temp and log files anywhere, another root.
+    "--junitxml",
+    "--junit-xml",
+    "--basetemp",
+    "--rootdir",
+    "--cov-report",
+    "--log-file",
+    // go test / go vet: profiles and binaries anywhere, a program of
+    // the agent's choice run as the test / tool, files replaced from a
+    // JSON map.
+    "-outputdir",
+    "-coverprofile",
+    "-cpuprofile",
+    "-memprofile",
+    "-blockprofile",
+    "-mutexprofile",
+    "-trace=",
+    "-exec ",
+    "-exec=",
+    "-toolexec",
+    "-vettool",
+    "-overlay",
+    // Any tool's config file: cargo's `build.target-dir` override, a
+    // vitest / eslint config outside the project that runs its code.
+    "--config",
+];
+
 /// Secret files no pane may READ, whatever its role. The panes run on the
 /// shared Claude config with `--setting-sources project`, so the user's
 /// own `permissions.deny` rules no longer constrain them; this baseline
@@ -240,6 +302,10 @@ pub(crate) fn denied_tools(agent_id: &str, session_id: &str) -> Vec<String> {
     // directory), so writing one forges a message.
     rules.push("Edit(./.bridgespace/.gitignore)".into());
     rules.push("Edit(./.bridgespace/_archive/**)".into());
+    // Neuron's memory of the project (see `experience`): it feeds the
+    // next session's personas, so an agent that could edit it would
+    // write tomorrow's instructions.
+    rules.push("Edit(./.bridgespace/experience.md)".into());
     rules.push(format!("Edit(./.bridgespace/{session_id}/processed/**)"));
     rules.push(format!("Edit(./.bridgespace/{session_id}/rejected/**)"));
     // The legacy `inbox/` drop path: the watcher still scans it and pastes
@@ -264,6 +330,10 @@ pub(crate) fn denied_tools(agent_id: &str, session_id: &str) -> Vec<String> {
         for (cmd, opt) in GIT_ESCAPES {
             rules.push(format!("Bash({cmd} *{opt}*)"));
             rules.push(format!("PowerShell({cmd} *{opt}*)"));
+        }
+        for opt in OUTPUT_ESCAPES {
+            rules.push(format!("Bash(*{opt}*)"));
+            rules.push(format!("PowerShell(*{opt}*)"));
         }
     }
     rules
@@ -291,6 +361,11 @@ pub(crate) fn allowed_tools(agent_id: &str, session_id: &str, facts: &ProjectFac
         }
     }
     if matches!(role, Role::Verify | Role::Build) {
+        // `echo`: the agents chain `; echo EXIT=$?` onto a verification
+        // command to quote its exit code, and claude checks every command
+        // of a chain — six denials in one live run. Writes go through
+        // claude's own redirect check, which the project boundary covers.
+        rules.push("Bash(echo:*)".to_string());
         // claude has a separate PowerShell tool on Windows; the same
         // commands must be reachable through it, with the same limits.
         for c in verify_commands(&facts.commands) {
@@ -355,7 +430,15 @@ pub(crate) fn describe_for_persona(agent_id: &str, facts: &ProjectFacts) -> Stri
                 reddedilir. Web araçları kapalı.";
     let git = "`git diff` / `git log` / `git show` içinde `--output`, `--no-index` ve \
                `--ext-diff` seçenekleri reddedilir; `git diff` ile proje dışı bir yolu \
-               (`C:/…`, `~/…`, `../…`) okumak da reddedilir.";
+               (`C:/…`, `~/…`, `../…`) okumak da reddedilir. Doğrulama komutlarında çıktı \
+               yolu, profil, dış proje ve program seçenekleri de reddedilir (`--target-dir`, \
+               `--manifest-path`, `--outDir`, `--outputFile`, `--junitxml`, `-o`, \
+               `-coverprofile`, `-exec`, `--config`, `--dir`, `--root` …): komutu çıktısını \
+               proje dışına yazacak ya da başka bir projeyi okuyacak biçimde çağırma. İçinde \
+               `$?`, `${PIPESTATUS[0]}` gibi bir kabuk değişkeni geçen komut, izinli olsa da \
+               reddedilir: çıkış kodunu yazdırmaya çalışma — araç sıfır dışı çıkış kodunu zaten \
+               gösterir, çıktı geldiyse komut geçmiştir. Sade `echo` serbest; zincirlediğin \
+               (`;`, `&&`, `|`) her komut tek tek izinli olmalı, yoksa satırın tamamı reddedilir.";
     match role_of(agent_id) {
         Role::Coordinate => {
             let mut text = format!(
@@ -609,7 +692,7 @@ mod tests {
                 .filter(|r| r.contains(".bridgespace"))
                 .collect();
             let mut expected: BTreeSet<String> =
-                [".gitignore", "_archive/**", "s/processed/**", "s/rejected/**", "s/inbox/**"]
+                [".gitignore", "_archive/**", "experience.md", "s/processed/**", "s/rejected/**", "s/inbox/**"]
                     .iter()
                     .map(|p| format!("Edit(./.bridgespace/{p})"))
                     .collect();
@@ -651,6 +734,84 @@ mod tests {
                     assert!(!rule.contains('\\'), "{agent}: backslash in {rule}");
                 }
             }
+        }
+    }
+
+    #[test]
+    fn shell_roles_lose_the_output_path_options_but_keep_their_commands() {
+        let facts = ProjectFacts {
+            commands: vec![
+                "pnpm -C app test".into(),
+                "pnpm -C app exec vitest run".into(),
+                "npm --prefix backend run test:unit".into(),
+            ],
+            install_commands: vec![
+                "npm ci".into(),
+                "npm --prefix backend install".into(),
+                "pnpm install --frozen-lockfile".into(),
+            ],
+            exact_commands: vec!["node app/node_modules/typescript/bin/tsc -p app --noEmit".into()],
+            ..ProjectFacts::default()
+        };
+        for &agent in AGENT_IDS {
+            let deny = denied_tools(agent, "s");
+            let has = |r: &str| deny.iter().any(|d| d == r);
+            if role_of(agent) == Role::Coordinate {
+                assert!(!has("Bash(*--target-dir*)"), "{agent}");
+                continue;
+            }
+            for rule in [
+                "Bash(*--target-dir*)",
+                "Bash(*--outDir*)",
+                "Bash(*--outputFile*)",
+                "Bash(*--junitxml*)",
+                "Bash(* -o *)",
+                "Bash(*-exec *)",
+                "Bash(*--manifest-path*)",
+                "PowerShell(*--target-dir*)",
+                "PowerShell(*-coverprofile*)",
+            ] {
+                assert!(has(rule), "{agent} lacks {rule}");
+            }
+            // No option in the list hits a command the role may run: a deny
+            // beats an allow, so one collision would silently kill a
+            // project's own test or install command.
+            for allowed in allowed_tools(agent, "s", &facts) {
+                for opt in OUTPUT_ESCAPES {
+                    assert!(!allowed.contains(opt), "{agent}: `{opt}` would deny {allowed}");
+                }
+            }
+            let text = describe_for_persona(agent, &facts);
+            assert!(text.contains("--target-dir") && text.contains("`-o`"), "{agent}: {text}");
+        }
+    }
+
+    #[test]
+    fn shell_roles_may_echo_but_are_told_not_to_expand_variables() {
+        // Live run 2026-10-23: six verification commands were denied whole
+        // because the agent chained `; echo EXIT=$?` onto them. claude
+        // checks every command of a chain (`echo` was not allowed) and
+        // refuses any command with a shell variable whatever the rules say
+        // (live probe) — so `echo` is allowed and the persona says no `$?`.
+        for &agent in AGENT_IDS {
+            let allowed = allowed_tools(agent, "s", &none());
+            let echoes = allowed.contains(&"Bash(echo:*)".to_string());
+            assert_eq!(echoes, role_of(agent) != Role::Coordinate, "{agent}");
+            if echoes {
+                let text = describe_for_persona(agent, &none());
+                assert!(text.contains("`echo`") && text.contains("`$?`"), "{agent}: {text}");
+            }
+        }
+    }
+
+    #[test]
+    fn nobody_writes_the_experience_file() {
+        // Neuron's memory of the project feeds the next session's
+        // personas: an agent that could edit it would write tomorrow's
+        // instructions.
+        for &agent in AGENT_IDS {
+            let deny = denied_tools(agent, "s");
+            assert!(deny.contains(&"Edit(./.bridgespace/experience.md)".to_string()), "{agent}: {deny:?}");
         }
     }
 

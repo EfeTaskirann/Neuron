@@ -134,6 +134,8 @@ function startedSession(): TerminalSwarmSessionHandle {
     messagesDelivered: 0,
     messageBudget: 300,
     budgetReached: false,
+  tokensUsed: 0,
+  taskTokenBudget: 3000000,
   };
 }
 

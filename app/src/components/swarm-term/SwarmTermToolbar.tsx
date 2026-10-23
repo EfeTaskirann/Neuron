@@ -1,5 +1,5 @@
 import type { TerminalSwarmPaneState } from '../../lib/bindings';
-import { READINESS_LABEL } from './constants';
+import { READINESS_LABEL, formatTokens } from './constants';
 import { SessionTimer } from './SessionTimer';
 
 interface SwarmTermToolbarProps {
@@ -24,6 +24,10 @@ interface SwarmTermToolbarProps {
   pausePending: boolean;
   /** Every pane's readiness while a session runs (empty otherwise). */
   paneStates: TerminalSwarmPaneState[];
+  /** Tokens the session's answers cost so far, and the per-task budget
+   *  (`0`: none) — see the backend's `tokens`. */
+  tokensUsed: number;
+  taskTokenBudget: number;
   onLaunch: () => void;
   onRestart: () => void;
   onStop: () => void;
@@ -46,6 +50,8 @@ export function SwarmTermToolbar({
   paused,
   pausePending,
   paneStates,
+  tokensUsed,
+  taskTokenBudget,
   onLaunch,
   onRestart,
   onStop,
@@ -113,6 +119,9 @@ export function SwarmTermToolbar({
         </>
       )}
       {sessionStartMs != null && <SessionTimer startMs={sessionStartMs} />}
+      {sessionActive && tokensUsed > 0 && (
+        <UsageBadge tokensUsed={tokensUsed} taskTokenBudget={taskTokenBudget} />
+      )}
       {sessionActive && paneStates.length > 0 && <ReadyBadge paneStates={paneStates} />}
       <button
         type="button"
@@ -143,6 +152,28 @@ export function SwarmTermToolbar({
 const PROBLEM_STATES = ['blocked', 'not_ready', 'exited'];
 
 /** "n/9 ready", with who is not and why in the tooltip / description. */
+/** Tokens the session's answers cost so far (input + cache + output). */
+function UsageBadge({
+  tokensUsed,
+  taskTokenBudget,
+}: {
+  tokensUsed: number;
+  taskTokenBudget: number;
+}): JSX.Element {
+  const label = `${formatTokens(tokensUsed)} token`;
+  const budget =
+    taskTokenBudget > 0 ? `; görev başına bütçe ${formatTokens(taskTokenBudget)}` : '';
+  return (
+    <span
+      className="swarm-term-session-timer"
+      title={`Bu oturumda harcanan token (girdi + önbellek + çıktı)${budget}`}
+      aria-label={`Harcanan token ${label}`}
+    >
+      {label}
+    </span>
+  );
+}
+
 function ReadyBadge({ paneStates }: { paneStates: TerminalSwarmPaneState[] }): JSX.Element {
   const ready = paneStates.filter((p) => p.readiness === 'ready').length;
   const waiting = paneStates.filter((p) => p.readiness !== 'ready');

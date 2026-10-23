@@ -25,6 +25,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use crate::swarm_term::waits::{Deadlock, WaitGraph};
 use crate::swarm_term::hierarchy::{
     is_allowed, is_builder, is_reviewer, reviewer_for_builder,
 };
@@ -69,6 +70,18 @@ pub const TASK_FAILED_PREFIX: &str = "TASK_FAILED ";
 /// passed review — a reviewer approval alone does not prove the failing
 /// test passes now, and the tester alone never reads the fix's code.
 pub const RETEST_PREFIX: &str = "retest ";
+
+/// Body-prefix of the synthesised first test request sent to the
+/// integration-tester once a domain reviewer approved a task: a review
+/// reads the code, only a run proves it (the live EvE run approved eight
+/// tasks with no test ever run). `TASK_DONE` follows the tester's
+/// `APPROVED`, never the reviewer's.
+pub const TEST_PREFIX: &str = "test ";
+
+/// Body-prefix of the synthesised clarification request sent to the
+/// planner when a reviewer rejects a task as `belirsiz`: the task is
+/// not wrong code to rework but an unclear spec to fix.
+pub const CLARIFY_PREFIX: &str = "netleştir ";
 
 /// Rework rounds a task gets after `CHANGES_NEEDED`. The rejection
 /// after the last round closes the task as failed. The single source of
@@ -126,6 +139,20 @@ impl LifecycleState {
     }
 }
 
+/// A task open on a pane, as the re-pin after a compaction names it
+/// (see `repin`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenTask {
+    pub id: String,
+    pub state: LifecycleState,
+    /// The dispatch that gave it, shortened to [`DISPATCH_EXCERPT_CHARS`]
+    /// — what a compaction's summary most often loses.
+    pub dispatch: Option<String>,
+}
+
+/// How much of a dispatch the store keeps for the re-pin.
+pub const DISPATCH_EXCERPT_CHARS: usize = 240;
+
 /// How a task ended. Once set, no further fanout happens for the id and
 /// new dispatches carrying it are refused (ids are single-use).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -161,6 +188,13 @@ pub struct Recorded {
     pub limit_exceeded: bool,
     /// The task was already closed before this signal; nothing fans out.
     pub already_closed: Option<Closure>,
+    /// With `retest`: the tester never saw this task, so the request is
+    /// the first `test <id>`, not a `retest <id>`.
+    pub first_test: bool,
+    /// This `CHANGES_NEEDED` named a cause that is not the builder's
+    /// code: the task is held (`Izin` / `Ortam`, for the user) or sent
+    /// back to the planner (`Belirsiz`), and no rework round was spent.
+    pub blocked: Option<Cause>,
 }
 
 impl Recorded {
@@ -173,8 +207,194 @@ impl Recorded {
             rejections: 0,
             limit_exceeded: false,
             already_closed: None,
+            first_test: false,
+            blocked: None,
         }
     }
+}
+
+/// Why a reviewer rejected a task, or an agent gave it up — read off the
+/// leading tag of its note (`[izin] …`, `ortam: …`). Only `Kod` (and an
+/// untagged note) is the builder's to fix and counts toward
+/// [`MAX_REWORK_ROUNDS`]: an environment or permission problem is the
+/// USER's to fix, and an unclear spec the planner's (live run: two tasks
+/// burnt their rounds on a missing install permission).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Cause {
+    /// A tool or command the agent needs is denied by its permissions.
+    Izin,
+    /// The environment is not set up: missing dependencies, tools, services.
+    Ortam,
+    /// The task's spec or acceptance criterion is unclear.
+    Belirsiz,
+    /// The builder's code is wrong.
+    Kod,
+}
+
+impl Cause {
+    /// The tag as the personas spell it.
+    pub fn tag(self) -> &'static str {
+        match self {
+            Self::Izin => "izin",
+            Self::Ortam => "ortam",
+            Self::Belirsiz => "belirsiz",
+            Self::Kod => "kod",
+        }
+    }
+
+    /// The user must act before the task can go on.
+    pub fn needs_user(self) -> bool {
+        matches!(self, Self::Izin | Self::Ortam)
+    }
+}
+
+/// Pure: the cause tag a note LEADS with (`[izin] npm install reddedildi`,
+/// `(ortam) node_modules yok`, `belirsiz: kabul ölçütü yok`, `KOD — …`),
+/// in Turkish or English. A tag anywhere else is prose.
+pub fn cause_of(note: &str) -> Option<Cause> {
+    let head = note
+        .trim()
+        .trim_start_matches(|c: char| c.is_whitespace() || matches!(c, '[' | '(' | '*' | '`' | '_' | '#'));
+    let word: String = head.chars().take_while(|c| c.is_alphabetic()).collect();
+    let after = head[word.len()..].trim_start();
+    // The tag ends the way a tag does, not the way a sentence goes on.
+    if !after.is_empty() && !after.starts_with([']', ')', ':', '—', '–', '-', '*', '`']) {
+        return None;
+    }
+    match word.to_lowercase().as_str() {
+        "izin" | "permission" | "yetki" => Some(Cause::Izin),
+        "ortam" | "env" | "environment" | "kurulum" => Some(Cause::Ortam),
+        "belirsiz" | "unclear" | "spec" => Some(Cause::Belirsiz),
+        "kod" | "code" | "bug" => Some(Cause::Kod),
+        _ => None,
+    }
+}
+
+/// Pure: a message that asks for something — a dispatch, a `review` /
+/// `test` request, a question — as opposed to a protocol signal or
+/// report (`DONE`, `APPROVED`, `TASK_DONE`, `hata`, `alındı`, `bilgi —`,
+/// `talimat gördüm`), which asks for nothing. Only a request opens a
+/// wait (see `waits`); every message answers one.
+pub fn is_request(body: &str, task_id: Option<&str>) -> bool {
+    if parse_lifecycle_token_with_fallback(body, task_id).is_some()
+        || is_error_report(body)
+        || is_injection_report(body)
+    {
+        return false;
+    }
+    let head: String = body
+        .trim()
+        .trim_start_matches(is_decoration)
+        .chars()
+        .take(12)
+        .collect::<String>()
+        .to_lowercase();
+    !["task_done", "task_failed", "alındı", "alindi", "bilgi", "tamam"]
+        .iter()
+        .any(|w| head.starts_with(w))
+}
+
+/// Pure: the note after its leading cause tag (`[izin] npm reddedildi`
+/// → `npm reddedildi`); the note itself when it leads with none.
+pub fn strip_cause_tag(note: &str) -> &str {
+    if cause_of(note).is_none() {
+        return note.trim();
+    }
+    let head = note
+        .trim()
+        .trim_start_matches(|c: char| c.is_whitespace() || matches!(c, '[' | '(' | '*' | '`' | '_' | '#'));
+    let word_len: usize = head.chars().take_while(|c| c.is_alphabetic()).map(char::len_utf8).sum();
+    head[word_len..].trim_start_matches(|c: char| {
+        c.is_whitespace() || matches!(c, ']' | ')' | ':' | '—' | '–' | '-' | '*' | '`')
+    })
+}
+
+/// What a builder's `DONE` note says about running the verification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DoneEvidence {
+    /// Names a verification command and its result.
+    Ran,
+    /// Says, with a reason, that nothing could be run (`doğrulama yok: …`).
+    Declined,
+    /// Neither: the DONE is not accepted.
+    Missing,
+}
+
+/// Command spellings a verification run starts with.
+const RUN_VERBS: &[&str] = &[
+    "cargo ", "pnpm ", "npm ", "npx ", "yarn ", "bun ", "pytest", "python -m pytest", "go test",
+    "go vet", "tsc", "vitest", "jest", "eslint", "node ", "mvn ", "gradle", "dotnet ", "make ",
+];
+
+/// Words that report a run's outcome (either way: a reported failure is
+/// evidence too, just not a passing one).
+const RESULT_WORDS: &[&str] = &[
+    "exit 0", "exit code 0", "çıkış 0", "çıkış kodu 0", "geçti", "passed", " pass", "0 failed",
+    "başarılı", "hatasız", "temiz", "clean", "yeşil", "green", " ok", "✅", "failed", "fail:",
+    "exit 1", "çıkış 1", "hata verdi",
+];
+
+/// How a builder says it could not run anything; a reason must follow.
+const DECLINE_WORDS: &[&str] = &[
+    "doğrulama yok", "dogrulama yok", "test yok", "doğrulanamadı", "koşulamadı", "no verification",
+    "not verified",
+];
+
+/// Pure: did the builder's `DONE` note carry run evidence? `Ran` needs a
+/// command AND an outcome ("cargo test → 12 geçti, exit 0"); naming a
+/// command without a result ("cargo test çalıştırmadım") is not a run.
+/// `Declined` needs a reason after the declaration.
+pub fn done_evidence(note: Option<&str>) -> DoneEvidence {
+    let Some(note) = note else {
+        return DoneEvidence::Missing;
+    };
+    let lower = note.to_lowercase();
+    for word in DECLINE_WORDS {
+        if let Some(at) = lower.find(word) {
+            let rest = lower[at + word.len()..]
+                .trim_start_matches(|c: char| c.is_whitespace() || matches!(c, ':' | '—' | '–' | '-' | ','));
+            if rest.chars().filter(|c| c.is_alphanumeric()).count() >= 3 {
+                return DoneEvidence::Declined;
+            }
+        }
+    }
+    let ran = RUN_VERBS.iter().any(|v| lower.contains(v));
+    let reported = RESULT_WORDS.iter().any(|w| lower.contains(w));
+    if ran && reported {
+        DoneEvidence::Ran
+    } else {
+        DoneEvidence::Missing
+    }
+}
+
+/// Pure: does a `CHANGES_NEEDED` note point at something concrete — a
+/// failing test, an error line, a file and line? "kod kötü, baştan yaz"
+/// gives the builder nothing to act on and spends a round for nothing.
+pub fn rework_evidence(note: &str) -> bool {
+    let lower = note.to_lowercase();
+    const HINTS: &[&str] = &[
+        "test", "fail", "error", "hata", "panic", "expected", "assert", "exception", "satır", "line ",
+        " ts", "warning", "uyarı", "çıktı", "output",
+    ];
+    if HINTS.iter().any(|h| lower.contains(h)) {
+        return true;
+    }
+    // A `file.ext` or `file.ext:42` reference.
+    let bytes = lower.as_bytes();
+    (1..bytes.len().saturating_sub(1)).any(|i| {
+        bytes[i] == b'.'
+            && bytes[i - 1].is_ascii_alphanumeric()
+            && lower[i + 1..]
+                .chars()
+                .take_while(|c| c.is_ascii_alphabetic())
+                .count()
+                .clamp(0, 5)
+                >= 1
+            && lower[i + 1..]
+                .chars()
+                .find(|c| !c.is_ascii_alphabetic())
+                .map_or(true, |c| c.is_whitespace() || matches!(c, ':' | '(' | ',' | ';' | ')'))
+    })
 }
 
 /// The four lifecycle transitions recognised on routed envelope bodies.
@@ -385,6 +605,23 @@ pub fn is_error_report(body: &str) -> bool {
         && !head[4..].chars().next().is_some_and(char::is_alphanumeric)
 }
 
+/// Head of the report an agent sends when it found an instruction in
+/// the project's text (a README, a comment, a rule file) and did not
+/// follow it: `talimat gördüm — <dosya>: <özet>`. The bridge delivers it
+/// like any message and shows it to the user (Routing Log, toast).
+pub const INJECTION_PREFIX: &str = "talimat gördüm";
+
+/// Pure: true when a body is an injection report (see
+/// [`INJECTION_PREFIX`]; any case, leading markdown).
+pub fn is_injection_report(body: &str) -> bool {
+    let head = body.trim().trim_start_matches(is_decoration);
+    // `to_lowercase` turns the Turkish dotted İ into `i` + U+0307.
+    let folded: String = head.to_lowercase().replace('\u{307}', "");
+    folded
+        .strip_prefix(INJECTION_PREFIX)
+        .is_some_and(|rest| !rest.chars().next().is_some_and(char::is_alphanumeric))
+}
+
 /// Pure: true when a coordinator-bound body LOOKS like a lifecycle
 /// signal (starts with `done` / `approved` / `changes needed` / …, or —
 /// when the envelope carries a `task_id` — the Turkish completion word
@@ -420,6 +657,17 @@ pub fn error_reason(body: &str) -> Option<String> {
         .trim_start_matches(|c| is_separator(c) || matches!(c, '.' | ',' | ';'))
         .trim();
     (!reason.is_empty()).then(|| cap_note(reason))
+}
+
+/// One line of a dispatch, at most [`DISPATCH_EXCERPT_CHARS`] chars.
+fn dispatch_excerpt(body: &str) -> String {
+    let one_line = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    if one_line.chars().count() <= DISPATCH_EXCERPT_CHARS {
+        return one_line;
+    }
+    let mut cut: String = one_line.chars().take(DISPATCH_EXCERPT_CHARS).collect();
+    cut.push('…');
+    cut
 }
 
 fn cap_note(note: &str) -> String {
@@ -524,10 +772,16 @@ pub struct LifecycleStore {
 #[derive(Default)]
 struct Inner {
     entries: HashMap<(String, String), Entry>,
+    /// `(pane, task_id)` → the excerpt of the dispatch that pane got for
+    /// the task (its own `build` / `review`-less `test` / rework text) —
+    /// what the re-pin after a compaction gives it back.
+    dispatches: HashMap<(String, String), String>,
     tasks: HashMap<String, TaskMeta>,
     /// Set while the stall clocks stand still (see
     /// [`LifecycleStore::pause_clocks`]).
     paused_since: Option<Instant>,
+    /// Who waits for whom (see `waits`).
+    waits: WaitGraph,
     /// `(advisor, asker)` → the asker's first question the advisor has
     /// not answered yet (see [`ADVISORS`]).
     questions: HashMap<(String, String), Question>,
@@ -569,6 +823,14 @@ struct TaskMeta {
     /// A rejection the coordinator has not re-dispatched yet.
     rework: Option<Entry>,
     closed: Option<Closure>,
+    /// Held for the user (`Izin` / `Ortam`) or the planner (`Belirsiz`):
+    /// no stall clock runs and no round is counted until the next
+    /// dispatch of the id lifts it.
+    blocked: Option<Cause>,
+    /// The FIRST dispatch's wording, shortened: what the task is, for
+    /// the experience card (later dispatches — `test <id>`, a rework —
+    /// are per pane, see `Inner::dispatches`).
+    dispatch: Option<String>,
 }
 
 impl TaskMeta {
@@ -665,6 +927,8 @@ impl Inner {
         let meta = self.tasks.entry(task_id.to_string()).or_default();
         meta.closed = Some(closure);
         meta.rework = None;
+        // Whatever was asked about the task is moot now (see `waits`).
+        self.waits.forget_task(task_id);
     }
 
     /// Move every stall clock — the entries, the pending reworks and the
@@ -681,6 +945,7 @@ impl Inner {
         for q in self.questions.values_mut() {
             q.since += d;
         }
+        self.waits.shift(d);
     }
 
     /// VAL-01: bound memory over a long session. Pane entries that are
@@ -690,6 +955,8 @@ impl Inner {
     fn evict_if_full(&mut self) {
         if self.entries.len() >= MAX_LIFECYCLE_ENTRIES {
             self.entries.retain(|_, e| e.state.in_flight());
+            let entries = &self.entries;
+            self.dispatches.retain(|k, _| entries.contains_key(k));
         }
         if self.tasks.len() >= MAX_LIFECYCLE_ENTRIES {
             for m in self.tasks.values_mut().filter(|m| m.closed.is_some()) {
@@ -732,6 +999,27 @@ impl LifecycleStore {
         self.record_at(source_agent, source_pane, transition, verdict_panes, note, Instant::now())
     }
 
+    /// [`record`](Self::record) with the cause a `CHANGES_NEEDED` named
+    /// (see [`Cause`]); `None` counts as the builder's code.
+    pub fn record_with_cause(
+        &self,
+        source_agent: &str,
+        source_pane: &str,
+        transition: &Transition,
+        verdict_panes: &[&str],
+        note: Option<&str>,
+        cause: Option<Cause>,
+    ) -> Recorded {
+        self.record_with_cause_at(
+            (source_agent, source_pane),
+            transition,
+            verdict_panes,
+            note,
+            cause,
+            Instant::now(),
+        )
+    }
+
     fn record_at(
         &self,
         source_agent: &str,
@@ -741,6 +1029,20 @@ impl LifecycleStore {
         note: Option<&str>,
         now: Instant,
     ) -> Recorded {
+        self.record_with_cause_at((source_agent, source_pane), transition, verdict_panes, note, None, now)
+    }
+
+    /// `source` = the signal's `(agent, pane)`.
+    fn record_with_cause_at(
+        &self,
+        source: (&str, &str),
+        transition: &Transition,
+        verdict_panes: &[&str],
+        note: Option<&str>,
+        cause: Option<Cause>,
+        now: Instant,
+    ) -> Recorded {
+        let (source_agent, source_pane) = source;
         let id = transition.task_id.as_str();
         let key = (source_pane.to_string(), id.to_string());
         let mut g = self.lock();
@@ -765,11 +1067,16 @@ impl LifecycleStore {
             TransitionKind::Building | TransitionKind::Done => None,
         }
         .filter(|_| is_reviewer(source_agent));
+        // A hold (environment / permission / unclear spec) stops the
+        // builder wherever it is, not only after its DONE: nothing it
+        // does can go on until the user or the planner acted.
+        let held = transition.kind == TransitionKind::ChangesNeeded
+            && matches!(cause, Some(Cause::Izin | Cause::Ortam | Cause::Belirsiz));
         if let Some(builder_next) = verdict {
             for ((pane, eid), e) in g.entries.iter_mut() {
                 if eid == id
                     && verdict_panes.contains(&pane.as_str())
-                    && e.state == LifecycleState::AwaitingReview
+                    && (e.state == LifecycleState::AwaitingReview || (held && e.state.in_flight()))
                 {
                     *e = Entry::new(builder_next, now);
                 }
@@ -783,23 +1090,21 @@ impl LifecycleStore {
                     meta.done_notes.push((source_agent.to_string(), note.to_string()));
                 }
             }
-            // A domain reviewer approved the fix of a task the TESTER
-            // rejected: the task stays open until the tester re-runs it.
-            TransitionKind::Approved
-                if verdict.is_some()
-                    && source_agent != TESTER
-                    && g.tasks.get(id).is_some_and(|m| m.needs_retest) =>
-            {
+            // A domain reviewer approved: the task stays open until the
+            // tester runs it — the first time (`test`) or again after a
+            // tester rejection (`retest`). A review alone closes nothing.
+            TransitionKind::Approved if verdict.is_some() && source_agent != TESTER => {
                 rec.retest = true;
+                rec.first_test = !g.tasks.get(id).is_some_and(|m| m.needs_retest);
                 rec.builder_note = g.tasks.get(id).and_then(TaskMeta::builder_note);
                 rec.others_in_flight = g
                     .entries
                     .iter()
                     .any(|(k, e)| k != &key && k.1 == id && e.state.in_flight());
             }
+            // The tester's pass closes the task. The orchestrator must
+            // hear what the fix changed, not only "tests pass".
             TransitionKind::Approved if verdict.is_some() => {
-                // A task closed after a tester rejection: the orchestrator
-                // must hear what the fix changed, not only "tests pass".
                 rec.builder_note = g
                     .tasks
                     .get(id)
@@ -809,19 +1114,38 @@ impl LifecycleStore {
             }
             TransitionKind::ChangesNeeded if verdict.is_some() => {
                 let meta = g.tasks.entry(id.to_string()).or_default();
-                meta.rejections = meta.rejections.saturating_add(1);
-                if source_agent == TESTER {
-                    // A new fix round starts: its notes are what the
-                    // next retest is about.
-                    meta.needs_retest = true;
-                    meta.done_notes.clear();
-                }
                 rec.rejections = meta.rejections;
-                if meta.rejections > MAX_REWORK_ROUNDS {
-                    rec.limit_exceeded = true;
-                    g.close(id, Closure::Failed, now);
-                } else {
-                    meta.rework = Some(Entry::new(LifecycleState::Failed, now));
+                match cause {
+                    // Not the builder's to fix: hold the task for the user,
+                    // no round spent, no rework nag.
+                    Some(c @ (Cause::Izin | Cause::Ortam)) => {
+                        meta.blocked = Some(c);
+                        meta.rework = None;
+                        rec.blocked = Some(c);
+                    }
+                    // An unclear spec goes back to the planner; the
+                    // coordinator still owes the re-dispatch afterwards.
+                    Some(Cause::Belirsiz) => {
+                        meta.blocked = Some(Cause::Belirsiz);
+                        meta.rework = Some(Entry::new(LifecycleState::Failed, now));
+                        rec.blocked = Some(Cause::Belirsiz);
+                    }
+                    Some(Cause::Kod) | None => {
+                        meta.rejections = meta.rejections.saturating_add(1);
+                        if source_agent == TESTER {
+                            // A new fix round starts: its notes are what the
+                            // next retest is about.
+                            meta.needs_retest = true;
+                            meta.done_notes.clear();
+                        }
+                        rec.rejections = meta.rejections;
+                        if meta.rejections > MAX_REWORK_ROUNDS {
+                            rec.limit_exceeded = true;
+                            g.close(id, Closure::Failed, now);
+                        } else {
+                            meta.rework = Some(Entry::new(LifecycleState::Failed, now));
+                        }
+                    }
                 }
             }
             _ => {}
@@ -837,19 +1161,45 @@ impl LifecycleStore {
         self.assign_at(pane, task_id, Instant::now())
     }
 
+    /// [`assign`](Self::assign) that also keeps an excerpt of the
+    /// dispatch's `body` for the re-pin after a compaction.
+    pub fn assign_with_dispatch(&self, pane: &str, task_id: &str, body: Option<&str>) -> bool {
+        self.assign_with_dispatch_at(pane, task_id, body, Instant::now())
+    }
+
     fn assign_at(&self, pane: &str, task_id: &str, now: Instant) -> bool {
+        self.assign_with_dispatch_at(pane, task_id, None, now)
+    }
+
+    fn assign_with_dispatch_at(
+        &self,
+        pane: &str,
+        task_id: &str,
+        body: Option<&str>,
+        now: Instant,
+    ) -> bool {
         let mut g = self.lock();
         g.evict_if_full();
         let meta = g.tasks.entry(task_id.to_string()).or_default();
         if meta.closed.is_some() {
             return false;
         }
+        let excerpt = body.map(dispatch_excerpt);
+        if let Some(excerpt) = &excerpt {
+            meta.dispatch.get_or_insert_with(|| excerpt.clone());
+        }
         meta.rework = None;
+        // A re-dispatch is how a held task goes on: the user (or the
+        // planner) acted, the coordinator sent it again.
+        meta.blocked = None;
         let key = (pane.to_string(), task_id.to_string());
         if g.entries.get(&key).is_some_and(|e| {
             matches!(e.state, LifecycleState::Building | LifecycleState::AwaitingReview)
         }) {
             return false;
+        }
+        if let Some(excerpt) = excerpt {
+            g.dispatches.insert(key.clone(), excerpt);
         }
         g.entries.insert(key, Entry::new(LifecycleState::Assigned, now));
         true
@@ -936,6 +1286,48 @@ impl LifecycleStore {
         };
         g.close(task_id, Closure::Failed, now);
         outcome
+    }
+
+    /// An agent reported `hata — [izin|ortam] …` for `task_id`: the task
+    /// is not given up but HELD — its in-flight work on `closable_panes`
+    /// is settled, no stall clock runs, and the next dispatch of the id
+    /// (after the user fixed the cause) reopens it. The same ownership
+    /// rules as [`abandon`](Self::abandon): someone else's open task is
+    /// left alone ([`Abandon::Elsewhere`]).
+    pub fn block(&self, closable_panes: &[&str], task_id: &str, cause: Cause) -> Abandon {
+        let mut g = self.lock();
+        if let Some(closure) = g.tasks.get(task_id).and_then(|m| m.closed) {
+            return Abandon::AlreadyClosed(closure);
+        }
+        let in_flight = |own: bool| {
+            g.entries.iter().any(|((pane, id), e)| {
+                id == task_id
+                    && e.state.in_flight()
+                    && closable_panes.contains(&pane.as_str()) == own
+            })
+        };
+        let outcome = if in_flight(true) {
+            Abandon::Closed
+        } else if in_flight(false) {
+            return Abandon::Elsewhere;
+        } else {
+            Abandon::Untracked
+        };
+        let now = Instant::now();
+        for ((pane, id), e) in g.entries.iter_mut() {
+            if id == task_id && e.state.in_flight() && closable_panes.contains(&pane.as_str()) {
+                *e = Entry::new(LifecycleState::Failed, now);
+            }
+        }
+        let meta = g.tasks.entry(task_id.to_string()).or_default();
+        meta.blocked = Some(cause);
+        meta.rework = None;
+        outcome
+    }
+
+    /// Held for the user or the planner (see [`Cause`]).
+    pub fn is_blocked(&self, task_id: &str) -> bool {
+        self.lock().tasks.get(task_id).is_some_and(|m| m.blocked.is_some())
     }
 
     /// The coordinator reported `TASK_FAILED <id>` to the orchestrator:
@@ -1161,6 +1553,67 @@ impl LifecycleStore {
         out
     }
 
+    /// Evidence that the agent on `pane` is working on its task (a tool
+    /// call in its transcript): its in-progress entries' stall clocks
+    /// start over. A stall is time WITHOUT evidence, not wall-clock
+    /// time since the dispatch — a long build keeps producing evidence.
+    pub fn note_progress(&self, pane: &str) {
+        self.note_progress_at(pane, Instant::now());
+    }
+
+    fn note_progress_at(&self, pane: &str, now: Instant) {
+        let mut g = self.lock();
+        for ((p, _), e) in g.entries.iter_mut() {
+            if p == pane && e.state.in_progress() {
+                *e = Entry::new(e.state, now);
+            }
+        }
+    }
+
+    /// The paired reviewer is working: the `AwaitingReview` entries on
+    /// `builder_pane` start over likewise.
+    pub fn note_review_progress(&self, builder_pane: &str) {
+        self.note_review_progress_at(builder_pane, Instant::now());
+    }
+
+    fn note_review_progress_at(&self, builder_pane: &str, now: Instant) {
+        let mut g = self.lock();
+        for ((p, _), e) in g.entries.iter_mut() {
+            if p == builder_pane && e.state == LifecycleState::AwaitingReview {
+                *e = Entry::new(e.state, now);
+            }
+        }
+    }
+
+    /// The bridge delivered `from` → `to` (see `waits`); `request` as
+    /// [`is_request`] judges the body.
+    pub fn note_message(&self, from: &str, to: &str, task_id: Option<&str>, request: bool) {
+        self.note_message_at(from, to, task_id, request, Instant::now());
+    }
+
+    fn note_message_at(&self, from: &str, to: &str, task_id: Option<&str>, request: bool, now: Instant) {
+        self.lock().waits.note_message(from, to, task_id, request, now);
+    }
+
+    /// `agent` called a tool (see `waits`).
+    pub fn note_activity(&self, agent: &str) {
+        self.note_activity_at(agent, Instant::now());
+    }
+
+    fn note_activity_at(&self, agent: &str, now: Instant) {
+        self.lock().waits.note_activity(agent, now);
+    }
+
+    /// The deadlocks standing now (see `waits`); none while the clocks
+    /// are paused.
+    pub fn take_deadlocks(&self, now: Instant, wait_after: Duration) -> Vec<Deadlock> {
+        let mut g = self.lock();
+        if g.paused_since.is_some() {
+            return Vec::new();
+        }
+        g.waits.take_deadlocks(now, wait_after)
+    }
+
     /// The agent behind `old` runs in a new pane now (restarted): its
     /// tasks move with it.
     pub fn rename_pane(&self, old: &str, new: &str) {
@@ -1173,6 +1626,9 @@ impl LifecycleStore {
             .collect();
         for ((_, task_id), e) in moved {
             g.entries.remove(&(old.to_string(), task_id.clone()));
+            if let Some(d) = g.dispatches.remove(&(old.to_string(), task_id.clone())) {
+                g.dispatches.insert((new.to_string(), task_id.clone()), d);
+            }
             g.entries.insert((new.to_string(), task_id), e);
         }
     }
@@ -1191,6 +1647,58 @@ impl LifecycleStore {
         panes.sort();
         panes.dedup();
         panes
+    }
+
+    /// The in-flight tasks on `pane`, sorted by id, each with the
+    /// dispatch excerpt kept for it — what the re-pin after a compaction
+    /// reminds the agent of.
+    pub fn open_tasks_of(&self, pane: &str) -> Vec<OpenTask> {
+        let g = self.lock();
+        let mut open: Vec<OpenTask> = g
+            .entries
+            .iter()
+            .filter(|((p, _), e)| p == pane && e.state.in_flight())
+            .map(|((p, id), e)| OpenTask {
+                id: id.clone(),
+                state: e.state,
+                dispatch: g
+                    .dispatches
+                    .get(&(p.clone(), id.clone()))
+                    .cloned()
+                    .or_else(|| g.tasks.get(id).and_then(|m| m.dispatch.clone())),
+            })
+            .collect();
+        open.sort_by(|a, b| a.id.cmp(&b.id));
+        open
+    }
+
+    /// The dispatch excerpt kept for `task_id` (see [`OpenTask`]).
+    pub fn dispatch_of(&self, task_id: &str) -> Option<String> {
+        self.lock().tasks.get(task_id).and_then(|m| m.dispatch.clone())
+    }
+
+    /// What the coordinator still owes on open tasks, `(id, what)`
+    /// sorted by id: a rework dispatch after a `[kod]` rejection, a
+    /// re-dispatch of a task held for the user, or the planner's
+    /// clarification it waits for.
+    pub fn owed_by_coordinator(&self) -> Vec<(String, String)> {
+        let g = self.lock();
+        let mut owed: Vec<(String, String)> = g
+            .tasks
+            .iter()
+            .filter(|(_, m)| m.closed.is_none())
+            .filter_map(|(id, m)| {
+                let what = match m.blocked {
+                    Some(Cause::Belirsiz) => "planner'ın netleştirmesini bekliyor".to_string(),
+                    Some(cause) => format!("beklemede ({})", cause.tag()),
+                    None if m.rework.is_some() => "düzeltme dispatch'i bekliyor".to_string(),
+                    None => return None,
+                };
+                Some((id.clone(), what))
+            })
+            .collect();
+        owed.sort();
+        owed
     }
 
     /// Mark `(source_pane, task_id)` as `Done` regardless of prior
@@ -1248,11 +1756,21 @@ pub fn followup_for_coordinator_inbound(
             if rec.others_in_flight {
                 return None;
             }
-            (TESTER, format!("{RETEST_PREFIX}{id}"))
+            let prefix = if rec.first_test { TEST_PREFIX } else { RETEST_PREFIX };
+            (TESTER, format!("{prefix}{id}"))
         }
         TransitionKind::Approved if is_reviewer(src_agent) => {
             ("orchestrator", format!("{TASK_DONE_PREFIX}{id}"))
         }
+        // An unclear spec is the planner's to fix; a held task (user's
+        // environment / permissions) fans out nowhere — the bridge's
+        // notice carries it.
+        TransitionKind::ChangesNeeded
+            if is_reviewer(src_agent) && rec.blocked == Some(Cause::Belirsiz) =>
+        {
+            ("planner", format!("{CLARIFY_PREFIX}{id}"))
+        }
+        TransitionKind::ChangesNeeded if rec.blocked.is_some() => return None,
         TransitionKind::ChangesNeeded if is_reviewer(src_agent) && rec.limit_exceeded => (
             "orchestrator",
             format!(
@@ -1292,6 +1810,348 @@ mod tests {
 
     fn fresh() -> Recorded {
         Recorded::plain(LifecycleState::Assigned)
+    }
+
+    // -- run evidence on DONE ---------------------------------------- //
+
+    #[test]
+    fn done_evidence_accepts_a_run_command_with_its_result() {
+        for note in [
+            "auth.rs: refresh eklendi; doğrulama: cargo test -p neuron auth → 12 geçti, exit 0",
+            "routes.ts değişti. doğrulama: npm --prefix storefront test: 116 passed",
+            "doğrulama: node backend/node_modules/typescript/bin/tsc -p backend --noEmit — hatasız (çıkış 0)",
+            "pnpm -C app lint ran clean, exit code 0",
+        ] {
+            assert_eq!(done_evidence(Some(note)), DoneEvidence::Ran, "{note}");
+        }
+    }
+
+    #[test]
+    fn done_evidence_accepts_an_explicit_decline_with_a_reason() {
+        assert_eq!(
+            done_evidence(Some("README güncellendi; doğrulama yok: projede test komutu yok")),
+            DoneEvidence::Declined
+        );
+        // A bare declaration with no reason is not a declaration.
+        assert_eq!(done_evidence(Some("doğrulama yok")), DoneEvidence::Missing);
+    }
+
+    #[test]
+    fn done_evidence_rejects_a_note_without_a_run() {
+        assert_eq!(done_evidence(None), DoneEvidence::Missing);
+        assert_eq!(done_evidence(Some("auth.rs: refresh eklendi")), DoneEvidence::Missing);
+        // Naming a command is not running it: no result follows.
+        assert_eq!(
+            done_evidence(Some("cargo test çalıştırmadım, zaman kalmadı")),
+            DoneEvidence::Missing
+        );
+    }
+
+    // -- cause tags ---------------------------------------------------- //
+
+    #[test]
+    fn cause_of_reads_a_leading_tag_in_any_spelling() {
+        assert_eq!(cause_of("[izin] npm install reddedildi"), Some(Cause::Izin));
+        assert_eq!(cause_of("(ortam) node_modules yok"), Some(Cause::Ortam));
+        assert_eq!(cause_of("belirsiz: kabul ölçütü verilmedi"), Some(Cause::Belirsiz));
+        assert_eq!(cause_of("KOD — test_refresh fails"), Some(Cause::Kod));
+        assert_eq!(cause_of("[permission] denied"), Some(Cause::Izin));
+        assert_eq!(cause_of("[env] missing node"), Some(Cause::Ortam));
+    }
+
+    #[test]
+    fn strip_cause_tag_leaves_the_reason() {
+        assert_eq!(strip_cause_tag("[izin] npm install reddedildi"), "npm install reddedildi");
+        assert_eq!(strip_cause_tag("(ortam) node yok"), "node yok");
+        assert_eq!(strip_cause_tag("belirsiz: kabul ölçütü yok"), "kabul ölçütü yok");
+        assert_eq!(strip_cause_tag("KOD — auth.rs:42"), "auth.rs:42");
+        assert_eq!(strip_cause_tag("npm failed"), "npm failed");
+        assert_eq!(strip_cause_tag("[izin]"), "");
+    }
+
+    #[test]
+    fn cause_of_ignores_a_tag_that_does_not_lead() {
+        assert_eq!(cause_of("auth.rs [izin] eksik"), None);
+        assert_eq!(cause_of("izinli kullanıcı testi fail"), None);
+        assert_eq!(cause_of(""), None);
+    }
+
+    #[test]
+    fn rework_evidence_needs_a_test_name_or_an_error_line() {
+        for note in [
+            "src/auth.rs:42 null deref on refresh",
+            "test_refresh fails: expected 200 got 401",
+            "account.ts(247,22): error TS7006",
+            "cargo test → 1 failed: tests::parses_done_token",
+        ] {
+            assert!(rework_evidence(note), "{note}");
+        }
+        for note in ["kod kötü, baştan yaz", "beğenmedim", ""] {
+            assert!(!rework_evidence(note), "{note:?}");
+        }
+    }
+
+    // -- the tester closes every task -------------------------------- //
+
+    #[test]
+    fn a_reviewers_approval_sends_the_task_to_the_tester_before_task_done() {
+        let s = LifecycleStore::new();
+        let t0 = Instant::now();
+        s.assign_at("p-builder", "T1", t0);
+        let done = Transition { kind: TransitionKind::Done, task_id: "T1".into() };
+        s.record_at("backend-builder", "p-builder", &done, &[], Some("auth.rs; doğrulama: cargo test ok"), t0);
+        let ok = Transition { kind: TransitionKind::Approved, task_id: "T1".into() };
+        let rec = rec_at(&s, "p-reviewer", &ok, t0);
+        assert!(rec.retest && rec.first_test, "{rec:?}");
+        assert_eq!(rec.builder_note.as_deref(), Some("auth.rs; doğrulama: cargo test ok"));
+        assert_eq!(
+            followup_for_coordinator_inbound("backend-reviewer", &ok, &rec),
+            Some(("integration-tester".into(), "test T1".into()))
+        );
+        assert_eq!(s.closure("T1"), None, "a review alone must not close the task");
+    }
+
+    #[test]
+    fn the_testers_approval_closes_the_task() {
+        let s = LifecycleStore::new();
+        let t0 = Instant::now();
+        s.assign_at("p-builder", "T1", t0);
+        let done = Transition { kind: TransitionKind::Done, task_id: "T1".into() };
+        s.record_at("backend-builder", "p-builder", &done, &[], None, t0);
+        let ok = Transition { kind: TransitionKind::Approved, task_id: "T1".into() };
+        rec_at(&s, "p-reviewer", &ok, t0);
+        let rec = rec_at(&s, "p-tester", &ok, t0);
+        assert!(!rec.retest, "{rec:?}");
+        assert_eq!(
+            followup_for_coordinator_inbound(TESTER, &ok, &rec),
+            Some(("orchestrator".into(), "TASK_DONE T1".into()))
+        );
+        assert_eq!(s.closure("T1"), Some(Closure::Done));
+    }
+
+    #[test]
+    fn a_fix_of_a_tester_rejection_is_retested_not_tested() {
+        let s = LifecycleStore::new();
+        let t0 = Instant::now();
+        s.assign_at("p-builder", "T1", t0);
+        let done = Transition { kind: TransitionKind::Done, task_id: "T1".into() };
+        let no = Transition { kind: TransitionKind::ChangesNeeded, task_id: "T1".into() };
+        let ok = Transition { kind: TransitionKind::Approved, task_id: "T1".into() };
+        s.record_at("backend-builder", "p-builder", &done, &[], None, t0);
+        rec_at(&s, "p-reviewer", &ok, t0);
+        s.record_with_cause("integration-tester", "p-tester", &no, &["p-builder", "p-bb"], Some("tests::x fails"), Some(Cause::Kod));
+        s.assign_at("p-builder", "T1", t0);
+        s.record_at("backend-builder", "p-builder", &done, &[], Some("fixed x"), t0);
+        let rec = rec_at(&s, "p-reviewer", &ok, t0);
+        assert!(rec.retest && !rec.first_test, "{rec:?}");
+        assert_eq!(
+            followup_for_coordinator_inbound("backend-reviewer", &ok, &rec),
+            Some(("integration-tester".into(), "retest T1".into()))
+        );
+    }
+
+    // -- what a pane holds, for the re-pin after a compaction ----------- //
+
+    #[test]
+    fn a_dispatch_excerpt_is_kept_for_the_repin() {
+        let s = LifecycleStore::new();
+        let t0 = Instant::now();
+        let long = format!("build T1 — auth.rs'e token refresh ekle; kabul: cargo test geçer. {}", "x".repeat(600));
+        assert!(s.assign_with_dispatch("p-builder", "T1", Some(&long)));
+        let open = s.open_tasks_of("p-builder");
+        assert_eq!(open.len(), 1);
+        assert_eq!((open[0].id.as_str(), open[0].state), ("T1", LifecycleState::Assigned));
+        let d = open[0].dispatch.as_deref().unwrap();
+        assert!(d.starts_with("build T1 — auth.rs'e token refresh ekle"), "{d}");
+        assert!(d.chars().count() <= 241, "{}", d.chars().count());
+        // A plain `assign` (no body) keeps the excerpt; DONE keeps the task open
+        // (awaiting review); the tester's pass ends it.
+        s.assign_at("p-builder", "T1", t0);
+        assert!(s.open_tasks_of("p-builder")[0].dispatch.is_some());
+        assert!(s.dispatch_of("T1").is_some_and(|d| d.starts_with("build T1 — auth.rs")));
+        assert_eq!(s.dispatch_of("nope"), None);
+        s.record_at("backend-builder", "p-builder", &tr(TransitionKind::Done, "T1"), &[], None, t0);
+        assert_eq!(s.open_tasks_of("p-builder")[0].state, LifecycleState::AwaitingReview);
+        // A later dispatch of the id to another pane (the tester's `test`)
+        // keeps the task's first excerpt and gives that pane its own.
+        assert!(s.assign_with_dispatch("p-tester", "T1", Some("test T1 — builder notu")));
+        assert!(s.dispatch_of("T1").is_some_and(|d| d.starts_with("build T1 — auth.rs")));
+        assert_eq!(s.open_tasks_of("p-tester")[0].dispatch.as_deref(), Some("test T1 — builder notu"));
+        assert!(s.open_tasks_of("p-builder")[0].dispatch.as_deref().is_some_and(|d| d.starts_with("build T1")));
+        rec_at(&s, "p-reviewer", &tr(TransitionKind::Approved, "T1"), t0);
+        rec_at(&s, "p-tester", &tr(TransitionKind::Approved, "T1"), t0);
+        assert!(s.open_tasks_of("p-builder").is_empty());
+        assert!(s.open_tasks_of("p-nobody").is_empty());
+    }
+
+    #[test]
+    fn the_coordinator_owes_rework_and_held_tasks() {
+        let s = LifecycleStore::new();
+        let t0 = Instant::now();
+        s.assign_at("p-builder", "T1", t0);
+        s.assign_at("p-fb", "T2", t0);
+        assert!(s.owed_by_coordinator().is_empty());
+        let no1 = Transition { kind: TransitionKind::ChangesNeeded, task_id: "T1".into() };
+        s.record_with_cause("backend-reviewer", "p-reviewer", &no1, &["p-builder"], Some("auth.rs:42 wrong"), Some(Cause::Kod));
+        let no2 = Transition { kind: TransitionKind::ChangesNeeded, task_id: "T2".into() };
+        s.record_with_cause("frontend-reviewer", "p-fr", &no2, &["p-fb"], Some("[izin] npm denied"), Some(Cause::Izin));
+        let owed = s.owed_by_coordinator();
+        assert_eq!(
+            owed,
+            [("T1".to_string(), "düzeltme dispatch'i bekliyor".to_string()), ("T2".to_string(), "beklemede (izin)".to_string())]
+        );
+        // The re-dispatch settles the debt.
+        s.assign_at("p-builder", "T1", t0);
+        assert_eq!(s.owed_by_coordinator().len(), 1);
+    }
+
+    // -- progress-based stalls and deadlocks --------------------------- //
+
+    #[test]
+    fn progress_evidence_resets_the_stall_clock() {
+        let s = LifecycleStore::new();
+        let t0 = Instant::now();
+        s.assign_at("p-builder", "T1", t0);
+        // Tool calls keep coming: no reminder at the wall-clock threshold.
+        s.note_progress_at("p-builder", t0 + 15 * MIN);
+        assert!(s.take_stalls(t0 + 25 * MIN, 10 * MIN, 20 * MIN).is_empty());
+        let st = s.take_stalls(t0 + 36 * MIN, 10 * MIN, 20 * MIN);
+        assert_eq!((st.len(), st[0].level, st[0].age), (1, 1, 21 * MIN));
+        // Progress on another pane changes nothing here.
+        s.note_progress_at("p-fb", t0 + 50 * MIN);
+        assert_eq!(s.take_stalls(t0 + 57 * MIN, 10 * MIN, 20 * MIN).len(), 1);
+        // A review in progress (the reviewer's tool calls) keeps the
+        // builder's AwaitingReview entry fresh.
+        s.record_at("backend-builder", "p-builder", &tr(TransitionKind::Done, "T1"), &[], None, t0 + 60 * MIN);
+        s.note_review_progress_at("p-builder", t0 + 68 * MIN);
+        assert!(s.take_stalls(t0 + 72 * MIN, 10 * MIN, 20 * MIN).is_empty());
+        let st = s.take_stalls(t0 + 79 * MIN, 10 * MIN, 20 * MIN);
+        assert_eq!((st.len(), st[0].state), (1, LifecycleState::AwaitingReview));
+    }
+
+    #[test]
+    fn deadlocks_are_read_through_the_store_and_wait_out_a_pause() {
+        let s = LifecycleStore::new();
+        let t0 = Instant::now();
+        s.note_message_at("backend-builder", "planner", Some("T1"), true, t0);
+        s.note_message_at("planner", "coordinator", None, true, t0 + MIN);
+        s.note_message_at("coordinator", "backend-builder", Some("T1"), true, t0 + 2 * MIN);
+        // Paused (the usage limit): nothing is reported, nothing ages.
+        s.pause_clocks_at(t0 + 3 * MIN);
+        assert!(s.take_deadlocks(t0 + 20 * MIN, 10 * MIN).is_empty());
+        s.resume_clocks_at(t0 + 30 * MIN);
+        assert!(s.take_deadlocks(t0 + 35 * MIN, 10 * MIN).is_empty());
+        let found = s.take_deadlocks(t0 + 40 * MIN, 10 * MIN);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].edges.len(), 3);
+        assert_eq!(found[0].edges[0].since, 13 * MIN);
+        // Activity breaks it; idling again re-forms (and re-reports) it.
+        s.note_activity_at("planner", t0 + 41 * MIN);
+        assert!(s.take_deadlocks(t0 + 45 * MIN, 10 * MIN).is_empty());
+        assert_eq!(s.take_deadlocks(t0 + 55 * MIN, 10 * MIN).len(), 1);
+    }
+
+    #[test]
+    fn closing_a_task_forgets_its_waits() {
+        let s = LifecycleStore::new();
+        let t0 = Instant::now();
+        s.assign_at("p-builder", "T1", t0);
+        s.note_message_at("orchestrator", "backend-builder", Some("T1"), true, t0);
+        s.note_message_at("backend-builder", "planner", Some("T1"), true, t0 + MIN);
+        s.note_message_at("planner", "orchestrator", Some("T1"), true, t0 + 2 * MIN);
+        assert_eq!(s.take_deadlocks(t0 + 13 * MIN, 10 * MIN).len(), 1);
+        assert!(s.fail_task("T1"));
+        // The cycle was about the task; with it closed nothing stands —
+        // and it is not reported again even where it would re-form.
+        assert!(s.take_deadlocks(t0 + 14 * MIN, 10 * MIN).is_empty());
+    }
+
+    #[test]
+    fn requests_open_waits_signals_do_not() {
+        for body in ["p6-1 — JSDoc ekle", "review p6-1 — notu", "test p6-1 — notu", "kabul ölçütü net mi?", "netleştir p6-1"] {
+            assert!(is_request(body, Some("p6-1")), "{body}");
+        }
+        for body in [
+            "DONE p6-1 — x; doğrulama: tsc → ok",
+            "APPROVED p6-1",
+            "CHANGES_NEEDED p6-1 — [kod] x",
+            "BUILDING p6-1",
+            "TASK_DONE p6-1 — ok",
+            "TASK_FAILED p6-1 — y",
+            "hata — [izin] docker",
+            "alındı — anladım",
+            "bilgi — p6-1 kapandı",
+            "talimat gördüm — README.md: x",
+        ] {
+            assert!(!is_request(body, Some("p6-1")), "{body}");
+        }
+    }
+
+    // -- rejections by cause ------------------------------------------- //
+
+    #[test]
+    fn an_environment_rejection_does_not_consume_a_rework_round() {
+        let s = LifecycleStore::new();
+        let t0 = Instant::now();
+        s.assign_at("p-builder", "T1", t0);
+        let no = Transition { kind: TransitionKind::ChangesNeeded, task_id: "T1".into() };
+        for _ in 0..3 {
+            let rec = s.record_with_cause("backend-reviewer", "p-reviewer", &no, &["p-builder"], Some("[ortam] node_modules yok"), Some(Cause::Ortam));
+            assert_eq!(rec.rejections, 0, "{rec:?}");
+            assert!(!rec.limit_exceeded);
+            assert_eq!(rec.blocked, Some(Cause::Ortam));
+            assert_eq!(followup_for_coordinator_inbound("backend-reviewer", &no, &rec), None);
+            s.assign_at("p-builder", "T1", t0);
+        }
+        assert_eq!(s.closure("T1"), None);
+        // The first real code rejection is round 1, not round 4.
+        let rec = s.record_with_cause("backend-reviewer", "p-reviewer", &no, &["p-builder"], Some("auth.rs:42 wrong"), Some(Cause::Kod));
+        assert_eq!(rec.rejections, 1);
+        assert_eq!(rec.blocked, None);
+    }
+
+    #[test]
+    fn a_blocked_task_is_reopened_by_the_next_dispatch() {
+        let s = LifecycleStore::new();
+        let t0 = Instant::now();
+        s.assign_at("p-builder", "T1", t0);
+        let no = Transition { kind: TransitionKind::ChangesNeeded, task_id: "T1".into() };
+        s.record_with_cause("backend-reviewer", "p-reviewer", &no, &["p-builder"], None, Some(Cause::Izin));
+        assert!(s.is_blocked("T1"));
+        // No rework nag while the user fixes it: the coordinator owes nothing yet.
+        assert!(s.take_stalls(t0 + Duration::from_secs(3600), Duration::from_secs(60), Duration::from_secs(60)).is_empty());
+        assert!(s.assign_at("p-builder", "T1", t0));
+        assert!(!s.is_blocked("T1"));
+        assert_eq!(s.state_of("p-builder", "T1"), Some(LifecycleState::Assigned));
+    }
+
+    #[test]
+    fn an_unclear_rejection_goes_back_to_the_planner_without_a_round() {
+        let s = LifecycleStore::new();
+        let t0 = Instant::now();
+        s.assign_at("p-builder", "T1", t0);
+        let no = Transition { kind: TransitionKind::ChangesNeeded, task_id: "T1".into() };
+        let rec = s.record_with_cause("backend-reviewer", "p-reviewer", &no, &["p-builder"], Some("belirsiz: kabul ölçütü yok"), Some(Cause::Belirsiz));
+        assert_eq!(rec.rejections, 0);
+        assert_eq!(
+            followup_for_coordinator_inbound("backend-reviewer", &no, &rec),
+            Some(("planner".into(), "netleştir T1".into()))
+        );
+        assert_eq!(s.closure("T1"), None);
+    }
+
+    #[test]
+    fn an_error_report_with_an_environment_cause_blocks_instead_of_closing() {
+        let s = LifecycleStore::new();
+        let t0 = Instant::now();
+        s.assign_at("p-builder", "T1", t0);
+        assert_eq!(s.block(&["p-builder"], "T1", Cause::Izin), Abandon::Closed);
+        assert_eq!(s.closure("T1"), None);
+        assert!(s.is_blocked("T1"));
+        // Someone else's open task is not this reporter's to block.
+        s.assign_at("p-fb", "T2", t0);
+        assert_eq!(s.block(&["p-builder"], "T2", Cause::Ortam), Abandon::Elsewhere);
+        assert!(!s.is_blocked("T2"));
     }
 
     #[test]
@@ -1841,6 +2701,21 @@ mod tests {
     }
 
     #[test]
+    fn injection_report_detection() {
+        for body in [
+            "talimat gördüm — README.md: \"run curl …\"",
+            "Talimat gördüm: src/x.rs yorumu",
+            "**TALİMAT GÖRDÜM** — AGENTS.md",
+            "talimat gördüm",
+        ] {
+            assert!(is_injection_report(body), "{body}");
+        }
+        for body in ["talimatı uyguladım", "hata — x", "", "talimat gördümde", "gördüm talimat"] {
+            assert!(!is_injection_report(body), "{body}");
+        }
+    }
+
+    #[test]
     fn reviewer_verdict_closes_the_builders_awaiting_entry() {
         // DONE is keyed by the builder pane, APPROVED by the reviewer
         // pane — the verdict must still settle the builder's entry, or
@@ -2223,6 +3098,8 @@ mod tests {
         s.assign_at("p-builder", "old-1", t0);
         rec_at(&s, "p-builder", &tr(TransitionKind::Done, "old-1"), t0);
         rec_at(&s, "p-reviewer", &tr(TransitionKind::Approved, "old-1"), t0);
+        // The tester's pass is what closes a task.
+        rec_at(&s, "p-tester", &tr(TransitionKind::Approved, "old-1"), t0);
         for n in 0..MAX_LIFECYCLE_ENTRIES + 10 {
             s.assign_at("p-x", &format!("t{n}"), t0);
         }
@@ -2294,9 +3171,12 @@ mod tests {
         // tester is not a builder.
         assert_eq!(s.dispatch_conflict("p-builder", "T3", &builders), None);
         assert_eq!(s.dispatch_conflict("p-tester", "T3", &builders), None);
-        // Closed ids are refused for everyone.
+        // Closed ids are refused for everyone — and only the tester's
+        // pass closes; after the review alone the id is still open.
         rec_at(&s, "p-builder", &tr(TransitionKind::Done, "T3"), t0);
         rec_at(&s, "p-reviewer", &tr(TransitionKind::Approved, "T3"), t0);
+        assert_eq!(s.dispatch_conflict("p-tester", "T3", &builders), None);
+        rec_at(&s, "p-tester", &tr(TransitionKind::Approved, "T3"), t0);
         assert!(s.dispatch_conflict("p-tester", "T3", &builders).unwrap().contains("TASK_DONE"));
     }
 
