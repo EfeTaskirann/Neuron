@@ -9,8 +9,8 @@ use super::delivery::{
 };
 use super::envelope::{sniff_from, Envelope};
 use super::notify::rejection_notice;
-use super::stall::{escalation_for, give_up_texts, reminder_for};
-use crate::swarm_term::lifecycle::{LifecycleState, Stall};
+use super::stall::{escalation_for, give_up_texts, question_notice, question_reminder, reminder_for};
+use crate::swarm_term::lifecycle::{LifecycleState, Stall, Unanswered};
 use super::fsops::{
     archive_rejected, attempts_sidecar, bump_attempts, drop_envelope,
     ensure_gitignore, move_to_processed, move_to_rejected, prepare_layout,
@@ -158,6 +158,21 @@ fn stall(state: LifecycleState, mins: u64, level: u8) -> Stall {
         level,
         give_up: false,
     }
+}
+
+#[test]
+fn an_unanswered_question_reminds_the_advisor_then_tells_the_asker() {
+    let question = |mins: u64, level: u8| Unanswered {
+        advisor: "planner".into(),
+        asker: "coordinator".into(),
+        age: std::time::Duration::from_secs(mins * 60),
+        level,
+    };
+    let reminder = question_reminder(&question(10, 1));
+    assert!(reminder.contains("@coordinator 10 dakikadır cevabını bekliyor"), "{reminder}");
+    let notice = question_notice(&question(20, 2));
+    assert!(notice.contains("@planner 20 dakikadır cevap vermedi"), "{notice}");
+    assert!(notice.contains("Onsuz devam et"), "{notice}");
 }
 
 #[test]

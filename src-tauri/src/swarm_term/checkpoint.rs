@@ -877,6 +877,32 @@ mod tests {
         assert!(left.note.unwrap_or_default().contains("sembolik bağ"));
     }
 
+    /// The same guard on Windows, where Neuron runs: a directory junction
+    /// is the link any user can make (`mklink /J`, no Developer Mode), and
+    /// it counts as a link too.
+    #[cfg(windows)]
+    #[test]
+    fn revert_refuses_to_write_through_a_junction_parent() {
+        let Some((base, r)) = repo() else { return };
+        let app = base.path().join("app");
+        take(&app, &r, "s1").unwrap();
+        std::fs::write(r.join("src/lib.rs"), "changed\n").unwrap();
+        // The src/ folder is swapped for a junction pointing outside the project.
+        let outside = base.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::remove_dir_all(r.join("src")).unwrap();
+        let made = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(r.join("src"))
+            .arg(&outside)
+            .output()
+            .expect("run mklink");
+        assert!(made.status.success(), "mklink /J: {}", String::from_utf8_lossy(&made.stderr));
+        let left = revert(&app, &r, Some(&["src/lib.rs".to_string()])).unwrap();
+        assert!(!outside.join("lib.rs").exists(), "revert wrote through the junction");
+        assert!(left.note.unwrap_or_default().contains("sembolik bağ"));
+    }
+
     #[test]
     fn the_change_list_is_read_from_gits_nul_separated_output() {
         let status = b"M\0app/src/a.ts\0A\0app/new file.md\0D\0app/old.rs\0A\0app/.bridgespace/.gitignore\0";
