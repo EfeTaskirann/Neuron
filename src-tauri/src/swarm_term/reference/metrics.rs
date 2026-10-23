@@ -283,7 +283,9 @@ pub(crate) fn render_distribution(distribution: &[(String, usize)]) -> String {
 /// team: the last `window` runs as ✔/✘, the pass rate over them, the
 /// medians of the work time and the tokens, and the newest run against
 /// the median of the `base` runs before it. A pass turning into a fail
-/// and a time or output-token jump are flagged.
+/// and a time or output-token jump are flagged. A "run" is one suite
+/// invocation: its k repetitions (`NEURON_REF_REPEAT`) are one mark — ✔
+/// only when every repetition passed — and one median.
 pub(crate) fn trend_table(history: &[RunRecord], window: usize, base: usize) -> String {
     if history.is_empty() {
         return "Henüz kayıt yok.\n".into();
@@ -298,19 +300,21 @@ pub(crate) fn trend_table(history: &[RunRecord], window: usize, base: usize) -> 
     );
     let (mut passes, mut runs) = (0, 0);
     for ((task, team), all) in &rows {
-        let recent = &all[all.len().saturating_sub(window)..];
-        let marks: String = recent.iter().map(|r| if r.pass { '✔' } else { '✘' }).collect();
-        let pass = recent.iter().filter(|r| r.pass).count();
+        let invocations = by_suite(all);
+        let recent = &invocations[invocations.len().saturating_sub(window)..];
+        let marks: String = recent.iter().map(|inv| if all_passed(inv) { '✔' } else { '✘' }).collect();
+        let pass = recent.iter().filter(|inv| all_passed(inv)).count();
         passes += pass;
         runs += recent.len();
+        let records = || recent.iter().flatten();
         out.push_str(&format!(
             "| {task} | {team} | {marks} | {pass}/{} ({}%) | {} | {} | {} | {} |\n",
             recent.len(),
             percent(pass, recent.len()),
-            secs(median(recent.iter().map(|r| r.work_s()))),
-            tokens(median(recent.iter().map(|r| r.tokens.output as f64))),
-            tokens(median(recent.iter().map(|r| r.tokens.input_total() as f64))),
-            newest_vs_base(all, base),
+            secs(median(records().map(|r| r.work_s()))),
+            tokens(median(records().map(|r| r.tokens.output as f64))),
+            tokens(median(records().map(|r| r.tokens.input_total() as f64))),
+            newest_vs_base(&invocations, base),
         ));
     }
     out.push_str(&format!(
@@ -320,28 +324,52 @@ pub(crate) fn trend_table(history: &[RunRecord], window: usize, base: usize) -> 
     out
 }
 
-/// Pure: the newest of `runs` against the median of the `base` before it.
-fn newest_vs_base(runs: &[&RunRecord], base: usize) -> String {
-    let Some((newest, before)) = runs.split_last() else { return String::new() };
+/// Pure: one task's records (oldest first) grouped by suite invocation —
+/// consecutive records of one suite are its repetitions.
+fn by_suite<'a>(all: &[&'a RunRecord]) -> Vec<Vec<&'a RunRecord>> {
+    let mut groups: Vec<Vec<&'a RunRecord>> = Vec::new();
+    for r in all {
+        match groups.last_mut() {
+            Some(g) if g[0].suite == r.suite => g.push(r),
+            _ => groups.push(vec![r]),
+        }
+    }
+    groups
+}
+
+fn all_passed(invocation: &[&RunRecord]) -> bool {
+    invocation.iter().all(|r| r.pass)
+}
+
+/// Pure: the newest invocation against the medians of the `base`
+/// invocations before it (an invocation's own value is the median of its
+/// repetitions).
+fn newest_vs_base(invocations: &[Vec<&RunRecord>], base: usize) -> String {
+    let Some((newest, before)) = invocations.split_last() else { return String::new() };
     let before = &before[before.len().saturating_sub(base)..];
     if before.is_empty() {
         return "ilk koşu".into();
     }
     let mut notes = Vec::new();
-    if !newest.pass && before.iter().any(|r| r.pass) {
+    if !all_passed(newest) && before.iter().any(|inv| all_passed(inv)) {
         notes.push("✘ REGRESYON".to_string());
     }
-    let mut compare = |what: &str, now: f64, then: Option<f64>| {
-        let Some(then) = then.filter(|t| *t > 0.0) else { return };
+    let mut compare = |what: &str, now: Option<f64>, then: Option<f64>| {
+        let (Some(now), Some(then)) = (now, then.filter(|t| *t > 0.0)) else { return };
         let change = now / then - 1.0;
         let flag = if change > JUMP { " ⚠" } else { "" };
         notes.push(format!("{what} {:+.0}%{flag}", change * 100.0));
     };
-    compare("süre", newest.work_s(), median(before.iter().map(|r| r.work_s())));
+    let before_records = || before.iter().flatten();
+    compare(
+        "süre",
+        median(newest.iter().map(|r| r.work_s())),
+        median(before_records().map(|r| r.work_s())),
+    );
     compare(
         "output",
-        newest.tokens.output as f64,
-        median(before.iter().map(|r| r.tokens.output as f64)),
+        median(newest.iter().map(|r| r.tokens.output as f64)),
+        median(before_records().map(|r| r.tokens.output as f64)),
     );
     notes.join(", ")
 }
@@ -454,15 +482,23 @@ mod tests {
         }
     }
 
+    /// Each record its own suite invocation (one run each).
+    fn invocations(mut history: Vec<RunRecord>) -> Vec<RunRecord> {
+        for (i, r) in history.iter_mut().enumerate() {
+            r.suite = format!("ref-{}", i + 1);
+        }
+        history
+    }
+
     #[test]
     fn the_trend_table_flags_a_new_failure_and_a_jump() {
-        let history = vec![
+        let history = invocations(vec![
             run("bug-off-by-one", true, 100.0, 15_000),
             run("bug-off-by-one", true, 120.0, 17_000),
             run("feature-discount", true, 200.0, 20_000),
             // Newest: failed, twice as slow, output about the same.
             run("bug-off-by-one", false, 220.0, 16_500),
-        ];
+        ]);
         let table = trend_table(&history, 10, 5);
         let row = |task: &str| {
             table.lines().find(|l| l.starts_with(&format!("| {task} |"))).unwrap_or_default().to_string()
@@ -483,9 +519,11 @@ mod tests {
 
     #[test]
     fn only_the_last_window_counts_and_teams_are_kept_apart() {
-        let mut history: Vec<RunRecord> = (0..12).map(|i| run("t", i >= 2, 60.0, 1000)).collect();
+        let mut history: Vec<RunRecord> =
+            invocations((0..12).map(|i| run("t", i >= 2, 60.0, 1000)).collect());
         let mut lite = run("t", false, 30.0, 500);
         lite.team = "lite".into();
+        lite.suite = "ref-lite".into();
         history.push(lite);
         let table = trend_table(&history, 10, 5);
         // The two old failures fell out of the window of ten.
@@ -509,6 +547,25 @@ mod tests {
         assert_eq!(records.iter().map(|r| r.task.as_str()).collect::<Vec<_>>(), ["a", "b"]);
         assert_eq!(records[1], run("b", false, 20.0, 2));
         assert_eq!(skipped, 1);
+    }
+
+    #[test]
+    fn k_repetitions_of_one_invocation_are_one_run_in_the_trend() {
+        // ref-1 ran `a` once (pass, 60 s); ref-2 ran it three times, one of
+        // them failing, at twice the time: one ✘ mark, a regression and a
+        // time jump against ref-1 — not rep 3 against reps 1–2.
+        let mut history = vec![run("a", true, 60.0, 1000)];
+        for (rep, pass) in [(1, true), (2, false), (3, true)] {
+            let mut r = run("a", pass, 120.0, 1000);
+            r.suite = "ref-2".into();
+            r.rep = rep;
+            history.push(r);
+        }
+        let table = trend_table(&history, 10, 5);
+        let row = table.lines().find(|l| l.starts_with("| a |")).unwrap_or_default().to_string();
+        assert!(row.contains("| ✔✘ |") && row.contains("1/2 (50%)"), "{row}");
+        assert!(row.contains("✘ REGRESYON") && row.contains("süre +100% ⚠"), "{row}");
+        assert!(table.contains("1/2 geçti (50%)"), "{table}");
     }
 
     #[test]

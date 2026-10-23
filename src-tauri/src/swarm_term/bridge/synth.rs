@@ -20,7 +20,8 @@ use crate::swarm_term::hierarchy::{
 };
 use crate::swarm_term::lifecycle::{
     body_task_id, cause_of, declared_files, dependencies, done_evidence, error_reason,
-    followup_for_coordinator_inbound, is_error_report, lifecycle_note, looks_like_unparsed_signal,
+    followup_for_coordinator_inbound, has_file_list, is_error_report, lifecycle_note,
+    looks_like_unparsed_signal,
     parse_lifecycle_token_with_fallback, rework_evidence, strip_cause_tag, task_failed_id, Abandon, Cause, Closure,
     DoneEvidence, LifecycleState, LifecycleStore, TransitionKind, MAX_REWORK_ROUNDS,
     TASK_FAILED_PREFIX, TESTER,
@@ -157,7 +158,7 @@ pub(super) fn lifecycle_synthesise<R: Runtime>(
                 format!(
                     "@{from_agent} `{id}` için `hata` bildirdi ama görev başka bir ajanda \
                      hâlâ açık, bu yüzden kapatılmadı. Görev gerçekten yürümüyorsa \
-                     orchestrator'a `TASK_FAILED {id} — <sebep>` yolla (task_id alanı `{id}`)."
+                     orchestrator'a `TASK_FAILED {id} — [FM-x.y] <sebep>` yolla (task_id alanı `{id}`)."
                 ),
                 "hata about a task open elsewhere",
             )],
@@ -176,6 +177,11 @@ pub(super) fn lifecycle_synthesise<R: Runtime>(
             .collect();
     };
     let id = transition.task_id.clone();
+    // A late signal for a finished task is answered as such — not with an
+    // evidence refusal that would send the agent back into a closed task.
+    if let Some(closure) = lifecycle.closure(&id) {
+        return vec![closed_notice(from_agent, &id, closure)];
+    }
     // The sender's free-text note (what changed / what to check / why it
     // was rejected) — carried into the follow-up so it is not
     // context-free.
@@ -217,19 +223,26 @@ pub(super) fn lifecycle_synthesise<R: Runtime>(
             "DONE without file declaration",
         )];
     }
-    // The tester's APPROVED closes the task: it must say what it ran, as
-    // a builder's DONE must — a bare pass is a claim, not a run.
+    // The tester's APPROVED closes the task: it must say what it ran. A
+    // builder may decline (`doğrulama yok: …`); the tester's whole role is
+    // the run, so only a run passes.
     if transition.kind == TransitionKind::Approved
         && from_agent == TESTER
-        && done_evidence(note.as_deref()) == DoneEvidence::Missing
+        && done_evidence(note.as_deref()) != DoneEvidence::Ran
     {
         tracing::info!(source = %from_agent, task_id = %id, "swarm-term bridge: tester APPROVED refused — no run evidence");
+        let builder_command = if lifecycle.has_claim(&id) {
+            " Builder'ın `doğrulama:` komutunu aynen koştuğunu da yaz."
+        } else {
+            ""
+        };
         return vec![Notice::new(
             from_agent,
             format!(
                 "`APPROVED {id}` KABUL EDİLMEDİ: koştuğun komut ve sonucu yok, görev kapanmadı. \
                  `APPROVED {id} — <komut>: <sonuç, ör. cargo test: 40 passed>` diye yeniden \
-                 gönder; builder'ın `doğrulama:` komutunu aynen koştuğunu da yaz."
+                 gönder.{builder_command} Koşamıyorsan APPROVED değil, task_id'li \
+                 `hata — [izin] <komut>` ya da `hata — [ortam] <eksik olan>` yaz."
             ),
             "APPROVED without run evidence",
         )];
@@ -412,6 +425,11 @@ fn claim_notices(
     panes_by_agent: &HashMap<String, String>,
     lifecycle: &LifecycleStore,
 ) -> Vec<Notice> {
+    // A DONE note tops the declaration up only with an explicit list; its
+    // prose names files as context, and a context mention is no claim.
+    if kind == TransitionKind::Done && !note.is_some_and(has_file_list) {
+        return Vec::new();
+    }
     let Some(files) = declared_files(note) else {
         if kind != TransitionKind::Building {
             return Vec::new();
@@ -714,8 +732,12 @@ fn unparsed_signal_notice(
     has_task_id: bool,
 ) -> Option<String> {
     let expected = if is_builder(from_agent) {
-        "Görev bittiyse body TAM OLARAK `DONE <task_id> — <ne değişti, hangi \
-         dosyalar>` biçiminde olmalı (ör. `DONE T1 — auth.rs: refresh eklendi`)"
+        "Görev bittiyse body TAM OLARAK `DONE <task_id> — <ne değişti, hangi dosyalar>; \
+         doğrulama: <komut> → <sonuç>` biçiminde olmalı (ör. `DONE T1 — auth.rs: refresh \
+         eklendi; doğrulama: cargo test → 12 geçti`)"
+    } else if from_agent == TESTER {
+        "Karar verdiysen body TAM OLARAK `APPROVED <task_id> — <komut>: <sonuç>` ya da \
+         `CHANGES_NEEDED <task_id> — [kod] <test/hata> — <ne değişmeli>` biçiminde olmalı"
     } else if is_reviewer(from_agent) {
         "Karar verdiysen body TAM OLARAK `APPROVED <task_id>` ya da \
          `CHANGES_NEEDED <task_id> — <ne değişmeli>` biçiminde olmalı"

@@ -822,6 +822,14 @@ mod tests {
         assert!(tester.contains("dosyalar:"), "tester reads the declared files");
         assert!(tester.contains("AYNEN"), "tester re-runs the builder's command exactly");
         assert!(tester.contains("komutsuz") || tester.contains("komut ve sonuç"), "tester cites its run");
+        // The file list is a snapshot: an undeclared change is information
+        // for the coordinator, not a FAIL charged to the task under test.
+        assert!(tester.contains("bilgi — <task_id> diff'inde beyan dışı dosya"), "tester reports, not rejects");
+        assert!(!tester.contains("[kod] beyan dışı"), "no FAIL for another task's file");
+        for id in ["backend-reviewer", "frontend-reviewer", "coordinator"] {
+            let body = &reg.get(id).expect(id).body;
+            assert!(body.contains("test <task_id> — <builder notu> | dosyalar: <beyan>"), "{id} names the test body");
+        }
         let footer = build_persona_prompt("integration-tester", "x", &dummy_bridge_root(), &facts(), AGENT_IDS);
         assert!(footer.contains("| dosyalar:"), "footer names the test body's file section");
         assert!(footer.contains("komut ve sonuç ŞART"), "footer: a tester APPROVED needs its run");

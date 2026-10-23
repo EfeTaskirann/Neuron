@@ -393,11 +393,10 @@ async fn lifecycle_failure_paths_with_fake_agents() {
         && log("backend-reviewer").contains("v2 test added"));
     send("backend-reviewer", "coordinator", "APPROVED R1", Some("R1"));
     // A review alone closes nothing: the tester runs it first.
-    // The declaration (`src/auth.rs`) plus what the DONE notes named (`auth.rs`).
+    // The declaration alone: the DONE notes' prose (`auth.rs`) is not a list.
     step!("A6 tester got test R1 with the builder's note and the declared files",
         log("integration-tester").contains("test R1") && log("integration-tester").contains("v2 test added")
-            && log("integration-tester").contains("| dosyalar: ")
-            && log("integration-tester").contains("src/auth.rs"));
+            && log("integration-tester").contains("| dosyalar: src/auth.rs"));
     step!("A7 no TASK_DONE before the tester passes", !log("orchestrator").contains("TASK_DONE R1"));
     send("integration-tester", "coordinator", "APPROVED R1 - cargo test: 40 passed", Some("R1"));
     step!("A8 orchestrator got TASK_DONE R1", log("orchestrator").contains("TASK_DONE R1"));
@@ -424,12 +423,14 @@ async fn lifecycle_failure_paths_with_fake_agents() {
     step!("B6 tester got retest S1 with the builder's note and the declared files",
         log("integration-tester").contains("retest S1") && log("integration-tester").contains("parse.rs fixed")
             && log("integration-tester").contains("retest S1 — ")
-            && log("integration-tester").contains("| dosyalar: ")
-            && log("integration-tester").contains("src/parse.rs"));
+            && log("integration-tester").contains("| dosyalar: src/parse.rs"));
     step!("B7 no TASK_DONE before the retest passes", !log("orchestrator").contains("TASK_DONE S1"));
+    send("integration-tester", "coordinator", "APPROVED S1 - testler koşulamadı: node_modules yok", Some("S1"));
+    step!("B7a a tester APPROVED that ran nothing is refused",
+        count("integration-tester", "KABUL EDİLMEDİ") == 1 && !log("orchestrator").contains("TASK_DONE S1"));
     send("integration-tester", "coordinator", "APPROVED S1", Some("S1"));
     step!("B7b a tester APPROVED without its run is refused",
-        log("integration-tester").contains("KABUL EDİLMEDİ") && !log("orchestrator").contains("TASK_DONE S1"));
+        count("integration-tester", "KABUL EDİLMEDİ") == 2 && !log("orchestrator").contains("TASK_DONE S1"));
     send("integration-tester", "coordinator", "APPROVED S1 - cargo test: 12 passed", Some("S1"));
     step!("B8 orchestrator got TASK_DONE S1 naming the fix",
         log("orchestrator").contains("TASK_DONE S1") && log("orchestrator").contains("parse.rs fixed"));
@@ -578,12 +579,22 @@ async fn lifecycle_failure_paths_with_fake_agents() {
     step!("N0 backend-builder got N1", log("backend-builder").contains("build N1"));
     send("coordinator", "orchestrator", "TASK_FAILED N1 — builder cannot get the API key", Some("N1"));
     step!("N1 the untagged give-up still closes the task", log("orchestrator").contains("TASK_FAILED N1"));
+    send("orchestrator", "backend-builder", "retry N1", Some("N1"));
+    step!("N1b the closed N1 cannot be re-dispatched",
+        !log("backend-builder").contains("retry N1") && log("orchestrator").contains("`N1` already closed"));
     step!("N2 the coordinator is asked for the label", log("coordinator").contains("MAST etiketi yok"));
     send("orchestrator", "frontend-builder", "build N2", Some("N2"));
     step!("N3 frontend-builder got N2", log("frontend-builder").contains("build N2"));
     send("coordinator", "orchestrator", "TASK_FAILED N2 — [FM-2.3] builder wandered into a redesign", Some("N2"));
-    step!("N4 the tagged give-up passes quietly",
-        log("orchestrator").contains("TASK_FAILED N2") && count("coordinator", "MAST etiketi yok") == 1);
+    step!("N4 the tagged give-up closes the task", log("orchestrator").contains("TASK_FAILED N2"));
+    // A third, untagged one: its notice arrives after any (wrong) notice for
+    // N2 would have, so the count pins "no notice for a tagged report".
+    send("orchestrator", "backend-builder", "build N3", Some("N3"));
+    step!("N5 backend-builder got N3", log("backend-builder").contains("build N3"));
+    send("coordinator", "orchestrator", "TASK_FAILED N3 — no label again", Some("N3"));
+    step!("N6 only the untagged give-ups were asked for a label",
+        log("coordinator").contains("`TASK_FAILED N3` kabul edildi ama MAST etiketi yok")
+            && count("coordinator", "MAST etiketi yok") == 2);
 
     // ---- Z: close what the scenarios left open ------------------------ //
     // G runs the stall clocks at 2 s. Every open task then stalls too, and

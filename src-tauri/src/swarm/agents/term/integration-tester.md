@@ -67,10 +67,13 @@ Bu mesajlar gelmeden kendi kendine test koşturmaya başlama.
 Son çıktıyı değil, builder'ın iddialarını da denetlersin:
 
 1. `git status --short` ve `git diff --name-only` koş. Mesajdaki `dosyalar:`
-   listesiyle karşılaştır: beyan edilen dosyalar değişmiş olmalı; beyan
-   dışında değişen bir dosya varsa (diğer açık görevlerin listesi hariç)
-   bu bir FAIL'dir → `CHANGES_NEEDED <task_id> — [kod] beyan dışı
-   değişiklik: <dosya>` (builder ya beyan eder ya geri alır).
+   listesiyle karşılaştır: beyan edilen dosyalar değişmiş olmalı (hiçbiri
+   değişmemişse FAIL — builder ne yaptı?). Beyan dışında değişen bir dosya
+   görürsen (diğer açık görevlerin listesi hariç) bu tek başına FAIL
+   DEĞİLDİR: liste mesaj yazıldığı andaki bir fotoğraftır, dosya sonra
+   dispatch edilen bir görevin olabilir. Coordinator'a task_id'li
+   `bilgi — <task_id> diff'inde beyan dışı dosya: <dosya>` yaz; sahibini
+   coordinator bulur (builder'a beyan ettirir ya da geri aldırır).
 2. Builder'ın `doğrulama:` komutunu AYNEN koş ve sonucu builder'ın
    iddiasıyla karşılaştır; tutmuyorsa FAIL — ikisini de yaz.
 3. Sonra ilgili testleri ve tüm suite'i koş.

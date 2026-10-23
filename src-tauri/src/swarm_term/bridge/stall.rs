@@ -235,7 +235,7 @@ pub(super) fn reminder_for(
             let text = if agent == TESTER {
                 format!(
                     "hatırlatma: `{id}` test görevi {since} ilerlemiyor (araç çağrısı, mesaj yok). Testi \
-                     koşturup coordinator'a `APPROVED {id}` (PASS) ya da `CHANGES_NEEDED \
+                     koşturup coordinator'a `APPROVED {id} — <komut>: <sonuç>` (PASS) ya da `CHANGES_NEEDED \
                      {id} — <hangi test, hangi dosya, hangi builder>` (FAIL) yolla; \
                      koşturamıyorsan coordinator'a `hata — <sebep>` yaz (task_id alanı `{id}`)."
                 )
@@ -254,7 +254,7 @@ pub(super) fn reminder_for(
                 "hatırlatma: `{id}` için CHANGES_NEEDED geldi ama {since} yeniden \
                  dispatch edilmedi. Reddedenin feedback'iyle ilgili builder'a AYNI task_id \
                  (`{id}`) ile düzeltme dispatch'i yaz (en fazla {MAX_REWORK_ROUNDS} tur); \
-                 düzeltilemiyorsa orchestrator'a `TASK_FAILED {id} — <sebep>` yolla."
+                 düzeltilemiyorsa orchestrator'a `TASK_FAILED {id} — [FM-x.y] <sebep>` yolla."
             ),
         )),
         _ => None,
@@ -293,7 +293,7 @@ pub(super) fn deadlock_text(deadlock: &Deadlock) -> String {
         "KİLİTLENME: {}. Her biri son mesajından beri cevap bekliyor ve hiçbiri çalışmıyor. \
          Zinciri kır: cevapsız kalan soruyu sen yanıtla, bekleyen görevi aynı task_id ile \
          yeniden dispatch et ya da çözülmüyorsa orchestrator'a `TASK_FAILED <task_id> — \
-         kilitlenme` yolla.",
+         [FM-x.y] kilitlenme` yolla.",
         chain.join(", ")
     )
 }
@@ -319,7 +319,7 @@ pub(super) fn escalation_for(responsible: &str, stall: &Stall) -> (&'static str,
         format!(
             "`{id}` görevi {since} @{responsible}'da takılı ({:?}); hatırlatmaya \
              cevap gelmedi. Gerekirse yeniden dispatch et ya da orchestrator'a \
-             `TASK_FAILED {id} — <özet>` yolla (task_id alanı `{id}`).",
+             `TASK_FAILED {id} — [FM-x.y] <özet>` yolla (task_id alanı `{id}`).",
             stall.state,
         ),
     )

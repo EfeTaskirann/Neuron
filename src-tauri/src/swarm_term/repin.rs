@@ -152,13 +152,17 @@ fn rules_for(agent: &str) -> &'static str {
             "dispatch'lerde `task_id` ve kabul ölçütü ver. Builder DONE → reviewer'a `review`, \
              reviewer APPROVED → tester'a `test`, tester APPROVED → TASK_DONE'u Neuron iletir. \
              `CHANGES_NEEDED [kod]` gelince aynı task_id ile düzeltme dispatch et (en fazla 2 \
-             tur; sonrasını Neuron `TASK_FAILED <task_id>` ile kapatır). BEKLEMEDE görevi \
+             tur; sonrasını Neuron `TASK_FAILED <task_id>` ile kapatır). Kendi vazgeçişin \
+             `TASK_FAILED <task_id> — [FM-x.y] <sebep>` (MAST türü). BEKLEMEDE görevi \
              kullanıcıya tek cümleyle bildir, çözülünce aynı task_id ile yeniden dispatch et."
         }
         TESTER => {
-            "`test` / `retest <task_id>` gelince testleri sen koştur; `APPROVED <task_id> — \
-             <komut>: <sonuç>` görevi kapatır; `CHANGES_NEEDED <task_id> — \
-             [kod|izin|ortam|belirsiz] <kanıt> — <ne değişmeli, hangi builder>`."
+            "`test` / `retest <task_id>` gelince önce `git diff --name-only` çıktısını mesajdaki \
+             `dosyalar:` beyanıyla karşılaştır (beyan dışı dosyayı coordinator'a `bilgi —` ile \
+             bildir), builder'ın `doğrulama:` komutunu aynen koş, sonra testleri sen koştur; \
+             `APPROVED <task_id> — <komut>: <sonuç>` görevi kapatır (komutsuz kabul edilmez); \
+             `CHANGES_NEEDED <task_id> — [kod|izin|ortam|belirsiz] <kanıt> — <ne değişmeli, \
+             hangi builder>`."
         }
         "orchestrator" => {
             "görevleri coordinator'a `task_id` ve kabul ölçütüyle ver; sonuç `TASK_DONE` / \

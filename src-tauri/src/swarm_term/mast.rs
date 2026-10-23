@@ -102,25 +102,38 @@ impl FailureMode {
         format!("[{}]", self.code())
     }
 
-    /// Pure: the mode named by `FM-1.3`, `[fm-1.3]`, `FM 1.3`, `fm1.3`…
+    /// Pure: the mode named by `FM-1.3`, `[fm-1.3]`, `**FM–1.3**`, `FM 1.3`,
+    /// `fm1.3`…
     pub fn parse(s: &str) -> Option<Self> {
         let t: String = s
             .trim()
-            .trim_matches(|c: char| matches!(c, '[' | ']' | '(' | ')' | '`' | '.' | ',' | ';'))
+            .trim_matches(|c: char| {
+                matches!(c, '[' | ']' | '(' | ')' | '`' | '*' | '_' | '"' | '\'' | '<' | '>' | '.' | ',' | ';')
+            })
             .chars()
             .filter(|c| !c.is_whitespace())
             .collect::<String>()
             .to_ascii_lowercase();
-        let rest = t.strip_prefix("fm")?.trim_start_matches(['-', '_', ':']);
+        let rest = t.strip_prefix("fm")?.trim_start_matches(['-', '_', ':', '–', '—']);
         FailureMode::ALL.iter().copied().find(|m| &m.code()[3..] == rest)
     }
 }
 
 /// Pure: the first mode a `TASK_FAILED` body names — a `[FM-x.y]` tag or a
-/// bare `FM-x.y` in the coordinator's prose.
+/// bare `FM-x.y` in the coordinator's prose, however it is wrapped
+/// (`**[FM-2.3]**`, `[FM-2.3]builder`) or spaced (`[FM 2.3]`).
 pub fn failure_mode_of(body: &str) -> Option<FailureMode> {
-    body.split(|c: char| c.is_whitespace() || matches!(c, ',' | ';' | ':' | '(' | ')'))
+    let tokens: Vec<&str> = body
+        .split(|c: char| {
+            c.is_whitespace() || matches!(c, ',' | ';' | ':' | '(' | ')' | '[' | ']' | '*' | '`' | '"' | '\'')
+        })
+        .filter(|t| !t.is_empty())
+        .collect();
+    tokens
+        .iter()
+        .copied()
         .find_map(FailureMode::parse)
+        .or_else(|| tokens.windows(2).find_map(|w| FailureMode::parse(&format!("{}{}", w[0], w[1]))))
 }
 
 /// One line naming every mode with its code, for a persona bullet.
@@ -167,6 +180,17 @@ mod tests {
             failure_mode_of("TASK_FAILED T2 — builder wandered off, FM-2.3, redesigned the module"),
             Some(FailureMode::TaskDerailment)
         );
+        // Agents bold tokens, glue them to the next word, space the code.
+        for body in [
+            "TASK_FAILED N1 — **[FM-2.3]** builder redesigned the module",
+            "TASK_FAILED N1 — [FM-2.3]builder redesigned the module",
+            "TASK_FAILED N1 — [FM 2.3] builder redesigned the module",
+            "TASK_FAILED N1 — `FM–2.3` builder redesigned the module",
+        ] {
+            assert_eq!(failure_mode_of(body), Some(FailureMode::TaskDerailment), "{body}");
+        }
+        // The persona templates' placeholder is not a label.
+        assert_eq!(failure_mode_of("TASK_FAILED T1 — [FM-x.y] kilitlenme"), None);
         assert_eq!(failure_mode_of("TASK_FAILED T3 — no label at all"), None);
         assert_eq!(failure_mode_of("TASK_FAILED T4 — [kod] test_x fails"), None);
         // The bridge's own closures have fixed labels.

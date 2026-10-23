@@ -10,13 +10,13 @@ use super::delivery::{
 use super::envelope::{sniff_from, Envelope};
 use super::notify::rejection_notice;
 use super::stall::{deadlock_text, escalation_for, give_up_texts, question_notice, question_reminder, reminder_for};
-use crate::swarm_term::lifecycle::{LifecycleState, Stall, Unanswered};
+use crate::swarm_term::lifecycle::{Closure, LifecycleState, LifecycleStore, Stall, Unanswered};
 use crate::swarm_term::waits::{Deadlock, WaitEdge};
 use super::fsops::{
     archive_rejected, attempts_sidecar, bump_attempts, bump_held, clear_held, drop_envelope,
     ensure_gitignore, held_sidecar, move_to_processed, move_to_rejected, prepare_layout,
 };
-use super::synth::dispatch_dependencies;
+use super::synth::{dispatch_dependencies, lifecycle_synthesise};
 use super::watcher::{dependency_gate, DependencyGate, DEPENDENCY_GRACE};
 use crate::swarm_term::lifecycle::DependencyHold;
 
@@ -237,7 +237,80 @@ fn an_unanswered_dispatch_reminds_its_receiver_in_role_terms() {
         reminder_for(Some("integration-tester"), &stall(LifecycleState::Assigned, 21, 1))
             .expect("tester reminder");
     assert_eq!(who, "integration-tester");
-    assert!(text.contains("APPROVED T9") && text.contains("CHANGES_NEEDED T9"));
+    // The bridge refuses a bare tester APPROVED: the reminder must not teach it.
+    assert!(text.contains("APPROVED T9 — <komut>") && text.contains("CHANGES_NEEDED T9"), "{text}");
+}
+
+#[test]
+fn every_neuron_text_that_dictates_a_task_failed_shows_the_label_slot() {
+    // The watcher scolds an untagged coordinator TASK_FAILED, so no Neuron
+    // text may dictate one.
+    let (_, rework) = reminder_for(None, &stall(LifecycleState::Failed, 11, 1)).expect("rework");
+    assert!(rework.contains("TASK_FAILED T9 — [FM-x.y]"), "{rework}");
+    let (_, escalation) = escalation_for("backend-builder", &stall(LifecycleState::Assigned, 21, 2));
+    assert!(escalation.contains("TASK_FAILED T9 — [FM-x.y]"), "{escalation}");
+    let deadlock = deadlock_text(&Deadlock {
+        edges: vec![WaitEdge {
+            from: "coordinator".into(),
+            to: "planner".into(),
+            task_id: Some("T9".into()),
+            since: std::time::Duration::from_secs(900),
+        }],
+    });
+    assert!(deadlock.contains("TASK_FAILED <task_id> — [FM-x.y]"), "{deadlock}");
+}
+
+/// The newest envelope the lifecycle fanout dropped into the coordinator's outbox.
+fn last_fanout_body(root: &std::path::Path) -> String {
+    let mut files: Vec<std::path::PathBuf> = fs::read_dir(root.join("outbox").join("coordinator"))
+        .expect("coordinator outbox")
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("json"))
+        .collect();
+    files.sort();
+    let raw = fs::read_to_string(files.last().expect("a fanout")).expect("read");
+    serde_json::from_str::<serde_json::Value>(&raw).expect("json")["body"].as_str().unwrap_or("").to_string()
+}
+
+#[tokio::test]
+async fn the_tester_approved_needs_a_run_and_the_test_body_names_the_declared_files() {
+    let (app, _pool, dir) = crate::test_support::mock_app_with_pool().await;
+    let handle = app.handle().clone();
+    let root = dir.path().join("bridge");
+    prepare_layout(&root).expect("layout");
+    let panes: std::sync::Arc<std::collections::HashMap<String, String>> =
+        std::sync::Arc::new(AGENT_IDS.iter().map(|a| (a.to_string(), format!("p-{a}"))).collect());
+    let lifecycle = std::sync::Arc::new(LifecycleStore::new());
+    assert!(lifecycle.assign_with_dispatch("p-backend-builder", "T1", Some("build T1 — auth")));
+    let synth = |from: &str, body: &str| lifecycle_synthesise(&handle, &root, from, body, Some("T1"), &panes, &lifecycle);
+
+    assert!(synth("backend-builder", "BUILDING T1 — dosyalar: src/auth.rs").is_empty());
+    // The DONE note names `auth.rs` in prose: not a declaration, not claimed.
+    assert!(synth("backend-builder", "DONE T1 — v1 auth.rs; cargo test → 3 geçti").is_empty());
+    assert_eq!(lifecycle.claimed_files("T1"), vec!["src/auth.rs".to_string()]);
+    // A reviewer's bare APPROVED is fine; the test body carries the declaration.
+    assert!(synth("backend-reviewer", "APPROVED T1").is_empty());
+    let body = last_fanout_body(&root);
+    assert_eq!(body, "test T1 — v1 auth.rs; cargo test → 3 geçti | dosyalar: src/auth.rs");
+    // The tester: a bare or declining APPROVED is refused; a run closes the task.
+    for bad in [
+        "APPROVED T1",
+        "APPROVED T1 — testler koşulamadı: node_modules yok, kod incelendi",
+        "APPROVED T1 — doğrulama yok: projede test komutu yok",
+    ] {
+        let notices = synth("integration-tester", bad);
+        assert_eq!(notices.len(), 1, "{bad}");
+        assert_eq!((notices[0].to.as_str(), notices[0].reason), ("integration-tester", "APPROVED without run evidence"), "{bad}");
+        assert!(notices[0].text.contains("hata — [izin]"), "{}", notices[0].text);
+        assert_eq!(lifecycle.closure("T1"), None, "{bad}");
+    }
+    assert!(synth("integration-tester", "APPROVED T1 — cargo test: 40 tests run, 0 failures").is_empty());
+    assert_eq!(lifecycle.closure("T1"), Some(Closure::Done));
+    assert!(last_fanout_body(&root).starts_with("TASK_DONE T1"));
+    // A late signal for a closed task gets the closed notice, not the evidence refusal.
+    let late = synth("integration-tester", "APPROVED T1");
+    assert_eq!(late.len(), 1);
+    assert_eq!(late[0].reason, "task already closed");
 }
 
 #[test]

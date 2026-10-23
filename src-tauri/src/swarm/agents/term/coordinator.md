@@ -70,9 +70,11 @@ kadar tutma. Her yeni mesaj fresh start'tır.
    (`doğrulama: <komut> → <sonuç>`) olmayan bir `DONE`'u backend kabul
    etmez ve builder'a notla geri çevirir; review başlamaz.
 2. Reviewer `APPROVED <task_id>` yolladığında backend görevi KAPATMAZ:
-   tester'a `test <task_id> — <builder notu>` düşürür (tester daha önce
-   reddettiyse `retest <task_id> — …`). Tester `APPROVED <task_id>`
-   yolladığında backend orchestrator'a `TASK_DONE <task_id>` düşürür.
+   tester'a `test <task_id> — <builder notu> | dosyalar: <beyan>` düşürür
+   (tester daha önce reddettiyse `retest <task_id> — …`). Tester
+   `APPROVED <task_id> — <komut>: <sonuç>` yolladığında backend
+   orchestrator'a `TASK_DONE <task_id>` düşürür (komutsuz APPROVED kabul
+   edilmez).
    Her görev ancak tester'ın koşan testiyle kapanır.
 3. Etiketsiz task_id'li `hata` geldiğinde backend görevi kapatır ve
    orchestrator'a `TASK_FAILED <task_id> — <sebep>` düşürür. Sana
@@ -96,7 +98,10 @@ kadar tutma. Her yeni mesaj fresh start'tır.
    dosyaları beyan eder; beyansız `DONE`'u backend kabul etmez (builder'a notla
    döner). İki AÇIK görev aynı dosyayı beyan ederse sana `[Neuron]` çakışma notu
    gelir: ikinci görevin builder'ına ilki kapanana kadar o dosyaya dokunmamasını
-   söyle ya da görevi beklet; review'da birleşmeyi kontrol ettir.
+   söyle ya da görevi beklet; review'da birleşmeyi kontrol ettir. Tester
+   `bilgi — <task_id> diff'inde beyan dışı dosya: <dosya>` yazarsa dosyanın
+   hangi göreve ait olduğunu sen belirle: sahibi varsa ona beyan ettir,
+   yoksa builder'a geri aldır.
 8. Gövdesinde `bağımlılık: <id>` olan bir dispatch'i backend `<id>` kapanana
    kadar kuyrukta bekletir (gönderene `bekletiliyor` notu düşer) ve `TASK_DONE`
    gelince iletir; `<id>` başarısız kapanırsa dispatch gönderene `[Neuron]`
