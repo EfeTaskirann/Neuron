@@ -532,6 +532,10 @@ async fn lifecycle_failure_paths_with_fake_agents() {
     step!("L7 the empty declaration is accepted", count("coordinator", "BUILDING C3") == 1);
     send("backend-builder", "coordinator", "DONE C3 - src/c3.rs; doğrulama: cargo test → 2 geçti, exit 0", Some("C3"));
     step!("L8 the review starts once the declaration is in", log("backend-reviewer").contains("review C3"));
+    send("backend-reviewer", "coordinator", "APPROVED C3", Some("C3"));
+    step!("L9 C3 goes to the tester", log("integration-tester").contains("test C3"));
+    send("integration-tester", "coordinator", "APPROVED C3 - cargo test: 2 passed", Some("C3"));
+    step!("L10 orchestrator got TASK_DONE C3", log("orchestrator").contains("TASK_DONE C3"));
 
     // ---- M: a dispatch naming an open dependency waits for it --------- //
     send("orchestrator", "backend-builder", "build M1 base", Some("M1"));
@@ -558,9 +562,30 @@ async fn lifecycle_failure_paths_with_fake_agents() {
     step!("M10 orchestrator got TASK_DONE M3", log("orchestrator").contains("TASK_DONE M3"));
     step!("M11 the dependent dispatch is delivered once M3 closed", log("frontend-builder").contains("build M4"));
 
+    // ---- Z: close what the scenarios left open ------------------------ //
+    // G runs the stall clocks at 2 s. Every open task then stalls too, and
+    // each costs the checker a pane paste per level; with nine of them
+    // the checker lagged so far on CI that ST1 went from the reminder
+    // straight to the give-up (level 3) and the escalation (level 2) was
+    // never sent. A builder's untagged `hata` closes its own open task.
+    for (builder, id) in [
+        ("backend-builder", "D1"),
+        ("frontend-builder", "F1"),
+        ("backend-builder", "V1"),
+        ("frontend-builder", "P1"),
+        ("backend-builder", "K1"),
+        ("backend-builder", "C1"),
+        ("frontend-builder", "C2"),
+        ("frontend-builder", "M4"),
+    ] {
+        send(builder, "coordinator", &format!("hata - {id} dropped before the stall scenario"), Some(id));
+        step!(format!("Z {id} closed before the stall scenario"),
+            log("orchestrator").contains(&format!("TASK_FAILED {id}")));
+    }
+
     // ---- G: an unanswered dispatch is reminded, escalated, given up --- //
     // Short thresholds from here on (restored on drop, even on panic);
-    // earlier open tasks may be reminded too — only ST1's texts count.
+    // only ST1 is open now, so only ST1's clocks run.
     let _stall_override = EnvOverride::set("NEURON_TERM_STALL_SECS", "2");
     send("orchestrator", "frontend-builder", "build ST1", Some("ST1"));
     step!("G1 builder got ST1", log("frontend-builder").contains("build ST1"));
