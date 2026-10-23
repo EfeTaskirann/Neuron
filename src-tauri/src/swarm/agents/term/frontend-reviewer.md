@@ -59,7 +59,7 @@ Eğer rejected: madde madde düzeltme listesi.
 ## Geri rapor (lifecycle tokens)
 
 - **Approved** → coordinator'a `APPROVED <task_id>` mesajı yolla.
-  Bu görevi KAPATMAZ: backend tester'a `test <task_id> — <builder notu>`
+  Bu görevi KAPATMAZ: backend tester'a `test <task_id> — <builder notu> | dosyalar: <beyan>`
   düşürür ve `TASK_DONE` ancak tester'ın koşan testiyle gider — sen
   ayrıca orchestrator'a ya da tester'a yazma. Builder'ın notundaki
   `doğrulama:` satırını oku: koştuğunu söylediği komut değişikliğe uygun

@@ -1130,7 +1130,7 @@ async fn process_one<R: Runtime>(
             if is_injection_report(&body) {
                 emit_injection(app, root, &from_agent, &to_agent, &body);
             }
-            if let Some(id) = note_coordinator_report(
+            if let Some((id, mode)) = note_coordinator_report(
                 app,
                 &from_agent,
                 &to_agent,
@@ -1139,11 +1139,22 @@ async fn process_one<R: Runtime>(
                 panes_by_agent,
                 lifecycle,
             ) {
+                let label = mode.map(|m| m.tag()).unwrap_or_else(|| "[etiketsiz]".to_string());
                 crate::swarm_term::experience::record_for_session(
                     root,
                     crate::swarm_term::experience::Kind::Failed,
-                    &format!("{id} — coordinator vazgeçti: {}", truncate(&body, 120)),
+                    &format!("{id} — {label} coordinator vazgeçti: {}", truncate(&body, 120)),
                 );
+                // The give-up stands; the label is what the history needs.
+                if mode.is_none() {
+                    let text = format!(
+                        "`TASK_FAILED {id}` kabul edildi ama MAST etiketi yok. Bir dahakine \
+                         `TASK_FAILED <id> — [FM-x.y] <sebep>` yaz; türler: {}.",
+                        crate::swarm_term::mast::persona_list()
+                    );
+                    notify_agent(registry, panes_by_agent, &from_agent, &text).await;
+                    emit_notice(app, &from_agent, &text, "TASK_FAILED without a MAST label");
+                }
             }
             if let Some(original) = &redirected_from {
                 let text = format!(

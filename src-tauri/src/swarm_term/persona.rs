@@ -317,10 +317,11 @@ pub(crate) fn build_persona_prompt(
            `bekletiliyor` notu gelir) ve kapanınca iletir; görev `TASK_FAILED` olursa mesaj\n\
            sana `[Neuron]` notuyla geri döner. `bağımlılık: yok` hemen iletilir.\n\
          - **Reviewer ise** onay verince: `body: \"APPROVED <task_id>\"`. Bu görevi\n\
-           KAPATMAZ: backend tester'a `test <task_id> — <builder notu>` düşürür; bir görev\n\
-           ancak tester'ın koşan testiyle kapanır.\n\
+           KAPATMAZ: backend tester'a `test <task_id> — <builder notu> | dosyalar: <beyan>`\n\
+           düşürür; bir görev ancak tester'ın koşan testiyle kapanır.\n\
          - **integration-tester ise** PASS verince: `body: \"APPROVED <task_id> — <komut>:\n\
-           <sonuç>\"`. Görevi bu kapatır (orchestrator'a `TASK_DONE <task_id>` gider).\n\
+           <sonuç>\"`. Görevi bu kapatır (orchestrator'a `TASK_DONE <task_id>` gider);\n\
+           komut ve sonuç ŞART, komutsuz `APPROVED` kabul edilmez.\n\
          - **Reviewer / integration-tester ise** değişiklik gerekiyorsa:\n\
            `body: \"CHANGES_NEEDED <task_id> — [neden] <kanıt> — <ne değişmeli, hangi builder>\"`.\n\
            Neden etiketi: `[kod]` (varsayılan: builder'ın hatası; KANIT ŞART — başarısız\n\
@@ -496,7 +497,7 @@ mod tests {
         let p = build_persona_prompt("backend-builder", "x", &dummy_bridge_root(), &facts(), AGENT_IDS);
         assert!(p.contains("doğrulama: <koştuğun komut> → <sonucu>"), "{p}");
         assert!(p.contains("`doğrulama yok: <neden>`"));
-        assert!(p.contains("`test <task_id> — <builder notu>`"));
+        assert!(p.contains("`test <task_id> — <builder notu> | dosyalar: <beyan>`"));
         assert!(p.contains("`[izin]`") && p.contains("`[ortam]`") && p.contains("`[belirsiz]`"));
         assert!(p.contains("`hata — [izin] <reddedilen komut>`"));
         assert!(p.contains("KANIT ŞART"));
@@ -799,6 +800,39 @@ mod tests {
         assert!(coord.contains("bağımlılık: <id>"));
         let planner = &reg.get("planner").expect("planner").body;
         assert!(planner.contains("bağımlılık: yok"));
+    }
+
+    #[test]
+    fn term_personas_label_failures_and_judge_the_process() {
+        use crate::swarm_term::mast::FailureMode;
+        let reg = crate::swarm::profile::ProfileRegistry::load_term(None).expect("load_term");
+        // The coordinator picks a MAST mode for its own give-ups; the list is complete.
+        let coord = &reg.get("coordinator").expect("coordinator").body;
+        assert!(coord.contains("TASK_FAILED <task_id> — [FM-x.y]"), "coordinator template");
+        for m in FailureMode::ALL {
+            assert!(coord.contains(m.code()), "coordinator.md lacks {}", m.code());
+        }
+        // The orchestrator knows what the tag means.
+        let orch = &reg.get("orchestrator").expect("orchestrator").body;
+        assert!(orch.contains("[FM-x.y]"), "orchestrator reads the label");
+        // The tester judges the process: declared files vs the diff, the
+        // builder's command re-run, evidence in its own APPROVED.
+        let tester = &reg.get("integration-tester").expect("tester").body;
+        assert!(tester.contains("git diff --name-only"), "tester compares the diff");
+        assert!(tester.contains("dosyalar:"), "tester reads the declared files");
+        assert!(tester.contains("AYNEN"), "tester re-runs the builder's command exactly");
+        assert!(tester.contains("komutsuz") || tester.contains("komut ve sonuç"), "tester cites its run");
+        // The file list is a snapshot: an undeclared change is information
+        // for the coordinator, not a FAIL charged to the task under test.
+        assert!(tester.contains("bilgi — <task_id> diff'inde beyan dışı dosya"), "tester reports, not rejects");
+        assert!(!tester.contains("[kod] beyan dışı"), "no FAIL for another task's file");
+        for id in ["backend-reviewer", "frontend-reviewer", "coordinator"] {
+            let body = &reg.get(id).expect(id).body;
+            assert!(body.contains("test <task_id> — <builder notu> | dosyalar: <beyan>"), "{id} names the test body");
+        }
+        let footer = build_persona_prompt("integration-tester", "x", &dummy_bridge_root(), &facts(), AGENT_IDS);
+        assert!(footer.contains("| dosyalar:"), "footer names the test body's file section");
+        assert!(footer.contains("komut ve sonuç ŞART"), "footer: a tester APPROVED needs its run");
     }
 
     #[test]

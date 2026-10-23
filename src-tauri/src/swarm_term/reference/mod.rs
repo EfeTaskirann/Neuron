@@ -18,6 +18,10 @@
 //! - `NEURON_REF_HISTORY`: the history file (default
 //!   `.livetest/reference/history.jsonl` in this checkout).
 //! - `NEURON_REF_TIMEOUT_MIN`: per task, default 20.
+//! - `NEURON_REF_REPEAT`: how many times each task runs (default 1). The
+//!   summary reports pass^k — a task passes only if every run passed — and
+//!   the TASK_FAILEDs by MAST label; the suite fails unless every task
+//!   passed every run.
 //!
 //! A task's folder, `<root>\<run>\<task>\`, holds the repository the swarm
 //! works in (`project\`), an empty `outside\` beside it that a task may
@@ -54,6 +58,21 @@ fn settle_for(task: &RefTask) -> Duration {
         Expect::Done => 90,
         Expect::NotDone => 180,
     })
+}
+
+/// Pure: `NEURON_REF_REPEAT` — at least one run.
+fn repeat_from_env(value: Option<&str>) -> u32 {
+    value.and_then(|v| v.trim().parse::<u32>().ok()).filter(|k| *k >= 1).unwrap_or(1)
+}
+
+/// Pure: the task's folder under the suite — its own per repetition, since
+/// `materialize` writes over whatever a folder holds.
+fn work_dir_name(task_id: &str, rep: u32, repeat: u32) -> String {
+    if repeat <= 1 {
+        task_id.to_string()
+    } else {
+        format!("{task_id}-r{rep}")
+    }
 }
 
 /// Pure: the tasks `spec` names (`smoke`, `full`, or ids with commas).
@@ -354,6 +373,7 @@ struct RunMeta<'a> {
     team: &'a str,
     neuron: &'a str,
     started_at: i64,
+    rep: u32,
 }
 
 fn record(task: &RefTask, report: &LiveReport, checks: Vec<Check>, meta: &RunMeta<'_>) -> RunRecord {
@@ -368,6 +388,17 @@ fn record(task: &RefTask, report: &LiveReport, checks: Vec<Check>, meta: &RunMet
     let done = report.signals.iter().filter(|s| s.done).count();
     RunRecord {
         schema: 1,
+        rep: meta.rep,
+        failures: report
+            .signals
+            .iter()
+            .filter(|s| !s.done)
+            .map(|s| metrics::FailureNote {
+                task: s.task_id.clone().unwrap_or_else(|| "?".into()),
+                label: s.label.clone(),
+                reason: s.reason.clone().unwrap_or_default(),
+            })
+            .collect(),
         suite: meta.suite.into(),
         task: task.id.into(),
         tier: task.tier.label().into(),
@@ -500,6 +531,17 @@ mod tests {
         }
     }
 
+    #[test]
+    fn each_repetition_gets_its_own_folder() {
+        assert_eq!(work_dir_name("bug-off-by-one", 1, 1), "bug-off-by-one");
+        assert_eq!(work_dir_name("bug-off-by-one", 1, 3), "bug-off-by-one-r1");
+        assert_eq!(work_dir_name("bug-off-by-one", 3, 3), "bug-off-by-one-r3");
+        assert_eq!(repeat_from_env(None), 1);
+        assert_eq!(repeat_from_env(Some("3")), 3);
+        assert_eq!(repeat_from_env(Some("0")), 1);
+        assert_eq!(repeat_from_env(Some("x")), 1);
+    }
+
     /// Opt-in LIVE: the reference tasks (`NEURON_REF_TASKS`, default the
     /// smoke tier) one after another on the real swarm, each recorded in
     /// the history; then the trend table. Spends tokens — about 1–2.5M
@@ -518,6 +560,7 @@ mod tests {
         let timeout = Duration::from_secs(
             60 * std::env::var("NEURON_REF_TIMEOUT_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(20u64),
         );
+        let repeat = repeat_from_env(std::env::var("NEURON_REF_REPEAT").ok().as_deref());
         let history = history_file();
         let suite = format!("ref-{}", crate::time::now_seconds());
         let neuron = neuron_commit();
@@ -529,16 +572,17 @@ mod tests {
             }
         }
         println!(
-            "H3 {suite}: {} task(s), team {team_label}, Neuron {neuron}\n  projects: {}\n  history:  {}",
+            "H3 {suite}: {} task(s) × {repeat}, team {team_label}, Neuron {neuron}\n  projects: {}\n  history:  {}",
             selected.len(),
             root.join(&suite).display(),
             history.display()
         );
         let mut passed = 0usize;
-        for task in &selected {
-            let work = root.join(&suite).join(task.id);
+        for (rep, task) in (1..=repeat).flat_map(|rep| selected.iter().map(move |t| (rep, *t))) {
+            let work = root.join(&suite).join(work_dir_name(task.id, rep, repeat));
             let project = materialize(task, &work).unwrap_or_else(|e| panic!("{}: {e}", task.id));
-            println!("\n===== {} ({}) =====", task.id, task.tier.label());
+            let round = if repeat > 1 { format!(" — koşu {rep}/{repeat}") } else { String::new() };
+            println!("\n===== {} ({}){round} =====", task.id, task.tier.label());
             let started_at = crate::time::now_seconds();
             let spec = LiveSpec {
                 project: project.clone(),
@@ -559,7 +603,7 @@ mod tests {
             let changed: Vec<String> = report.changed.iter().map(|(p, _)| p.clone()).collect();
             let mut checks = run_checks(task, &report);
             checks.extend(project_checks(task, &work, &changed));
-            let meta = RunMeta { suite: &suite, team: &team_label, neuron: &neuron, started_at };
+            let meta = RunMeta { suite: &suite, team: &team_label, neuron: &neuron, started_at, rep };
             let rec = record(task, &report, checks, &meta);
             println!(
                 "RESULT {}: {} — work {:.0} s, {} calls, {} output / {} input tokens",
@@ -579,7 +623,22 @@ mod tests {
         }
         let (all, _) = metrics::read_history(&history);
         println!("\n{}", metrics::trend_table(&all, 10, 5));
-        assert_eq!(passed, selected.len(), "H3 {suite}: {passed}/{} passed", selected.len());
+        let mine: Vec<RunRecord> = all.iter().filter(|r| r.suite == suite).cloned().collect();
+        let pk = metrics::pass_k(&mine);
+        println!(
+            "{}{}",
+            pk.render(),
+            metrics::render_distribution(&metrics::failure_distribution(&mine))
+        );
+        let runs = selected.len() * repeat as usize;
+        assert_eq!(passed, runs, "H3 {suite}: {passed}/{runs} passed");
+        assert_eq!(
+            pk.all_passed,
+            selected.len(),
+            "H3 {suite}: pass^{repeat} {}/{} tasks",
+            pk.all_passed,
+            selected.len()
+        );
     }
 
     /// The trend table from the history file, without running anything.
@@ -595,5 +654,13 @@ mod tests {
             if skipped > 0 { format!(", {skipped} unreadable line(s) skipped") } else { String::new() }
         );
         println!("{}", metrics::trend_table(&history, 10, 5));
+        if let Some(newest) = history.last().map(|r| r.suite.clone()) {
+            let mine: Vec<RunRecord> = history.iter().filter(|r| r.suite == newest).cloned().collect();
+            println!(
+                "son koşu {newest}: {}{}",
+                metrics::pass_k(&mine).render(),
+                metrics::render_distribution(&metrics::failure_distribution(&mine))
+            );
+        }
     }
 }

@@ -155,8 +155,9 @@ pub(crate) fn warn_notice(task_id: &str, spent: u64, budget: u64) -> String {
 /// the coordinator's notice, and the notice for the agents holding it.
 pub(crate) fn stop_texts(task_id: &str, spent: u64, budget: u64) -> (String, String, String) {
     let failed = format!(
-        "{TASK_FAILED_PREFIX}{task_id} — token bütçesinin iki katı aşıldı ({} harcandı, bütçe \
+        "{TASK_FAILED_PREFIX}{task_id} — {} token bütçesinin iki katı aşıldı ({} harcandı, bütçe \
          {}); Neuron görevi kapattı. Kalan iş yeni bir task_id ile, daha dar kapsamla verilmeli.",
+        crate::swarm_term::mast::TOKEN_OVERRUN.tag(),
         fmt_tokens(spent),
         fmt_tokens(budget)
     );
@@ -252,7 +253,8 @@ mod tests {
             "{w}"
         );
         let (failed, coordinator, holder) = stop_texts("T1", 6_100_000, 3_000_000);
-        assert!(failed.starts_with("TASK_FAILED T1 — ") && failed.contains("6,1M"), "{failed}");
+        // Burning twice the budget is step repetition (MAST FM-1.3).
+        assert!(failed.starts_with("TASK_FAILED T1 — [FM-1.3] ") && failed.contains("6,1M"), "{failed}");
         assert!(
             coordinator.contains("`T1`") && coordinator.contains("TASK_FAILED") && coordinator.contains("yeniden dispatch ETME"),
             "{coordinator}"

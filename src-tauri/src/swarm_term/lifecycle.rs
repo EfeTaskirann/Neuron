@@ -390,6 +390,13 @@ fn path_token(raw: &str) -> Option<String> {
     Some(norm.to_string())
 }
 
+/// Pure: does `note` carry an explicit file list (`dosyalar:` / `files:`)?
+/// A `DONE` note tops a task's declaration up only with one — its prose
+/// names files as context (`auth.rs: refresh eklendi`), not as a claim.
+pub fn has_file_list(note: &str) -> bool {
+    find_any_ci(note, &["dosyalar:", "dosya:", "files:", "file:"]).is_some()
+}
+
 /// Pure: the files a builder's note declares, in order, each once. The
 /// `dosyalar:` / `files:` list when there is one (`yok` / `none` / `-`:
 /// an explicit declaration of none); otherwise the path-like tokens
@@ -505,6 +512,8 @@ const RESULT_WORDS: &[&str] = &[
     "exit 0", "exit code 0", "çıkış 0", "çıkış kodu 0", "geçti", "passed", " pass", "0 failed",
     "başarılı", "hatasız", "temiz", "clean", "yeşil", "green", " ok", "✅", "failed", "fail:",
     "exit 1", "çıkış 1", "hata verdi",
+    // Count-style summaries (`40 tests run, 0 failures`, `Failures: 0`).
+    "0 failures", "failures: 0", "0 errors", "errors: 0", "success", "0 başarısız", "başarısız: 0",
 ];
 
 /// How a builder says it could not run anything; a reason must follow.
@@ -832,14 +841,27 @@ pub fn error_reason(body: &str) -> Option<String> {
     (!reason.is_empty()).then(|| cap_note(reason))
 }
 
-/// One line of a dispatch, at most [`DISPATCH_EXCERPT_CHARS`] chars.
+/// The tester's file sections ride at the end of a `test` body; the
+/// excerpt keeps this much of them past the cut.
+const EXCERPT_TAIL_CHARS: usize = 200;
+
+/// One line of a dispatch, at most [`DISPATCH_EXCERPT_CHARS`] chars — plus
+/// the tester's ` | dosyalar: …` sections (capped), which the re-pin
+/// after a compaction must not lose.
 fn dispatch_excerpt(body: &str) -> String {
     let one_line = body.split_whitespace().collect::<Vec<_>>().join(" ");
     if one_line.chars().count() <= DISPATCH_EXCERPT_CHARS {
         return one_line;
     }
-    let mut cut: String = one_line.chars().take(DISPATCH_EXCERPT_CHARS).collect();
-    cut.push('…');
+    let (head, tail) = match one_line.find(" | dosyalar:") {
+        Some(at) => (&one_line[..at], &one_line[at..]),
+        None => (one_line.as_str(), ""),
+    };
+    let mut cut: String = head.chars().take(DISPATCH_EXCERPT_CHARS).collect();
+    if cut.chars().count() < head.chars().count() {
+        cut.push('…');
+    }
+    cut.extend(tail.chars().take(EXCERPT_TAIL_CHARS));
     cut
 }
 
@@ -1895,6 +1917,21 @@ impl LifecycleStore {
             .unwrap_or_default()
     }
 
+    /// The files every OTHER open task declared, `(task, files)` sorted by
+    /// task — what the tester may see in the diff besides `task_id`'s own
+    /// files. Tasks that declared none are left out.
+    pub fn open_claims(&self, task_id: &str) -> Vec<(String, Vec<String>)> {
+        let g = self.lock();
+        let mut out: Vec<(String, Vec<String>)> = g
+            .tasks
+            .iter()
+            .filter(|(id, m)| id.as_str() != task_id && m.closed.is_none() && !m.files.is_empty())
+            .map(|(id, m)| (id.clone(), m.files.iter().cloned().collect()))
+            .collect();
+        out.sort();
+        out
+    }
+
     /// Where `deps` stand: open (known, not closed), failed, or never
     /// seen. Ids closed as done need no waiting and are left out.
     pub fn dependency_hold(&self, deps: &[String]) -> DependencyHold {
@@ -2014,8 +2051,9 @@ pub fn followup_for_coordinator_inbound(
         TransitionKind::ChangesNeeded if is_reviewer(src_agent) && rec.limit_exceeded => (
             "orchestrator",
             format!(
-                "{TASK_FAILED_PREFIX}{id} — {}. ret: düzeltme limiti ({MAX_REWORK_ROUNDS} tur) \
+                "{TASK_FAILED_PREFIX}{id} — {} {}. ret: düzeltme limiti ({MAX_REWORK_ROUNDS} tur) \
                  aşıldı (@{src_agent})",
+                crate::swarm_term::mast::REWORK_LIMIT.tag(),
                 rec.rejections
             ),
         ),
@@ -2061,6 +2099,9 @@ mod tests {
             "routes.ts değişti. doğrulama: npm --prefix storefront test: 116 passed",
             "doğrulama: node backend/node_modules/typescript/bin/tsc -p backend --noEmit — hatasız (çıkış 0)",
             "pnpm -C app lint ran clean, exit code 0",
+            // Count-style summaries report a result too.
+            "cargo test: 40 tests run, 0 failures",
+            "mvn test: Tests run: 40, Failures: 0, BUILD SUCCESS",
         ] {
             assert_eq!(done_evidence(Some(note)), DoneEvidence::Ran, "{note}");
         }
@@ -2204,6 +2245,12 @@ mod tests {
         let d = open[0].dispatch.as_deref().unwrap();
         assert!(d.starts_with("build T1 — auth.rs'e token refresh ekle"), "{d}");
         assert!(d.chars().count() <= 241, "{}", d.chars().count());
+        // The tester's file sections ride past the cut: the re-pin must keep them.
+        let long_test = format!("test T2 — {} | dosyalar: src/a.rs, src/b.rs", "y".repeat(300));
+        assert!(s.assign_with_dispatch("p-tester", "T2", Some(&long_test)));
+        let d2 = s.open_tasks_of("p-tester")[0].dispatch.clone().unwrap();
+        assert!(d2.ends_with("| dosyalar: src/a.rs, src/b.rs"), "{d2}");
+        assert!(d2.contains('…') && d2.chars().count() <= 241 + 32, "{}", d2.chars().count());
         // A plain `assign` (no body) keeps the excerpt; DONE keeps the task open
         // (awaiting review); the tester's pass ends it.
         s.assign_at("p-builder", "T1", t0);
@@ -2866,6 +2913,10 @@ mod tests {
             Some(vec!["auth.rs".to_string(), "src/lib.rs".to_string(), "src/x/y.ts".to_string()])
         );
         assert_eq!(declared_files(Some("dosyalar: yok")), Some(Vec::new()));
+        // A DONE note tops the claim up only with an explicit list.
+        assert!(has_file_list("src/a.rs değişti; dosyalar: src/a.rs, src/b.rs; doğrulama: cargo test → ok"));
+        assert!(has_file_list("Files: src/a.rs"));
+        assert!(!has_file_list("auth.rs: refresh eklendi; doğrulama: cargo test → 3 geçti"));
         assert_eq!(declared_files(Some("files: none")), Some(Vec::new()));
         assert_eq!(declared_files(Some("refresh eklendi; 3 test geçti, exit 0, v1.2")), None);
         assert_eq!(declared_files(None), None);
@@ -2932,6 +2983,46 @@ mod tests {
             }
         );
         assert_eq!(s.dependency_hold(&[]), DependencyHold::default());
+    }
+
+    #[test]
+    fn open_claims_lists_the_other_open_tasks_files() {
+        let s = LifecycleStore::new();
+        let t0 = Instant::now();
+        s.assign_at("p-builder", "T1", t0);
+        s.claim_files("T1", &["src/a.rs".to_string()]);
+        s.assign_at("p-fb", "T2", t0);
+        s.claim_files("T2", &["app/b.tsx".to_string(), "app/c.tsx".to_string()]);
+        s.assign_at("p-fb", "T3", t0);
+        s.claim_files("T3", &[]); // declared none: not listed
+        s.assign_at("p-builder", "T4", t0);
+        s.claim_files("T4", &["src/d.rs".to_string()]);
+        assert!(s.fail_task("T4")); // closed: not listed
+        assert_eq!(
+            s.open_claims("T1"),
+            vec![("T2".to_string(), vec!["app/b.tsx".to_string(), "app/c.tsx".to_string()])]
+        );
+        assert_eq!(
+            s.open_claims("T2"),
+            vec![("T1".to_string(), vec!["src/a.rs".to_string()])]
+        );
+        assert!(s.open_claims("nope").len() == 2);
+    }
+
+    #[test]
+    fn the_rework_limit_failure_is_labelled_step_repetition() {
+        let mut rec = Recorded::plain(LifecycleState::Failed);
+        rec.limit_exceeded = true;
+        rec.rejections = 3;
+        let (to, body) = followup_for_coordinator_inbound(
+            "backend-reviewer",
+            &tr(TransitionKind::ChangesNeeded, "L1"),
+            &rec,
+        )
+        .expect("the limit fans out");
+        assert_eq!(to, "orchestrator");
+        assert!(body.starts_with("TASK_FAILED L1 — [FM-1.3] 3. ret: düzeltme limiti"), "{body}");
+        assert_eq!(crate::swarm_term::mast::failure_mode_of(&body), Some(crate::swarm_term::mast::REWORK_LIMIT));
     }
 
     // -- take_stalls ------------------------------------------------- //
@@ -3460,7 +3551,7 @@ mod tests {
         assert!(r.limit_exceeded);
         let (to, body) = ok_followup("backend-reviewer", &ch, &r).expect("TASK_FAILED");
         assert_eq!(to, "orchestrator");
-        assert!(body.starts_with("TASK_FAILED T1 — 3. ret"), "{body}");
+        assert!(body.starts_with("TASK_FAILED T1 — [FM-1.3] 3. ret"), "{body}");
         assert_eq!(s.closure("T1"), Some(Closure::Failed));
 
         // Nothing fans out for a closed task, and it cannot be re-dispatched.

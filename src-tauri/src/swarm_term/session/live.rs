@@ -116,6 +116,35 @@ pub(crate) struct TaskSignal {
     pub at: Duration,
     pub done: bool,
     pub task_id: Option<String>,
+    /// `TASK_FAILED` only: the MAST code its body carries (`FM-3.1`),
+    /// none when the coordinator wrote no label.
+    pub label: Option<String>,
+    /// `TASK_FAILED` only: the text after the dash, cut to 240 chars.
+    pub reason: Option<String>,
+}
+
+/// A `TASK_FAILED` signal: its task (the body's id, else the envelope's),
+/// the MAST label and the reason the body carries.
+fn failed_signal(at: Duration, body: &str, envelope_id: Option<String>) -> TaskSignal {
+    TaskSignal {
+        at,
+        done: false,
+        task_id: signal_task_id(body).or(envelope_id),
+        label: crate::swarm_term::mast::failure_mode_of(body).map(|m| m.code().to_string()),
+        reason: signal_reason(body),
+    }
+}
+
+/// Pure: a signal's reason — what follows the id token (`TASK_FAILED T1 —
+/// <this>`), whichever separator the coordinator used (`—`, `–`, `-`, `:`).
+fn signal_reason(body: &str) -> Option<String> {
+    let is_separator = |c: char| c.is_whitespace() || matches!(c, '—' | '–' | '-' | ':');
+    // Past `TASK_FAILED`, then past the id token (a bare separator where
+    // the id is only in the envelope).
+    let after_keyword = body.trim_start().split_once(char::is_whitespace)?.1.trim_start();
+    let after_id = after_keyword.split_once(char::is_whitespace).map(|(_, r)| r).unwrap_or("");
+    let reason = after_id.trim_start_matches(is_separator).trim();
+    (!reason.is_empty()).then(|| reason.chars().take(240).collect())
 }
 
 /// What one live run did. Durations count from the start of the run.
@@ -426,10 +455,16 @@ pub(crate) async fn run_live(spec: &LiveSpec) -> LiveReport {
                     let head = full_body.trim_start();
                     let done = head.starts_with("TASK_DONE");
                     if *target == "orchestrator" && (done || head.starts_with("TASK_FAILED")) {
-                        report.signals.push(TaskSignal {
-                            at: started.elapsed(),
-                            done,
-                            task_id: signal_task_id(head).or(task_id),
+                        report.signals.push(if done {
+                            TaskSignal {
+                                at: started.elapsed(),
+                                done: true,
+                                task_id: signal_task_id(head).or(task_id),
+                                label: None,
+                                reason: None,
+                            }
+                        } else {
+                            failed_signal(started.elapsed(), head, task_id)
                         });
                     }
                 }
@@ -598,6 +633,32 @@ fn signal_task_id(body: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_failed_signal_carries_its_label_and_reason() {
+        let s = failed_signal(
+            std::time::Duration::from_secs(1),
+            "TASK_FAILED T1 — [FM-3.1] @backend-builder hata bildirdi: cannot build",
+            Some("T1".to_string()),
+        );
+        assert_eq!((s.done, s.task_id.as_deref()), (false, Some("T1")));
+        assert_eq!(s.label.as_deref(), Some("FM-3.1"));
+        assert_eq!(s.reason.as_deref(), Some("[FM-3.1] @backend-builder hata bildirdi: cannot build"));
+        let bare = failed_signal(std::time::Duration::ZERO, "TASK_FAILED T2 — gave up", None);
+        assert_eq!((bare.label, bare.reason.as_deref()), (None, Some("gave up")));
+        let none = failed_signal(std::time::Duration::ZERO, "TASK_FAILED T3", None);
+        assert_eq!((none.task_id.as_deref(), none.reason), (Some("T3"), None));
+        // The coordinator's own wording varies: a colon, an en dash.
+        for body in ["TASK_FAILED T3: [FM-2.2] builder never asked", "TASK_FAILED T3 – [FM-2.2] builder never asked"] {
+            let s = failed_signal(std::time::Duration::ZERO, body, None);
+            assert_eq!(s.task_id.as_deref(), Some("T3"), "{body}");
+            assert_eq!(s.label.as_deref(), Some("FM-2.2"), "{body}");
+            assert_eq!(s.reason.as_deref(), Some("[FM-2.2] builder never asked"), "{body}");
+        }
+        // A reason is cut, a done signal carries none.
+        let long = format!("TASK_FAILED T4 — {}", "x".repeat(400));
+        assert!(failed_signal(std::time::Duration::ZERO, &long, None).reason.unwrap().chars().count() <= 240);
+    }
 
     #[test]
     fn a_signal_names_its_task() {

@@ -393,8 +393,10 @@ async fn lifecycle_failure_paths_with_fake_agents() {
         && log("backend-reviewer").contains("v2 test added"));
     send("backend-reviewer", "coordinator", "APPROVED R1", Some("R1"));
     // A review alone closes nothing: the tester runs it first.
-    step!("A6 tester got test R1 with the builder's note",
-        log("integration-tester").contains("test R1") && log("integration-tester").contains("v2 test added"));
+    // The declaration alone: the DONE notes' prose (`auth.rs`) is not a list.
+    step!("A6 tester got test R1 with the builder's note and the declared files",
+        log("integration-tester").contains("test R1") && log("integration-tester").contains("v2 test added")
+            && log("integration-tester").contains("| dosyalar: src/auth.rs"));
     step!("A7 no TASK_DONE before the tester passes", !log("orchestrator").contains("TASK_DONE R1"));
     send("integration-tester", "coordinator", "APPROVED R1 - cargo test: 40 passed", Some("R1"));
     step!("A8 orchestrator got TASK_DONE R1", log("orchestrator").contains("TASK_DONE R1"));
@@ -418,10 +420,18 @@ async fn lifecycle_failure_paths_with_fake_agents() {
     step!("B4 the fix is reviewed first", log("backend-reviewer").contains("review S1"));
     step!("B5 no retest before the review", !log("integration-tester").contains("retest S1"));
     send("backend-reviewer", "coordinator", "APPROVED S1 - looks right", Some("S1"));
-    step!("B6 tester got retest S1 with the builder's note",
-        log("integration-tester").contains("retest S1") && log("integration-tester").contains("parse.rs fixed"));
+    step!("B6 tester got retest S1 with the builder's note and the declared files",
+        log("integration-tester").contains("retest S1") && log("integration-tester").contains("parse.rs fixed")
+            && log("integration-tester").contains("retest S1 — ")
+            && log("integration-tester").contains("| dosyalar: src/parse.rs"));
     step!("B7 no TASK_DONE before the retest passes", !log("orchestrator").contains("TASK_DONE S1"));
+    send("integration-tester", "coordinator", "APPROVED S1 - testler koşulamadı: node_modules yok", Some("S1"));
+    step!("B7a a tester APPROVED that ran nothing is refused",
+        count("integration-tester", "KABUL EDİLMEDİ") == 1 && !log("orchestrator").contains("TASK_DONE S1"));
     send("integration-tester", "coordinator", "APPROVED S1", Some("S1"));
+    step!("B7b a tester APPROVED without its run is refused",
+        count("integration-tester", "KABUL EDİLMEDİ") == 2 && !log("orchestrator").contains("TASK_DONE S1"));
+    send("integration-tester", "coordinator", "APPROVED S1 - cargo test: 12 passed", Some("S1"));
     step!("B8 orchestrator got TASK_DONE S1 naming the fix",
         log("orchestrator").contains("TASK_DONE S1") && log("orchestrator").contains("parse.rs fixed"));
 
@@ -431,8 +441,9 @@ async fn lifecycle_failure_paths_with_fake_agents() {
     send("frontend-builder", "orchestrator", "hata - npm install is not allowed", Some("H1"));
     step!("C2 hata re-addressed to the coordinator", log("coordinator").contains("npm install is not allowed"));
     step!("C3 sender told about the re-addressing", log("frontend-builder").contains("@coordinator'a iletildi"));
-    step!("C4 orchestrator got TASK_FAILED H1 with the reason",
-        log("orchestrator").contains("TASK_FAILED H1") && log("orchestrator").contains("npm install is not allowed"));
+    step!("C4 orchestrator got TASK_FAILED H1 with the reason and the MAST label",
+        log("orchestrator").contains("TASK_FAILED H1") && log("orchestrator").contains("npm install is not allowed")
+            && log("orchestrator").contains("TASK_FAILED H1 — [FM-3.1]"));
     step!("C5 coordinator told not to re-dispatch H1", log("coordinator").contains("TASK_FAILED H1"));
     send("coordinator", "frontend-builder", "retry H1", Some("H1"));
     step!("C6 dispatch of a closed id refused", !log("frontend-builder").contains("retry H1")
@@ -453,7 +464,8 @@ async fn lifecycle_failure_paths_with_fake_agents() {
             step!(format!("D{round} rework dispatched"), log("backend-builder").contains(&format!("L1 rework {round}")));
         }
     }
-    step!("D4 orchestrator got TASK_FAILED L1", log("orchestrator").contains("TASK_FAILED L1"));
+    step!("D4 orchestrator got TASK_FAILED L1 labelled step repetition",
+        log("orchestrator").contains("TASK_FAILED L1 — [FM-1.3]"));
     step!("D5 coordinator told the limit is used up", log("coordinator").contains("TASK_FAILED L1"));
 
     // ---- E: one open task id belongs to one builder (A6) -------------- //
@@ -562,6 +574,28 @@ async fn lifecycle_failure_paths_with_fake_agents() {
     step!("M10 orchestrator got TASK_DONE M3", log("orchestrator").contains("TASK_DONE M3"));
     step!("M11 the dependent dispatch is delivered once M3 closed", log("frontend-builder").contains("build M4"));
 
+    // ---- N: the coordinator's own TASK_FAILED carries a MAST label ---- //
+    send("orchestrator", "backend-builder", "build N1", Some("N1"));
+    step!("N0 backend-builder got N1", log("backend-builder").contains("build N1"));
+    send("coordinator", "orchestrator", "TASK_FAILED N1 — builder cannot get the API key", Some("N1"));
+    step!("N1 the untagged give-up still closes the task", log("orchestrator").contains("TASK_FAILED N1"));
+    send("orchestrator", "backend-builder", "retry N1", Some("N1"));
+    step!("N1b the closed N1 cannot be re-dispatched",
+        !log("backend-builder").contains("retry N1") && log("orchestrator").contains("`N1` already closed"));
+    step!("N2 the coordinator is asked for the label", log("coordinator").contains("MAST etiketi yok"));
+    send("orchestrator", "frontend-builder", "build N2", Some("N2"));
+    step!("N3 frontend-builder got N2", log("frontend-builder").contains("build N2"));
+    send("coordinator", "orchestrator", "TASK_FAILED N2 — [FM-2.3] builder wandered into a redesign", Some("N2"));
+    step!("N4 the tagged give-up closes the task", log("orchestrator").contains("TASK_FAILED N2"));
+    // A third, untagged one: its notice arrives after any (wrong) notice for
+    // N2 would have, so the count pins "no notice for a tagged report".
+    send("orchestrator", "backend-builder", "build N3", Some("N3"));
+    step!("N5 backend-builder got N3", log("backend-builder").contains("build N3"));
+    send("coordinator", "orchestrator", "TASK_FAILED N3 — no label again", Some("N3"));
+    step!("N6 only the untagged give-ups were asked for a label",
+        log("coordinator").contains("`TASK_FAILED N3` kabul edildi ama MAST etiketi yok")
+            && count("coordinator", "MAST etiketi yok") == 2);
+
     // ---- Z: close what the scenarios left open ------------------------ //
     // G runs the stall clocks at 2 s. Every open task then stalls too, and
     // each costs the checker a pane paste per level; with nine of them
@@ -602,7 +636,7 @@ async fn lifecycle_failure_paths_with_fake_agents() {
     }
     if !wait_until(15, || {
         let l = log("orchestrator");
-        l.contains("TASK_FAILED ST1") && l.contains("yanıt vermedi")
+        l.contains("TASK_FAILED ST1 — [FM-3.1]") && l.contains("yanıt vermedi")
     })
     .await
     {
