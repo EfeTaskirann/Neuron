@@ -1,14 +1,14 @@
-//! Opt-in end-to-end test of the bridge against REAL PTY panes.
+//! End-to-end test of the bridge against REAL PTY panes, run by CI and
+//! opt-in locally (it opens 9 consoles).
 //!
 //! Each of the 9 agents is a real pane running a tiny fake agent (a
-//! python script that appends every character it receives on stdin to
-//! a per-agent log file). Envelopes are dropped into the sender outbox exactly
+//! PowerShell script that appends every key its console receives to a
+//! per-agent log file). Envelopes are dropped into the sender outbox exactly
 //! as a claude `Write` call would, the real watcher delivers them, and
 //! the test asserts on the filesystem queue + what each pane received.
 //!
 //! Run with:
 //!   cargo test --lib swarm_term::bridge::e2e_tests -- --ignored --nocapture
-//! `NEURON_E2E_PYTHON` overrides the interpreter (default `python`).
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -26,26 +26,16 @@ use crate::test_support::mock_app_with_pool_and_terminal_registry;
 
 use super::{install, prepare_layout, uninstall, BridgeControl};
 
-/// Fake agent: optional banner line (argv[2]) on stdout, then append
-/// every received character to argv[1]. `msvcrt.getwch` reads the
-/// console char-by-char (no line buffering, no echo) on Windows.
+/// Fake agent: optional banner line (`$Banner`) on stdout, then append
+/// every received key to `$Log`. `[Console]::ReadKey($true)` reads the
+/// console key by key (no line buffering, no echo). Windows PowerShell
+/// ships with Windows, so the test needs no interpreter of its own.
 const FAKE_AGENT: &str = r#"
-import sys
-log = sys.argv[1]
-if len(sys.argv) > 2:
-    print(sys.argv[2], flush=True)
-out = open(log, 'a', encoding='utf-8', newline='')
-try:
-    import msvcrt
-    read = msvcrt.getwch
-except ImportError:
-    read = lambda: sys.stdin.read(1)
-while True:
-    c = read()
-    if c == '':
-        break
-    out.write(c)
-    out.flush()
+param([string]$Log, [string]$Banner)
+if ($Banner) { [Console]::Out.WriteLine($Banner) }
+$out = New-Object System.IO.StreamWriter($Log, $true, (New-Object System.Text.UTF8Encoding($false)))
+$out.AutoFlush = $true
+while ($true) { $out.Write([Console]::ReadKey($true).KeyChar) }
 "#;
 
 fn fwd(p: &Path) -> String {
@@ -81,10 +71,8 @@ async fn spawn_fake_agents(
     work: &Path,
     tester_awaits_approval: bool,
 ) -> (HashMap<String, String>, HashMap<&'static str, PathBuf>) {
-    let script = work.join("fake_agent.py");
+    let script = work.join("fake_agent.ps1");
     fs::write(&script, FAKE_AGENT).expect("script");
-    let python =
-        std::env::var("NEURON_E2E_PYTHON").unwrap_or_else(|_| "python".into());
     let mut panes_by_agent: HashMap<String, String> = HashMap::new();
     let mut logs: HashMap<&'static str, PathBuf> = HashMap::new();
     for &agent in AGENT_IDS {
@@ -95,7 +83,11 @@ async fn spawn_fake_agents(
         } else {
             ("shell", "")
         };
-        let cmd = format!("{python} '{}' '{}'{banner}", fwd(&script), fwd(&log));
+        let cmd = format!(
+            "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File '{}' '{}'{banner}",
+            fwd(&script),
+            fwd(&log)
+        );
         let pane = registry
             .spawn_pane(
                 PaneSpawnInput {
@@ -120,7 +112,7 @@ async fn spawn_fake_agents(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spawns 9 real PTY panes running python — opt in via --ignored"]
+#[ignore = "spawns 9 real PTY panes with fake agents — CI runs it; opt in via --ignored"]
 async fn bridge_end_to_end_with_fake_agents() {
     let (app, pool, _db_dir) = mock_app_with_pool_and_terminal_registry().await;
     let registry = app.state::<TerminalRegistry>().inner().clone();
@@ -131,7 +123,7 @@ async fn bridge_end_to_end_with_fake_agents() {
         spawn_fake_agents(&app, &registry, &pool, work.path(), true).await;
     let log = |a: &str| read(&logs[a]);
 
-    // Let the interpreters boot, and wait for the approval false
+    // Let the fake agents boot, and wait for the approval false
     // positive to land on the tester pane.
     let tester_pane = panes_by_agent["integration-tester"].clone();
     let deadline = Instant::now() + Duration::from_secs(15);
@@ -250,9 +242,7 @@ async fn bridge_end_to_end_with_fake_agents() {
         ("03 invalid envelope → rejected/scout", Box::new(|| r("rejected/scout/03.json").is_file())),
         ("03 sender scout got [Neuron] notice", Box::new(|| { let l = log("scout"); l.contains("[Neuron]") && l.contains("missing field `body`") })),
         ("04 DONE delivered to coordinator", Box::new(|| log("coordinator").contains("**DONE** T4"))),
-        // The fake agent's console input drops `—` (python msvcrt), so the
-        // separator is not asserted — only that the note follows the id.
-        ("04 reviewer got review WITH note", Box::new(|| { let l = log("backend-reviewer"); l.contains("review T4") && l.contains("auth.rs: refresh eklendi") })),
+        ("04 reviewer got review WITH note", Box::new(|| log("backend-reviewer").contains("review T4 — auth.rs: refresh eklendi"))),
         ("05 frontend-builder told signal not recognised", Box::new(|| log("frontend-builder").contains("TANINMADI"))),
         ("06 awaiting_approval pane still received", Box::new(|| log("integration-tester").contains("smoke-run-06"))),
         ("07 expired not-ready → rejected/planner", Box::new(|| r("rejected/planner/07.json").is_file())),
@@ -339,10 +329,9 @@ async fn wait_until(secs: u64, cond: impl Fn() -> bool) -> bool {
 /// The task-lifecycle FAILURE paths (swarm-logic review A1–A6) driven
 /// through real panes and the real watcher: the test plays every agent
 /// by dropping envelopes into their outboxes one step at a time, and
-/// asserts on what the bridge pasted into each pane. Bodies are ASCII —
-/// the fake agent's console input drops characters like `—`.
+/// asserts on what the bridge pasted into each pane.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spawns 9 real PTY panes running python — opt in via --ignored"]
+#[ignore = "spawns 9 real PTY panes with fake agents — CI runs it; opt in via --ignored"]
 async fn lifecycle_failure_paths_with_fake_agents() {
     let (app, pool, _db_dir) = mock_app_with_pool_and_terminal_registry().await;
     let registry = app.state::<TerminalRegistry>().inner().clone();
@@ -528,6 +517,25 @@ async fn lifecycle_failure_paths_with_fake_agents() {
     .await
     {
         failed.push("G4 nobody answered: ST1 given up as TASK_FAILED".into());
+    }
+    // A question the planner never answers: the planner is reminded, then
+    // the asker is told to go on — nothing is given up.
+    send("coordinator", "planner", "plan the parser split", None);
+    if !wait_until(15, || {
+        let l = log("planner");
+        l.contains("@coordinator") && l.contains("cevabını bekliyor")
+    })
+    .await
+    {
+        failed.push("G5 silent planner reminded of the question".into());
+    }
+    if !wait_until(15, || {
+        let l = log("coordinator");
+        l.contains("@planner") && l.contains("cevap vermedi")
+    })
+    .await
+    {
+        failed.push("G6 coordinator told the planner did not answer".into());
     }
     drop(_stall_override);
 

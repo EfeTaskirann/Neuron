@@ -48,17 +48,16 @@
 //! flat re-exports below:
 //!   * [`envelope`]  — the [`Envelope`] wire type + structural validation.
 //!   * [`fsops`]     — filesystem layout/queue ops (`prepare_layout`,
-//!                     `ensure_gitignore`, `drop_envelope`, file moves,
-//!                     attempts sidecar).
+//!     `ensure_gitignore`, `drop_envelope`, file moves, attempts sidecar).
 //!   * [`delivery`]  — pane-status gate, route-write + timeout, the
-//!                     bracketed-paste wire format.
+//!     bracketed-paste wire format.
 //!   * [`watcher`]   — the poll loop and per-file delivery state machine.
 //!   * [`synth`]     — lifecycle-token fanout on coordinator-bound
-//!                     deliveries.
+//!     deliveries.
 //!   * [`notify`]    — `[Neuron]` notices pasted into a sender's pane
-//!                     (rejections, unrecognised lifecycle signals).
+//!     (rejections, unrecognised lifecycle signals).
 //!   * [`stall`]     — reminders for tasks stuck in `Building` /
-//!                     `AwaitingReview` (escalated to the coordinator).
+//!     `AwaitingReview` (escalated to the coordinator).
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;

@@ -9,8 +9,8 @@ use super::delivery::{
 };
 use super::envelope::{sniff_from, Envelope};
 use super::notify::rejection_notice;
-use super::stall::{deadlock_text, escalation_for, give_up_texts, reminder_for};
-use crate::swarm_term::lifecycle::{LifecycleState, Stall};
+use super::stall::{deadlock_text, escalation_for, give_up_texts, question_notice, question_reminder, reminder_for};
+use crate::swarm_term::lifecycle::{LifecycleState, Stall, Unanswered};
 use crate::swarm_term::waits::{Deadlock, WaitEdge};
 use super::fsops::{
     archive_rejected, attempts_sidecar, bump_attempts, drop_envelope,
@@ -181,6 +181,21 @@ fn deadlock_text_names_every_waiter_and_the_task() {
     assert!(t.contains("@backend-builder → @planner") && t.contains("`T1`") && t.contains("13 dakikadır"), "{t}");
     assert!(t.contains("@coordinator → @backend-builder") && t.contains("TASK_FAILED"), "{t}");
     assert!(!t.contains('\n'));
+}
+
+#[test]
+fn an_unanswered_question_reminds_the_advisor_then_tells_the_asker() {
+    let question = |mins: u64, level: u8| Unanswered {
+        advisor: "planner".into(),
+        asker: "coordinator".into(),
+        age: std::time::Duration::from_secs(mins * 60),
+        level,
+    };
+    let reminder = question_reminder(&question(10, 1));
+    assert!(reminder.contains("@coordinator 10 dakikadır cevabını bekliyor"), "{reminder}");
+    let notice = question_notice(&question(20, 2));
+    assert!(notice.contains("@planner 20 dakikadır cevap vermedi"), "{notice}");
+    assert!(notice.contains("Onsuz devam et"), "{notice}");
 }
 
 #[test]

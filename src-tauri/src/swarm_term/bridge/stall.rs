@@ -11,6 +11,10 @@
 //! escalation either, the task is given up and reported `TASK_FAILED`.
 //! Without this a task whose review never came back waited silently
 //! forever.
+//!
+//! A question to an advisor (scout, planner) that gets no answer reminds
+//! the advisor, and at twice the review threshold tells the asker to go
+//! on without it; nothing is given up, an advisor owns no task.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -23,7 +27,8 @@ use crate::sidecar::terminal::TerminalRegistry;
 use crate::swarm_term::hierarchy::{reviewer_for_builder, AGENT_IDS};
 use crate::swarm_term::waits::Deadlock;
 use crate::swarm_term::lifecycle::{
-    LifecycleState, LifecycleStore, Stall, MAX_REWORK_ROUNDS, TASK_FAILED_PREFIX, TESTER,
+    LifecycleState, LifecycleStore, Stall, Unanswered, MAX_REWORK_ROUNDS, TASK_FAILED_PREFIX,
+    TESTER,
 };
 
 use super::notify::notify_agent;
@@ -135,6 +140,44 @@ pub(super) async fn check_stalls<R: Runtime>(
         notify_agent(registry, panes_by_agent, "coordinator", &text).await;
         emit_reminder(app, "coordinator", &text, "deadlock");
     }
+    for question in lifecycle.take_unanswered(Instant::now(), review_after) {
+        tracing::warn!(
+            advisor = %question.advisor,
+            asker = %question.asker,
+            age_secs = question.age.as_secs(),
+            level = question.level,
+            "swarm-term bridge: unanswered question — reminder sent"
+        );
+        let reminder = question_reminder(&question);
+        notify_agent(registry, panes_by_agent, &question.advisor, &reminder).await;
+        emit_reminder(app, &question.advisor, &reminder, "unanswered question");
+        if question.level >= 2 {
+            let notice = question_notice(&question);
+            notify_agent(registry, panes_by_agent, &question.asker, &notice).await;
+            emit_reminder(app, &question.asker, &notice, "unanswered question");
+        }
+    }
+}
+
+/// Pure: the reminder for an advisor that has not answered a question.
+pub(super) fn question_reminder(question: &Unanswered) -> String {
+    format!(
+        "hatırlatma: @{} {} cevabını bekliyor (sana bir mesaj yazdı). Cevabını ona \
+         gönder; veremiyorsan nedenini kısaca yaz.",
+        question.asker,
+        since(question.age)
+    )
+}
+
+/// Pure: what the asker is told once the advisor stayed silent past the
+/// reminder too.
+pub(super) fn question_notice(question: &Unanswered) -> String {
+    format!(
+        "@{} {} cevap vermedi (hatırlatmadan sonra da). Onsuz devam et ya da \
+         sorunu yeniden, kısaca sor.",
+        question.advisor,
+        since(question.age)
+    )
 }
 
 fn emit_reminder<R: Runtime>(app: &AppHandle<R>, target: &str, text: &str, reason: &str) {
