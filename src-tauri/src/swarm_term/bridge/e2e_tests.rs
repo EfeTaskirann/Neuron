@@ -209,6 +209,11 @@ async fn bridge_end_to_end_with_fake_agents() {
     // Structurally invalid (no body) → rejected after retries, sender told.
     drop_raw(&root, "scout", "03",
         r#"{"from":"scout","to":"coordinator"}"#, None);
+    // Item 9: the builder declared its files before that DONE (older
+    // mtime → processed first, whatever the write order).
+    drop_raw(&root, "backend-builder", "03b",
+        r#"{"from":"backend-builder","to":"coordinator","body":"BUILDING T4 — dosyalar: src/auth.rs","task_id":"T4"}"#,
+        Some(Duration::from_secs(5)));
     // H3 + H7: decorated DONE with a note → review fanout carrying it.
     drop_raw(&root, "backend-builder", "04",
         r#"{"from":"backend-builder","to":"coordinator","body":"**DONE** T4 — auth.rs: refresh eklendi; cargo test ok","task_id":"T4"}"#, None);
@@ -375,6 +380,8 @@ async fn lifecycle_failure_paths_with_fake_agents() {
     // ---- A: reviewer rejects → coordinator re-dispatches → re-review -- //
     send("orchestrator", "backend-builder", "build R1", Some("R1"));
     step!("A1 builder got the dispatch", log("backend-builder").contains("build R1"));
+    send("backend-builder", "coordinator", "BUILDING R1 - dosyalar: src/auth.rs", Some("R1"));
+    step!("A1b the builder declared its files", count("coordinator", "BUILDING R1") == 1);
     send("backend-builder", "coordinator", "DONE R1 - v1 auth.rs; cargo test ok", Some("R1"));
     step!("A2 reviewer got review R1", count("backend-reviewer", "review R1") == 1);
     send("backend-reviewer", "coordinator", "CHANGES_NEEDED R1 - no test covers parse(): add one", Some("R1"));
@@ -405,6 +412,8 @@ async fn lifecycle_failure_paths_with_fake_agents() {
     step!("B2 coordinator got the test failure", log("coordinator").contains("CHANGES_NEEDED S1"));
     send("coordinator", "backend-builder", "S1 fix test_parse", Some("S1"));
     step!("B3 builder got the fix dispatch", log("backend-builder").contains("S1 fix test_parse"));
+    send("backend-builder", "coordinator", "BUILDING S1 - dosyalar: src/parse.rs", Some("S1"));
+    step!("B3b the builder declared its files", count("coordinator", "BUILDING S1") == 1);
     send("backend-builder", "coordinator", "DONE S1 - parse.rs fixed; cargo test passed", Some("S1"));
     step!("B4 the fix is reviewed first", log("backend-reviewer").contains("review S1"));
     step!("B5 no retest before the review", !log("integration-tester").contains("retest S1"));
@@ -432,6 +441,8 @@ async fn lifecycle_failure_paths_with_fake_agents() {
     // ---- D: rework limit — the 3rd rejection fails the task ----------- //
     send("orchestrator", "backend-builder", "build L1", Some("L1"));
     step!("D0 builder got L1", log("backend-builder").contains("build L1"));
+    send("backend-builder", "coordinator", "BUILDING L1 - dosyalar: src/l1.rs", Some("L1"));
+    step!("D0b the builder declared its files", count("coordinator", "BUILDING L1") == 1);
     for round in 1..=3usize {
         send("backend-builder", "coordinator", &format!("DONE L1 - attempt {round}; npm test passed"), Some("L1"));
         step!(format!("D{round} review L1 #{round}"), count("backend-reviewer", "review L1") == round);
@@ -456,6 +467,8 @@ async fn lifecycle_failure_paths_with_fake_agents() {
     // ---- F: misaddressed DONE still starts the review ----------------- //
     send("orchestrator", "frontend-builder", "build F1", Some("F1"));
     step!("F1 builder got F1", log("frontend-builder").contains("build F1"));
+    send("frontend-builder", "coordinator", "BUILDING F1 - dosyalar: Login.tsx", Some("F1"));
+    step!("F1b the builder declared its files", count("coordinator", "BUILDING F1") == 1);
     send("frontend-builder", "orchestrator", "DONE F1 - Login.tsx; pnpm test passed", Some("F1"));
     step!("F2 DONE sent to the orchestrator still reached the reviewer",
         log("frontend-reviewer").contains("review F1"));
@@ -463,6 +476,8 @@ async fn lifecycle_failure_paths_with_fake_agents() {
     // ---- I: a DONE without run evidence is refused, not reviewed ----- //
     send("orchestrator", "backend-builder", "build V1", Some("V1"));
     step!("I0 builder got V1", log("backend-builder").contains("build V1"));
+    send("backend-builder", "coordinator", "BUILDING V1 - dosyalar: src/auth.rs", Some("V1"));
+    step!("I0b the builder declared its files", count("coordinator", "BUILDING V1") == 1);
     send("backend-builder", "coordinator", "DONE V1 - auth.rs changed", Some("V1"));
     step!("I1 the builder is told its DONE was refused",
         log("backend-builder").contains("KABUL EDİLMEDİ") && !log("backend-reviewer").contains("review V1"));
@@ -481,6 +496,8 @@ async fn lifecycle_failure_paths_with_fake_agents() {
     // ---- K: a code rejection without evidence is refused -------------- //
     send("orchestrator", "backend-builder", "build K1", Some("K1"));
     step!("K0 builder got K1", log("backend-builder").contains("build K1"));
+    send("backend-builder", "coordinator", "BUILDING K1 - dosyalar: src/k.rs", Some("K1"));
+    step!("K0b the builder declared its files", count("coordinator", "BUILDING K1") == 1);
     send("backend-builder", "coordinator", "DONE K1 - k.rs; cargo test passed", Some("K1"));
     step!("K1 reviewer got review K1", log("backend-reviewer").contains("review K1"));
     send("backend-reviewer", "coordinator", "CHANGES_NEEDED K1 - rewrite it, I dislike it", Some("K1"));
@@ -493,9 +510,82 @@ async fn lifecycle_failure_paths_with_fake_agents() {
     send("backend-builder", "coordinator", "hata - no permission for this", Some("H2"));
     step!("H2 orchestrator got TASK_FAILED H2", log("orchestrator").contains("TASK_FAILED H2"));
 
+    // ---- L: two open tasks declare one file; a DONE needs a declaration //
+    send("orchestrator", "backend-builder", "build C1 shared part one", Some("C1"));
+    step!("L0 backend-builder got C1", log("backend-builder").contains("build C1"));
+    send("backend-builder", "coordinator", "BUILDING C1 - dosyalar: src/shared.rs, src/c1.rs", Some("C1"));
+    step!("L1 the first declaration raises no conflict",
+        count("coordinator", "BUILDING C1") == 1 && !log("coordinator").contains("aynı dosya"));
+    send("orchestrator", "frontend-builder", "build C2 shared part two", Some("C2"));
+    step!("L2 frontend-builder got C2", log("frontend-builder").contains("build C2"));
+    send("frontend-builder", "coordinator", "BUILDING C2 - dosyalar: src/shared.rs", Some("C2"));
+    step!("L3 the second builder is told the file is claimed by C1",
+        log("frontend-builder").contains("kapanmadan bu dosyaya yazma") && log("frontend-builder").contains("`C1`"));
+    step!("L4 the coordinator is told to sequence the two tasks",
+        log("coordinator").contains("aynı dosya") && log("coordinator").contains("src/shared.rs"));
+    send("orchestrator", "backend-builder", "build C3 no declaration", Some("C3"));
+    step!("L5 backend-builder got C3", log("backend-builder").contains("build C3"));
+    send("backend-builder", "coordinator", "DONE C3 - src/c3.rs; doğrulama: cargo test → 2 geçti, exit 0", Some("C3"));
+    step!("L6 a DONE without a file declaration is refused",
+        log("backend-builder").contains("dosya beyanı yok") && !log("backend-reviewer").contains("review C3"));
+    send("backend-builder", "coordinator", "BUILDING C3 - dosyalar: yok", Some("C3"));
+    step!("L7 the empty declaration is accepted", count("coordinator", "BUILDING C3") == 1);
+    send("backend-builder", "coordinator", "DONE C3 - src/c3.rs; doğrulama: cargo test → 2 geçti, exit 0", Some("C3"));
+    step!("L8 the review starts once the declaration is in", log("backend-reviewer").contains("review C3"));
+    send("backend-reviewer", "coordinator", "APPROVED C3", Some("C3"));
+    step!("L9 C3 goes to the tester", log("integration-tester").contains("test C3"));
+    send("integration-tester", "coordinator", "APPROVED C3 - cargo test: 2 passed", Some("C3"));
+    step!("L10 orchestrator got TASK_DONE C3", log("orchestrator").contains("TASK_DONE C3"));
+
+    // ---- M: a dispatch naming an open dependency waits for it --------- //
+    send("orchestrator", "backend-builder", "build M1 base", Some("M1"));
+    step!("M0 backend-builder got M1", log("backend-builder").contains("build M1"));
+    send("orchestrator", "frontend-builder", "build M2 on top — bağımlılık: M1", Some("M2"));
+    step!("M1 the orchestrator is told M2 is held",
+        log("orchestrator").contains("bekletiliyor") && log("orchestrator").contains("`M1`"));
+    step!("M2 the held dispatch is not delivered", !log("frontend-builder").contains("build M2"));
+    send("backend-builder", "coordinator", "hata - M1 cannot be built", Some("M1"));
+    step!("M3 orchestrator got TASK_FAILED M1", log("orchestrator").contains("TASK_FAILED M1"));
+    step!("M4 the dependent dispatch comes back to its sender",
+        log("orchestrator").contains("başarısız kapandı") && !log("frontend-builder").contains("build M2"));
+    send("orchestrator", "backend-builder", "build M3 base two", Some("M3"));
+    step!("M5 backend-builder got M3", log("backend-builder").contains("build M3"));
+    send("orchestrator", "frontend-builder", "build M4 on top — bağımlılık: M3", Some("M4"));
+    step!("M6 M4 is held too", count("orchestrator", "bekletiliyor") == 2);
+    send("backend-builder", "coordinator", "BUILDING M3 - dosyalar: src/m3.rs", Some("M3"));
+    step!("M7 M3 declared", count("coordinator", "BUILDING M3") == 1);
+    send("backend-builder", "coordinator", "DONE M3 - src/m3.rs; doğrulama: cargo test → 1 geçti, exit 0", Some("M3"));
+    step!("M8 M3 is reviewed", log("backend-reviewer").contains("review M3"));
+    send("backend-reviewer", "coordinator", "APPROVED M3", Some("M3"));
+    step!("M9 M3 is tested", log("integration-tester").contains("test M3"));
+    send("integration-tester", "coordinator", "APPROVED M3 - cargo test: 1 passed", Some("M3"));
+    step!("M10 orchestrator got TASK_DONE M3", log("orchestrator").contains("TASK_DONE M3"));
+    step!("M11 the dependent dispatch is delivered once M3 closed", log("frontend-builder").contains("build M4"));
+
+    // ---- Z: close what the scenarios left open ------------------------ //
+    // G runs the stall clocks at 2 s. Every open task then stalls too, and
+    // each costs the checker a pane paste per level; with nine of them
+    // the checker lagged so far on CI that ST1 went from the reminder
+    // straight to the give-up (level 3) and the escalation (level 2) was
+    // never sent. A builder's untagged `hata` closes its own open task.
+    for (builder, id) in [
+        ("backend-builder", "D1"),
+        ("frontend-builder", "F1"),
+        ("backend-builder", "V1"),
+        ("frontend-builder", "P1"),
+        ("backend-builder", "K1"),
+        ("backend-builder", "C1"),
+        ("frontend-builder", "C2"),
+        ("frontend-builder", "M4"),
+    ] {
+        send(builder, "coordinator", &format!("hata - {id} dropped before the stall scenario"), Some(id));
+        step!(format!("Z {id} closed before the stall scenario"),
+            log("orchestrator").contains(&format!("TASK_FAILED {id}")));
+    }
+
     // ---- G: an unanswered dispatch is reminded, escalated, given up --- //
     // Short thresholds from here on (restored on drop, even on panic);
-    // earlier open tasks may be reminded too — only ST1's texts count.
+    // only ST1 is open now, so only ST1's clocks run.
     let _stall_override = EnvOverride::set("NEURON_TERM_STALL_SECS", "2");
     send("orchestrator", "frontend-builder", "build ST1", Some("ST1"));
     step!("G1 builder got ST1", log("frontend-builder").contains("build ST1"));

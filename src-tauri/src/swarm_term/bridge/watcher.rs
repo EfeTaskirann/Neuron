@@ -20,19 +20,23 @@ use tokio::sync::Notify;
 
 use crate::sidecar::terminal::TerminalRegistry;
 use crate::swarm_term::hierarchy::{allowed_for, is_allowed, AGENT_IDS};
-use crate::swarm_term::lifecycle::{is_injection_report, is_request, misaddressed_signal, LifecycleStore};
+use crate::swarm_term::lifecycle::{
+    is_injection_report, is_request, misaddressed_signal, DependencyHold, LifecycleStore,
+};
 
 use super::delivery::{
     format_routed_message, is_delivery_blocked, submit_pasted,
     perform_route_write_with_timeout, truncate, RouteWriteOutcome,
 };
 use super::envelope::{sniff_from, Envelope};
-use super::fsops::{bump_attempts, move_to_processed, move_to_rejected};
+use super::fsops::{
+    bump_attempts, bump_held, clear_held, held_count, move_to_processed, move_to_rejected,
+};
 use super::notify::{notify_agent, rejection_notice};
 use super::stall::{check_stalls, stall_check_every, STALL_CADENCE_REFRESH};
 use super::synth::{
-    delivery_task_id, dispatch_conflict, lifecycle_synthesise, note_coordinator_report,
-    note_dispatch,
+    delivery_task_id, dispatch_conflict, dispatch_dependencies, lifecycle_synthesise,
+    note_coordinator_report, note_dispatch,
 };
 
 /// Polling cadence for [`watcher_loop`]. Each tick scans every inbox
@@ -423,20 +427,60 @@ fn waited(path: &Path, attempts: u32) -> Duration {
 /// delivery grace ([`waited`]) is measured from the resume rather than
 /// from when the message was first written (which includes the hold).
 fn reset_grace_clocks(root: &Path) {
-    let now = SystemTime::now();
     for kind in ["outbox", "inbox"] {
         for &agent in AGENT_IDS {
             for path in json_entries(&root.join(kind).join(agent)) {
-                if let Ok(file) = fs::OpenOptions::new().write(true).open(&path) {
-                    let _ = file.set_modified(now);
-                }
+                restart_grace_clock(&path);
             }
         }
     }
 }
 
+/// Measure `path`'s waiting time ([`waited`]) from now on: a held
+/// dispatch's delivery grace starts when the hold lifts, not when the
+/// sender wrote it.
+fn restart_grace_clock(path: &Path) {
+    if let Ok(file) = fs::OpenOptions::new().write(true).open(path) {
+        let _ = file.set_modified(SystemTime::now());
+    }
+}
+
 fn should_emit_retry_event(attempts: u32) -> bool {
     attempts == 1 || attempts % RETRY_EVENT_EVERY == 0
+}
+
+/// How long a dispatch waits for a dependency nobody has dispatched yet
+/// before it goes out anyway: one turn writes its files within seconds,
+/// so the dependency's own dispatch is usually a tick away; a typo would
+/// otherwise hold the step forever.
+pub(super) const DEPENDENCY_GRACE: Duration = Duration::from_secs(60);
+
+/// What the dependency gate does with a dispatch (see [`dependency_gate`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum DependencyGate {
+    /// Deliver; `ignored` names the dependencies nobody dispatched
+    /// within the grace.
+    Deliver { ignored: Vec<String> },
+    /// Keep the file in the outbox; `on` is what it waits for.
+    Hold { on: Vec<String> },
+    /// Return it to the sender: these dependencies closed as failed.
+    Reject { failed: Vec<String> },
+}
+
+/// Pure: a failed dependency sends the dispatch back (the plan must
+/// change); an open one holds it; an unknown one holds it for
+/// [`DEPENDENCY_GRACE`] (`waited` so far), then it goes.
+pub(super) fn dependency_gate(hold: &DependencyHold, waited: Duration) -> DependencyGate {
+    if !hold.failed.is_empty() {
+        return DependencyGate::Reject { failed: hold.failed.clone() };
+    }
+    if !hold.open.is_empty() {
+        return DependencyGate::Hold { on: hold.open.clone() };
+    }
+    if !hold.unknown.is_empty() && waited < DEPENDENCY_GRACE {
+        return DependencyGate::Hold { on: hold.unknown.clone() };
+    }
+    DependencyGate::Deliver { ignored: hold.unknown.clone() }
 }
 
 /// Move `path` to `rejected/` and, when the sender is a known agent,
@@ -826,6 +870,80 @@ async fn process_one<R: Runtime>(
         return;
     }
 
+    // ---- Dependency gate --------------------------------------------- //
+    // A dispatch naming `bağımlılık: <id>` waits in the outbox until that
+    // task closes: delivered after its TASK_DONE, returned to the sender
+    // after its TASK_FAILED (see `lifecycle::dependencies`).
+    let mut ignored_deps: Vec<String> = Vec::new();
+    let deps = dispatch_dependencies(&from_agent, &to_agent, &body);
+    if !deps.is_empty() {
+        let what = envelope_task_id.as_deref().unwrap_or("dispatch");
+        let hold = lifecycle.dependency_hold(&deps);
+        match dependency_gate(&hold, waited(path, held_count(path))) {
+            DependencyGate::Reject { failed } => {
+                let reason = format!(
+                    "`{what}` iletilmedi: bağlı olduğu `{}` başarısız kapandı (TASK_FAILED). \
+                     Adımı yeniden planla; bağımlılık kalkarsa YENİ bir task_id ile gönder.",
+                    failed.join("`, `")
+                );
+                let _ = app.emit(
+                    crate::events::SWARM_TERM_ROUTE,
+                    json!({
+                        "source": from_agent,
+                        "target": to_agent,
+                        "body": body,
+                        "outcome": "rejected",
+                        "reason": reason,
+                    }),
+                );
+                reject_and_notify(
+                    app,
+                    registry,
+                    root,
+                    path,
+                    panes_by_agent,
+                    Some(from_agent.as_str()),
+                    &to_agent,
+                    &reason,
+                    &body,
+                    stuck,
+                )
+                .await;
+                return;
+            }
+            DependencyGate::Hold { on } => {
+                // Told once; the file stays and is looked at every tick.
+                if bump_held(path) == 1 {
+                    let on = on.join("`, `");
+                    let _ = app.emit(
+                        crate::events::SWARM_TERM_ROUTE,
+                        json!({
+                            "source": from_agent,
+                            "target": to_agent,
+                            "body": body,
+                            "outcome": "held",
+                            "reason": format!("waits for `{on}`"),
+                        }),
+                    );
+                    let text = format!(
+                        "`{what}` → @{to_agent} bekletiliyor: bağlı olduğu `{on}` henüz kapanmadı. \
+                         `TASK_DONE` gelince Neuron iletir, `TASK_FAILED` gelirse mesaj sana geri \
+                         döner; ayrıca bir şey yapma."
+                    );
+                    notify_agent(registry, panes_by_agent, &from_agent, &text).await;
+                    emit_notice(app, &from_agent, &text, "dependency open");
+                }
+                return;
+            }
+            DependencyGate::Deliver { ignored } => {
+                if clear_held(path) {
+                    restart_grace_clock(path);
+                }
+                ignored_deps = ignored;
+            }
+        }
+    }
+
     // ---- Persona-injection readiness -------------------------------- //
     let is_ready = ready_panes
         .lock()
@@ -997,6 +1115,18 @@ async fn process_one<R: Runtime>(
             lifecycle.note_message(&from_agent, &to_agent, task_id, is_request(&body, task_id));
             // A question to an advisor, or an advisor speaking (see `stall`).
             lifecycle.note_route(&from_agent, &to_agent);
+            if !ignored_deps.is_empty() {
+                let text = format!(
+                    "`{}` @{to_agent}'a iletildi ama bağımlılığı `{}` tanınmıyor (hiç dispatch \
+                     edilmedi; {} s beklendi): bağımlılık yok sayıldı. Gerçekten bekletmek \
+                     istiyorsan önce o görevi dispatch et.",
+                    task_id.unwrap_or("dispatch"),
+                    ignored_deps.join("`, `"),
+                    DEPENDENCY_GRACE.as_secs()
+                );
+                notify_agent(registry, panes_by_agent, &from_agent, &text).await;
+                emit_notice(app, &from_agent, &text, "unknown dependency ignored");
+            }
             if is_injection_report(&body) {
                 emit_injection(app, root, &from_agent, &to_agent, &body);
             }

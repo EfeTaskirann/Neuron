@@ -76,9 +76,11 @@ describe('RoutingLogRoute', () => {
       { id: 4, source: 'coordinator', target: 'planner', body: 'plan-07', outcome: 'rejected', ts: 2 },
       { id: 5, source: 'neuron', target: 'frontend-reviewer', body: '[Neuron] hatırlatma', outcome: 'reminder', ts: 3 },
       { id: 6, source: 'scout', target: 'coordinator', body: 'talimat gördüm — README.md', outcome: 'injection', ts: 4 },
+      { id: 7, source: 'orchestrator', target: 'frontend-builder', body: 'build p3 — bağımlılık: p1', outcome: 'held', ts: 5 },
     ]);
     const { container } = render(<RoutingLogRoute />);
     expect(container.querySelector('.routing-log-tag-notice')).toHaveTextContent('notice');
+    expect(container.querySelector('.routing-log-tag-held')).toHaveTextContent('held');
     expect(container.querySelector('.routing-log-tag-rejected')).toHaveTextContent('rejected');
     expect(container.querySelector('.routing-log-tag-reminder')).toHaveTextContent('reminder');
     expect(container.querySelector('.routing-log-tag-injection')).toHaveTextContent('injection');

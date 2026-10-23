@@ -92,11 +92,16 @@ başında verdi, planı sen ürettirdin, execute etmek senin işin. Faz 2
 tamamlanır tamamlanmaz Faz 3'ün dispatch'lerini yaz — her adım için
 sahip builder'a ayrı bir `Write`.
 
-- **Bağımsız adımlar** (bağımlılığı yok) aynı turda PARALEL dispatch
-  edilir. **Bağımlı adım** (`bağımlılık: <id>`) ancak o id'nin
-  `TASK_DONE`'u geldikten sonra dispatch edilir.
+- **Bütün adımları aynı turda dispatch et** — bağımsızları da bağımlıları
+  da. Bağımlı adımın gövdesine planın `bağımlılık: <id>` alanını aynen yaz:
+  Neuron o mesajı kuyrukta bekletir, `<id>`'nin `TASK_DONE`'u gelince
+  builder'a iletir (sana `bekletiliyor` notu düşer; bekleme, başka işe geç).
+  `<id>` `TASK_FAILED` olursa mesaj sana `[Neuron]` notuyla geri döner —
+  adımı yeniden planla. `bağımlılık: yok` olan adımlar hemen iletilir.
 - **Aynı dosyayı iki builder'a aynı anda verme.** Bir dosyaya iki adım
-  dokunuyorsa o adımları sıralı yap.
+  dokunuyorsa o adımları bağımlılıkla sırala. Builder'lar `BUILDING` ile
+  dokunacakları dosyaları beyan eder; iki açık görev aynı dosyayı beyan
+  ederse coordinator'a `[Neuron]` çakışma notu düşer ve sıralamayı o yapar.
 - **task_id'ler benzersizdir:** her dispatch kendi id'sini taşır, iki
   builder'a aynı id verilmez, bitmiş (`TASK_DONE` / `TASK_FAILED`) bir
   id tekrar kullanılmaz — backend bunları reddeder.

@@ -26,6 +26,9 @@ import { notifyTaskSignal } from '../lib/swarmNotify';
 //   injection            — an agent reported an instruction it found in the
 //                          project's text (`talimat gördüm — …`); delivered
 //                          as usual, shown so the user sees the attempt
+//   held                 — a dispatch naming `bağımlılık: <id>` waits in the
+//                          outbox until that task closes (delivered after its
+//                          TASK_DONE, returned to the sender after TASK_FAILED)
 //
 // Collection is a MODULE-LEVEL store (mirrors lib/toast.ts): one
 // app-lifetime listener starts on the first consumer mount and the
@@ -48,7 +51,8 @@ export type RouteOutcome =
   | 'rejected'
   | 'notice'
   | 'reminder'
-  | 'injection';
+  | 'injection'
+  | 'held';
 
 export interface RouteEvent {
   /** Client-minted monotonic id — a stable React list key (rows
@@ -89,6 +93,7 @@ export const ALL_OUTCOMES: readonly RouteOutcome[] = [
   'notice',
   'reminder',
   'injection',
+  'held',
 ];
 
 function coerceOutcome(raw: string): RouteOutcome {

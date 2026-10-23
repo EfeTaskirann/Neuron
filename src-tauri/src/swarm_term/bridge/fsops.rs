@@ -187,6 +187,35 @@ pub(super) fn attempts_sidecar(path: &Path) -> PathBuf {
     sidecar
 }
 
+/// The `.held` sidecar: how many ticks a dispatch has waited for a
+/// dependency (see `watcher::dependency_gate`) — apart from the
+/// delivery retries in `.attempts`, which start once the hold lifts.
+pub(super) fn held_sidecar(path: &Path) -> PathBuf {
+    let mut sidecar = path.to_path_buf();
+    sidecar.set_extension("held");
+    sidecar
+}
+
+/// Ticks `path` has been held so far (0: not held).
+pub(super) fn held_count(path: &Path) -> u32 {
+    fs::read_to_string(held_sidecar(path))
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+/// Count one more held tick for `path`; returns the new count.
+pub(super) fn bump_held(path: &Path) -> u32 {
+    let next = held_count(path).saturating_add(1);
+    let _ = fs::write(held_sidecar(path), next.to_string());
+    next
+}
+
+/// Forget the hold on `path`; `true` when there was one.
+pub(super) fn clear_held(path: &Path) -> bool {
+    fs::remove_file(held_sidecar(path)).is_ok()
+}
+
 pub(super) fn move_to_processed(
     root: &Path,
     path: &Path,
@@ -201,6 +230,7 @@ pub(super) fn move_to_processed(
     fs::rename(path, &dest)?;
     // Successful delivery — discard the attempts counter if any.
     let _ = fs::remove_file(attempts_sidecar(path));
+    let _ = fs::remove_file(held_sidecar(path));
     Ok(())
 }
 
@@ -223,5 +253,6 @@ pub(super) fn move_to_rejected(
     reason_path.set_extension("reason");
     let _ = fs::write(&reason_path, reason);
     let _ = fs::remove_file(attempts_sidecar(path));
+    let _ = fs::remove_file(held_sidecar(path));
     Ok(())
 }

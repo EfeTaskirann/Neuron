@@ -21,7 +21,7 @@
 //! See [`crate::swarm_term::hierarchy`] for the cycle diagram and the
 //! static routing graph that the fanout targets are validated against.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -292,6 +292,179 @@ pub fn is_request(body: &str, task_id: Option<&str>) -> bool {
     !["task_done", "task_failed", "alındı", "alindi", "bilgi", "tamam"]
         .iter()
         .any(|w| head.starts_with(w))
+}
+
+/// A file declared by two open tasks (see [`LifecycleStore::claim_files`]).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct FileConflict {
+    pub file: String,
+    /// The other open task that declared it.
+    pub other_task: String,
+}
+
+/// Where a dispatch's dependencies stand (see
+/// [`LifecycleStore::dependency_hold`]); ids closed as done are absent.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct DependencyHold {
+    /// Known and not closed yet: the dispatch waits.
+    pub open: Vec<String>,
+    /// Closed as failed: the dispatch goes back to its sender.
+    pub failed: Vec<String>,
+    /// Never seen — maybe still on its way, maybe a typo.
+    pub unknown: Vec<String>,
+}
+
+/// Byte range of `needle` in `hay`, compared char by char ignoring case
+/// (`Bağımlılık:` finds `bağımlılık:`). Offsets come from `hay` itself: a
+/// lowercased copy would index the wrong string once a char changes
+/// length (`İ` → `i̇`).
+fn find_ci(hay: &str, needle: &str) -> Option<(usize, usize)> {
+    let needle: Vec<char> = needle.chars().flat_map(char::to_lowercase).collect();
+    let chars: Vec<(usize, char)> = hay.char_indices().collect();
+    'starts: for i in 0..chars.len() {
+        let mut pending = needle.iter().peekable();
+        for (k, (_, c)) in chars[i..].iter().enumerate() {
+            for lc in c.to_lowercase() {
+                match pending.next() {
+                    Some(n) if *n == lc => {}
+                    Some(_) => continue 'starts,
+                    None => break,
+                }
+            }
+            if pending.peek().is_none() {
+                let end = chars.get(i + k + 1).map_or(hay.len(), |(b, _)| *b);
+                return Some((chars[i].0, end));
+            }
+        }
+    }
+    None
+}
+
+/// The earliest of `keys` in `text`, ignoring case (see [`find_ci`]).
+fn find_any_ci(text: &str, keys: &[&str]) -> Option<(usize, usize)> {
+    keys.iter().filter_map(|k| find_ci(text, k)).min()
+}
+
+/// Wrapping an agent puts around a path or an id (`` `src/a.rs` ``,
+/// `"auth.rs"`, `(Login.tsx)`), stripped from both ends.
+fn is_wrapping(c: char) -> bool {
+    matches!(c, '`' | '"' | '\'' | '*' | '(' | ')' | '[' | ']' | '<' | '>')
+}
+
+/// Pure: `raw` as a normalised path when it looks like one — it has a
+/// `/` or a `\`, a lettered extension (`auth.rs`, `Login.tsx`), or is a
+/// dotfile (`.gitignore`). A `:line[:col]` suffix, wrapping and a leading
+/// `./` go, `\` becomes `/`. Flags (`--noEmit`), URLs, handles (`@scout`)
+/// and numbers (`v1.2`, `0`) are not paths.
+fn path_token(raw: &str) -> Option<String> {
+    let mut t = raw
+        .trim_matches(is_wrapping)
+        .trim_end_matches([',', ';', ':', '.', '!', '?']);
+    while let Some((file, line)) = t.rsplit_once(':') {
+        if line.is_empty() || !line.chars().all(|c| c.is_ascii_digit()) {
+            break;
+        }
+        t = file;
+    }
+    if t.is_empty() || t.starts_with('-') || t.starts_with('@') || t.contains("://") {
+        return None;
+    }
+    let slashed = t.replace('\\', "/");
+    let norm = slashed.strip_prefix("./").unwrap_or(&slashed).trim_end_matches('/');
+    let name = norm.rsplit('/').next().unwrap_or(norm);
+    let has_extension = name.rsplit_once('.').is_some_and(|(stem, ext)| {
+        !stem.is_empty()
+            && (1..=5).contains(&ext.len())
+            && ext.chars().all(|c| c.is_ascii_alphanumeric())
+            && ext.chars().any(|c| c.is_ascii_alphabetic())
+    });
+    let dotfile = name.len() > 1
+        && name.starts_with('.')
+        && name[1..].chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'));
+    if norm.is_empty()
+        || !(norm.contains('/') || has_extension || dotfile)
+        || !norm.chars().any(char::is_alphabetic)
+    {
+        return None;
+    }
+    Some(norm.to_string())
+}
+
+/// Pure: the files a builder's note declares, in order, each once. The
+/// `dosyalar:` / `files:` list when there is one (`yok` / `none` / `-`:
+/// an explicit declaration of none); otherwise the path-like tokens
+/// before the evidence part (`doğrulama:` — commands name paths of their
+/// own). `None`: nothing declared.
+pub fn declared_files(note: Option<&str>) -> Option<Vec<String>> {
+    let note = note?;
+    let head = match find_any_ci(note, &["doğrulama", "dogrulama", "verification"]) {
+        Some((cut, _)) => &note[..cut],
+        None => note,
+    };
+    let (list, explicit) = match find_any_ci(head, &["dosyalar:", "dosya:", "files:", "file:"]) {
+        Some((_, after)) => (&head[after..], true),
+        None => (head, false),
+    };
+    let mut files: Vec<String> = Vec::new();
+    for raw in list.split(|c: char| c.is_whitespace() || matches!(c, ',' | ';' | '(' | ')')) {
+        if let Some(path) = path_token(raw) {
+            if !files.contains(&path) {
+                files.push(path);
+            }
+        }
+    }
+    if files.is_empty() {
+        let none = explicit
+            && list.split_whitespace().next().is_some_and(|w| {
+                matches!(
+                    w.trim_matches(is_wrapping).trim_end_matches('.').to_lowercase().as_str(),
+                    "yok" | "none" | "no" | "-" | "hiç" | "hiçbiri"
+                )
+            });
+        return none.then(Vec::new);
+    }
+    Some(files)
+}
+
+/// Pure: the task ids a dispatch says it depends on — the ids after
+/// `bağımlılık:` (the planner's field; also `bağlı:`, `depends_on:`,
+/// `depends:`), up to the next `|` / `;` / `—` / line end; `yok` / `none`
+/// / `-` is none. Prose after the ids is skipped by shape: an id has a
+/// digit and a letter (`p1`, `R1`, `p0-1`), a word has no digit; a lone
+/// word (`auth-task`) is taken as the id.
+pub fn dependencies(body: &str) -> Vec<String> {
+    const KEYS: [&str; 8] = [
+        "bağımlılık:", "bagimlilik:", "bağımlılıklar:", "bağlı:",
+        "depends_on:", "depends:", "dependencies:", "dependency:",
+    ];
+    let Some((_, after)) = find_any_ci(body, &KEYS) else {
+        return Vec::new();
+    };
+    let rest = &body[after..];
+    let end = rest.find(['|', ';', '\n', '—']).unwrap_or(rest.len());
+    let words: Vec<&str> = rest[..end]
+        .split(|c: char| c.is_whitespace() || c == ',')
+        .map(|w| w.trim_matches(|c: char| is_wrapping(c) || matches!(c, '.' | ':')))
+        .filter(|w| !w.is_empty())
+        .collect();
+    if words.first().is_some_and(|w| {
+        matches!(w.to_lowercase().as_str(), "yok" | "none" | "no" | "-" | "hayır" | "hiç")
+    }) {
+        return Vec::new();
+    }
+    let id_like = |w: &str| w.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'));
+    let mut ids: Vec<String> = Vec::new();
+    for w in words.iter().filter(|w| {
+        id_like(w) && w.chars().any(|c| c.is_ascii_digit()) && w.chars().any(|c| c.is_ascii_alphabetic())
+    }) {
+        if !ids.iter().any(|id| id == w) {
+            ids.push(w.to_string());
+        }
+    }
+    if ids.is_empty() && words.len() == 1 && id_like(words[0]) {
+        ids.push(words[0].to_string());
+    }
+    ids
 }
 
 /// Pure: the note after its leading cause tag (`[izin] npm reddedildi`
@@ -831,6 +1004,13 @@ struct TaskMeta {
     /// the experience card (later dispatches — `test <id>`, a rework —
     /// are per pane, see `Inner::dispatches`).
     dispatch: Option<String>,
+    /// The files the task's builder declared (`BUILDING <id> — dosyalar:
+    /// …`, topped up by its `DONE` note): two open tasks on one file are
+    /// told so (see [`LifecycleStore::claim_files`]).
+    files: BTreeSet<String>,
+    /// A declaration was made — possibly of no files (`dosyalar: yok`).
+    /// A builder's `DONE` needs one.
+    declared: bool,
 }
 
 impl TaskMeta {
@@ -961,6 +1141,7 @@ impl Inner {
         if self.tasks.len() >= MAX_LIFECYCLE_ENTRIES {
             for m in self.tasks.values_mut().filter(|m| m.closed.is_some()) {
                 m.done_notes = Vec::new();
+                m.files = BTreeSet::new();
             }
         }
         if self.tasks.len() >= MAX_TASK_IDS {
@@ -1670,6 +1851,65 @@ impl LifecycleStore {
             .collect();
         open.sort_by(|a, b| a.id.cmp(&b.id));
         open
+    }
+
+    /// Declare `files` for `task_id` (a builder's `BUILDING` list, its
+    /// `DONE` note): every file NEW to the task that another OPEN task
+    /// already declared comes back as a conflict, sorted — a file
+    /// declared again raises nothing again. An empty list is still a
+    /// declaration (`dosyalar: yok`). A closed task takes none.
+    pub fn claim_files(&self, task_id: &str, files: &[String]) -> Vec<FileConflict> {
+        let mut g = self.lock();
+        if g.tasks.get(task_id).is_some_and(|m| m.closed.is_some()) {
+            return Vec::new();
+        }
+        let already: BTreeSet<String> =
+            g.tasks.get(task_id).map(|m| m.files.clone()).unwrap_or_default();
+        let mut conflicts: Vec<FileConflict> = Vec::new();
+        for file in files.iter().filter(|f| !already.contains(*f)) {
+            for (other, m) in g.tasks.iter() {
+                if other != task_id && m.closed.is_none() && m.files.contains(file) {
+                    conflicts.push(FileConflict { file: file.clone(), other_task: other.clone() });
+                }
+            }
+        }
+        conflicts.sort();
+        g.evict_if_full();
+        let meta = g.tasks.entry(task_id.to_string()).or_default();
+        meta.declared = true;
+        meta.files.extend(files.iter().cloned());
+        conflicts
+    }
+
+    /// Whether `task_id` has a file declaration (see [`Self::claim_files`]).
+    pub fn has_claim(&self, task_id: &str) -> bool {
+        self.lock().tasks.get(task_id).is_some_and(|m| m.declared)
+    }
+
+    /// The files declared for `task_id`, sorted.
+    pub fn claimed_files(&self, task_id: &str) -> Vec<String> {
+        self.lock()
+            .tasks
+            .get(task_id)
+            .map(|m| m.files.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Where `deps` stand: open (known, not closed), failed, or never
+    /// seen. Ids closed as done need no waiting and are left out.
+    pub fn dependency_hold(&self, deps: &[String]) -> DependencyHold {
+        let g = self.lock();
+        let mut hold = DependencyHold::default();
+        for id in deps {
+            let known = g.tasks.contains_key(id) || g.entries.keys().any(|(_, t)| t == id);
+            match g.tasks.get(id).and_then(|m| m.closed) {
+                Some(Closure::Done) => {}
+                Some(Closure::Failed) => hold.failed.push(id.clone()),
+                None if known => hold.open.push(id.clone()),
+                None => hold.unknown.push(id.clone()),
+            }
+        }
+        hold
     }
 
     /// The dispatch excerpt kept for `task_id` (see [`OpenTask`]).
@@ -2606,6 +2846,92 @@ mod tests {
             s.state_of("p-backend-builder", "42"),
             Some(LifecycleState::Done)
         );
+    }
+
+    // -- file claims and dependencies (item 9) ----------------------- //
+
+    #[test]
+    fn declared_files_reads_paths_from_a_note() {
+        // The `dosyalar:` list wins; otherwise the path-like tokens before
+        // the evidence part; an explicit `yok` declares none.
+        assert_eq!(
+            declared_files(Some("dosyalar: src/auth.rs, app/src/Login.tsx; doğrulama: cargo test → 3 geçti")),
+            Some(vec!["src/auth.rs".to_string(), "app/src/Login.tsx".to_string()])
+        );
+        assert_eq!(
+            declared_files(Some(
+                "auth.rs: refresh eklendi (`./src/lib.rs`, src\\x\\y.ts:42, auth.rs); \
+                 doğrulama: node backend/node_modules/.bin/tsc → exit 0"
+            )),
+            Some(vec!["auth.rs".to_string(), "src/lib.rs".to_string(), "src/x/y.ts".to_string()])
+        );
+        assert_eq!(declared_files(Some("dosyalar: yok")), Some(Vec::new()));
+        assert_eq!(declared_files(Some("files: none")), Some(Vec::new()));
+        assert_eq!(declared_files(Some("refresh eklendi; 3 test geçti, exit 0, v1.2")), None);
+        assert_eq!(declared_files(None), None);
+    }
+
+    #[test]
+    fn claims_conflict_only_with_open_tasks() {
+        let s = LifecycleStore::new();
+        let t0 = Instant::now();
+        assert!(!s.has_claim("T1"));
+        assert!(s.claim_files("T1", &["src/a.rs".to_string(), "src/b.rs".to_string()]).is_empty());
+        assert!(s.has_claim("T1"));
+        assert_eq!(s.claimed_files("T1"), vec!["src/a.rs".to_string(), "src/b.rs".to_string()]);
+        // The second task shares one file with the open first task.
+        assert_eq!(
+            s.claim_files("T2", &["src/b.rs".to_string(), "src/c.rs".to_string()]),
+            vec![FileConflict { file: "src/b.rs".into(), other_task: "T1".into() }]
+        );
+        // Claiming again adds without duplicating and never conflicts with itself.
+        assert!(s.claim_files("T2", &["src/c.rs".to_string()]).is_empty());
+        assert_eq!(s.claimed_files("T2"), vec!["src/b.rs".to_string(), "src/c.rs".to_string()]);
+        // An explicit empty declaration is still a claim.
+        assert!(s.claim_files("T4", &[]).is_empty());
+        assert!(s.has_claim("T4"));
+        // A closed task's files are free again, and it takes no new claim.
+        s.assign_at("p-builder", "T1", t0);
+        assert!(s.fail_task("T1"));
+        assert!(s.claim_files("T3", &["src/a.rs".to_string()]).is_empty());
+        assert!(s.claim_files("T1", &["src/z.rs".to_string()]).is_empty());
+        assert_eq!(s.claimed_files("T1"), vec!["src/a.rs".to_string(), "src/b.rs".to_string()]);
+    }
+
+    #[test]
+    fn dependencies_are_read_from_a_dispatch() {
+        assert_eq!(dependencies("p3 | backend-builder | src/x.rs | kabul: test geçer | bağımlılık: p1"), vec!["p1"]);
+        assert_eq!(dependencies("build p4 — iki parça.\nBağımlılık: p1, `p2`."), vec!["p1", "p2"]);
+        assert_eq!(dependencies("build p2 — depends_on: p1; kabul: tsc temiz"), vec!["p1"]);
+        assert_eq!(dependencies("build p5 — bağımlılık: p1 bittikten sonra başla"), vec!["p1"]);
+        assert_eq!(dependencies("build p6 — bağımlılık: auth-task"), vec!["auth-task"]);
+        assert!(dependencies("build p1 — bağımlılık: yok").is_empty());
+        assert!(dependencies("build p7 — hiç bağımlılık yok, hemen başla").is_empty());
+        assert!(dependencies("DONE p8 — x.rs; doğrulama: cargo test → ok").is_empty());
+    }
+
+    #[test]
+    fn dependency_hold_reports_open_failed_unknown() {
+        let s = LifecycleStore::new();
+        let t0 = Instant::now();
+        s.assign_at("p-builder", "T1", t0); // stays open
+        s.assign_at("p-fb", "T2", t0);
+        assert!(s.fail_task("T2")); // closed as failed
+        s.assign_at("p-builder", "T4", t0); // closed as done
+        rec_at(&s, "p-builder", &tr(TransitionKind::Done, "T4"), t0);
+        rec_at(&s, "p-reviewer", &tr(TransitionKind::Approved, "T4"), t0);
+        rec_at(&s, "p-tester", &tr(TransitionKind::Approved, "T4"), t0);
+        assert_eq!(s.closure("T4"), Some(Closure::Done));
+        let deps: Vec<String> = ["T1", "T2", "T3", "T4"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            s.dependency_hold(&deps),
+            DependencyHold {
+                open: vec!["T1".into()],
+                failed: vec!["T2".into()],
+                unknown: vec!["T3".into()],
+            }
+        );
+        assert_eq!(s.dependency_hold(&[]), DependencyHold::default());
     }
 
     // -- take_stalls ------------------------------------------------- //

@@ -13,9 +13,12 @@ use super::stall::{deadlock_text, escalation_for, give_up_texts, question_notice
 use crate::swarm_term::lifecycle::{LifecycleState, Stall, Unanswered};
 use crate::swarm_term::waits::{Deadlock, WaitEdge};
 use super::fsops::{
-    archive_rejected, attempts_sidecar, bump_attempts, drop_envelope,
-    ensure_gitignore, move_to_processed, move_to_rejected, prepare_layout,
+    archive_rejected, attempts_sidecar, bump_attempts, bump_held, clear_held, drop_envelope,
+    ensure_gitignore, held_sidecar, move_to_processed, move_to_rejected, prepare_layout,
 };
+use super::synth::dispatch_dependencies;
+use super::watcher::{dependency_gate, DependencyGate, DEPENDENCY_GRACE};
+use crate::swarm_term::lifecycle::DependencyHold;
 
 fn fresh_root() -> tempfile::TempDir {
     let d = tempdir().expect("tempdir");
@@ -642,4 +645,76 @@ fn a_verdict_is_shown_on_the_builder_and_a_smoke_on_the_tester() {
 
     // Untracked: no owner (the UI falls back to the signal's sender).
     assert!(super::synth::task_owners(&store, &panes, "nope-1").is_empty());
+}
+
+// ---- dependency hold (item 9) ------------------------------------ //
+
+#[test]
+fn only_a_tracked_dispatch_carries_dependencies() {
+    assert_eq!(dispatch_dependencies("orchestrator", "backend-builder", "build p3 — bağımlılık: p1"), vec!["p1"]);
+    assert_eq!(
+        dispatch_dependencies("coordinator", "integration-tester", "smoke p9 — bağımlılık: p1, p2"),
+        vec!["p1", "p2"]
+    );
+    // A builder's report, or a message to an advisor, holds nothing.
+    assert!(dispatch_dependencies("backend-builder", "coordinator", "DONE p3 — bağımlılık: p1 kalktı").is_empty());
+    assert!(dispatch_dependencies("orchestrator", "planner", "plan — bağımlılık: p1").is_empty());
+}
+
+#[test]
+fn dependency_gate_holds_open_returns_failed_and_waits_out_unknown() {
+    let hold = |open: &[&str], failed: &[&str], unknown: &[&str]| DependencyHold {
+        open: open.iter().map(|s| s.to_string()).collect(),
+        failed: failed.iter().map(|s| s.to_string()).collect(),
+        unknown: unknown.iter().map(|s| s.to_string()).collect(),
+    };
+    let z = std::time::Duration::ZERO;
+    assert_eq!(dependency_gate(&hold(&[], &[], &[]), z), DependencyGate::Deliver { ignored: vec![] });
+    assert_eq!(dependency_gate(&hold(&["p1"], &[], &[]), z), DependencyGate::Hold { on: vec!["p1".into()] });
+    // A failed dependency wins over an open one: the plan must change.
+    assert_eq!(
+        dependency_gate(&hold(&["p1"], &["p2"], &[]), z),
+        DependencyGate::Reject { failed: vec!["p2".into()] }
+    );
+    // An id nobody dispatched yet may still be on its way (one turn writes
+    // several files): wait the grace out, then deliver anyway.
+    assert_eq!(dependency_gate(&hold(&[], &[], &["p9"]), z), DependencyGate::Hold { on: vec!["p9".into()] });
+    assert_eq!(
+        dependency_gate(&hold(&[], &[], &["p9"]), DEPENDENCY_GRACE),
+        DependencyGate::Deliver { ignored: vec!["p9".into()] }
+    );
+    assert_eq!(
+        dependency_gate(&hold(&["p1"], &[], &["p9"]), DEPENDENCY_GRACE),
+        DependencyGate::Hold { on: vec!["p1".into()] }
+    );
+}
+
+#[test]
+fn a_held_dispatch_counts_its_holds_until_released() {
+    let d = tempdir().expect("tempdir");
+    let p = d.path().join("msg.json");
+    fs::write(&p, "{}").expect("write");
+    assert!(!clear_held(&p));
+    assert_eq!(bump_held(&p), 1);
+    assert_eq!(bump_held(&p), 2);
+    assert!(held_sidecar(&p).is_file());
+    // Independent of the delivery-retry counter.
+    assert!(!attempts_sidecar(&p).is_file());
+    assert!(clear_held(&p));
+    assert!(!held_sidecar(&p).is_file());
+}
+
+#[test]
+fn moves_drop_the_held_sidecar() {
+    let d = fresh_root();
+    let p = d.path().join("outbox").join("orchestrator").join("01.json");
+    fs::write(&p, serde_json::to_string(&env("orchestrator", "backend-builder", "hi")).unwrap()).unwrap();
+    bump_held(&p);
+    move_to_processed(d.path(), &p, "backend-builder").unwrap();
+    assert!(!held_sidecar(&p).is_file());
+    let p2 = d.path().join("outbox").join("orchestrator").join("02.json");
+    fs::write(&p2, "{}").unwrap();
+    bump_held(&p2);
+    move_to_rejected(d.path(), &p2, "backend-builder", "why").unwrap();
+    assert!(!held_sidecar(&p2).is_file());
 }

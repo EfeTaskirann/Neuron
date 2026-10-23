@@ -19,8 +19,8 @@ use crate::swarm_term::hierarchy::{
     builders_judged_by, is_allowed, is_builder, is_dispatcher, is_reviewer,
 };
 use crate::swarm_term::lifecycle::{
-    body_task_id, cause_of, done_evidence, error_reason, followup_for_coordinator_inbound,
-    is_error_report, lifecycle_note, looks_like_unparsed_signal,
+    body_task_id, cause_of, declared_files, dependencies, done_evidence, error_reason,
+    followup_for_coordinator_inbound, is_error_report, lifecycle_note, looks_like_unparsed_signal,
     parse_lifecycle_token_with_fallback, rework_evidence, strip_cause_tag, task_failed_id, Abandon, Cause, Closure,
     DoneEvidence, LifecycleState, LifecycleStore, TransitionKind, MAX_REWORK_ROUNDS,
     TASK_FAILED_PREFIX, TESTER,
@@ -197,6 +197,25 @@ pub(super) fn lifecycle_synthesise<R: Runtime>(
             "DONE without run evidence",
         )];
     }
+    // ...and must follow a file declaration (`BUILDING <id> — dosyalar:
+    // …`): two builders on one file are caught while they work, not at
+    // the merge.
+    if transition.kind == TransitionKind::Done
+        && is_builder(from_agent)
+        && !lifecycle.has_claim(&id)
+    {
+        tracing::info!(source = %from_agent, task_id = %id, "swarm-term bridge: DONE refused — no file declaration");
+        return vec![Notice::new(
+            from_agent,
+            format!(
+                "`DONE {id}` KABUL EDİLMEDİ: dosya beyanı yok, review başlamadı. Önce \
+                 `BUILDING {id} — dosyalar: <dokunduğun yollar>` gönder (dosya yoksa \
+                 `dosyalar: yok`), sonra bu DONE'u aynen yeniden yolla. Bir sonraki görevde \
+                 beyanı işe BAŞLARKEN yaz: iki builder'ın aynı dosyaya yazmasını o yakalar."
+            ),
+            "DONE without file declaration",
+        )];
+    }
     // A rejection names its cause; a code rejection must point at
     // something to fix (a failing test, an error line, file:line) or the
     // builder spends a round guessing.
@@ -233,6 +252,16 @@ pub(super) fn lifecycle_synthesise<R: Runtime>(
     if let Some(closure) = rec.already_closed {
         return vec![closed_notice(from_agent, &id, closure)];
     }
+    // What the builder declared it touches (a BUILDING's list, a DONE
+    // note's paths): a file open in another task is a conflict both the
+    // builder and the coordinator hear about.
+    let claim_notices = if is_builder(from_agent)
+        && matches!(transition.kind, TransitionKind::Building | TransitionKind::Done)
+    {
+        claim_notices(from_agent, &id, transition.kind, note.as_deref(), panes_by_agent, lifecycle)
+    } else {
+        Vec::new()
+    };
     // A CHANGES_NEEDED that used up the rework limit CLOSES the task as
     // failed; both it and a normal within-limit rejection record
     // `state: Failed` (lifecycle::apply_transition), so label the closing
@@ -287,7 +316,7 @@ pub(super) fn lifecycle_synthesise<R: Runtime>(
     }
     let Some((target, base)) = followup_for_coordinator_inbound(from_agent, &transition, &rec)
     else {
-        return Vec::new();
+        return claim_notices;
     };
     // A retest carries the BUILDERS' notes (what the fix changed), not
     // the reviewer's approval text; the TASK_DONE that closes such a task
@@ -329,8 +358,73 @@ pub(super) fn lifecycle_synthesise<R: Runtime>(
             ),
             "unclear task sent to the planner",
         )],
-        _ => Vec::new(),
+        _ => claim_notices,
     }
+}
+
+/// The notices a builder's file declaration earns — none for a clean
+/// one. A BUILDING that declares nothing: the builder is asked for the
+/// list. A declared file open in another task: the coordinator is told
+/// to sequence the two; on a BUILDING the builder is told not to write
+/// it yet (on a DONE it already did).
+fn claim_notices(
+    from_agent: &str,
+    id: &str,
+    kind: TransitionKind,
+    note: Option<&str>,
+    panes_by_agent: &HashMap<String, String>,
+    lifecycle: &LifecycleStore,
+) -> Vec<Notice> {
+    let Some(files) = declared_files(note) else {
+        if kind != TransitionKind::Building {
+            return Vec::new();
+        }
+        return vec![Notice::new(
+            from_agent,
+            format!(
+                "`BUILDING {id}` alındı ama dosya beyanı yok. Hangi dosyalara dokunacaksın? \
+                 `BUILDING {id} — dosyalar: <yollar, virgülle>` diye yeniden yaz (dosya yoksa \
+                 `dosyalar: yok`); beyansız `DONE` kabul edilmez."
+            ),
+            "BUILDING without files",
+        )];
+    };
+    let conflicts = lifecycle.claim_files(id, &files);
+    if conflicts.is_empty() {
+        return Vec::new();
+    }
+    let list = conflicts
+        .iter()
+        .map(|c| {
+            let who = task_owners(lifecycle, panes_by_agent, &c.other_task);
+            if who.is_empty() {
+                format!("`{}` → `{}`", c.file, c.other_task)
+            } else {
+                format!("`{}` → `{}` (@{})", c.file, c.other_task, who.join(", @"))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut notices = vec![Notice::new(
+        "coordinator",
+        format!(
+            "`{id}` (@{from_agent}) ile başka bir açık görev aynı dosyaya dokunuyor: {list}. \
+             Sırala: biri kapanmadan diğerinin o dosyaya yazmasına izin verme; review'da \
+             birleşmeyi kontrol ettir."
+        ),
+        "file claimed by another open task",
+    )];
+    if kind == TransitionKind::Building {
+        notices.push(Notice::new(
+            from_agent,
+            format!(
+                "Beyan ettiğin dosya şu an başka bir açık görevde de beyanlı: {list}. O görev \
+                 kapanmadan bu dosyaya yazma; coordinator'a bildirildi, sıralamayı o yapar."
+            ),
+            "file claimed by another open task",
+        ));
+    }
+    notices
 }
 
 /// The coordinator's notice for a task held for the user (`[izin]` /
@@ -406,6 +500,16 @@ pub(super) fn dispatch_conflict(
 
 fn tracks_dispatch(from_agent: &str, to_agent: &str) -> bool {
     is_dispatcher(from_agent) && (is_builder(to_agent) || to_agent == TESTER)
+}
+
+/// The task ids a tracked dispatch (see [`tracks_dispatch`]) says it
+/// depends on (`bağımlılık: <id>`); nothing for any other message.
+pub(super) fn dispatch_dependencies(from_agent: &str, to_agent: &str, body: &str) -> Vec<String> {
+    if tracks_dispatch(from_agent, to_agent) {
+        dependencies(body)
+    } else {
+        Vec::new()
+    }
 }
 
 /// The task id a delivery carries: the envelope field, or — for a

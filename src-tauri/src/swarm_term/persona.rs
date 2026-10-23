@@ -308,8 +308,14 @@ pub(crate) fn build_persona_prompt(
            koşamıyorsan `doğrulama yok: <neden>` yaz. `—` sonrasındaki not reviewer'a ve\n\
            tester'a otomatik iletilir; neye bakılacağı oradan öğrenilir, o yüzden dosya\n\
            yollarını yaz.\n\
-         - **Builder ise** çalışmaya başladığını duyurmak istiyorsan (opsiyonel):\n\
-           `body: \"BUILDING <task_id>\"`.\n\
+         - **Builder ise** işe başlarken ZORUNLU: `body: \"BUILDING <task_id> — dosyalar:\n\
+           <dokunacağın yollar, virgülle>\"` (dosya yoksa `dosyalar: yok`). Beyansız `DONE`\n\
+           kabul edilmez. Beyan ettiğin bir dosya başka bir AÇIK görevde de beyanlıysa sana\n\
+           ve coordinator'a `[Neuron]` notu gelir: o görev kapanmadan o dosyaya yazma.\n\
+         - **Orchestrator / coordinator ise** bir dispatch'in gövdesine `bağımlılık: <task_id>`\n\
+           yazarsan Neuron mesajı o görev `TASK_DONE` olana dek kuyrukta bekletir (sana\n\
+           `bekletiliyor` notu gelir) ve kapanınca iletir; görev `TASK_FAILED` olursa mesaj\n\
+           sana `[Neuron]` notuyla geri döner. `bağımlılık: yok` hemen iletilir.\n\
          - **Reviewer ise** onay verince: `body: \"APPROVED <task_id>\"`. Bu görevi\n\
            KAPATMAZ: backend tester'a `test <task_id> — <builder notu>` düşürür; bir görev\n\
            ancak tester'ın koşan testiyle kapanır.\n\
@@ -766,6 +772,33 @@ mod tests {
         let t = build_persona_prompt("integration-tester", "x", &dummy_bridge_root(), &facts(), AGENT_IDS);
         assert!(t.contains("Reviewer / integration-tester ise"));
         assert!(t.contains("HER ZAMAN coordinator'a gönder"));
+    }
+
+    #[test]
+    fn footer_requires_a_file_declaration_and_explains_dependency_holds() {
+        // Item 9: BUILDING declares the files (no longer optional); a
+        // dispatch's `bağımlılık:` is held by Neuron, not by the dispatcher.
+        let b = build_persona_prompt("backend-builder", "x", &dummy_bridge_root(), &facts(), AGENT_IDS);
+        assert!(b.contains("BUILDING <task_id> — dosyalar:"));
+        assert!(b.contains("dosyalar: yok"));
+        assert!(b.contains("Beyansız `DONE`"));
+        assert!(!b.contains("duyurmak istiyorsan"));
+        let o = build_persona_prompt("orchestrator", "x", &dummy_bridge_root(), &facts(), AGENT_IDS);
+        assert!(o.contains("bağımlılık: <task_id>"));
+        assert!(o.contains("bekletir"));
+    }
+
+    #[test]
+    fn term_dispatchers_know_the_hold_and_the_claims() {
+        let reg = crate::swarm::profile::ProfileRegistry::load_term(None).expect("load_term");
+        let orch = &reg.get("orchestrator").expect("orchestrator").body;
+        assert!(orch.contains("bağımlılık: <id>") && orch.contains("bekletir"), "all steps go out at once; Neuron holds");
+        assert!(!orch.contains("geldikten sonra dispatch edilir"));
+        let coord = &reg.get("coordinator").expect("coordinator").body;
+        assert!(coord.contains("BUILDING <task_id> — dosyalar"));
+        assert!(coord.contains("bağımlılık: <id>"));
+        let planner = &reg.get("planner").expect("planner").body;
+        assert!(planner.contains("bağımlılık: yok"));
     }
 
     #[test]
