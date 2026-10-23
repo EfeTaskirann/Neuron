@@ -23,6 +23,7 @@ const OUTCOME_LABEL: Record<RouteOutcome, string> = {
   notice: 'notice',
   reminder: 'reminder',
   injection: 'injection',
+  held: 'held',
 };
 
 function formatTs(ts: number): string {

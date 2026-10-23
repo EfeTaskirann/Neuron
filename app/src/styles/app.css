@@ -1490,7 +1490,8 @@ html[data-motion="off"] *::after {
 }
 .routing-log-tag-target_not_ready,
 .routing-log-tag-notice,
-.routing-log-tag-reminder {
+.routing-log-tag-reminder,
+.routing-log-tag-held {
   background: color-mix(in oklch, var(--syn-warning) 18%, transparent);
   border-color: var(--syn-warning);
   color: color-mix(in oklch, var(--syn-warning) 70%, white);
